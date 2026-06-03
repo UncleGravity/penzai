@@ -1,5 +1,5 @@
 {
-  description = "penzai llama.cpp fake remote buffer e2e experiment";
+  description = "penzai llama.cpp backend experiments";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -75,8 +75,8 @@
             '';
           };
 
-          e2e = pkgs.stdenv.mkDerivation {
-            pname = "penzai-llama-remote-buffer-e2e";
+          llama-experiments = pkgs.stdenv.mkDerivation {
+            pname = "penzai-llama-experiments";
             version = "0.1.0";
             src = ./.;
 
@@ -99,7 +99,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p "$out/bin"
-              cp zig-out/bin/llama-remote-buffer-e2e "$out/bin/"
+              cp zig-out/bin/* "$out/bin/"
               runHook postInstall
             '';
 
@@ -109,23 +109,46 @@
           };
         in {
           packages = {
-            inherit e2e llama-cpp tiny-gguf;
-            default = e2e;
+            inherit llama-cpp tiny-gguf;
+            all = llama-experiments;
+            default = llama-experiments;
+            backend-e2e = llama-experiments;
+            remote-buffer-e2e = llama-experiments;
+            partial-offload = llama-experiments;
+            op-census = llama-experiments;
+            binding-lower-dryrun = llama-experiments;
           };
 
           apps = {
-            default = {
+            default = self'.apps.backend-e2e;
+            backend-e2e = {
               type = "app";
-              program = "${self'.packages.default}/bin/llama-remote-buffer-e2e";
+              program = "${self'.packages.all}/bin/llama-backend-e2e";
             };
-            e2e = {
+            remote-buffer-e2e = {
               type = "app";
-              program = "${self'.packages.e2e}/bin/llama-remote-buffer-e2e";
+              program = "${self'.packages.all}/bin/llama-remote-buffer-e2e";
+            };
+            partial-offload = {
+              type = "app";
+              program = "${self'.packages.all}/bin/llama-partial-offload";
+            };
+            op-census = {
+              type = "app";
+              program = "${self'.packages.all}/bin/llama-op-census";
+            };
+            binding-lower-dryrun = {
+              type = "app";
+              program = "${self'.packages.all}/bin/llama-binding-lower-dryrun";
             };
           };
 
           checks = {
-            e2e = self'.packages.e2e;
+            backend-e2e = self'.packages.backend-e2e;
+            remote-buffer-e2e = self'.packages.remote-buffer-e2e;
+            partial-offload = self'.packages.partial-offload;
+            op-census = self'.packages.op-census;
+            binding-lower-dryrun = self'.packages.binding-lower-dryrun;
           };
 
           devShells.default = pkgs.mkShell {
@@ -135,8 +158,12 @@
               pkgs.ninja
             ];
             shellHook = ''
-              echo "llama remote buffer e2e:"
-              echo "  nix run .#e2e"
+              echo "llama experiments:"
+              echo "  nix run .#backend-e2e"
+              echo "  nix run .#remote-buffer-e2e"
+              echo "  nix run .#partial-offload"
+              echo "  nix run .#op-census"
+              echo "  nix run .#binding-lower-dryrun"
             '';
           };
         };

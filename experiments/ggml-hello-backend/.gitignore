@@ -1,5 +1,0 @@
-# vendored upstream clone (re-clone with the command in README.md)
-/vendor/
-# zig build cache + output
-/.zig-cache/
-/zig-out/
