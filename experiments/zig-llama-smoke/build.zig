@@ -39,7 +39,7 @@ pub fn build(b: *std.Build) void {
     root_mod.addImport("c", translate_c.createModule());
 
     const exe = b.addExecutable(.{
-        .name = "panzai-ggml-smoke",
+        .name = "penzai-ggml-smoke",
         .root_module = root_mod,
     });
 

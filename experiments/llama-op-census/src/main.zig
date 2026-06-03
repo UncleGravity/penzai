@@ -12,7 +12,7 @@ const Error = error{
     DecodeFailed,
     LogitsMissing,
     NoCensus,
-    NoPanzaiCompute,
+    NoPenzaiCompute,
     TooManyPatterns,
 };
 
@@ -52,7 +52,7 @@ const Pattern = struct {
     support_calls: usize = 0,
     eval_ask_calls: usize = 0,
     eval_observe_calls: usize = 0,
-    panzai_compute_calls: usize = 0,
+    penzai_compute_calls: usize = 0,
 };
 
 const Census = struct {
@@ -62,7 +62,7 @@ const Census = struct {
     support_calls: usize = 0,
     eval_ask_calls: usize = 0,
     eval_observe_calls: usize = 0,
-    panzai_compute_calls: usize = 0,
+    penzai_compute_calls: usize = 0,
     graph_compute_calls: usize = 0,
     accepted_ops: usize = 0,
     accepted_mul_mat: usize = 0,
@@ -92,9 +92,9 @@ const Dev = struct {
     }
 };
 
-var panzai = Dev{
-    .name = "panzai-census",
-    .desc = "panzai op census backend (CPU-delegating)",
+var penzai = Dev{
+    .name = "penzai-census",
+    .desc = "penzai op census backend (CPU-delegating)",
 };
 
 fn quietLog(level: c.enum_ggml_log_level, text: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
@@ -174,7 +174,7 @@ fn patternFor(t: *c.ggml_tensor) ?*Pattern {
     return pattern;
 }
 
-const RecordKind = enum { support, eval_ask, eval_observe, panzai_compute };
+const RecordKind = enum { support, eval_ask, eval_observe, penzai_compute };
 
 fn recordNode(t: *c.ggml_tensor, kind: RecordKind) void {
     const pattern = patternFor(t) orelse return;
@@ -191,9 +191,9 @@ fn recordNode(t: *c.ggml_tensor, kind: RecordKind) void {
             census.eval_observe_calls += 1;
             pattern.eval_observe_calls += 1;
         },
-        .panzai_compute => {
-            census.panzai_compute_calls += 1;
-            pattern.panzai_compute_calls += 1;
+        .penzai_compute => {
+            census.penzai_compute_calls += 1;
+            pattern.penzai_compute_calls += 1;
         },
     }
 }
@@ -297,7 +297,7 @@ fn backendGraphCompute(backend: c.ggml_backend_t, cgraph: ?*c.ggml_cgraph) callc
     const n = c.ggml_graph_n_nodes(g);
     var i: c_int = 0;
     while (i < n) : (i += 1) {
-        if (c.ggml_graph_node(g, i)) |node| recordNode(node, .panzai_compute);
+        if (c.ggml_graph_node(g, i)) |node| recordNode(node, .penzai_compute);
     }
 
     const d = devOf(backend.?.*.context);
@@ -434,7 +434,7 @@ fn runDecode(model_path: [:0]const u8) !void {
     model_params.n_gpu_layers = 1;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
 
-    var devices = [_]c.ggml_backend_dev_t{ &panzai.device, null };
+    var devices = [_]c.ggml_backend_dev_t{ &penzai.device, null };
     model_params.devices = &devices;
 
     const model = c.llama_model_load_from_file(model_path.ptr, model_params) orelse return Error.ModelLoadFailed;
@@ -499,11 +499,11 @@ fn argModelPath() ![:0]const u8 {
 
 fn printPattern(index: usize, p: *const Pattern) void {
     std.debug.print(
-        "{d: >3} eval={d: >3} panzai={d: >3} support={d: >4} op={s: <12} dst={s: <5} dst_ne={any} src0={s: <5}{any} src1={s: <5}{any} ex={s}\n",
+        "{d: >3} eval={d: >3} penzai={d: >3} support={d: >4} op={s: <12} dst={s: <5} dst_ne={any} src0={s: <5}{any} src1={s: <5}{any} ex={s}\n",
         .{
             index,
             p.eval_observe_calls,
-            p.panzai_compute_calls,
+            p.penzai_compute_calls,
             p.support_calls,
             p.op_name[0..p.op_name_len],
             p.dst_type_name[0..p.dst_type_name_len],
@@ -520,12 +520,12 @@ fn printPattern(index: usize, p: *const Pattern) void {
 fn printCensus(model_path: [:0]const u8) void {
     std.debug.print("llama op census\nmodel: {s}\n", .{model_path});
     std.debug.print(
-        "summary: unique_patterns={d}, support_calls={d}, eval_nodes={d}, panzai_nodes={d}, graph_compute_calls={d}, accepted_ops={d}, accepted_mul_mat={d}, overflow={d}\n",
+        "summary: unique_patterns={d}, support_calls={d}, eval_nodes={d}, penzai_nodes={d}, graph_compute_calls={d}, accepted_ops={d}, accepted_mul_mat={d}, overflow={d}\n",
         .{
             census.len,
             census.support_calls,
             census.eval_observe_calls,
-            census.panzai_compute_calls,
+            census.penzai_compute_calls,
             census.graph_compute_calls,
             census.accepted_ops,
             census.accepted_mul_mat,
@@ -539,7 +539,7 @@ fn printCensus(model_path: [:0]const u8) void {
 }
 
 pub fn main() !void {
-    panzai.wire();
+    penzai.wire();
 
     const model_path = try argModelPath();
     defer allocator.free(model_path);
@@ -553,6 +553,6 @@ pub fn main() !void {
     printCensus(model_path);
 
     if (census.len == 0 or census.eval_observe_calls == 0) return Error.NoCensus;
-    if (census.panzai_compute_calls == 0 or census.graph_compute_calls == 0) return Error.NoPanzaiCompute;
+    if (census.penzai_compute_calls == 0 or census.graph_compute_calls == 0) return Error.NoPenzaiCompute;
     if (census.overflow != 0) return Error.TooManyPatterns;
 }

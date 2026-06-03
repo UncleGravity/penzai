@@ -2,7 +2,7 @@ const std = @import("std");
 
 // Builds the experiment by compiling ggml-base's C/C++ sources with Zig's own
 // bundled clang — no CMake, no system toolchain. This is the "one build"
-// panzai is aiming for: ggml linked straight into the Zig artifact.
+// penzai is aiming for: ggml linked straight into the Zig artifact.
 const ggml = "vendor/llama.cpp/ggml";
 
 const base_c = [_][]const u8{
@@ -22,12 +22,12 @@ const base_cpp = [_][]const u8{
 
 const defines = [_][]const u8{
     "-D_DARWIN_C_SOURCE",
-    "-DGGML_VERSION=\"0.13.1-panzai-hello\"",
+    "-DGGML_VERSION=\"0.13.1-penzai-hello\"",
     "-DGGML_COMMIT=\"hello\"",
     // ggml computes graph sizes via pointer arithmetic from a NULL base
     // (incr_ptr_aligned), which is UB in C and trips Zig's UB sanitizer when
     // these TUs are built in Debug. Disable it for ggml's own sources only;
-    // our Zig keeps full safety. panzai's build will need the same.
+    // our Zig keeps full safety. penzai's build will need the same.
     "-fno-sanitize=undefined",
 };
 

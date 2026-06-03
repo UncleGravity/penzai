@@ -15,10 +15,10 @@ nix run .#e2e
 
 The census records three perspectives:
 
-- `support` calls: ops llama's scheduler asked the panzai device about.
+- `support` calls: ops llama's scheduler asked the penzai device about.
 - `eval` calls: actual executed graph nodes observed via the scheduler eval
   callback.
-- `panzai` calls: nodes that reached the Zig panzai backend's `graph_compute`.
+- `penzai` calls: nodes that reached the Zig penzai backend's `graph_compute`.
 
 The backend still delegates math to ggml CPU. This experiment is about graph
 shape and scheduler placement, not accelerator kernels.
@@ -30,7 +30,7 @@ shape and scheduler placement, not accelerator kernels.
 - `77` unique op/type/shape patterns.
 - `1136` scheduler `supports_op` calls.
 - `186` executed graph nodes via the scheduler eval callback.
-- `176` nodes that actually reached the panzai backend `graph_compute`.
+- `176` nodes that actually reached the penzai backend `graph_compute`.
 - `277` accepted `MUL_MAT` support checks.
 - `0` census overflow.
 

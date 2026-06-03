@@ -1,5 +1,5 @@
 {
-  description = "panzai llama.cpp partial offload experiment";
+  description = "penzai llama.cpp partial offload experiment";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -36,7 +36,7 @@
           };
 
           llama-cpp = pkgs.stdenv.mkDerivation {
-            pname = "panzai-e2e-llama-cpp";
+            pname = "penzai-e2e-llama-cpp";
             version = "pinned";
             src = llama-cpp-src;
 
@@ -76,7 +76,7 @@
           };
 
           e2e = pkgs.stdenv.mkDerivation {
-            pname = "panzai-llama-partial-offload";
+            pname = "penzai-llama-partial-offload";
             version = "0.1.0";
             src = ./.;
 

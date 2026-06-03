@@ -28,7 +28,7 @@ const Error = error{
 };
 
 const MaxBindings = 4096;
-const RemoteMagic: u64 = 0x7061_6e7a_6169_6275; // "panzaibu"
+const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 
 const Counters = struct {
     init_backend_calls: usize = 0,
@@ -102,9 +102,9 @@ const Dev = struct {
     }
 };
 
-var panzai = Dev{
-    .name = "panzai-bind-dryrun",
-    .desc = "panzai remote binding + dry-run lowerer",
+var penzai = Dev{
+    .name = "penzai-bind-dryrun",
+    .desc = "penzai remote binding + dry-run lowerer",
 };
 
 fn quietLog(level: c.enum_ggml_log_level, text: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
@@ -370,7 +370,7 @@ fn backendGraphCompute(backend: c.ggml_backend_t, cgraph: ?*c.ggml_cgraph) callc
         } else {
             counters.graph_unexpected_nodes += 1;
             std.debug.print(
-                "unexpected panzai graph node: op={s}, name={s}\n",
+                "unexpected penzai graph node: op={s}, name={s}\n",
                 .{ std.mem.span(c.ggml_op_name(node.*.op)), std.mem.span(c.ggml_get_name(node)) },
             );
         }
@@ -470,7 +470,7 @@ fn devOffloadOp(dev: c.ggml_backend_dev_t, op: ?*const c.ggml_tensor) callconv(.
 
 fn devSupportsBuft(dev: c.ggml_backend_dev_t, buft: c.ggml_backend_buffer_type_t) callconv(.c) bool {
     const d = devOf(dev.?.*.context);
-    // Match the old pynqz1 backend: real lowerable commands must use panzai
+    // Match the old pynqz1 backend: real lowerable commands must use penzai
     // buffers so every tensor has a remote binding. Accepting host buffers here
     // lets the scheduler hand graph_compute CPU-resident inputs.
     return buft == &d.buft;
@@ -524,13 +524,13 @@ const DecodeResult = struct {
     }
 };
 
-fn runDecode(model_path: [:0]const u8, use_panzai: bool) !DecodeResult {
+fn runDecode(model_path: [:0]const u8, use_penzai: bool) !DecodeResult {
     var model_params = c.llama_model_default_params();
-    model_params.n_gpu_layers = if (use_panzai) 1 else 0;
+    model_params.n_gpu_layers = if (use_penzai) 1 else 0;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
 
-    var devices = [_]c.ggml_backend_dev_t{ &panzai.device, null };
-    if (use_panzai) {
+    var devices = [_]c.ggml_backend_dev_t{ &penzai.device, null };
+    if (use_penzai) {
         model_params.devices = &devices;
     }
 
@@ -607,7 +607,7 @@ fn argModelPath() ![:0]const u8 {
 }
 
 pub fn main() !void {
-    panzai.wire();
+    penzai.wire();
 
     const model_path = try argModelPath();
     defer allocator.free(model_path);
@@ -630,7 +630,7 @@ pub fn main() !void {
     const diff = maxAbsDiff(cpu.logits, accelerated.logits);
 
     std.debug.print(
-        "panzai counters: init_backend={d}, supports_op={d}, accepted_mul_mat={d}, accepted_metadata={d}, accepted_none={d}, rejected={d}, offload_op={d}, offloaded_mul_mat={d}, graph_compute={d}, graph_nodes={d}, graph_metadata={d}, metadata_bound={d}, graph_mul_mat={d}, graph_unexpected={d}, dryrun_commands={d}, dryrun_missing_bindings={d}, init_tensor={d}, normal_bindings={d}, view_bindings={d}, binding_overflow={d}, alloc_buffer={d}, non_host_alloc={d}, set_tensor={d}, get_tensor={d}, remote_alloc_bytes={d}, remote_upload_bytes={d}, remote_download_bytes={d}\n",
+        "penzai counters: init_backend={d}, supports_op={d}, accepted_mul_mat={d}, accepted_metadata={d}, accepted_none={d}, rejected={d}, offload_op={d}, offloaded_mul_mat={d}, graph_compute={d}, graph_nodes={d}, graph_metadata={d}, metadata_bound={d}, graph_mul_mat={d}, graph_unexpected={d}, dryrun_commands={d}, dryrun_missing_bindings={d}, init_tensor={d}, normal_bindings={d}, view_bindings={d}, binding_overflow={d}, alloc_buffer={d}, non_host_alloc={d}, set_tensor={d}, get_tensor={d}, remote_alloc_bytes={d}, remote_upload_bytes={d}, remote_download_bytes={d}\n",
         .{
             counters.init_backend_calls,
             counters.supports_op_calls,

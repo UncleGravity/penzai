@@ -1,5 +1,5 @@
 {
-  description = "panzai llama.cpp ggml op census experiment";
+  description = "penzai llama.cpp ggml op census experiment";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -36,7 +36,7 @@
           };
 
           llama-cpp = pkgs.stdenv.mkDerivation {
-            pname = "panzai-e2e-llama-cpp";
+            pname = "penzai-e2e-llama-cpp";
             version = "pinned";
             src = llama-cpp-src;
 
@@ -76,7 +76,7 @@
           };
 
           e2e = pkgs.stdenv.mkDerivation {
-            pname = "panzai-llama-op-census";
+            pname = "penzai-llama-op-census";
             version = "0.1.0";
             src = ./.;
 

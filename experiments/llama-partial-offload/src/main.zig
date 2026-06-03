@@ -68,9 +68,9 @@ const Dev = struct {
     }
 };
 
-var panzai = Dev{
-    .name = "panzai-partial",
-    .desc = "panzai partial-offload experiment backend (MUL_MAT + metadata)",
+var penzai = Dev{
+    .name = "penzai-partial",
+    .desc = "penzai partial-offload experiment backend (MUL_MAT + metadata)",
 };
 
 fn quietLog(level: c.enum_ggml_log_level, text: [*c]const u8, user_data: ?*anyopaque) callconv(.c) void {
@@ -206,7 +206,7 @@ fn backendGraphCompute(backend: c.ggml_backend_t, cgraph: ?*c.ggml_cgraph) callc
         } else {
             counters.graph_unexpected_nodes += 1;
             std.debug.print(
-                "unexpected panzai graph node: op={s}, name={s}\n",
+                "unexpected penzai graph node: op={s}, name={s}\n",
                 .{ std.mem.span(c.ggml_op_name(node.*.op)), std.mem.span(c.ggml_get_name(node)) },
             );
         }
@@ -363,13 +363,13 @@ const DecodeResult = struct {
     }
 };
 
-fn runDecode(model_path: [:0]const u8, use_panzai: bool) !DecodeResult {
+fn runDecode(model_path: [:0]const u8, use_penzai: bool) !DecodeResult {
     var model_params = c.llama_model_default_params();
-    model_params.n_gpu_layers = if (use_panzai) 1 else 0;
+    model_params.n_gpu_layers = if (use_penzai) 1 else 0;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
 
-    var devices = [_]c.ggml_backend_dev_t{ &panzai.device, null };
-    if (use_panzai) {
+    var devices = [_]c.ggml_backend_dev_t{ &penzai.device, null };
+    if (use_penzai) {
         model_params.devices = &devices;
     }
 
@@ -446,7 +446,7 @@ fn argModelPath() ![:0]const u8 {
 }
 
 pub fn main() !void {
-    panzai.wire();
+    penzai.wire();
 
     const model_path = try argModelPath();
     defer allocator.free(model_path);
@@ -469,7 +469,7 @@ pub fn main() !void {
     const diff = maxAbsDiff(cpu.logits, accelerated.logits);
 
     std.debug.print(
-        "panzai counters: init_backend={d}, supports_op={d}, accepted_mul_mat={d}, accepted_metadata={d}, accepted_none={d}, rejected={d}, offload_op={d}, offloaded_mul_mat={d}, offload_rejected={d}, offload_metadata_rejected={d}, graph_compute={d}, graph_nodes={d}, graph_mul_mat={d}, graph_metadata={d}, graph_reshape={d}, graph_permute={d}, graph_view={d}, graph_transpose={d}, graph_unexpected={d}, alloc_buffer={d}, set_tensor={d}, get_tensor={d}\n",
+        "penzai counters: init_backend={d}, supports_op={d}, accepted_mul_mat={d}, accepted_metadata={d}, accepted_none={d}, rejected={d}, offload_op={d}, offloaded_mul_mat={d}, offload_rejected={d}, offload_metadata_rejected={d}, graph_compute={d}, graph_nodes={d}, graph_mul_mat={d}, graph_metadata={d}, graph_reshape={d}, graph_permute={d}, graph_view={d}, graph_transpose={d}, graph_unexpected={d}, alloc_buffer={d}, set_tensor={d}, get_tensor={d}\n",
         .{
             counters.init_backend_calls,
             counters.supports_op_calls,

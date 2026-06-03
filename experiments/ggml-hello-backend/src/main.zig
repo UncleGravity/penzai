@@ -1,6 +1,6 @@
-//! ggml hello-backend: proving the riskiest panzai seam from Zig.
+//! ggml hello-backend: proving the riskiest penzai seam from Zig.
 //!
-//! panzai's host side must implement ggml's backend interface (the unstable
+//! penzai's host side must implement ggml's backend interface (the unstable
 //! `ggml-backend-impl.h` vtables: backend / device / reg / buffer-type) from
 //! Zig, register it in-process, and let llama.cpp's scheduler place ops on it.
 //! This program proves that whole path against real ggml, with no C++ glue:
@@ -10,7 +10,7 @@
 //!             ggml calling back into Zig + we compute correct results).
 //!   Stage 2 — register a full device/reg/buffer-type and let
 //!             `ggml_backend_sched` split a graph across TWO Zig backends:
-//!             a "panzai" accelerator (GPU-type, MUL_MAT only — like the real
+//!             a "penzai" accelerator (GPU-type, MUL_MAT only — like the real
 //!             PYNQ board) and a CPU-type fallback that takes the glue op.
 //!             This is the exact shape of the real system (matmul offloaded,
 //!             glue on the CPU fallback), and it exercises supports_op,
@@ -319,8 +319,8 @@ const reg_iface = c.ggml_backend_reg_i{
 // ════════════════════════════════════════════════════════════════════════
 
 var accel = Dev{
-    .name = "panzai",
-    .desc = "panzai PYNQ-Z1 accelerator (hello experiment, host-memory)",
+    .name = "penzai",
+    .desc = "penzai PYNQ-Z1 accelerator (hello experiment, host-memory)",
     .dev_type = c.GGML_BACKEND_DEVICE_TYPE_GPU, // an offload target, not the CPU
     .support_mul_mat = true,
     .support_add = false, // matmul only, like the real board
@@ -378,7 +378,7 @@ fn stage1() void {
 
 /// Stage 2 — scheduler splits a graph across the two Zig backends.
 fn stage2() void {
-    std.debug.print("\nStage 2: scheduler splits graph (matmul→panzai, add→cpu-fallback)\n", .{});
+    std.debug.print("\nStage 2: scheduler splits graph (matmul→penzai, add→cpu-fallback)\n", .{});
 
     const ctx = c.ggml_init(.{ .mem_size = 16 * 1024 * 1024, .mem_buffer = null, .no_alloc = true }).?;
     defer c.ggml_free(ctx);
@@ -401,7 +401,7 @@ fn stage2() void {
     const gf = c.ggml_new_graph(ctx);
     c.ggml_build_forward_expand(gf, out);
 
-    // panzai first (priority for supported ops), CPU-type fallback last (the
+    // penzai first (priority for supported ops), CPU-type fallback last (the
     // scheduler asserts the final backend is a CPU device).
     var backends = [_]c.ggml_backend_t{ &accel.backend, &cpu_fallback.backend };
     const sched = c.ggml_backend_sched_new(&backends, null, backends.len, @intCast(c.ggml_graph_size(gf)), false, false).?;
@@ -426,7 +426,7 @@ fn stage2() void {
 
     const mm_on = c.ggml_backend_sched_get_tensor_backend(sched, mm);
     const add_on = c.ggml_backend_sched_get_tensor_backend(sched, out);
-    report("scheduler placed mul_mat on panzai", mm_on == @as(c.ggml_backend_t, &accel.backend));
+    report("scheduler placed mul_mat on penzai", mm_on == @as(c.ggml_backend_t, &accel.backend));
     report("scheduler placed add on cpu-fallback", add_on == @as(c.ggml_backend_t, &cpu_fallback.backend));
 
     var got: [N * M]f32 = undefined;
@@ -442,7 +442,7 @@ pub fn main() void {
     accel.wire();
     cpu_fallback.wire();
 
-    std.debug.print("panzai ggml hello-backend\nggml backend API version: {d}\n", .{c.GGML_BACKEND_API_VERSION});
+    std.debug.print("penzai ggml hello-backend\nggml backend API version: {d}\n", .{c.GGML_BACKEND_API_VERSION});
 
     stage1();
     stage2();

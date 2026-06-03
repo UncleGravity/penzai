@@ -1,12 +1,12 @@
 # llama binding lower dryrun
 
-End-to-end proof that panzai can model ggml metadata ops as remote tensor
+End-to-end proof that penzai can model ggml metadata ops as remote tensor
 descriptors, then dry-run lower real work into command records.
 
 This experiment ports the key old `pynqz1` idea into Zig:
 
 - the backend exposes a non-host buffer type;
-- `supports_buft` accepts only that panzai buffer type, not host buffers;
+- `supports_buft` accepts only that penzai buffer type, not host buffers;
 - each ggml buffer allocation gets one fake remote handle;
 - `init_tensor` binds every ggml tensor to `(handle, offset, nbytes)`;
 - views reuse the source handle and add `view_offs`;
@@ -25,9 +25,9 @@ nix run .#e2e
 
 The test fails if:
 
-- llama does not allocate/use the non-host panzai buffer;
+- llama does not allocate/use the non-host penzai buffer;
 - `init_tensor` does not bind normal tensors and view tensors;
-- panzai graph splits contain unsupported compute ops;
+- penzai graph splits contain unsupported compute ops;
 - a dry-run `MUL_MAT` command is missing source or destination bindings;
 - logits differ from CPU-only.
 
@@ -48,8 +48,8 @@ from the earlier remote-buffer smoke test. That let the scheduler assign matmuls
 whose inputs were still host/CPU tensors, so dry-run lowering saw
 `dryrun_missing_bindings=46`.
 
-Matching the old `pynqz1` policy fixed it: panzai supports only its own remote
-buffer type. With that change, ggml materializes the needed tensors into panzai
+Matching the old `pynqz1` policy fixed it: penzai supports only its own remote
+buffer type. With that change, ggml materializes the needed tensors into penzai
 buffers, every backend matmul has complete source/destination bindings, and
 metadata nodes remain descriptor-only.
 
@@ -80,7 +80,7 @@ Passing run:
 - `remote_download_bytes=214112`
 - `logits max_abs_diff=0.000000`
 
-Design rule: a real panzai backend should not claim host buffer support unless it
+Design rule: a real penzai backend should not claim host buffer support unless it
 can truly lower commands against host-resident tensors. For the planned remote
 runtime, `supports_buft` should be strict, and CPU/host boundaries should appear
-as explicit scheduler copies/materializations into panzai-owned descriptors.
+as explicit scheduler copies/materializations into penzai-owned descriptors.

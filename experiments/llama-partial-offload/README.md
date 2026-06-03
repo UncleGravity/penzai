@@ -1,6 +1,6 @@
 # llama partial offload
 
-End-to-end proof of how llama.cpp behaves when the Zig panzai backend advertises
+End-to-end proof of how llama.cpp behaves when the Zig penzai backend advertises
 matmul plus metadata support, while selecting only matmul as real offloaded
 work.
 
@@ -20,8 +20,8 @@ nix run .#e2e
 The test compares one decode against CPU-only and fails if:
 
 - llama does not initialize/use the Zig backend.
-- no `MUL_MAT` ops are accepted for panzai.
-- panzai receives anything other than `MUL_MAT` or metadata ops in
+- no `MUL_MAT` ops are accepted for penzai.
+- penzai receives anything other than `MUL_MAT` or metadata ops in
   `graph_compute`.
 - logits differ from the CPU-only baseline.
 
@@ -35,7 +35,7 @@ Strict `MUL_MAT`-only offload is not the same as strict `MUL_MAT`-only backend
 execution. In this llama.cpp scheduler path, `offload_op` is installed but was
 not called at all; `supports_op` is the active placement signal. With
 `supports_op` accepting `GGML_OP_MUL_MAT` plus metadata, the graph splits
-assigned to panzai still include view-like metadata nodes around attention
+assigned to penzai still include view-like metadata nodes around attention
 matmuls.
 
 The observed extra nodes are `RESHAPE` and `PERMUTE`, both of which are metadata
@@ -49,7 +49,7 @@ placement, then skipped during lowering. The callback difference is that
 `offload_op` exists for parity with the old backend API, but this exact
 `llama_decode` path did not exercise it.
 
-## Decision for panzai
+## Decision for penzai
 
 Metadata ops should not become wire/device commands. `lower.zig` should treat
 them as tensor descriptor changes:

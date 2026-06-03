@@ -67,9 +67,9 @@ const Dev = struct {
     }
 };
 
-var panzai = Dev{
-    .name = "panzai-remote",
-    .desc = "panzai fake remote buffer backend (CPU-delegating)",
+var penzai = Dev{
+    .name = "penzai-remote",
+    .desc = "penzai fake remote buffer backend (CPU-delegating)",
 };
 
 fn devOf(ctx: ?*anyopaque) *Dev {
@@ -330,13 +330,13 @@ const DecodeResult = struct {
     }
 };
 
-fn runDecode(model_path: [:0]const u8, use_panzai: bool) !DecodeResult {
+fn runDecode(model_path: [:0]const u8, use_penzai: bool) !DecodeResult {
     var model_params = c.llama_model_default_params();
-    model_params.n_gpu_layers = if (use_panzai) 1 else 0;
+    model_params.n_gpu_layers = if (use_penzai) 1 else 0;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
 
-    var devices = [_]c.ggml_backend_dev_t{ &panzai.device, null };
-    if (use_panzai) {
+    var devices = [_]c.ggml_backend_dev_t{ &penzai.device, null };
+    if (use_penzai) {
         model_params.devices = &devices;
     }
 
@@ -413,7 +413,7 @@ fn argModelPath() ![:0]const u8 {
 }
 
 pub fn main() !void {
-    panzai.wire();
+    penzai.wire();
 
     const model_path = try argModelPath();
     defer allocator.free(model_path);
@@ -435,7 +435,7 @@ pub fn main() !void {
     const diff = maxAbsDiff(cpu.logits, accelerated.logits);
 
     std.debug.print(
-        "panzai counters: init_backend={d}, supports_op={d}, accepted={d}, accepted_mul_mat={d}, graph_compute={d}, alloc_buffer={d}, non_host_alloc={d}, set_tensor={d}, get_tensor={d}, remote_alloc_bytes={d}, remote_upload_bytes={d}, remote_download_bytes={d}\n",
+        "penzai counters: init_backend={d}, supports_op={d}, accepted={d}, accepted_mul_mat={d}, graph_compute={d}, alloc_buffer={d}, non_host_alloc={d}, set_tensor={d}, get_tensor={d}, remote_alloc_bytes={d}, remote_upload_bytes={d}, remote_download_bytes={d}\n",
         .{
             counters.init_backend_calls,
             counters.supports_op_calls,

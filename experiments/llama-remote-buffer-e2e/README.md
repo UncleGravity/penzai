@@ -10,7 +10,7 @@ ggml's CPU backend over shadow bytes. That keeps the experiment focused on the
 host/device memory seam:
 
 ```
-GGUF load -> llama tensor upload -> non-host panzai buffer -> scheduler -> Zig backend -> logits
+GGUF load -> llama tensor upload -> non-host penzai buffer -> scheduler -> Zig backend -> logits
 ```
 
 Run:

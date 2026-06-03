@@ -1,13 +1,13 @@
 # ggml hello-backend (Zig)
 
-Proves the riskiest seam in the [panzai plan](../../plan.md): implementing
+Proves the riskiest seam in the [penzai plan](../../plan.md): implementing
 ggml's **backend interface from Zig**, in-process, and letting llama.cpp's
 scheduler place ops on it. This is the part `plan.md` draws as a one-liner
 (`backend.zig — ggml vtables; registered in-process`) but where most of the
 real integration difficulty lives.
 
 No CMake, no `.so`, no system toolchain: ggml-base is compiled straight into
-the Zig artifact with Zig's own bundled clang — the "one build" panzai wants.
+the Zig artifact with Zig's own bundled clang — the "one build" penzai wants.
 
 ## Run
 
@@ -23,8 +23,8 @@ Expected output:
 ```
 Stage 1: custom Zig backend, direct graph_compute dispatch
   [PASS] zig backend mul_mat+add matches reference
-Stage 2: scheduler splits graph (matmul→panzai, add→cpu-fallback)
-  [PASS] scheduler placed mul_mat on panzai
+Stage 2: scheduler splits graph (matmul→penzai, add→cpu-fallback)
+  [PASS] scheduler placed mul_mat on penzai
   [PASS] scheduler placed add on cpu-fallback
   [PASS] scheduled split-graph result matches reference
 ALL STAGES PASSED — the Zig<->ggml backend seam works.
@@ -38,10 +38,10 @@ ALL STAGES PASSED — the Zig<->ggml backend seam works.
   - **Stage 1** builds a `mul_mat`+`add` graph and dispatches it straight
     through our `graph_compute`. Proves ggml calls back into Zig fn-pointers and
     we compute bit-exact results.
-  - **Stage 2** registers two backends — a `panzai` accelerator (GPU-type,
+  - **Stage 2** registers two backends — a `penzai` accelerator (GPU-type,
     MUL_MAT only, like the real PYNQ board) and a CPU-type fallback — and lets
     `ggml_backend_sched` split the graph. The scheduler routes the matmul to
-    `panzai` and the `add` glue op to the CPU fallback, purely from `supports_op`
+    `penzai` and the `add` glue op to the CPU fallback, purely from `supports_op`
     + device type. **This is the exact shape of the real system** (matmul
     offloaded to the board, glue ops on the CPU/llama fallback).
 
@@ -51,7 +51,7 @@ large arch-specific `ggml-cpu/` tree). The ABI risk being de-risked is identical
 
 ## Findings that feed back into `plan.md`
 
-Concrete things panzai's `build.zig` / `host/backend.zig` will have to handle,
+Concrete things penzai's `build.zig` / `host/backend.zig` will have to handle,
 discovered here:
 
 1. **`@cImport` is gone in Zig 0.17.** C interop now goes through the build
@@ -66,7 +66,7 @@ discovered here:
    - `type` is a Zig keyword → tensor/props fields are `t.@"type"`.
 4. **`ggml_cgraph` is opaque** in the public headers (defined in `ggml-impl.h`),
    so a backend must walk it via `ggml_graph_n_nodes` / `ggml_graph_node`, not
-   field access. Relevant to panzai's `lower.zig`.
+   field access. Relevant to penzai's `lower.zig`.
 5. **ggml does NULL-pointer arithmetic** (`incr_ptr_aligned`, used to size
    graphs) which is UB in C and trips Zig's UB sanitizer in Debug. Compile
    ggml's own TUs with `-fno-sanitize=undefined` (our Zig keeps full safety).
@@ -75,7 +75,7 @@ discovered here:
    CMake itself was a dead end here — its compiler probe hangs under nix on
    macOS; Zig's hermetic clang sidesteps it entirely.
 7. **The scheduler asserts the last backend is a CPU-type device**
-   (`ggml-backend.cpp`). For panzai in-process this is satisfied for free by
+   (`ggml-backend.cpp`). For penzai in-process this is satisfied for free by
    llama.cpp's real CPU backend, which is always present as the fallback.
 
 ## Not covered here (next seams)

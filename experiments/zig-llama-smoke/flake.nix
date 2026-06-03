@@ -1,5 +1,5 @@
 {
-  description = "panzai Zig + llama.cpp/ggml smoke experiment";
+  description = "penzai Zig + llama.cpp/ggml smoke experiment";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -31,7 +31,7 @@
           };
 
           llama-cpp = pkgs.stdenv.mkDerivation {
-            pname = "panzai-smoke-llama-cpp";
+            pname = "penzai-smoke-llama-cpp";
             version = "pinned";
             src = llama-cpp-src;
 
@@ -71,7 +71,7 @@
           };
 
           smoke = pkgs.stdenv.mkDerivation {
-            pname = "panzai-ggml-smoke";
+            pname = "penzai-ggml-smoke";
             version = "0.1.0";
             src = ./.;
 
@@ -93,7 +93,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p "$out/bin"
-              cp zig-out/bin/panzai-ggml-smoke "$out/bin/"
+              cp zig-out/bin/penzai-ggml-smoke "$out/bin/"
               runHook postInstall
             '';
 
@@ -109,11 +109,11 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${inputs.self.packages.${system}.default}/bin/panzai-ggml-smoke";
+          program = "${inputs.self.packages.${system}.default}/bin/penzai-ggml-smoke";
         };
         smoke = {
           type = "app";
-          program = "${inputs.self.packages.${system}.smoke}/bin/panzai-ggml-smoke";
+          program = "${inputs.self.packages.${system}.smoke}/bin/penzai-ggml-smoke";
         };
       });
 
