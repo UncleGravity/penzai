@@ -1,0 +1,34 @@
+/dts-v1/;
+/plugin/;
+
+/*
+ * loopback_zocl.dts — Stage B overlay. Loads the bitstream AND brings up a
+ * zocl node so XRT exposes an accelerator device (BO allocation).
+ *
+ * The zocl node lives INSIDE the fpga-region overlay (a child of fpga_full),
+ * NOT as a separate fragment: the dfx-mgr/xmutil flow applies only the
+ * fragment targeting the region and drops others (verified — a fragment@1 on
+ * &amba never reached the live DT). This also matches Vitis/PYNQ overlays.
+ *
+ *   dtc -@ -O dtb -o penzai-loopback.dtbo loopback_zocl.dts
+ */
+
+/ {
+	fragment@0 {
+		target = <&fpga_full>;
+		__overlay__ {
+			#address-cells = <0x02>;
+			#size-cells = <0x02>;
+			firmware-name = "penzai-loopback.bit.bin";
+			resets = <&zynqmp_reset 0x74
+			          &zynqmp_reset 0x75
+			          &zynqmp_reset 0x76
+			          &zynqmp_reset 0x77>;
+
+			zyxclmm_drm {
+				compatible = "xlnx,zocl";
+				status = "okay";
+			};
+		};
+	};
+};
