@@ -1,10 +1,11 @@
 [Unit]
-Description=Load penzai-loopback PL app (bitstream + zocl overlay) at boot
+Description=Load penzai-loopback XRT app at boot
 After=dfx-mgr.service systemd-modules-load.service
 Wants=dfx-mgr.service
 
 [Service]
 Type=oneshot
+ExecStartPre=-/usr/bin/xmutil unloadapp
 ExecStart=/usr/bin/xmutil loadapp penzai-loopback
 RemainAfterExit=yes
 

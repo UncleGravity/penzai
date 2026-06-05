@@ -1,0 +1,22 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target = <&fpga_full>;
+		__overlay__ {
+			#address-cells = <0x02>;
+			#size-cells = <0x02>;
+			firmware-name = "penzai-loopback.bit.bin";
+			resets = <&zynqmp_reset 0x74
+			          &zynqmp_reset 0x75
+			          &zynqmp_reset 0x76
+			          &zynqmp_reset 0x77>;
+
+			zyxclmm_drm {
+				compatible = "xlnx,zocl";
+				status = "okay";
+			};
+		};
+	};
+};

@@ -39,7 +39,7 @@ echo Done. Outputs in fpga\out\ :
 echo   loopback.bit
 echo   loopback.bit.bin
 echo.
-echo Next (from the Mac), copy the bitstream + overlay to the board:
-echo   scp fpga/out/loopback.bit.bin overlay/loopback.dts board/deploy.sh ubuntu@kria:/tmp/
-echo   ssh -t ubuntu@kria "bash /tmp/deploy.sh"
+echo Next (from the host):
+echo   ./deploy.sh
+echo   ./test.sh
 exit /b 0

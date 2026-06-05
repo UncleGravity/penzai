@@ -1,4 +1,4 @@
-/* dma_loopback.c — full KR260 Stage-B data-path test.
+/* dma_loopback.c - full KR260 XRT BO + MMIO DMA data-path test.
  *
  * Combines the two penzai planes:
  *   memory  -> XRT BO (src/dst buffers, physical addr, cache sync)

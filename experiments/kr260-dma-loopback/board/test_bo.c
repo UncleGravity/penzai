@@ -1,4 +1,4 @@
-/* test_bo.c — minimal XRT-native-C-API probe of the KR260 memory path.
+/* test_bo.c - minimal XRT-native-C-API probe of the KR260 memory path.
  * Mirrors the planned Zig binding: open device, alloc BO, get phys addr,
  * map, write, cache-sync. Proves XRT-for-memory works (or shows where it
  * stops). Build on the board:

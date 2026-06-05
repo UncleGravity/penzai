@@ -1,15 +1,15 @@
-# build.tcl — KR260 minimal AXI-DMA loopback overlay (no custom RTL)
+# build.tcl - KR260 minimal AXI-DMA loopback overlay (no custom RTL)
 #
 #   vivado -mode batch -source build.tcl
 #
 # Design:
-#   zynq_ultra_ps_e ──M_AXI_HPM0_FPD──> axi_dma.S_AXI_LITE   (control, MMIO poke)
-#   axi_dma.M_AXIS_MM2S ─> axis_data_fifo ─> axi_dma.S_AXIS_S2MM   (stream loopback)
-#   axi_dma.{M_AXI_MM2S,M_AXI_S2MM} ──> ps.S_AXI_HP0_FPD       (DDR via HP port)
+#   zynq_ultra_ps_e -> axi_dma.S_AXI_LITE       (control, MMIO poke)
+#   axi_dma.M_AXIS_MM2S -> axis_data_fifo -> axi_dma.S_AXIS_S2MM
+#   axi_dma.{M_AXI_MM2S,M_AXI_S2MM} -> ps.S_AXI_HP0_FPD       (DDR via HP port)
 #
 # Validates the whole KR260 path: ZynqMP bitstream build, PL bring-up via
 # dtbo, an XRT device appearing, XRT BO memory, AXI-DMA MMIO control, and
-# src==dst data integrity. Pure Xilinx IP — nothing to stage but this file.
+# src==dst data integrity. Pure Xilinx IP - nothing to stage but this file.
 #
 # CONFIRM THESE before a build run (they are the usual first-try failures):
 #   * board_part string  -> in Vivado tcl console: `get_board_parts *kr260*`
@@ -78,7 +78,7 @@ connect_bd_net [get_bd_pins fan_ttc0_ch2/Dout]   [get_bd_ports fan_en_b]
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* dma
 # c_addr_width 40 so the DMA can reach all of the KR260's 4 GB DDR (incl. the
 # high bank > 2 GB); 32-bit would exclude HP0_DDR_HIGH and could leave XRT
-# buffers unreachable in Stage B. Adds the SA/DA MSB registers (0x1C/0x4C).
+# buffers unreachable. Adds the SA/DA MSB registers (0x1C/0x4C).
 set_property -dict [list \
     CONFIG.c_include_sg {0} \
     CONFIG.c_include_mm2s {1} \
@@ -138,7 +138,7 @@ assign_bd_address
 validate_bd_design
 save_bd_design
 
-# Print the DMA control base address — needed for the MMIO-poke driver.
+# Print the DMA control base address - needed for the MMIO-poke driver.
 puts "==============================================================="
 puts "DIAG: assigned addresses"
 foreach seg [get_bd_addr_segs] { puts "  $seg" }
@@ -173,11 +173,10 @@ launch_runs impl_1 -to_step write_bitstream -jobs 4
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation failed" }
 
-# ---- Exports: .bit (Stage A) and .xsa (Stage B DTG input) -----------------
-# Stage A loads the bitstream with a hand-authored overlay (../overlay/
-# loopback.dts, a clone of the board's starter-kit dtbo) — the XSA is unused
-# there. Stage B feeds this XSA to the Vitis Python DTG (../fpga/gen_dtbo.py)
-# to generate the full zocl-bearing overlay for the XRT path.
+# ---- Exports: .bit and .xsa -----------------------------------------------
+# build.bat converts loopback.bit to loopback.bit.bin with bootgen. deploy.sh
+# packages that .bit.bin with overlay/penzai-loopback.dts for xmutil/dfx-mgr.
+# The .xsa is retained for hardware handoff and inspection.
 set bit [lindex [glob [file normalize ./$proj/$proj.runs/impl_1/${bd}_wrapper.bit]] 0]
 file copy -force $bit $outdir/loopback.bit
 open_run impl_1
