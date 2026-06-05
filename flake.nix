@@ -8,7 +8,7 @@
 
     # ensure zls <-> zig match versions
     zls-flake = {
-      url = "github:zigtools/zls?ref=master";
+      url = "github:zigtools/zls?ref=0.16.0";
       inputs.nixpkgs.follows = "nixpkgs";
     };
   };
@@ -29,7 +29,7 @@
             # --------------- Zig
             overlays = [
               (final: prev: {
-                zig = zig-flake.packages.${system}."master";
+                zig = zig-flake.packages.${system}."0.16.0";
                 zls = zls-flake.packages.${system}.default.overrideAttrs (old: {
                   nativeBuildInputs = (old.nativeBuildInputs or [ ])
                     ++ [ final.zig ];

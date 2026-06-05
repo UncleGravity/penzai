@@ -1,7 +1,7 @@
 @echo off
 REM build.bat - run from cmd on the Windows VM (Vivado/Vitis 2025.2.1).
 REM   build.bat
-REM Produces fpga\out\loopback.bit and fpga\out\loopback.bit.bin
+REM Produces out\loopback.bit and out\loopback.bit.bin
 REM
 REM CONFIRM this path (you said you call it manually). It must be the Vivado
 REM settings64.bat; bootgen needs to be on PATH after it (else also call the
@@ -40,6 +40,6 @@ echo   loopback.bit
 echo   loopback.bit.bin
 echo.
 echo Next (from the host):
-echo   ./deploy.sh
-echo   ./test.sh
+echo   zig build deploy
+echo   zig build verify
 exit /b 0

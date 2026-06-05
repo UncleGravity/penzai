@@ -25,7 +25,7 @@
             inherit system;
             overlays = [
               (_final: _prev: {
-                zig = zig-flake.packages.${system}."master";
+                zig = zig-flake.packages.${system}."0.16.0";
               })
             ];
           };

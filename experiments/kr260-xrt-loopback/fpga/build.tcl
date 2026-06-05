@@ -11,7 +11,7 @@
 # dtbo, an XRT device appearing, XRT BO memory, AXI-DMA MMIO control, and
 # src==dst data integrity. Pure Xilinx IP - nothing to stage but this file.
 #
-# CONFIRM THESE before a build run (they are the usual first-try failures):
+# Confirm these before a build run if Vivado fails early:
 #   * board_part string  -> in Vivado tcl console: `get_board_parts *kr260*`
 #   * KR260 board files installed (Tools > Xilinx > Store, or already present)
 #   * Vivado version matches the board image (2024.1) for the dtbo branch later
@@ -174,8 +174,9 @@ wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation failed" }
 
 # ---- Exports: .bit and .xsa -----------------------------------------------
-# build.bat converts loopback.bit to loopback.bit.bin with bootgen. deploy.sh
-# packages that .bit.bin with overlay/penzai-loopback.dts for xmutil/dfx-mgr.
+# build.bat converts loopback.bit to loopback.bit.bin with bootgen. The
+# top-level build.zig deploy step packages that .bit.bin with
+# overlay/penzai-loopback.dts for xmutil/dfx-mgr.
 # The .xsa is retained for hardware handoff and inspection.
 set bit [lindex [glob [file normalize ./$proj/$proj.runs/impl_1/${bd}_wrapper.bit]] 0]
 file copy -force $bit $outdir/loopback.bit
