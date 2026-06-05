@@ -18,6 +18,7 @@ dtc -@ -O dtb -o "$SRC/$APP.dtbo" "$SRC/loopback.dts"
 
 echo "== assemble app dir /lib/firmware/xilinx/$APP =="
 sudo mkdir -p "/lib/firmware/xilinx/$APP"
+sudo rm -f "/lib/firmware/xilinx/$APP"/*.bit.bin
 sudo cp "$SRC/loopback.bit.bin" "/lib/firmware/xilinx/$APP/$APP.bit.bin"
 sudo cp "$SRC/$APP.dtbo"         "/lib/firmware/xilinx/$APP/$APP.dtbo"
 printf '{\n    "shell_type": "XRT_FLAT",\n    "num_slots": "1"\n}\n' \

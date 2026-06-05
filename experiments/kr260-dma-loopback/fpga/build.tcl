@@ -46,13 +46,33 @@ apply_bd_automation -rule xilinx.com:bd_rule:zynq_ultra_ps_e \
 #   M_AXI_HPM0_FPD (GP0)  -> AXI-Lite control to the DMA
 #   S_AXI_HP0_FPD  (GP2)  -> DMA mastering into DDR
 #   PL clock 0 @ fclk_mhz -> the single PL clock domain
+#   TTC0 waveout[2]        -> fan_en_b (KR260 fan gate, Linux pwm-fan)
 set_property -dict [list \
     CONFIG.PSU__USE__M_AXI_GP0 {1} \
     CONFIG.PSU__USE__M_AXI_GP1 {0} \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ $fclk_mhz \
+    CONFIG.PSU__TTC0__PERIPHERAL__ENABLE {1} \
+    CONFIG.PSU__TTC0__WAVEOUT__ENABLE {1} \
+    CONFIG.PSU__TTC0__WAVEOUT__IO {EMIO} \
 ] [get_bd_cells ps]
+
+# KR260's Linux base DT controls /pwm-fan with TTC0 channel 2:
+#   pwms = <&ttc0 2 40000 PWM_POLARITY_INVERTED>
+# Leave PSU__TTC0__CLOCK__ENABLE off: that is the optional external TTC clock
+# input and it defaults to MIO 6, conflicting with the KR260 SPI1 preset.
+# The fan gate is a PL HDIO pin, so a full replacement bitstream must route
+# that TTC wave output to the board pin or the fan falls back to full speed.
+create_bd_cell -type ip -vlnv xilinx.com:ip:xlslice:* fan_ttc0_ch2
+set_property -dict [list \
+    CONFIG.DIN_WIDTH {3} \
+    CONFIG.DIN_FROM {2} \
+    CONFIG.DIN_TO {2} \
+] [get_bd_cells fan_ttc0_ch2]
+create_bd_port -dir O fan_en_b
+connect_bd_net [get_bd_pins ps/emio_ttc0_wave_o] [get_bd_pins fan_ttc0_ch2/Din]
+connect_bd_net [get_bd_pins fan_ttc0_ch2/Dout]   [get_bd_ports fan_en_b]
 
 # ---- AXI DMA (direct register mode, MM2S + S2MM) --------------------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:axi_dma:* dma
@@ -132,6 +152,18 @@ set wrap [lindex [glob -nocomplain \
 add_files -norecurse $wrap
 update_compile_order -fileset sources_1
 set_property top ${bd}_wrapper [current_fileset]
+
+# KR260 fan gate pin. This is intentionally constrained in the project script
+# instead of being left to board automation: the fan route is part of the
+# board-support contract for any full PL image loaded on this carrier.
+set fan_xdc $outdir/fan_en_b.xdc
+set fh [open $fan_xdc w]
+puts $fh {set_property PACKAGE_PIN A12 [get_ports fan_en_b]}
+puts $fh {set_property IOSTANDARD LVCMOS33 [get_ports fan_en_b]}
+puts $fh {set_property SLEW SLOW [get_ports fan_en_b]}
+puts $fh {set_property DRIVE 4 [get_ports fan_en_b]}
+close $fh
+add_files -fileset constrs_1 -norecurse $fan_xdc
 
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1

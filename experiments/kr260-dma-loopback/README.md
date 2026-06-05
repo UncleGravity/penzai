@@ -1,93 +1,76 @@
 # kr260-dma-loopback
 
-A minimal AXI-DMA loopback overlay for the KR260, to validate the ZynqMP
-bring-up path end to end: build a bitstream → package it as a Kria app
-(`bit.bin` + `dtbo` + `shell.json`) → `xmutil loadapp` → confirm the PL comes up
-and the DMA is reachable → (Stage B) drive a real loopback with XRT memory.
+## Objective
 
-**Zero custom RTL** — pure Xilinx IP:
+Validate the full KR260 (ZynqMP) bring-up on real hardware: build an AXI-DMA
+loopback bitstream → load it → prove **XRT-for-memory + MMIO-poke control**
+(the penzai split) by moving data through `MM2S→FIFO→S2MM` and checking
+`src == dst`. Pure Xilinx IP, no custom RTL.
 
 ```
-zynq_ultra_ps_e ──M_AXI_HPM0_FPD──▶ axi_dma.S_AXI_LITE        (control: MMIO poke)
-axi_dma.M_AXIS_MM2S ─▶ axis_data_fifo ─▶ axi_dma.S_AXIS_S2MM  (stream loopback)
-axi_dma.{M_AXI_MM2S,M_AXI_S2MM} ──▶ ps.S_AXI_HP0_FPD          (DDR via HP port)
+zynq_ultra_ps_e ─M_AXI_HPM0_FPD─▶ axi_dma.S_AXI_LITE       (control via /dev/mem)
+axi_dma.M_AXIS_MM2S ─▶ axis_data_fifo ─▶ axi_dma.S_AXIS_S2MM   (stream loopback)
+axi_dma.{M_AXI_MM2S,M_AXI_S2MM} ─▶ ps.S_AXI_HP0_FPD        (DDR via HP, 40-bit)
 ```
 
-## Environment (confirmed on the actual machines)
+## Instructions
 
-| | value |
-|---|---|
-| Board | KR260, Ubuntu 24.04, kernel `-v2024.1-`, XRT 2.18.0, `dtc` 1.7.0 present |
-| board_part | `xilinx.com:kr260_som:part0:1.1` |
-| Build VM | Windows, `C:\AMDDesignTools\2025.2.1\{Vivado,Vitis}\`, `cmd` only (no bash/WSL) |
-| Tooling note | 2025.2 has **no classic `xsct`** → DTG is now the Vitis **Python client/server** flow (`vitis -s script.py`). See `fpga/gen_dtbo.py`. |
+**1. Build bitstream** (Windows VM, Vivado/Vitis 2025.2 at `C:\AMDDesignTools\2025.2.1`):
+```sh
+./build.sh                 # from Host: syncs to VM, runs vivado+bootgen, pulls bit.bin back
+```
 
-**Two ways to make the dtbo, one per stage:**
-- **Stage A** — hand-authored `overlay/loopback.dts`, a clone of the board's
-  own known-good `k26-starter-kits.dtbo` (tiny: `firmware-name` + 4 FPD resets,
-  targeting `fpga_full`), compiled with on-board `dtc`. No XSA, no Vitis.
-- **Stage B** — `fpga/gen_dtbo.py` drives the Vitis 2025.2 DTG
-  (`create_platform_component`, `cpu=psu_cortexa53`, `dt_overlay="1"`,
-  `user_dtsi=zocl.dtsi`) to emit the full, vendor-correct overlay with a zocl
-  node. Input is the `.xsa` from `build.tcl`.
+**2. zocl driver** (once per board; bare image has none, apt's is stale 2.8.0):
+```sh
+git clone --depth 1 -b 2024.2 https://github.com/Xilinx/XRT
+cd XRT/src/runtime_src/core/edge/drm/zocl && make
+sudo make modules_install && sudo depmod -a && sudo modprobe zocl
+sudo usermod -aG render,video ubuntu        # then re-login (else XRT sees 0 devices)
+```
+
+**3. Load + test** (from host):
+```sh
+scp fpga/out/loopback.bit.bin overlay/loopback_zocl.dts board/{test_bo.c,dma_loopback.c} ubuntu@kria:/tmp/
+ssh ubuntu@kria 'cd /tmp && dtc -@ -O dtb -o penzai-loopback.dtbo loopback_zocl.dts \
+  && sudo mkdir -p /lib/firmware/xilinx/penzai-loopback \
+  && sudo rm -f /lib/firmware/xilinx/penzai-loopback/*.bit.bin \
+  && sudo cp penzai-loopback.dtbo /lib/firmware/xilinx/penzai-loopback/ \
+  && sudo cp loopback.bit.bin /lib/firmware/xilinx/penzai-loopback/penzai-loopback.bit.bin \
+  && printf "{\"shell_type\":\"XRT_FLAT\",\"num_slots\":\"1\"}\n" | sudo tee /lib/firmware/xilinx/penzai-loopback/shell.json \
+  && { sudo xmutil unloadapp 2>/dev/null || true; } \
+  && sudo xmutil loadapp penzai-loopback'
+ssh ubuntu@kria 'cd /tmp && gcc dma_loopback.c -o dma_loopback -lxrt_coreutil && sudo ./dma_loopback'
+# expect: PASS: DMA loopback src==dst
+```
 
 ## Files
 
-```
-fpga/build.tcl     Vivado: zynq_ultra_ps_e + axi_dma + axis_data_fifo → loopback.bit + .xsa
-fpga/build.bat     Windows cmd entry: call settings64.bat → vivado → bootgen
-fpga/gen_dtbo.py   Stage B: Vitis 2025.2 Python DTG → full zocl overlay (vitis -s)
-overlay/loopback.dts   Stage A PL overlay (clone of starter-kit template)
-board/deploy.sh    on-board: dtc → package app → xmutil loadapp → Stage-A check
-```
-
-## Flow
-
-**1. Windows VM (cmd):** set the `VIVADO_SETTINGS` path at the top of
-`build.bat` to your 2025.2 `settings64.bat`, then:
-```
-cd fpga
-build.bat
-```
-→ `fpga\out\loopback.bit` + `loopback.bit.bin`. Note the **DMA control base**
-printed under `DIAG: assigned addresses` (likely `0xA0000000`).
-
-**2. Mac → board:**
-```
-scp fpga/out/loopback.bit.bin overlay/loopback.dts board/deploy.sh ubuntu@kria:/tmp/
-ssh -t ubuntu@kria 'DMA_BASE=0xA0000000 bash /tmp/deploy.sh'   # use base from step 1
+```sh
+build.sh           Mac driver: sync → build on VM → fetch bit.bin
+fpga/build.tcl     Vivado BD (ps + axi_dma + axis_data_fifo) → loopback.bit + .xsa
+fpga/build.bat     Windows entry: settings64 → vivado → bootgen
+overlay/loopback.dts        Stage A: bitstream-only overlay (clone of starter-kit dtbo)
+overlay/loopback_zocl.dts   Stage B: + zocl node inside the fpga-region fragment
+board/test_bo.c             XRT BO alloc/map/addr/sync probe
+board/dma_loopback.c        full XRT-BO + MMIO-DMA loopback, src==dst
+fpga/gen_dtbo.py            unused alt (Vitis DTG); hand dts won instead
 ```
 
-## Staged validation (so we learn one thing at a time)
+## Findings (validated 2026-06-03)
 
-- **Stage A — this package.** Load the overlay, confirm `fpga_manager` →
-  `operating`, bridges appear, and reading `MM2S_DMASR` over `/dev/mem` returns
-  a sane value (not `0x0`/`0xffffffff`). That proves: 2025.2 bitstream builds,
-  loads on the 2024.1 board, PL is clocked, and AXI-Lite control is reachable —
-  i.e. the **MMIO-poke control plane works**. No XRT needed; `xrt-smi` will
-  still show 0 devices (the overlay has no zocl node, by design).
-- **Stage B — DONE (validated 2026-06-03).** XRT-for-memory + DMA loopback work
-  end-to-end on the KR260. The recipe (see also memory `kr260-xrt-bringup`):
-  1. **Build `zocl` from source** — the bare image has no driver and apt's
-     `xrt-dkms` is a stale 2.8.0. `git clone --depth 1 -b 2024.2 .../XRT`
-     (2.18=2024.2), `cd src/runtime_src/core/edge/drm/zocl && make`,
-     `sudo make modules_install && sudo depmod -a && sudo modprobe zocl`.
-  2. **Load `overlay/loopback_zocl.dts`** — same as `loopback.dts` plus a
-     `zyxclmm_drm`/`xlnx,zocl` node **inside the fpga-region fragment** (a
-     separate fragment is dropped by dfx-mgr). Gives `/dev/dri/renderD128`.
-  3. **`sudo usermod -aG render,video ubuntu`** (fresh login) or non-root XRT
-     enumerates 0 devices (also the real reason `xrt-smi` showed 0).
-  4. `board/test_bo.c` → XRT BO alloc/map/addr/sync OK (no xclbin needed,
-     `grp=0`). `board/dma_loopback.c` → full `src==dst` loopback. BOs land in
-     high DDR (>4 GB), so the 40-bit DMA + SA/DA MSB regs are mandatory.
-     `/dev/mem` (MMIO control) still needs root; UIO is the future non-root path.
+- Whole chain works: 2025.2 bitstream loads on the 2024.1 board, zocl up,
+  `xrtBOAlloc/Map/Address/Sync` OK, DMA loopback `src==dst` (4 KB).
+- **BOs land in high DDR (>4 GB)** → DMA needs `c_addr_width 40` and the SA/DA
+  **MSB** registers (0x1C / 0x4C). A 32-bit DMA cannot reach XRT buffers.
+- **No xclbin needed** for BO alloc (`grp=0`) once the zocl node is up.
+- DMA control base = `0xA0000000`.
 
-## Known second-pass risks
+## Notes
 
-- AXI is wired **by hand** (proc_sys_reset + two SmartConnects), not via
-  `apply_bd_automation` — 2025.2's axi4 rule fails to extract options for the
-  axi_dma-master → PS-slave direction. Manual pin names fail fast (~30s) in BD
-  build if any are wrong, so iteration is cheap.
-- 2025.2-generated bitstream on a 2024.1 kernel: the fabric load is
-  version-independent, but watch `dmesg` on load for any overlay/compatible
-  complaints (Stage A's `dmesg` tail surfaces them).
+- zocl node must be **inside** the fpga-region fragment; `xmutil`/dfx-mgr drops
+  any other fragment. (Same recipe captured in memory `kr260-xrt-bringup`.)
+- `xrt-smi`/XRT showing "0 devices" = missing `render` group, not a real fault.
+- `/dev/mem` (MMIO control) needs root; UIO is the future non-root path.
+- AXI wired by hand (proc_sys_reset + 2 SmartConnects) — 2025.2's `axi4`
+  automation rule fails for the dma-master→PS-slave direction.
+- Kria-PYNQ is not an option (rejects Ubuntu 24.04).
