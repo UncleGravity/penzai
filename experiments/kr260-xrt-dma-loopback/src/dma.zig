@@ -57,20 +57,38 @@ pub const Dma = struct {
         _ = close(self.fd);
     }
 
-    pub fn loopback(self: *Dma, src_phys: u64, dst_phys: u64, len: usize) !void {
-        const regs = self.regs;
+    pub fn loopback(self: *Dma, src_phys: u64, dst_phys: u64, len: usize) !usize {
+        return self.loopbackChunked(src_phys, dst_phys, len, len);
+    }
 
-        std.debug.print("dma: mmio map OK\n", .{});
-        self.dumpStatus("before reset");
+    pub fn loopbackChunked(self: *Dma, src_phys: u64, dst_phys: u64, len: usize, chunk_size: usize) !usize {
+        if (len == 0 or chunk_size == 0) return error.InvalidTransfer;
 
-        regs[MM2S_DMACR] = RESET;
-        regs[S2MM_DMACR] = RESET;
+        try self.reset();
+        self.regs[MM2S_DMACR] = RS;
+        self.regs[S2MM_DMACR] = RS;
+
+        var offset: usize = 0;
+        var chunks: usize = 0;
+        while (offset < len) {
+            const chunk_len = @min(chunk_size, len - offset);
+            if (chunk_len > std.math.maxInt(u32)) return error.ChunkTooLarge;
+            try self.loopbackOne(src_phys + offset, dst_phys + offset, chunk_len);
+            offset += chunk_len;
+            chunks += 1;
+        }
+        return chunks;
+    }
+
+    fn reset(self: *Dma) !void {
+        self.regs[MM2S_DMACR] = RESET;
+        self.regs[S2MM_DMACR] = RESET;
         try self.waitResetClear(MM2S_DMACR, "MM2S");
         try self.waitResetClear(S2MM_DMACR, "S2MM");
-        self.dumpStatus("after reset");
+    }
 
-        regs[MM2S_DMACR] = RS;
-        regs[S2MM_DMACR] = RS;
+    fn loopbackOne(self: *Dma, src_phys: u64, dst_phys: u64, len: usize) !void {
+        const regs = self.regs;
 
         regs[S2MM_DA] = @truncate(dst_phys & 0xffff_ffff);
         regs[S2MM_DA_MSB] = @truncate(dst_phys >> 32);
@@ -80,12 +98,11 @@ pub const Dma = struct {
         regs[MM2S_SA_MSB] = @truncate(src_phys >> 32);
         regs[MM2S_LENGTH] = @intCast(len);
 
-        self.dumpStatus("started");
         try self.waitIdle(MM2S_DMASR, "MM2S");
         try self.waitIdle(S2MM_DMASR, "S2MM");
     }
 
-    fn dumpStatus(self: *Dma, label: []const u8) void {
+    pub fn dumpStatus(self: *Dma, label: []const u8) void {
         std.debug.print(
             "dma: {s} status MM2S=0x{x:0>8} S2MM=0x{x:0>8}\n",
             .{ label, self.regs[MM2S_DMASR], self.regs[S2MM_DMASR] },
@@ -111,10 +128,7 @@ pub const Dma = struct {
                 std.debug.print("dma: {s} ERROR status=0x{x:0>8}\n", .{ name, status });
                 return error.DmaError;
             }
-            if (status & IDLE != 0) {
-                std.debug.print("dma: {s} idle PASS status=0x{x:0>8}\n", .{ name, status });
-                return;
-            }
+            if (status & IDLE != 0) return;
         }
 
         std.debug.print("dma: {s} TIMEOUT status=0x{x:0>8}\n", .{ name, self.regs[sr] });

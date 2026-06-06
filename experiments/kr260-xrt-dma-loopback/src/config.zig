@@ -1,0 +1,10 @@
+pub const dma_base: i64 = 0xA000_0000;
+pub const dma_span: usize = 0x10000;
+pub const smoke_transfer_size: usize = 4096;
+pub const smoke_bo_size: usize = 8 * 1024 * 1024;
+pub const default_bo_size: usize = 768 * 1024 * 1024;
+pub const default_max_transfer: usize = 384 * 1024 * 1024;
+pub const default_stress_size: usize = 256 * 1024 * 1024;
+pub const default_chunk_size: usize = 32 * 1024 * 1024;
+pub const default_stress_iters: usize = 10;
+pub const wait_limit: usize = 50_000_000;

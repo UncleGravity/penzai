@@ -1,5 +1,5 @@
 {
-  description = "KR260 XRT BO + AXI DMA loopback verifier in Zig";
+  description = "KR260 XRT BO + AXI DMA loopback verifier and bandwidth sweep in Zig";
 
   inputs = {
     nixpkgs.url = "github:nixos/nixpkgs?ref=nixos-unstable";
@@ -18,7 +18,7 @@
       packages = forAllSystems (system:
         let pkgs = pkgsFor system; in {
           default = pkgs.stdenv.mkDerivation {
-            pname = "kr260-xrt-loopback";
+            pname = "kr260-xrt-dma-loopback";
             version = "0.1.0";
             src = ./.;
             nativeBuildInputs = [ pkgs.zig ];
@@ -32,7 +32,7 @@
             installPhase = ''
               runHook preInstall
               mkdir -p "$out/bin"
-              cp zig-out/bin/kr260-xrt-loopback "$out/bin/"
+              cp zig-out/bin/kr260-xrt-dma-loopback "$out/bin/"
               runHook postInstall
             '';
           };
@@ -47,10 +47,11 @@
           default = pkgs.mkShell {
             nativeBuildInputs = [ pkgs.zig pkgs.openssh ];
             shellHook = ''
-              echo "kr260-xrt-loopback:"
+              echo "kr260-xrt-dma-loopback:"
               echo "  zig build bitstream  # build loopback.bit.bin on the Vivado VM"
               echo "  zig build deploy     # install/load the XRT app on the KR260"
               echo "  zig build verify     # copy/run the Zig verifier"
+              echo "  zig build verify -Dboard-args='sweep --bo 768MiB --max 384MiB --chunk 32MiB'"
               echo "  zig build all        # bitstream + deploy + verify"
             '';
           };

@@ -1,12 +1,12 @@
 [Unit]
-Description=Load penzai-loopback XRT app at boot
+Description=Load penzai-dma-loopback XRT app at boot
 After=dfx-mgr.service systemd-modules-load.service
 Wants=dfx-mgr.service
 
 [Service]
 Type=oneshot
 ExecStartPre=-/usr/bin/xmutil unloadapp
-ExecStart=/usr/bin/xmutil loadapp penzai-loopback
+ExecStart=/usr/bin/xmutil loadapp penzai-dma-loopback
 RemainAfterExit=yes
 
 [Install]

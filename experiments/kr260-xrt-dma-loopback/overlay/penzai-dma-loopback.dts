@@ -5,9 +5,7 @@
 	fragment@0 {
 		target = <&fpga_full>;
 		__overlay__ {
-			#address-cells = <0x02>;
-			#size-cells = <0x02>;
-			firmware-name = "penzai-loopback.bit.bin";
+			firmware-name = "penzai-dma-loopback.bit.bin";
 			resets = <&zynqmp_reset 0x74
 			          &zynqmp_reset 0x75
 			          &zynqmp_reset 0x76

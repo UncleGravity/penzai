@@ -18,6 +18,11 @@ pub fn build(b: *std.Build) void {
         },
     });
     const optimize = b.standardOptimizeOption(.{});
+    const board_args = b.option(
+        []const u8,
+        "board-args",
+        "Arguments passed to kr260-xrt-dma-loopback by zig build verify",
+    ) orelse "verify";
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -27,7 +32,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "kr260-xrt-loopback",
+        .name = "kr260-xrt-dma-loopback",
         .root_module = mod,
     });
     b.installArtifact(exe);
@@ -39,12 +44,12 @@ pub fn build(b: *std.Build) void {
     deploy.dependOn(&addDeployCommand(b).step);
 
     const verify = b.step("verify", "Copy and run the Zig verifier on the KR260");
-    verify.dependOn(&addVerifyCommand(b, exe).step);
+    verify.dependOn(&addVerifyCommand(b, exe, board_args).step);
 
     const all_bitstream = addBitstreamCommand(b);
     const all_deploy = addDeployCommand(b);
     all_deploy.step.dependOn(&all_bitstream.step);
-    const all_verify = addVerifyCommand(b, exe);
+    const all_verify = addVerifyCommand(b, exe, board_args);
     all_verify.step.dependOn(&all_deploy.step);
 
     const all = b.step("all", "Build bitstream, deploy app, and run the Zig verifier");
@@ -125,7 +130,11 @@ fn addDeployCommand(b: *std.Build) *std.Build.Step.Run {
     });
 }
 
-fn addVerifyCommand(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step.Run {
+fn addVerifyCommand(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+    board_args: []const u8,
+) *std.Build.Step.Run {
     const run = b.addSystemCommand(&.{
         "bash",
         "-lc",
@@ -134,20 +143,22 @@ fn addVerifyCommand(b: *std.Build, exe: *std.Build.Step.Compile) *std.Build.Step
             \\: "${BOARD:?config.env must set BOARD}"
             \\: "${BOARD_TMP:?config.env must set BOARD_TMP}"
             \\BIN="${1:?missing verifier binary}"
+            \\ARGS="${2:-verify}"
             \\
             \\echo "== copy Zig verifier -> $BOARD:$BOARD_TMP =="
             \\ssh "$BOARD" "mkdir -p '$BOARD_TMP'"
-            \\scp "$BIN" "$BOARD:$BOARD_TMP/kr260-xrt-loopback"
+            \\scp "$BIN" "$BOARD:$BOARD_TMP/kr260-xrt-dma-loopback"
             \\
-            \\echo "== run Zig verifier =="
-            \\ssh "$BOARD" "BOARD_TMP='$BOARD_TMP' bash -s" <<'REMOTE'
+            \\echo "== run kr260-xrt-dma-loopback $ARGS =="
+            \\ssh "$BOARD" "BOARD_TMP='$BOARD_TMP' ARGS='$ARGS' bash -s" <<'REMOTE'
             \\set -euo pipefail
-            \\chmod +x "$BOARD_TMP/kr260-xrt-loopback"
-            \\sudo "$BOARD_TMP/kr260-xrt-loopback"
+            \\chmod +x "$BOARD_TMP/kr260-xrt-dma-loopback"
+            \\sudo "$BOARD_TMP/kr260-xrt-dma-loopback" $ARGS
             \\REMOTE
         ,
         "zig-build",
     });
     run.addFileArg(exe.getEmittedBin());
+    run.addArg(board_args);
     return run;
 }

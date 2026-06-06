@@ -176,7 +176,7 @@ if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation
 # ---- Exports: .bit and .xsa -----------------------------------------------
 # build.bat converts loopback.bit to loopback.bit.bin with bootgen. The
 # top-level build.zig deploy step packages that .bit.bin with
-# overlay/penzai-loopback.dts for xmutil/dfx-mgr.
+# overlay/penzai-dma-loopback.dts for xmutil/dfx-mgr.
 # The .xsa is retained for hardware handoff and inspection.
 set bit [lindex [glob [file normalize ./$proj/$proj.runs/impl_1/${bd}_wrapper.bit]] 0]
 file copy -force $bit $outdir/loopback.bit

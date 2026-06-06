@@ -1,4 +1,4 @@
-# kr260-memory
+# kr260-xrt-memory
 
 KR260 XRT buffer-object memory probe for the `penzai` rewrite.
 
@@ -110,8 +110,8 @@ The binary can also be copied and run manually:
 
 ```sh
 zig build
-scp zig-out/bin/kr260-memory ubuntu@kria:/tmp/
-ssh ubuntu@kria /tmp/kr260-memory all
+scp zig-out/bin/kr260-xrt-memory ubuntu@kria:/tmp/
+ssh ubuntu@kria /tmp/kr260-xrt-memory all
 ```
 
 ## Commands

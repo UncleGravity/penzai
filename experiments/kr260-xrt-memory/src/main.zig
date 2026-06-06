@@ -92,7 +92,7 @@ pub fn main(init: std.process.Init) !void {
 
 fn printUsage() void {
     std.debug.print(
-        \\usage: kr260-memory <command> [options]
+        \\usage: kr260-xrt-memory <command> [options]
         \\
         \\commands:
         \\  info          print XRT/device and /proc/meminfo facts

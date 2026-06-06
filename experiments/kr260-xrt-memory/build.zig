@@ -21,7 +21,7 @@ pub fn build(b: *std.Build) void {
     const board_args = b.option(
         []const u8,
         "board-args",
-        "Arguments passed to kr260-memory by zig build run-board",
+        "Arguments passed to kr260-xrt-memory by zig build run-board",
     ) orelse "all";
 
     const mod = b.createModule(.{
@@ -32,7 +32,7 @@ pub fn build(b: *std.Build) void {
     });
 
     const exe = b.addExecutable(.{
-        .name = "kr260-memory",
+        .name = "kr260-xrt-memory",
         .root_module = mod,
     });
     b.installArtifact(exe);
@@ -61,15 +61,15 @@ fn addRunBoardCommand(
             \\  *) echo "ERROR: BOARD_TMP must be under /tmp, got: $BOARD_TMP" >&2; exit 1 ;;
             \\esac
             \\
-            \\echo "== copy kr260-memory -> $BOARD:$BOARD_TMP =="
+            \\echo "== copy kr260-xrt-memory -> $BOARD:$BOARD_TMP =="
             \\ssh "$BOARD" "mkdir -p '$BOARD_TMP'"
-            \\scp "$BIN" "$BOARD:$BOARD_TMP/kr260-memory"
+            \\scp "$BIN" "$BOARD:$BOARD_TMP/kr260-xrt-memory"
             \\
-            \\echo "== run kr260-memory $ARGS =="
+            \\echo "== run kr260-xrt-memory $ARGS =="
             \\ssh "$BOARD" "BOARD_TMP='$BOARD_TMP' ARGS='$ARGS' bash -s" <<'REMOTE'
             \\set -euo pipefail
-            \\chmod +x "$BOARD_TMP/kr260-memory"
-            \\"$BOARD_TMP/kr260-memory" $ARGS
+            \\chmod +x "$BOARD_TMP/kr260-xrt-memory"
+            \\"$BOARD_TMP/kr260-xrt-memory" $ARGS
             \\REMOTE
         ,
         "zig-build",
