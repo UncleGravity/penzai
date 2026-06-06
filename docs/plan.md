@@ -1,7 +1,7 @@
 # penzai — design plan
 
 A clean-slate rewrite of the PYNQ-Z1 LLM accelerator stack in Zig. One language,
-one build, the network demoted from "the architecture" to one optional transport.
+one build, the network demoted from "the architecture" to one transport option.
 Targets W1A8 (1-bit) now, W1.58A8 (ternary) later.
 
 ## What it is
@@ -9,10 +9,11 @@ Targets W1A8 (1-bit) now, W1.58A8 (ternary) later.
 - `penzai` — the host binary. Links llama.cpp as a **library**, registers the
   ggml backend **in-process** (no `.so`, no `dlopen`, no env vars), and drives the
   llama C API for the model frontend. This is the binary you run.
-- `penzaid` — the board runtime daemon (dev mode). Same `device/` code that
-  `penzai --device inproc` links directly when running on the board.
+- `penzaid` — the board runtime daemon. Runs on the PYNQ-Z1 and owns `device/`:
+  CMA, MMIO, DMA, PS kernels, PL kernels, scheduling, and profiling collection.
 - llama owns: GGUF parse, tokenizer, sampler, graph-per-architecture (→ multi-arch
   support is free). penzai owns: the process, the backend, the device link, all UX.
+  The board never runs llama or ggml.
 
 ## File tree
 
@@ -35,7 +36,7 @@ host/                             # ── runs wherever llama.cpp runs ──
   backend.zig                     #   ggml vtables; registered in-process
   lower.zig                       #   ggml node → wire command (table-driven; op registry)
   link.zig                        #   generic Link: framing+wire over any transport
-  transport/{inproc,tcp,usb}.zig  #   client byte-pipes (inproc = RAM loopback for tests)
+  transport/{fake,tcp,usb}.zig    #   client byte-pipes (fake = host-side no-hardware device)
   prof_report.zig                 #   `penzai prof`: JSONL rollup + Chrome-trace export
 
 device/                           # ── runs on the Zynq board; ZERO ggml/llama ──
@@ -77,12 +78,13 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 ## Transports
 
 - One `transport.zig` byte-pipe interface; framing + wire sit on top, transport-agnostic.
-- Impls: `inproc` (RAM loopback, full-stack tests with no hardware), `tcp`, `usb`
-  (libusb host / FunctionFS gadget device). Adding a transport = two files + a
-  `--device` case; nothing above the transport line changes. USB is noop for now. TCP
-  is still the target.
-- Topology is a flag: `penzai run --device inproc|tcp:host:port|usb:VID:PID`.
-  On-board production = `inproc` (no daemon, no socket).
+- Impls: `fake` (host-side fake device runtime for full-stack tests), `tcp`, `usb`
+  (libusb host / FunctionFS gadget device). Adding a real board transport = two files
+  + a `--device` case; nothing above the transport line changes. USB is noop for now.
+  TCP is the real hardware target.
+- Topology is a flag: `penzai run --device fake|tcp:host:port|usb:VID:PID`.
+  Hardware deployment = `penzaid` on the board plus `penzai --device tcp:board:port`
+  on the host.
 
 ## Device internals (keep it simple)
 
@@ -92,8 +94,9 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 - **Direct `switch` on op tag**, no kernel registry (closed op set).
 - **Slab interface** (cma/fake) and **matmul/matmul_ref** are the justified seams:
   both exist to run the whole runtime on a laptop and to give a bit-exact oracle.
-- **server/runtime split exists for inproc** (runtime must be usable without the
-  serve loop) — keep `runtime` thin (compose + route).
+- **server/runtime split exists for tests and deployment** — `server` owns transport
+  and framing; `runtime` is directly testable with fake memory/reference kernels.
+  Keep `runtime` thin (compose + route).
 - Allocator does multi-slab extents (CMA fragments ~32 MB; weights ~230 MB).
 
 ## FPGA / datatypes
@@ -114,7 +117,7 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
   ref drives the Verilator RTL test, so it validates software, gateware, *and* the
   packing contract). Float glue ops (rmsnorm/softmax/rope/silu) use tolerance.
 - Test tiers by what they need: T0 pure units (colocated) · T1 in-process integration
-  (fakes + inproc, no hardware) · T2 golden (per-op vectors + full-model logits vs
+  (`--device fake`, no hardware) · T2 golden (per-op vectors + full-model logits vs
   llama) · T3 hardware (differential real-vs-ref, bitstream smoke, bandwidth). T3 is
   minimal because T0–T2 cover all logic.
 - Generate golden vectors from the existing Python impl to de-risk the port.
@@ -137,4 +140,3 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
   cycles → array utilization) are first-class.
 - Mechanism lives in `shared/`; content is inline scoped calls; both comptime-gated.
 ```
-

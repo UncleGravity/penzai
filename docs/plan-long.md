@@ -31,7 +31,7 @@ into upstream `llama-cli` via environment variables, and the board daemon writte
 Python on the PYNQ platform with a C hot path reached through `ctypes`. The result is
 three languages, two build systems, an env-var/rpath dance, and a ~1100-line graph
 "lowering" pattern-matcher. None of that is essential complexity. The rewrite collapses
-it to one language, one build, and a network boundary that is optional and isolated.
+it to one language, one build, and an isolated transport boundary.
 
 ---
 
@@ -74,11 +74,11 @@ through a plugin seam. The per-layer compute path is unchanged: llama builds the
 graph → the ggml scheduler hands ops to our backend → we lower them to command buffers →
 the device executes. We did not reimplement the forward pass.
 
-**Inversion 2 — the network is one optional transport, not the architecture.** The
-prototype is organized around feeding a TCP socket. Here the architecture is the command
--buffer schema; a transport is just *how the bytes get to the device*, and one transport
-(`inproc`) moves no bytes over a wire at all. The whole comms stack is swappable below an
-unchanging schema.
+**Inversion 2 — the network is one transport, not the architecture.** The prototype is
+organized around feeding a TCP socket. Here the architecture is the command-buffer schema;
+a transport is just *how the bytes get to the device*. The `fake` device mode keeps the
+same host/backend/runtime path on a development machine with no board attached; TCP is the
+real hardware path. The whole comms stack is swappable below an unchanging schema.
 
 **Inversion 3 — binary wire format, device-collects/host-formats.** JSON encode/decode and
 string formatting per `RUN_GRAPH` on a 650 MHz A9 is pure overhead. The device deals only
@@ -101,14 +101,14 @@ shared/                           # ── compiled into BOTH binaries; comptime
   trace.zig                       #   comptime-gated diagnostics (custom std.log sink)
   profiling.zig                   #   Span record + ring buffer + clock abstraction + merge
 
-host/                             # ── runs wherever llama.cpp runs (Mac dev, or the A9) ──
+host/                             # ── runs wherever llama.cpp runs (dev/workstation host) ──
   main.zig                        #   `penzai run|prof`: args, --device, profiling flags
   run.zig                         #   decode loop: tokenize → llama_decode → sample → emit
   llama.zig                       #   thin @cImport("llama.h") wrapper
   backend.zig                     #   ggml vtables (reg/device/buffer); registered in-process
   lower.zig                       #   ggml node → wire command (table-driven; the op registry)
   link.zig                        #   generic Link: framing+wire over any transport
-  transport/{inproc,tcp,usb}.zig  #   client byte-pipes (inproc = RAM loopback for tests)
+  transport/{fake,tcp,usb}.zig    #   client byte-pipes (fake = no-hardware test device)
   prof_report.zig                 #   `penzai prof`: JSONL rollup + Chrome-trace export
 
 device/                           # ── runs on the Zynq board; imports ZERO ggml/llama ──
@@ -236,7 +236,7 @@ run.zig:   model = llama.loadModel("model.gguf")          // llama parses GGUF, 
   no transport special-casing lives here. It also owns the cumulative upload/download byte
   counters (I/O state belongs to the I/O layer).
 - **`transport/`** — the client byte-pipes. `tcp` (socket connect), `usb` (libusb;
-  deferred, see §8), `inproc` (a RAM loopback used for tests).
+  deferred, see §8), `fake` (a host-side fake device used for no-hardware tests).
 - **`prof_report.zig`** — `penzai prof`: roll a JSONL profiling run into a per-op table,
   and export Chrome-trace for a visual timeline.
 
@@ -247,22 +247,20 @@ run.zig:   model = llama.loadModel("model.gguf")          // llama parses GGUF, 
 **One interface, impls below it.** `transport.zig` (the byte-pipe) is the interface;
 `framing.zig` and `wire.zig` sit on top and are transport-agnostic by construction. The
 implementations differ per side because a client connects/opens and a server
-listens/accepts: client transports live in `host/transport/`, server transports in
-`device/transport/`. The generic compositions are `host/link.zig` and `device/server.zig`.
+listens/accepts: client/device-mode entries live in `host/transport/`, while real board
+server transports live in `device/transport/`. The generic compositions are `host/link.zig`
+and `device/server.zig`.
 
-**The three transports:**
+**The three device modes/transports:**
 
-- **`inproc` — RAM loopback, for tests.** A thread-safe in-memory pipe; the device
-  `server.zig` loop runs on a background thread reading/writing it. It is a *real*
-  transport (it moves bytes through memory), so `link.zig` and `server.zig` stay completely
-  generic and inproc requires no special-casing anywhere. The payoff: tests exercise the
-  genuine `framing` + `wire` + dispatch code path in one process with no hardware. (A
-  single-threaded loopback would deadlock — client `readExact` waits for a response the
-  server loop has not produced — so the background thread is intrinsic, and it faithfully
-  models the concurrent client↔server interaction.)
-- **`tcp` — the real target.** Socket client (host) and listen/accept server (device). This
-  is the working host↔board link for development and for board deployments where penzai
-  runs off-board.
+- **`fake` — host-side no-hardware device.** A test device that runs `device/runtime.zig`
+  on the host with `mem/fake.zig` and `pl/matmul_ref.zig`. Full-stack tests should route
+  through the same `Link`/framing/wire path as real hardware, using a RAM byte-pipe and a
+  background server loop, so lowering and dispatch are exercised without a board. Narrow
+  runtime tests can call `runtime.dispatch` directly.
+- **`tcp` — the real hardware target.** Socket client (host) and listen/accept server
+  (device). This is the working host↔board link for development and for production-style
+  board deployments: `penzai` runs on the host, `penzaid` runs on the PYNQ-Z1.
 - **`usb` — deferred / no-op for now.** Stubbed so the seam exists, but not implemented.
   When it lands it is libusb bulk transfers on the host (`@cImport` libusb) and a USB
   FunctionFS gadget on the device (read/write an fd, like a socket). Adding it is two files
@@ -270,10 +268,10 @@ listens/accepts: client transports live in `host/transport/`, server transports 
   whose justification is future, not present — built the day USB is real, not on spec.
 
 **Topology is a flag, not an architecture.**
-`penzai run --device inproc | tcp:host:port | usb:VID:PID`. On-board production uses
-`inproc`: penzai links the device runtime directly and there is no daemon and no socket.
-Because weights are resident and per-token traffic is tiny, the choice of transport never
-gates decode throughput — it only ever carries control traffic.
+`penzai run --device fake | tcp:host:port | usb:VID:PID`. Real hardware runs as two
+processes: `penzai` on the host and `penzaid` on the board. Because weights are resident
+and per-token traffic is tiny, the choice of board transport never gates decode throughput
+— it only ever carries control traffic.
 
 ---
 
@@ -292,10 +290,10 @@ ps/*.zig     pure kernels over mem handles      pl/matmul.zig  fabric matmul
 
 **`server.zig` vs `runtime.zig` — split for a load-bearing reason.** `server` is the
 transport loop + framing + dispatch; `runtime` owns the allocator, kernels, and fabric
-handle and executes commands. They are separate because the **inproc/co-located path
-bypasses the serve loop** — penzai calls `runtime.dispatch` directly — so `runtime` must be
-usable without `server`. Keep `runtime` thin: compose the pieces and route dispatch; the
-real logic lives in `schedule`/`mem`/`ps`/`pl`.
+handle and executes commands. They are separate because tests need both shapes: full-stack
+`fake` mode runs through the server over a RAM byte-pipe, while narrower runtime tests call
+`runtime.dispatch` directly with fake memory and reference kernels. Keep `runtime` thin:
+compose the pieces and route dispatch; the real logic lives in `schedule`/`mem`/`ps`/`pl`.
 
 **`schedule.zig` — the single-in-flight async pipeline.** The one piece of hard-won
 performance design. A matmul that issues its DMA returns a *pending* handle; subsequent ops
@@ -429,7 +427,7 @@ integration smoke (top-k agreement or logits within ε), not a precision gate.
 ## 12. Testing
 
 The architecture did the hard part: hardware is quarantined behind thin twinned interfaces
-(`mem/fake`↔`cma`, `pl/matmul_ref`↔`matmul`, `inproc`↔`tcp`), so the entire software stack
+(`mem/fake`↔`cma`, `pl/matmul_ref`↔`matmul`, `fake`↔`tcp`), so the entire software stack
 runs on a laptop. The test pyramid maps onto distance-from-hardware — the same axis as the
 file tree.
 
@@ -439,8 +437,8 @@ file tree.
   `matmul_ref`, wire/framing roundtrip, allocator over fake slabs, q1a8 layout, the HAL
   encoders.
 - **T1 — in-process integration** (sub-second; no hardware): the full device runtime over
-  `fake` + `matmul_ref`; the full stack `host → inproc → device`. Exercises the real
-  framing/wire/schedule code via the loopback transport.
+  `mem/fake` + `matmul_ref`; the full stack `host → fake device → device runtime`.
+  Exercises the real framing/wire/schedule code via the RAM byte-pipe.
 - **T2 — golden / numerical** (needs a small model fixture; no hardware): per-op golden
   vectors (fast, *localizing* — they tell you which kernel broke) plus full-model logits vs
   upstream llama.cpp (integration/lowering coverage).
@@ -451,8 +449,8 @@ file tree.
 **Two patterns do most of the work:**
 
 - **One spec, many impls (differential).** Write a behavior spec once, parameterize over
-  impls at comptime: the transport spec over `inproc`/`tcp`; the device spec over
-  `fake`/`cma` and `matmul_ref`/`matmul`. Cheap impls run always; hardware impls run the same
+  impls at comptime: the transport/device-link spec over `fake`/`tcp`; the device spec over
+  `mem/fake`/`cma` and `matmul_ref`/`matmul`. Cheap impls run always; hardware impls run the same
   assertions in T3. The reference implementation *is* the executable spec.
 - **One oracle for software, gateware, and the wire layout.** `matmul_ref.zig` is the
   bit-exact integer reference. It checks the Zig software kernel, it drives the Verilator RTL
@@ -480,7 +478,7 @@ surfaces (`framing.zig`, the `server.zig` command-buffer decode) where the bar i
 
 **Pitfalls:** do not make quantized golden tests bit-exact against llama (only the integer
 path against your own reference is `==`); do not mock the protocol in integration tests (route
-through real wire/framing via inproc); do not let any logic test reach for hardware — if it
+through real wire/framing via `fake`); do not let any logic test reach for hardware — if it
 does, the hardware boundary leaked.
 
 ---
@@ -495,8 +493,8 @@ question, so the design is shaped by them.
 **The core idea: device collects, host formats.** The device appends fixed-size binary
 **span** records during execution (a counter read and a store — near-free on the A9), ships
 them in the RPC response payload, and the host (with spare cycles) deserializes, merges,
-formats, and aggregates. Co-located (`inproc`), the "response" is just the returned buffer —
-same path, no serialization. The A9 never formats a string on the hot path.
+formats, and aggregates. In `fake` mode, the response comes from the host-side fake device
+runtime but uses the same profiling records. The A9 never formats a string on the hot path.
 
 **Call-site primitive:** a `defer`-based span, comptime-gated, with counters:
 
@@ -569,11 +567,11 @@ One codebase, one schema, topology chosen by a flag:
 
 | Command | Where | Transport | Notes |
 |---|---|---|---|
-| `penzai run model.gguf --device inproc` | on the board | none (direct call) | production: no daemon, no socket |
-| `penzaid` + `penzai run --device tcp:board:port` | board + dev machine | tcp | development against real hardware |
-| `penzai run --device inproc` (with `mem/fake`+`matmul_ref`) | laptop | loopback | full-stack test, no hardware |
+| `penzaid` + `penzai run model.gguf --device tcp:board:port` | board + host | tcp | real PYNQ-Z1 hardware |
+| `penzai run model.gguf --device usb:VID:PID` | board + host | usb | future hardware transport |
+| `penzai run model.gguf --device fake` | host only | RAM byte-pipe | full-stack test with `mem/fake` + `matmul_ref` |
 
-`penzaid` is the same `device/` code wrapped in `server.zig`; `inproc` links it directly.
+`penzaid` is the only board-side process. llama.cpp and ggml stay on the host.
 
 ---
 
@@ -595,7 +593,7 @@ Three cross-boundary contracts, each defined once with a test asserting agreemen
 
 - **USB transport** is the one abstraction justified only by a future need. It is stubbed,
   not built; implement it the day it is real (libusb host + FunctionFS gadget). TCP is the
-  working target; inproc covers tests.
+  working hardware target; `fake` covers no-hardware tests.
 - **One bitstream vs. two** for the two datatypes depends on Zynq-7020 place-and-route fit.
   The RTL factoring (decoder seam + neutral core) keeps both cheap, so the decision can wait
   for real timing/area numbers.
