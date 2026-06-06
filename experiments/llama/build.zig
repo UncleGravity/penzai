@@ -70,8 +70,11 @@ pub fn build(b: *std.Build) void {
     const translate_c = b.addTranslateC(.{
         .root_source_file = b.path("src/c_api.h"),
         .target = target,
-        // Zig 0.17-dev currently emits `translate-c -Osafe` for ReleaseSafe,
-        // but this translate-c binary only accepts the older mode names.
+        // translate-c only generates Zig source from the headers; the final
+        // binary's optimization is governed by the consuming module's `.optimize`
+        // (see root_mod below), so Debug here is free and produces identical
+        // bindings. Pinning it also sidesteps any translate-c `-O` flag-name
+        // churn across toolchains.
         .optimize = .Debug,
         .link_libc = true,
     });
