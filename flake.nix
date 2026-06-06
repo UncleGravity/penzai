@@ -40,7 +40,11 @@
           };
         in {
           devShells.default = pkgs.mkShell {
-            nativeBuildInputs = [ pkgs.zig pkgs.zls ];
+            nativeBuildInputs = [
+              pkgs.zig
+              pkgs.zls
+              pkgs.verilator
+            ];
           };
         };
     };
