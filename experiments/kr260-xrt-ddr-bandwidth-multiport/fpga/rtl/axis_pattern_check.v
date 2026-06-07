@@ -27,12 +27,14 @@ module axis_pattern_check (
 
     reg [63:0] byte_index;
     reg [31:0] remaining_beats;
+    reg [127:0] expected_data;
 
     reg        data_error;
     reg [3:0]  first_error_lane;
     reg [7:0]  first_error_expected;
     reg [7:0]  first_error_actual;
     integer lane;
+    integer update_lane;
 
     function [7:0] pattern_byte;
         input [7:0] index;
@@ -52,10 +54,10 @@ module axis_pattern_check (
 
         for (lane = 0; lane < DATA_BYTES; lane = lane + 1) begin
             if (!data_error &&
-                (s_axis_tdata[(lane * 8) +: 8] != pattern_byte(byte_index[7:0] + lane[7:0], seed))) begin
+                (s_axis_tdata[(lane * 8) +: 8] != expected_data[(lane * 8) +: 8])) begin
                 data_error = 1'b1;
                 first_error_lane = lane[3:0];
-                first_error_expected = pattern_byte(byte_index[7:0] + lane[7:0], seed);
+                first_error_expected = expected_data[(lane * 8) +: 8];
                 first_error_actual = s_axis_tdata[(lane * 8) +: 8];
             end
         end
@@ -65,6 +67,7 @@ module axis_pattern_check (
         if (!aresetn) begin
             byte_index <= 64'd0;
             remaining_beats <= 32'd0;
+            expected_data <= 128'd0;
             busy <= 1'b0;
             done <= 1'b0;
             error_seen <= 1'b0;
@@ -76,6 +79,9 @@ module axis_pattern_check (
         end else if (start) begin
             byte_index <= base_index;
             remaining_beats <= length_bytes[35:4];
+            for (update_lane = 0; update_lane < DATA_BYTES; update_lane = update_lane + 1) begin
+                expected_data[(update_lane * 8) +: 8] <= pattern_byte(base_index[7:0] + update_lane[7:0], seed);
+            end
             busy <= (length_bytes != 64'd0);
             done <= (length_bytes == 64'd0);
             error_seen <= 1'b0;
@@ -105,6 +111,9 @@ module axis_pattern_check (
                 end
 
                 bytes_checked <= bytes_checked + {32'd0, DATA_BYTES_U32};
+                for (update_lane = 0; update_lane < DATA_BYTES; update_lane = update_lane + 1) begin
+                    expected_data[(update_lane * 8) +: 8] <= expected_data[(update_lane * 8) +: 8] + 8'd112;
+                end
 
                 if (remaining_beats <= 32'd1) begin
                     byte_index <= {byte_index[63:4] + 60'd1, byte_index[3:0]};

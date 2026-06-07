@@ -143,8 +143,8 @@ for {set i 0} {$i < $port_count} {incr i} {
         CONFIG.c_m_axi_s2mm_data_width {128} \
         CONFIG.c_m_axis_mm2s_tdata_width {128} \
         CONFIG.c_s_axis_s2mm_tdata_width {128} \
-        CONFIG.c_mm2s_burst_size {256} \
-        CONFIG.c_s2mm_burst_size {256} \
+        CONFIG.c_mm2s_burst_size {16} \
+        CONFIG.c_s2mm_burst_size {16} \
     ] [get_bd_cells $dma]
 
     assert_config $dma c_m_axi_mm2s_data_width 128

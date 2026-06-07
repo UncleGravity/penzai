@@ -8,11 +8,38 @@ const regs = @import("regs.zig");
 const sizes = @import("sizes.zig");
 const xrt = @import("xrt.zig");
 
+const RunMode = enum {
+    both,
+    read,
+    write,
+
+    fn includesRead(self: RunMode) bool {
+        return self == .both or self == .read;
+    }
+
+    fn includesWrite(self: RunMode) bool {
+        return self == .both or self == .write;
+    }
+
+    fn label(self: RunMode) []const u8 {
+        return switch (self) {
+            .both => "both",
+            .read => "read",
+            .write => "write",
+        };
+    }
+};
+
 const Options = struct {
     ports: usize = config.lane_count,
+    ports_set: bool = false,
+    active: ?ActiveSet = null,
+    offsets: ?OffsetList = null,
     bo_bytes: ?usize = null,
     size_bytes: ?usize = null,
     chunk_bytes: usize = config.default_chunk_size,
+    repeat: usize = 1,
+    mode: RunMode = .both,
 };
 
 const Board = struct {
@@ -95,9 +122,33 @@ const ActiveSet = struct {
         return active;
     }
 
+    fn add(self: *ActiveSet, index: usize) !void {
+        if (self.count >= config.lane_count) return error.TooManyLanes;
+        if (self.contains(index)) return error.DuplicateLane;
+        self.indices[self.count] = index;
+        self.count += 1;
+    }
+
+    fn contains(self: *const ActiveSet, index: usize) bool {
+        for (self.slice()) |existing| {
+            if (existing == index) return true;
+        }
+        return false;
+    }
+
     fn slice(self: *const ActiveSet) []const usize {
         return self.indices[0..self.count];
     }
+};
+
+const OffsetList = struct {
+    values: [config.lane_count]usize = [_]usize{0} ** config.lane_count,
+    count: usize = 0,
+};
+
+const RunLayout = struct {
+    active: ActiveSet,
+    offsets: [config.lane_count]usize,
 };
 
 const LaneResult = struct {
@@ -153,9 +204,14 @@ fn printUsage() void {
         \\
         \\options:
         \\  --ports N       active HP ports from hp0 upward, default 4
+        \\  --active LIST   comma-separated lanes, e.g. hp0,hp3; overrides default run shape
+        \\  --offsets LIST  comma-separated BO offsets for active lanes, e.g. 0MiB,384MiB
         \\  --bo SIZE       backing BO size, default 768MiB for run
         \\  --size SIZE     per-port transfer size, default 192MiB for run
         \\  --chunk SIZE    DMA chunk size, default 32MiB
+        \\  --read-only     run only DDR -> PL checker cases
+        \\  --write-only    run only PL generator -> DDR cases
+        \\  --repeat N      repeat selected benchmark cases, default 1
         \\
         \\SIZE accepts B, KiB, MiB, GiB suffixes.
         \\
@@ -166,9 +222,19 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
     var opts: Options = .{};
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--ports")) {
+            opts.ports_set = true;
             opts.ports = try parsePorts(args.next() orelse return error.MissingValue);
         } else if (std.mem.startsWith(u8, arg, "--ports=")) {
+            opts.ports_set = true;
             opts.ports = try parsePorts(arg["--ports=".len..]);
+        } else if (std.mem.eql(u8, arg, "--active")) {
+            opts.active = try parseActive(args.next() orelse return error.MissingValue);
+        } else if (std.mem.startsWith(u8, arg, "--active=")) {
+            opts.active = try parseActive(arg["--active=".len..]);
+        } else if (std.mem.eql(u8, arg, "--offsets")) {
+            opts.offsets = try parseOffsets(args.next() orelse return error.MissingValue);
+        } else if (std.mem.startsWith(u8, arg, "--offsets=")) {
+            opts.offsets = try parseOffsets(arg["--offsets=".len..]);
         } else if (std.mem.eql(u8, arg, "--bo")) {
             opts.bo_bytes = try sizes.parse(args.next() orelse return error.MissingValue);
         } else if (std.mem.startsWith(u8, arg, "--bo=")) {
@@ -181,10 +247,22 @@ fn parseOptions(args: *std.process.Args.Iterator) !Options {
             opts.chunk_bytes = try sizes.parse(args.next() orelse return error.MissingValue);
         } else if (std.mem.startsWith(u8, arg, "--chunk=")) {
             opts.chunk_bytes = try sizes.parse(arg["--chunk=".len..]);
+        } else if (std.mem.eql(u8, arg, "--read-only")) {
+            if (opts.mode == .write) return error.ModeConflict;
+            opts.mode = .read;
+        } else if (std.mem.eql(u8, arg, "--write-only")) {
+            if (opts.mode == .read) return error.ModeConflict;
+            opts.mode = .write;
+        } else if (std.mem.eql(u8, arg, "--repeat")) {
+            opts.repeat = try parseRepeat(args.next() orelse return error.MissingValue);
+        } else if (std.mem.startsWith(u8, arg, "--repeat=")) {
+            opts.repeat = try parseRepeat(arg["--repeat=".len..]);
         } else {
             return error.UnknownOption;
         }
     }
+
+    if (opts.active != null and opts.ports_set) return error.ActiveConflictsWithPorts;
     return opts;
 }
 
@@ -194,11 +272,64 @@ fn parsePorts(text: []const u8) !usize {
     return value;
 }
 
+fn parseRepeat(text: []const u8) !usize {
+    const value = try std.fmt.parseInt(usize, text, 10);
+    if (value == 0) return error.InvalidRepeat;
+    return value;
+}
+
+fn parseActive(text: []const u8) !ActiveSet {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidActiveList;
+    if (std.ascii.eqlIgnoreCase(trimmed, "all")) return ActiveSet.first(config.lane_count);
+
+    var active: ActiveSet = .{};
+    var parts = std.mem.splitScalar(u8, trimmed, ',');
+    while (parts.next()) |part| {
+        const name = std.mem.trim(u8, part, " \t\r\n");
+        if (name.len == 0) return error.InvalidActiveList;
+        try active.add(try parseLaneName(name));
+    }
+    if (active.count == 0) return error.InvalidActiveList;
+    return active;
+}
+
+fn parseLaneName(text: []const u8) !usize {
+    for (config.lanes, 0..) |lane, index| {
+        if (std.ascii.eqlIgnoreCase(text, lane.name)) return index;
+    }
+
+    if (text.len == 1 and text[0] >= '0' and text[0] <= '3') {
+        return text[0] - '0';
+    }
+
+    return error.InvalidLaneName;
+}
+
+fn parseOffsets(text: []const u8) !OffsetList {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    if (trimmed.len == 0) return error.InvalidOffsetList;
+
+    var offsets: OffsetList = .{};
+    var parts = std.mem.splitScalar(u8, trimmed, ',');
+    while (parts.next()) |part| {
+        if (offsets.count >= config.lane_count) return error.TooManyOffsets;
+        const item = std.mem.trim(u8, part, " \t\r\n");
+        if (item.len == 0) return error.InvalidOffsetList;
+        offsets.values[offsets.count] = try sizes.parse(item);
+        offsets.count += 1;
+    }
+    if (offsets.count == 0) return error.InvalidOffsetList;
+    return offsets;
+}
+
 fn runBenchmark(io: std.Io, opts: Options, smoke: bool) !void {
     const transfer_size = opts.size_bytes orelse if (smoke) config.smoke_transfer_size else config.default_transfer_size;
-    const default_bo = if (smoke) @max(config.smoke_bo_size, alignUp(transfer_size * opts.ports, sizes.MiB)) else config.default_bo_size;
+    const default_active = opts.active orelse ActiveSet.first(opts.ports);
+    const default_layout = try makeLayout(default_active, transfer_size, opts.offsets);
+    const default_bo = if (smoke) @max(config.smoke_bo_size, alignUp(layoutEnd(default_layout, transfer_size), sizes.MiB)) else config.default_bo_size;
     const bo_size = opts.bo_bytes orelse default_bo;
-    try validateRunOptions(opts.ports, bo_size, transfer_size, opts.chunk_bytes);
+    try validateRunOptions(default_layout, bo_size, transfer_size, opts.chunk_bytes);
 
     var board = Board.open() catch |err| {
         std.debug.print("case=info variant={s} xrt_device_open=0 error={s}\n", .{ build_options.variant, @errorName(err) });
@@ -207,7 +338,7 @@ fn runBenchmark(io: std.Io, opts: Options, smoke: bool) !void {
     defer board.close();
 
     var lane_storage: [config.lane_count]?Lane = [_]?Lane{null} ** config.lane_count;
-    try openLanes(&lane_storage, opts.ports);
+    try openLanes(&lane_storage, default_active);
     defer closeLanes(&lane_storage);
 
     var bo = MappedBo.alloc(&board, bo_size) catch |err| {
@@ -217,10 +348,15 @@ fn runBenchmark(io: std.Io, opts: Options, smoke: bool) !void {
     defer bo.free(&board);
 
     std.debug.print(
-        "case=info variant={s} ports={d} xrt_device_open=1 lanes_open=1 bo_bytes={d} bo_mib={d} bo_phys=0x{x} size_bytes_each={d} size_mib_each={d} chunk_bytes={d} chunk_mib={d}\n",
+        "case=info variant={s} ports={d} active=",
+        .{ build_options.variant, default_active.count },
+    );
+    printActive(default_active);
+    std.debug.print(
+        " mode={s} repeat={d} xrt_device_open=1 lanes_open=1 bo_bytes={d} bo_mib={d} bo_phys=0x{x} size_bytes_each={d} size_mib_each={d} chunk_bytes={d} chunk_mib={d} offsets=",
         .{
-            build_options.variant,
-            opts.ports,
+            opts.mode.label(),
+            opts.repeat,
             bo.size,
             sizes.mib(bo.size),
             bo.phys,
@@ -230,34 +366,93 @@ fn runBenchmark(io: std.Io, opts: Options, smoke: bool) !void {
             sizes.mib(opts.chunk_bytes),
         },
     );
+    printOffsets(default_layout);
+    std.debug.print("\n", .{});
 
-    var lane_index: usize = 0;
-    while (lane_index < opts.ports) : (lane_index += 1) {
-        const active = ActiveSet.single(lane_index);
-        const write_result = try runWrite(io, &board, &lane_storage, &bo, active, transfer_size, opts.chunk_bytes);
-        printTransfer("write", active, transfer_size, write_result);
+    var iter: usize = 0;
+    while (iter < opts.repeat) : (iter += 1) {
+        if (opts.active != null) {
+            try runCase(io, &board, &lane_storage, &bo, default_layout, transfer_size, opts.chunk_bytes, opts.mode, iter, opts.repeat);
+        } else {
+            var lane_index: usize = 0;
+            while (lane_index < opts.ports) : (lane_index += 1) {
+                const layout = try makeLayout(ActiveSet.single(lane_index), transfer_size, null);
+                try runCase(io, &board, &lane_storage, &bo, layout, transfer_size, opts.chunk_bytes, opts.mode, iter, opts.repeat);
+            }
 
-        const read_result = try runRead(io, &board, &lane_storage, &bo, active, transfer_size, opts.chunk_bytes);
-        printTransfer("read", active, transfer_size, read_result);
+            if (opts.ports > 1) {
+                const layout = try makeLayout(ActiveSet.first(opts.ports), transfer_size, opts.offsets);
+                try runCase(io, &board, &lane_storage, &bo, layout, transfer_size, opts.chunk_bytes, opts.mode, iter, opts.repeat);
+            }
+        }
     }
 
-    if (opts.ports > 1) {
-        const active = ActiveSet.first(opts.ports);
-        const write_result = try runWrite(io, &board, &lane_storage, &bo, active, transfer_size, opts.chunk_bytes);
-        printTransfer("write", active, transfer_size, write_result);
-
-        const read_result = try runRead(io, &board, &lane_storage, &bo, active, transfer_size, opts.chunk_bytes);
-        printTransfer("read", active, transfer_size, read_result);
-    }
-
-    std.debug.print("case=summary variant={s} ports={d} ok=1\n", .{ build_options.variant, opts.ports });
+    std.debug.print("case=summary variant={s} ports={d} active=", .{ build_options.variant, default_active.count });
+    printActive(default_active);
+    std.debug.print(" mode={s} repeat={d} ok=1\n", .{ opts.mode.label(), opts.repeat });
 }
 
-fn openLanes(storage: *[config.lane_count]?Lane, count: usize) !void {
+fn runCase(
+    io: std.Io,
+    board: *Board,
+    lane_storage: *[config.lane_count]?Lane,
+    bo: *MappedBo,
+    layout: RunLayout,
+    transfer_size: usize,
+    chunk_size: usize,
+    mode: RunMode,
+    iter: usize,
+    repeat: usize,
+) !void {
+    if (mode.includesWrite()) {
+        const write_result = try runWrite(io, board, lane_storage, bo, layout, transfer_size, chunk_size);
+        printTransfer("write", layout, transfer_size, write_result, iter, repeat);
+    }
+
+    if (mode.includesRead()) {
+        const read_result = try runRead(io, board, lane_storage, bo, layout, transfer_size, chunk_size);
+        printTransfer("read", layout, transfer_size, read_result, iter, repeat);
+    }
+}
+
+fn makeLayout(active: ActiveSet, transfer_size: usize, maybe_offsets: ?OffsetList) !RunLayout {
+    var offsets = [_]usize{0} ** config.lane_count;
+    for (active.slice()) |idx| {
+        offsets[idx] = defaultLaneOffset(idx, transfer_size);
+    }
+
+    if (maybe_offsets) |custom| {
+        if (custom.count == active.count) {
+            for (active.slice(), 0..) |idx, pos| {
+                offsets[idx] = custom.values[pos];
+            }
+        } else if (custom.count == config.lane_count) {
+            for (active.slice()) |idx| {
+                offsets[idx] = custom.values[idx];
+            }
+        } else {
+            return error.InvalidOffsetCount;
+        }
+    }
+
+    return .{
+        .active = active,
+        .offsets = offsets,
+    };
+}
+
+fn layoutEnd(layout: RunLayout, transfer_size: usize) usize {
+    var end: usize = 0;
+    for (layout.active.slice()) |idx| {
+        end = @max(end, layout.offsets[idx] + transfer_size);
+    }
+    return end;
+}
+
+fn openLanes(storage: *[config.lane_count]?Lane, active: ActiveSet) !void {
     errdefer closeLanes(storage);
 
-    var i: usize = 0;
-    while (i < count) : (i += 1) {
+    for (active.slice()) |i| {
         const cfg = config.lanes[i];
         var d = dma.Dma.openDevice(cfg.dma_base) catch |err| {
             std.debug.print("case=info variant={s} lane={s} dma_open=0 base=0x{x} error={s}\n", .{ build_options.variant, cfg.name, @as(u64, @intCast(cfg.dma_base)), @errorName(err) });
@@ -291,15 +486,25 @@ fn laneAt(storage: *[config.lane_count]?Lane, index: usize) !*Lane {
     return error.LaneNotOpen;
 }
 
-fn validateRunOptions(ports: usize, bo_size: usize, transfer_size: usize, chunk_size: usize) !void {
-    if (ports == 0 or ports > config.lane_count) return error.InvalidPortCount;
+fn validateRunOptions(layout: RunLayout, bo_size: usize, transfer_size: usize, chunk_size: usize) !void {
+    if (layout.active.count == 0 or layout.active.count > config.lane_count) return error.InvalidPortCount;
     if (bo_size == 0 or transfer_size == 0 or chunk_size == 0) return error.InvalidSize;
     if (transfer_size % config.data_width_bytes != 0) return error.UnalignedTransfer;
     if (chunk_size % config.data_width_bytes != 0) return error.UnalignedChunk;
     if (chunk_size > config.max_dma_transfer) return error.ChunkExceedsDmaLengthWidth;
 
-    const end = laneOffset(ports - 1, transfer_size) + transfer_size;
-    if (end > bo_size) return error.TransferExceedsBo;
+    for (layout.active.slice(), 0..) |idx, pos| {
+        const offset = layout.offsets[idx];
+        if (offset % config.data_width_bytes != 0) return error.UnalignedOffset;
+        const end = std.math.add(usize, offset, transfer_size) catch return error.TransferExceedsBo;
+        if (end > bo_size) return error.TransferExceedsBo;
+
+        for (layout.active.slice()[0..pos]) |prev_idx| {
+            const prev_offset = layout.offsets[prev_idx];
+            const prev_end = prev_offset + transfer_size;
+            if (offset < prev_end and prev_offset < end) return error.OverlappingWindows;
+        }
+    }
 }
 
 fn runWrite(
@@ -307,7 +512,7 @@ fn runWrite(
     board: *Board,
     lane_storage: *[config.lane_count]?Lane,
     bo: *MappedBo,
-    active: ActiveSet,
+    layout: RunLayout,
     transfer_size: usize,
     chunk_size: usize,
 ) !TransferResult {
@@ -316,9 +521,9 @@ fn runWrite(
         .lanes = [_]LaneResult{.{}} ** config.lane_count,
     };
 
-    for (active.slice()) |idx| {
+    for (layout.active.slice()) |idx| {
         const lane = try laneAt(lane_storage, idx);
-        const base = laneOffset(idx, transfer_size);
+        const base = laneBoOffset(layout, idx);
         const dst = bo.mem[base .. base + transfer_size];
         @memset(dst, 0);
         if (board.x.boSync(bo.handle, xrt.sync_to_device, transfer_size, base) != 0) return error.BoSync;
@@ -330,23 +535,23 @@ fn runWrite(
     while (offset < transfer_size) {
         const len = @min(chunk_size, transfer_size - offset);
 
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
-            const phys = bo.phys + @as(u64, @intCast(laneOffset(idx, transfer_size) + offset));
+            const phys = bo.phys + @as(u64, @intCast(laneBoOffset(layout, idx) + offset));
             try lane.d.startWriteToDdr(phys, len);
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             try lane.engine.startWrite(len, offset, lane.cfg().seed);
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             lane.d.waitWriteDone() catch |err| {
                 printDmaFailure("write", lane);
                 return err;
             };
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             lane.engine.waitWriteDone() catch |err| {
                 printEngineFailure("write", lane);
@@ -360,10 +565,10 @@ fn runWrite(
     }
     result.elapsed_ns = elapsedNs(io, start);
 
-    for (active.slice()) |idx| {
+    for (layout.active.slice()) |idx| {
         const lane = try laneAt(lane_storage, idx);
         const cfg = lane.cfg();
-        const base = laneOffset(idx, transfer_size);
+        const base = laneBoOffset(layout, idx);
         if (board.x.boSync(bo.handle, xrt.sync_from_device, transfer_size, base) != 0) return error.BoSync;
 
         const dst = bo.mem[base .. base + transfer_size];
@@ -389,7 +594,7 @@ fn runRead(
     board: *Board,
     lane_storage: *[config.lane_count]?Lane,
     bo: *MappedBo,
-    active: ActiveSet,
+    layout: RunLayout,
     transfer_size: usize,
     chunk_size: usize,
 ) !TransferResult {
@@ -398,10 +603,10 @@ fn runRead(
         .lanes = [_]LaneResult{.{}} ** config.lane_count,
     };
 
-    for (active.slice()) |idx| {
+    for (layout.active.slice()) |idx| {
         const lane = try laneAt(lane_storage, idx);
         const cfg = lane.cfg();
-        const base = laneOffset(idx, transfer_size);
+        const base = laneBoOffset(layout, idx);
         const src = bo.mem[base .. base + transfer_size];
         fillPattern(src, cfg.seed);
         if (board.x.boSync(bo.handle, xrt.sync_to_device, transfer_size, base) != 0) return error.BoSync;
@@ -413,23 +618,23 @@ fn runRead(
     while (offset < transfer_size) {
         const len = @min(chunk_size, transfer_size - offset);
 
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             try lane.engine.startRead(len, offset, lane.cfg().seed);
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
-            const phys = bo.phys + @as(u64, @intCast(laneOffset(idx, transfer_size) + offset));
+            const phys = bo.phys + @as(u64, @intCast(laneBoOffset(layout, idx) + offset));
             try lane.d.startReadFromDdr(phys, len);
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             lane.d.waitReadDone() catch |err| {
                 printDmaFailure("read", lane);
                 return err;
             };
         }
-        for (active.slice()) |idx| {
+        for (layout.active.slice()) |idx| {
             const lane = try laneAt(lane_storage, idx);
             lane.engine.waitReadDone() catch |err| {
                 const snap = lane.engine.snapshot();
@@ -437,7 +642,7 @@ fn runRead(
                     const cfg = lane.cfg();
                     const ds = lane.d.snapshot();
                     const engine_cfg = lane.engine.configSnapshot();
-                    const lane_base = laneOffset(idx, transfer_size);
+                    const lane_base = laneBoOffset(layout, idx);
                     const phys = bo.phys + @as(u64, @intCast(lane_base + offset));
                     const transfer_error_index: usize = @intCast(@min(snap.first_error_index, @as(u64, @intCast(transfer_size - 1))));
                     const cpu_byte = bo.mem[lane_base + transfer_error_index];
@@ -496,14 +701,20 @@ fn runRead(
     return result;
 }
 
-fn printTransfer(test_name: []const u8, active: ActiveSet, transfer_size: usize, result: TransferResult) void {
-    const aggregate_bytes = transfer_size * active.count;
+fn printTransfer(test_name: []const u8, layout: RunLayout, transfer_size: usize, result: TransferResult, iter: usize, repeat: usize) void {
+    const aggregate_bytes = transfer_size * layout.active.count;
 
     std.debug.print(
         "case={s} variant={s} ports={d} active=",
-        .{ test_name, build_options.variant, active.count },
+        .{ test_name, build_options.variant, layout.active.count },
     );
-    printActive(active);
+    printActive(layout.active);
+    if (repeat > 1) std.debug.print(" iter={d}", .{iter + 1});
+    std.debug.print(
+        " offsets=",
+        .{},
+    );
+    printOffsets(layout);
     std.debug.print(
         " size_bytes_each={d} size_mib_each={d} ok=1 elapsed_us={d} aggregate_mib_s={d}",
         .{
@@ -514,7 +725,7 @@ fn printTransfer(test_name: []const u8, active: ActiveSet, transfer_size: usize,
         },
     );
 
-    for (active.slice()) |idx| {
+    for (layout.active.slice()) |idx| {
         const lane_result = result.lanes[idx];
         std.debug.print(
             " lane{d}_mib_s={d} lane{d}_chunks={d} lane{d}_pl_cycles={d} lane{d}_inferred_clk_mhz_x100={d} lane{d}_bytes_checked={d}",
@@ -539,6 +750,18 @@ fn printActive(active: ActiveSet) void {
     for (active.slice(), 0..) |idx, pos| {
         if (pos != 0) std.debug.print(",", .{});
         std.debug.print("{s}", .{config.lanes[idx].name});
+    }
+}
+
+fn printOffsets(layout: RunLayout) void {
+    for (layout.active.slice(), 0..) |idx, pos| {
+        if (pos != 0) std.debug.print(",", .{});
+        const offset = layout.offsets[idx];
+        if (offset % sizes.MiB == 0) {
+            std.debug.print("{s}:{d}MiB", .{ config.lanes[idx].name, sizes.mib(offset) });
+        } else {
+            std.debug.print("{s}:{d}B", .{ config.lanes[idx].name, offset });
+        }
     }
 }
 
@@ -575,7 +798,11 @@ inline fn pattern(i: usize, seed: u8) u8 {
     return @truncate(i *% 7 +% @as(usize, seed));
 }
 
-fn laneOffset(lane_index: usize, transfer_size: usize) usize {
+fn laneBoOffset(layout: RunLayout, lane_index: usize) usize {
+    return layout.offsets[lane_index];
+}
+
+fn defaultLaneOffset(lane_index: usize, transfer_size: usize) usize {
     if (transfer_size == config.default_transfer_size) return config.lanes[lane_index].bo_offset;
     return lane_index * transfer_size;
 }
