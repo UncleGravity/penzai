@@ -1,0 +1,16 @@
+# Q1A8 kernel AXI-Lite register map — single source of truth for the
+# driver (src/mmio.zig, added at M4) and the RTL (q1a8_kernel_top.v).
+# Ported from the old PYNQ-Z1 kernel; ID/VERSION unchanged.
+#
+# offset  name            access  reset        description
+0x00      ID              ro      0xB05A2000   kernel identifier
+0x04      VERSION         ro      0x00000004   v4 = dual-stream (S_AXIS weights + S_AXIS_ACTS)
+0x08      CTRL            wo      -            bit0 = start strobe (pulse)
+0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
+0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
+0x14      NUM_ROWBLOCKS   rw      0x00000000   ceil(M / 8)
+0x18      CYCLES          ro      0x00000000   busy-cycle count of last run
+0x1C      ROWS            ro      0x00000008   lanes per rowblock (constant)
+#
+# M5 addition: a STALL_CYCLES counter (cycles busy but starved on input DMA)
+# so array utilization = (CYCLES - STALL_CYCLES) / CYCLES is readable directly.
