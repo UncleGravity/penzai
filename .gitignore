@@ -3,6 +3,7 @@
 .zig-cache/
 zig-out/
 models/
+config.env
 
 # Nix
 result
