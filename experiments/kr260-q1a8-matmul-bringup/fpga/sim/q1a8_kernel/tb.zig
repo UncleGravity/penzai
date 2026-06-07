@@ -30,7 +30,9 @@ const Dut = struct {
     }
 };
 
-const Run = struct { out: []f32, busy_cycles: usize };
+const Run = struct { out: []f32, busy_cycles: usize, state_hist: [16]usize };
+
+const state_names = [_][]const u8{ "IDLE", "LOAD_ACTS", "LOAD_SCALE", "SCALES", "WBITS", "ISSUE", "WAIT_DONE", "DRAIN", "EMIT", "FINISH" };
 
 /// Run one matmul through the DUT, returning per-row fp32 results and the
 /// number of cycles the kernel was busy. Streams are never stalled, so
@@ -69,6 +71,7 @@ fn runKernel(
     var ai: usize = 0;
     var ri: usize = 0; // result byte cursor
     var busy_cycles: usize = 0;
+    var state_hist = [_]usize{0} ** 16;
     var cycle: usize = 0;
     while (cycle < CYCLE_LIMIT) : (cycle += 1) {
         c.dut_set_start(dut.h, if (cycle == 0) 1 else 0);
@@ -88,7 +91,10 @@ fn runKernel(
             ri += 8;
         }
 
-        if (c.dut_busy(dut.h) != 0) busy_cycles += 1;
+        if (c.dut_busy(dut.h) != 0) {
+            busy_cycles += 1;
+            state_hist[@intCast(c.dut_state(dut.h) & 0xf)] += 1;
+        }
         dut.step(); // rising edge commits transfers, then settle low
 
         if (w_fire) wi += 1;
@@ -100,7 +106,7 @@ fn runKernel(
 
     const out = try a.alloc(f32, rows);
     pack.unpackResults(num_rb, res_bytes, out);
-    return .{ .out = out, .busy_cycles = busy_cycles };
+    return .{ .out = out, .busy_cycles = busy_cycles, .state_hist = state_hist };
 }
 
 fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, seed: u64) !void {
@@ -170,6 +176,13 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, seed: u64) !void {
         "case rows={d} blocks={d} ok={d} max_rel={d:.4} busy_cycles={d} MAC/cycle={d:.1} (DDR budget ~286)\n",
         .{ rows, blocks, @intFromBool(max_rel <= 0.02), max_rel, run.busy_cycles, bpc },
     );
+    if (rows >= 64) {
+        std.debug.print("  cycle breakdown:", .{});
+        for (run.state_hist[0..state_names.len], state_names) |n, name| {
+            if (n > 0) std.debug.print(" {s}={d}({d}%)", .{ name, n, n * 100 / run.busy_cycles });
+        }
+        std.debug.print("\n", .{});
+    }
     if (max_rel > 0.02) return error.ResultMismatch;
 }
 

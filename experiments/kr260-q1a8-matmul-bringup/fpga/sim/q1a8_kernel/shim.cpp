@@ -44,4 +44,5 @@ int dut_m_last(Dut *d) { return d->t->m_axis_tlast; }
 uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
 int dut_busy(Dut *d) { return d->t->busy; }
 int dut_done(Dut *d) { return d->t->kernel_done; }
+int dut_state(Dut *d) { return d->t->dbg_state; }
 }

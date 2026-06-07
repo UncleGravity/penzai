@@ -30,6 +30,7 @@ int dut_m_last(Dut *);
 uint64_t dut_m_data(Dut *);
 int dut_busy(Dut *);
 int dut_done(Dut *);
+int dut_state(Dut *);
 
 #ifdef __cplusplus
 }

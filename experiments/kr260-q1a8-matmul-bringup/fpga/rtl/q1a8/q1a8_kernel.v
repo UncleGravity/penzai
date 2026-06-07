@@ -53,7 +53,9 @@ module q1a8_kernel #(
     output wire                  m_axis_tvalid,
     input  wire                  m_axis_tready,
     output wire                  m_axis_tlast,
-    output wire [7:0]            m_axis_tkeep
+    output wire [7:0]            m_axis_tkeep,
+
+    output wire [3:0]            dbg_state    // cosim profiling; unconnected in kernel_top
 );
 
     localparam integer SCALE_BEATS    = (ROWS + 3) / 4;
@@ -129,6 +131,7 @@ module q1a8_kernel #(
     wire [ROWS*32-1:0] rowblock_results;
 
     assign busy = busy_q;
+    assign dbg_state = state;
     assign s_axis_tready =
         busy_q &&
         ((state == ST_SCALES) || (state == ST_WBITS));
