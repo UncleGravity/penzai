@@ -78,6 +78,48 @@ pub fn packWeights(
     }
 }
 
+// ---- Wide weight layout (M6): one 256-bit (ROWS*32) beat per scale/subblock --
+pub const WIDE_BEAT_BYTES: usize = q1a8.ROWS * 4; // ROWS*32 bits
+
+pub fn weightBytesWide(num_rowblocks: usize, q1_blocks: usize) usize {
+    return num_rowblocks * q1_blocks * (1 + q1a8.Q8_SUBBLOCKS) * WIDE_BEAT_BYTES;
+}
+
+/// Pack weights for q1a8_kernel_wide: per q1block per rowblock, one scale beat
+/// (ROWS fp16 in the low bits) then 4 wbit beats (ROWS×32 bits, one subblock).
+pub fn packWeightsWide(
+    rows: usize,
+    q1_blocks: usize,
+    weight_bits: []const u128,
+    weight_scales: []const f16,
+    out: []u8,
+) void {
+    const num_rb = rows / q1a8.ROWS;
+    std.debug.assert(out.len == weightBytesWide(num_rb, q1_blocks));
+    var off: usize = 0;
+    var rb: usize = 0;
+    while (rb < num_rb) : (rb += 1) {
+        var blk: usize = 0;
+        while (blk < q1_blocks) : (blk += 1) {
+            @memset(out[off..][0..WIDE_BEAT_BYTES], 0); // scale beat (low bits used)
+            for (0..q1a8.ROWS) |lane| {
+                const s = weight_scales[(rb * q1a8.ROWS + lane) * q1_blocks + blk];
+                std.mem.writeInt(u16, out[off + lane * 2 ..][0..2], @bitCast(s), .little);
+            }
+            off += WIDE_BEAT_BYTES;
+            var sub: usize = 0;
+            while (sub < q1a8.Q8_SUBBLOCKS) : (sub += 1) {
+                for (0..q1a8.ROWS) |lane| {
+                    const bits = weight_bits[(rb * q1a8.ROWS + lane) * q1_blocks + blk];
+                    const w: u32 = @truncate(bits >> @intCast(sub * 32));
+                    std.mem.writeInt(u32, out[off + lane * 4 ..][0..4], w, .little);
+                }
+                off += WIDE_BEAT_BYTES;
+            }
+        }
+    }
+}
+
 /// Inverse of packWeights, for the roundtrip gate.
 pub fn unpackWeights(
     rows: usize,

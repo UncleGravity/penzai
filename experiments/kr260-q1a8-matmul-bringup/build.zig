@@ -33,7 +33,9 @@ pub fn build(b: *std.Build) void {
         test_step.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = tmod })).step);
     }
 
-    addCosim(b, target, optimize); // M2: zig build test-rtl
+    // M2 narrow cosim + M6 wide-ingestion prototype.
+    addCosim(b, target, optimize, "test-rtl", "M2: Verilator cosim of q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl);
+    addCosim(b, target, optimize, "test-rtl-wide", "M6: Verilator cosim of q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl);
 
     // ---- Board binary (M4): cross-compiled aarch64 ----
     const board_target = b.resolveTargetQuery(.{
@@ -93,51 +95,61 @@ fn attachBoard(b: *std.Build, mod: *std.Build.Module, t: std.Build.ResolvedTarge
     attachSrc(b, mod, t, o);
 }
 
-const datapath_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_kernel.v",     "fpga/rtl/q1a8/q1a8_rowblock.v",
-    "fpga/rtl/q1a8/q1a8_reducer.v",    "fpga/rtl/q1a8/fp32_add.v",
-    "fpga/rtl/q1a8/fp32_mul.v",        "fpga/rtl/q1a8/fp16_to_fp32.v",
-    "fpga/rtl/q1a8/int_to_fp32.v",
+const core_rtl = [_][]const u8{
+    "fpga/rtl/q1a8/q1a8_rowblock.v", "fpga/rtl/q1a8/q1a8_reducer.v",
+    "fpga/rtl/q1a8/fp32_add.v",      "fpga/rtl/q1a8/fp32_mul.v",
+    "fpga/rtl/q1a8/fp16_to_fp32.v",  "fpga/rtl/q1a8/int_to_fp32.v",
 };
+const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
+const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
 
-// M2: Verilator cosim of q1a8_kernel, driven from Zig, checked vs matmul_ref.
-fn addCosim(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const step = b.step("test-rtl", "M2: Verilator cosim of q1a8_kernel vs matmul_ref");
+// Verilator cosim of a kernel top, driven from Zig, checked vs matmul_ref.
+fn addCosim(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    desc: []const u8,
+    top: []const u8,
+    dir: []const u8,
+    rtl: []const []const u8,
+) void {
+    const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
         const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
         step.dependOn(&msg.step);
         return;
     };
     const vroot = std.mem.trim(u8, b.run(&.{ verilator, "--getenv", "VERILATOR_ROOT" }), " \n\r");
-    const gen = "fpga/sim/q1a8_kernel/obj_dir";
+    const gen = b.fmt("{s}/obj_dir", .{dir});
 
-    const vcmd = b.addSystemCommand(&.{
-        verilator,      "--cc",             "--build",          "--lib-create", "vq1a8",
-        "-Wno-fatal",   "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL",
-        "--top-module", "q1a8_kernel",      "--Mdir",           gen,
-    });
-    vcmd.addArgs(&datapath_rtl);
+    const vcmd = b.addSystemCommand(&.{ verilator, "--cc", "--build", "--lib-create" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "--Mdir", gen });
+    vcmd.addArgs(rtl);
 
     const tb_mod = b.createModule(.{
-        .root_source_file = b.path("fpga/sim/q1a8_kernel/tb.zig"),
+        .root_source_file = b.path(b.fmt("{s}/tb.zig", .{dir})),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
     });
     attachSrc(b, tb_mod, target, optimize);
-    tb_mod.addIncludePath(b.path("fpga/sim/q1a8_kernel"));
+    tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
     tb_mod.addIncludePath(b.path(gen));
     tb_mod.addCSourceFile(.{
-        .file = b.path("fpga/sim/q1a8_kernel/shim.cpp"),
+        .file = b.path(b.fmt("{s}/shim.cpp", .{dir})),
         .flags = &.{ "-std=c++17", b.fmt("-I{s}", .{gen}), b.fmt("-I{s}/include", .{vroot}), b.fmt("-I{s}/include/vltstd", .{vroot}) },
     });
-    tb_mod.addObjectFile(b.path(b.fmt("{s}/libvq1a8.a", .{gen})));
+    tb_mod.addObjectFile(b.path(b.fmt("{s}/lib{s}.a", .{ gen, top })));
     tb_mod.linkSystemLibrary("pthread", .{});
     tb_mod.link_libcpp = true;
 
-    const tb = b.addExecutable(.{ .name = "q1a8-cosim", .root_module = tb_mod });
+    const tb = b.addExecutable(.{ .name = b.fmt("{s}-cosim", .{top}), .root_module = tb_mod });
     tb.step.dependOn(&vcmd.step);
     step.dependOn(&b.addRunArtifact(tb).step);
 }

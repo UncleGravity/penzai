@@ -49,8 +49,15 @@ plan is a later step, not part of derisking.
 - **M5 — throughput/util** 🔜 (on hardware). The compute-bound finding is already
   hardware-confirmed (40.6 MAC/cycle = cosim). Remaining: real wall-clock GB/s, a
   STALL_CYCLES counter, and the clock ceiling (push 100 → ~137 MHz).
-- **M6 — widen the array** 🔜 (the real KR260 perf work; verifiable in sim). See
-  the finding below: the array must reach ~322 bits/cycle to be bandwidth-bound.
+- **M6 — widen the array** 🔧 cosim prototype done (`q1a8_kernel_wide.v`,
+  `zig build test-rtl-wide`). Widened the weight stream to ROWS×32 bits (256) so a
+  full subblock for all rows loads in **one beat**, issued at 1 subblock/cycle into
+  the *unchanged* `q1a8_rowblock` core. Result: **40.6 → 163.8 MAC/cycle (4.0×)**
+  at realistic M (256×2048), all bit-exact-within-ε; WISSUE is now 63% of cycles
+  (was 15%). Next levers: kill WSCALE overhead (15% — pack 2 q1blocks' scales per
+  256-bit beat or pipeline) → ~190; then the hard ceiling is **DDR delivery** — the
+  cosim has no bandwidth model, so reaching ~286 needs multi-HP weight DMAs feeding
+  the 256-bit stream (the real hardware step). See the budget below.
 
 ## Sim finding (from M2 cosim + multiport DDR result)
 
