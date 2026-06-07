@@ -121,10 +121,9 @@ device/                           # ── runs on the Zynq board; imports ZERO 
     slab.zig                      #     interface: write/read/clear over byte ranges
     cma.zig                       #     real: udmabuf/CMA contiguous buffers (board only)
     fake.zig                      #     test: bytearray (runs the whole device on a laptop)
-  ps/{rmsnorm,rope,softmax,glue,q1a8_merge}.zig   #   ARM Cortex-A9 kernels (pure fns)
+  ps/{matmul_q1a8,rmsnorm,rope,softmax,glue,q1a8_merge}.zig   #   ARM kernels + oracle (pure fns)
   pl/
     matmul.zig                    #     real W1A8 fabric driver (DMA descriptors + control)
-    matmul_ref.zig                #     scalar reference (runs with no fabric; the oracle)
     mmio.zig dma.zig fpga.zig     #     HAL: register map, DMA engine, bitstream load
 
 fpga/                             # ── gateware: Verilog/Vivado/Verilator; NOT zig build ──
@@ -146,9 +145,9 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side cross-module tests, no h
 - `device/` never imports ggml or llama. Its only contract is `shared/protocol/wire.zig`.
   A future non-ggml frontend would just emit the same command buffers.
 - ggml/llama coupling is confined to `host/{backend,lower,llama}.zig`.
-- The only hardware-bound files are `device/pl/{mmio,dma,fpga}.zig` and `device/mem/cma.zig`.
+- The only hardware-bound files are `device/pl/{matmul,mmio,dma,fpga}.zig` and `device/mem/cma.zig`.
   Everything else — including the entire device runtime, via `mem/fake.zig` and
-  `pl/matmul_ref.zig` — runs and is tested on a development machine.
+  `ps/matmul_q1a8.zig` — runs and is tested on a development machine.
 
 ---
 
@@ -254,7 +253,7 @@ and `device/server.zig`.
 **The three device modes/transports:**
 
 - **`fake` — host-side no-hardware device.** A test device that runs `device/runtime.zig`
-  on the host with `mem/fake.zig` and `pl/matmul_ref.zig`. Full-stack tests should route
+  on the host with `mem/fake.zig` and `ps/matmul_q1a8.zig`. Full-stack tests should route
   through the same `Link`/framing/wire path as real hardware, using a RAM byte-pipe and a
   background server loop, so lowering and dispatch are exercised without a board. Narrow
   runtime tests can call `runtime.dispatch` directly.
@@ -318,16 +317,12 @@ transparently via `read`/`write`; PL DMA asks for the extent list and programs o
 descriptor per extent. The extent complexity is forced by a hard hardware constraint, not
 gold-plating — but it is the one place extents are visible, and it should stay that way.
 
-**`ps/` — ARM kernels.** `rmsnorm`, `rope`, `softmax`, `glue` (add/mul/scale/silu/swiglu),
-and `q1a8_merge` (per-column activation merge into packed weights). Pure functions over
-slices — trivially unit-testable.
+**`ps/` — ARM kernels.** `matmul_q1a8` (scalar CPU fallback + oracle), `rmsnorm`, `rope`,
+`softmax`, `glue` (add/mul/scale/silu/swiglu), and `q1a8_merge` (per-column activation
+merge into packed weights). Pure functions over slices — trivially unit-testable.
 
-**`pl/` — fabric driver + reference + HAL.**
+**`pl/` — fabric driver + HAL.**
 - `matmul.zig` — the real W1A8 driver: build DMA descriptors, kick the fabric, read back.
-- `matmul_ref.zig` — a scalar reference doing the same integer accumulation. Two roles:
-  it lets the runtime run with no fabric (laptop tests), and it is the bit-exact oracle
-  for the real path and for the RTL. Same function signature as `matmul.zig`, selected at
-  comptime/runtime — no vtable.
 - `mmio.zig`/`dma.zig`/`fpga.zig` — the HAL. Each is split into a **pure encoder** (build
   the descriptor list, encode the register bits, parse/validate the bitstream header) and a
   **thin effect shim** (mmap + write, ioctl, write to `fpga_manager` sysfs). The pure half
@@ -384,7 +379,7 @@ Zig register struct, with a test asserting they match. Most fabric-bringup bugs 
 driver↔RTL offset mismatches; a generated regmap kills the whole class.
 
 **Adding a datatype** = one `fpga/rtl/decode/decode_<fmt>.v` + one `shared/q<fmt>.zig` packer
-+ extend the `WeightFormat` param in `matmul.zig`/`matmul_ref.zig` + one `fpga/sim/<fmt>/`
++ extend the `WeightFormat` param in `pl/matmul.zig`/`ps/matmul_q1a8.zig` + one `fpga/sim/<fmt>/`
 testbench + a regmap mode value. The core array, reducer, accumulator, output stage, DMA,
 AXI, and host runtime do not move.
 
@@ -398,7 +393,7 @@ implementations does not come from quantization; it comes from arithmetic domain
 
 - **The matmul core — `Σ(w·a)`, `w ∈ {-1,+1}`, `a ∈ int8` — is exact and order-independent.**
   Integer accumulation is lossless (an int32 accumulator trivially holds `127 × ~2048`), so
-  it does not matter whether `matmul_ref` sums left-to-right and the fabric sums in a tree:
+  it does not matter whether `ps/matmul_q1a8` sums left-to-right and the fabric sums in a tree:
   identical integers out. This is the strongest invariant in the system — test it `==`,
   never with tolerance. The same holds for ternary.
 - **Scales applied after** (`β_w · scale_a · accumulator`) are float multiplies — deterministic
@@ -419,7 +414,7 @@ kernel only exposes the final scaled float, the bit-exact guarantee is thrown aw
 **On comparing to llama.cpp:** bit-exact against llama is impossible for the float ops, and
 possibly for the matmul too (if its kernel dequantizes to float and runs an F32 GEMM instead
 of integer accumulation). So the per-op matmul oracle is *your own integer reference*
-(`matmul_ref.zig` / numpy), compared `==`; the full-model logits-vs-llama check is a fuzzy
+(`ps/matmul_q1a8.zig` / numpy), compared `==`; the full-model logits-vs-llama check is a fuzzy
 integration smoke (top-k agreement or logits within ε), not a precision gate.
 
 ---
@@ -427,17 +422,17 @@ integration smoke (top-k agreement or logits within ε), not a precision gate.
 ## 12. Testing
 
 The architecture did the hard part: hardware is quarantined behind thin twinned interfaces
-(`mem/fake`↔`cma`, `pl/matmul_ref`↔`matmul`, `fake`↔`tcp`), so the entire software stack
+(`mem/fake`↔`cma`, `ps/matmul_q1a8`↔`pl/matmul`, `fake`↔`tcp`), so the entire software stack
 runs on a laptop. The test pyramid maps onto distance-from-hardware — the same axis as the
 file tree.
 
 **Tiers by what they need to run:**
 
 - **T0 — pure units** (colocated `test {}` blocks; milliseconds; every save): kernels,
-  `matmul_ref`, wire/framing roundtrip, allocator over fake slabs, q1a8 layout, the HAL
+  `ps/matmul_q1a8`, wire/framing roundtrip, allocator over fake slabs, q1a8 layout, the HAL
   encoders.
 - **T1 — in-process integration** (sub-second; no hardware): the full device runtime over
-  `mem/fake` + `matmul_ref`; the full stack `host → fake device → device runtime`.
+  `mem/fake` + `ps/matmul_q1a8`; the full stack `host → fake device → device runtime`.
   Exercises the real framing/wire/schedule code via the RAM byte-pipe.
 - **T2 — golden / numerical** (needs a small model fixture; no hardware): per-op golden
   vectors (fast, *localizing* — they tell you which kernel broke) plus full-model logits vs
@@ -450,9 +445,9 @@ file tree.
 
 - **One spec, many impls (differential).** Write a behavior spec once, parameterize over
   impls at comptime: the transport/device-link spec over `fake`/`tcp`; the device spec over
-  `mem/fake`/`cma` and `matmul_ref`/`matmul`. Cheap impls run always; hardware impls run the same
+  `mem/fake`/`cma` and `ps/matmul_q1a8`/`pl/matmul`. Cheap impls run always; hardware impls run the same
   assertions in T3. The reference implementation *is* the executable spec.
-- **One oracle for software, gateware, and the wire layout.** `matmul_ref.zig` is the
+- **One oracle for software, gateware, and the wire layout.** `ps/matmul_q1a8.zig` is the
   bit-exact integer reference. It checks the Zig software kernel, it drives the Verilator RTL
   testbench, and — because it decodes the same packed bytes the RTL decoder does — it
   validates the host↔RTL packing contract for free.
@@ -461,7 +456,7 @@ file tree.
 CI-friendly) — not commercial sims, not pure-SV/UVM testbenches. The testbenches are Zig
 (`fpga/sim/<dut>/tb.zig`): a `zig build test-rtl` step verilates the DUT, compiles the
 generated `Vtop` together with the Zig testbench, and runs it, checking against
-`matmul_ref.zig`. This unifies language and build and gives the single-oracle property
+`ps/matmul_q1a8.zig`. This unifies language and build and gives the single-oracle property
 directly. (Migrating from the prototype's cocotb tests can be incremental; in the meantime
 feed cocotb and the Zig tests the same golden fixtures so they share one reference.)
 
@@ -569,7 +564,7 @@ One codebase, one schema, topology chosen by a flag:
 |---|---|---|---|
 | `penzaid` + `penzai run model.gguf --device tcp:board:port` | board + host | tcp | real PYNQ-Z1 hardware |
 | `penzai run model.gguf --device usb:VID:PID` | board + host | usb | future hardware transport |
-| `penzai run model.gguf --device fake` | host only | RAM byte-pipe | full-stack test with `mem/fake` + `matmul_ref` |
+| `penzai run model.gguf --device fake` | host only | RAM byte-pipe | full-stack test with `mem/fake` + `ps/matmul_q1a8` |
 
 `penzaid` is the only board-side process. llama.cpp and ggml stay on the host.
 
@@ -584,7 +579,7 @@ Three cross-boundary contracts, each defined once with a test asserting agreemen
 2. **Register map** — `fpga/regmap/q1a8.regmap`, generating Verilog `localparam` offsets and
    the Zig `mmio.zig` struct. Kills driver↔RTL offset drift.
 3. **Weight packing layout** — `shared/q1a8.zig` (and `q158.zig`), matched by the FPGA
-   decoder and `matmul_ref`. The Verilator-driven test and the host pack/unpack roundtrip
+   decoder and `ps/matmul_q1a8`. The Verilator-driven test and the host pack/unpack roundtrip
    together pin it.
 
 ---
@@ -616,7 +611,7 @@ Three cross-boundary contracts, each defined once with a test asserting agreemen
 - **An op:** add the pattern→emitter row in `host/lower.zig`, the op tag + record in
   `wire.zig`, and the kernel in `device/ps/` or `device/pl/`. Three edits, one per location.
 - **A datatype:** `fpga/rtl/decode/decode_<fmt>.v` + `shared/q<fmt>.zig` + a `WeightFormat`
-  param in `matmul.zig`/`matmul_ref.zig` + a `fpga/sim/<fmt>/` testbench + a regmap mode value.
+  param in `pl/matmul.zig`/`ps/matmul_q1a8.zig` + a `fpga/sim/<fmt>/` testbench + a regmap mode value.
 - **A transport:** `host/transport/<name>.zig` + `device/transport/<name>.zig` + a `--device`
   case. Nothing above the transport line changes.
 - **A bitstream:** a folder under `fpga/bitstreams/<name>/` with `build.sh` + `tcl/`; build

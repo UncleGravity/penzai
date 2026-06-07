@@ -1,7 +1,12 @@
 const std = @import("std");
 const wire = @import("wire");
 const heap_mod = @import("heap");
-const matmul_ref = @import("matmul_ref");
+const ps_activations = @import("ps_activations");
+const ps_elemwise = @import("ps_elemwise");
+const ps_matmul_q1a8 = @import("ps_matmul_q1a8");
+const ps_rmsnorm = @import("ps_rmsnorm");
+const ps_rope = @import("ps_rope");
+const ps_softmax = @import("ps_softmax");
 
 pub const RuntimeError = error{
     InvalidRequest,
@@ -95,10 +100,60 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const weights = self.heap.read(matmul.weights) catch |err| return mapHeapError(err);
                     const acts = self.heap.read(matmul.acts) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(matmul.dst) catch |err| return mapHeapError(err);
-                    matmul_ref.runQ1A8(self.allocator, weights, acts, dst, matmul.rows, matmul.cols, matmul.k) catch |err| switch (err) {
+                    ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, dst, matmul.rows, matmul.cols, matmul.k) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.InvalidRequest,
                     };
+                },
+                .rmsnorm => |rmsnorm| {
+                    const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
+                    const weight = self.heap.read(rmsnorm.weight) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(rmsnorm.dst) catch |err| return mapHeapError(err);
+                    ps_rmsnorm.runBytes(input, weight, dst, rmsnorm.eps) catch |err| return mapKernelError(err);
+                },
+                .rope => |rope| {
+                    const input = self.heap.read(rope.input) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(rope.dst) catch |err| return mapHeapError(err);
+                    ps_rope.applyBytes(input, dst, rope.position, rope.theta) catch |err| return mapKernelError(err);
+                },
+                .softmax => |softmax| {
+                    const src = self.heap.read(softmax.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(softmax.dst) catch |err| return mapHeapError(err);
+                    ps_softmax.runBytes(src, dst) catch |err| return mapKernelError(err);
+                },
+                .silu => |silu| {
+                    const src = self.heap.read(silu.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(silu.dst) catch |err| return mapHeapError(err);
+                    ps_activations.siluBytes(src, dst) catch |err| return mapKernelError(err);
+                },
+                .swiglu => |swiglu| {
+                    const gate = self.heap.read(swiglu.lhs) catch |err| return mapHeapError(err);
+                    const up = self.heap.read(swiglu.rhs) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(swiglu.dst) catch |err| return mapHeapError(err);
+                    ps_activations.swigluBytes(gate, up, dst) catch |err| return mapKernelError(err);
+                },
+                .add_f32 => |add| {
+                    const lhs = self.heap.read(add.lhs) catch |err| return mapHeapError(err);
+                    const rhs = self.heap.read(add.rhs) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(add.dst) catch |err| return mapHeapError(err);
+                    ps_elemwise.addBytes(lhs, rhs, dst) catch |err| return mapKernelError(err);
+                },
+                .mul_f32 => |mul| {
+                    const lhs = self.heap.read(mul.lhs) catch |err| return mapHeapError(err);
+                    const rhs = self.heap.read(mul.rhs) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(mul.dst) catch |err| return mapHeapError(err);
+                    ps_elemwise.mulBytes(lhs, rhs, dst) catch |err| return mapKernelError(err);
+                },
+                .scale_f32 => |scale| {
+                    const src = self.heap.read(scale.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(scale.dst) catch |err| return mapHeapError(err);
+                    ps_elemwise.scaleBytes(src, scale.scale, dst) catch |err| return mapKernelError(err);
+                },
+                .add_scaled_f32 => |add_scaled| {
+                    const lhs = self.heap.read(add_scaled.lhs) catch |err| return mapHeapError(err);
+                    const rhs = self.heap.read(add_scaled.rhs) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(add_scaled.dst) catch |err| return mapHeapError(err);
+                    ps_elemwise.addScaledBytes(lhs, rhs, add_scaled.rhs_scale, dst) catch |err| return mapKernelError(err);
                 },
             }
         }
@@ -134,4 +189,92 @@ fn mapHeapError(err: anyerror) RuntimeError {
         error.BackendFailure => error.BackendFailure,
         else => error.BackendFailure,
     };
+}
+
+fn mapKernelError(err: anyerror) RuntimeError {
+    return switch (err) {
+        error.OutOfMemory => error.OutOfMemory,
+        else => error.InvalidRequest,
+    };
+}
+
+test "runtime dispatches ps f32 command variants" {
+    var runtime = try Runtime.init(std.testing.allocator, 4096);
+    defer runtime.deinit();
+
+    const a = try tensor(&runtime, 2);
+    const b = try tensor(&runtime, 2);
+    const weight = try tensor(&runtime, 2);
+    const out_rms = try tensor(&runtime, 2);
+    const out_rope = try tensor(&runtime, 2);
+    const out_softmax = try tensor(&runtime, 2);
+    const out_silu = try tensor(&runtime, 2);
+    const out_swiglu = try tensor(&runtime, 2);
+    const out_add = try tensor(&runtime, 2);
+    const out_mul = try tensor(&runtime, 2);
+    const out_scale = try tensor(&runtime, 2);
+    const out_add_scaled = try tensor(&runtime, 2);
+
+    try writeTensor(&runtime, a, &.{ 3, 4 });
+    try writeTensor(&runtime, b, &.{ 1, 2 });
+    try writeTensor(&runtime, weight, &.{ 1, 1 });
+
+    const commands = [_]wire.Command{
+        .{ .rmsnorm = .{ .input = a, .weight = weight, .dst = out_rms, .eps = 0 } },
+        .{ .rope = .{ .input = b, .dst = out_rope, .position = 0, .theta = 10000 } },
+        .{ .softmax = .{ .src = b, .dst = out_softmax } },
+        .{ .silu = .{ .src = b, .dst = out_silu } },
+        .{ .swiglu = .{ .lhs = b, .rhs = a, .dst = out_swiglu } },
+        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add } },
+        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul } },
+        .{ .scale_f32 = .{ .src = b, .dst = out_scale, .scale = 0.5 } },
+        .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = out_add_scaled, .rhs_scale = 0.5 } },
+    };
+    var command_bytes: [1024]u8 = undefined;
+    const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
+
+    const result = try runtime.dispatch(.{ .run_graph = .{
+        .request_id = 99,
+        .command_bytes = command_bytes[0..command_len],
+    } });
+    try std.testing.expectEqual(wire.Status.ok, result.meta.status);
+    try std.testing.expectEqual(@as(u64, commands.len), result.meta.value0);
+
+    try expectTensor(&runtime, out_rms, &.{ 0.84852815, 1.1313709 });
+    try expectTensor(&runtime, out_rope, &.{ 1, 2 });
+    try expectTensor(&runtime, out_softmax, &.{ 0.26894143, 0.7310586 });
+    try expectTensor(&runtime, out_silu, &.{ 0.7310586, 1.761594 });
+    try expectTensor(&runtime, out_swiglu, &.{ 2.1931758, 7.046376 });
+    try expectTensor(&runtime, out_add, &.{ 4, 6 });
+    try expectTensor(&runtime, out_mul, &.{ 3, 8 });
+    try expectTensor(&runtime, out_scale, &.{ 0.5, 1 });
+    try expectTensor(&runtime, out_add_scaled, &.{ 3.5, 5 });
+}
+
+fn tensor(runtime: *Runtime, len: usize) !wire.TensorRange {
+    return runtime.heap.allocate(len * @sizeOf(f32), @alignOf(f32));
+}
+
+fn writeTensor(runtime: *Runtime, range: wire.TensorRange, values: []const f32) !void {
+    const bytes = try runtime.heap.bytes(range);
+    try std.testing.expectEqual(values.len * @sizeOf(f32), bytes.len);
+    for (values, 0..) |value, i| {
+        writeF32(bytes, i, value);
+    }
+}
+
+fn expectTensor(runtime: *Runtime, range: wire.TensorRange, expected: []const f32) !void {
+    const bytes = try runtime.heap.read(range);
+    try std.testing.expectEqual(expected.len * @sizeOf(f32), bytes.len);
+    for (expected, 0..) |value, i| {
+        try std.testing.expect(@abs(value - readF32(bytes, i)) <= 0.000001);
+    }
+}
+
+fn writeF32(bytes: []u8, index: usize, value: f32) void {
+    std.mem.writeInt(u32, bytes[index * @sizeOf(f32) ..][0..4], @bitCast(value), .little);
+}
+
+fn readF32(bytes: []const u8, index: usize) f32 {
+    return @bitCast(std.mem.readInt(u32, bytes[index * @sizeOf(f32) ..][0..4], .little));
 }

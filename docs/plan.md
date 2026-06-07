@@ -46,8 +46,8 @@ device/                           # ── runs on the Zynq board; ZERO ggml/lla
   schedule.zig                    #   single-in-flight async pipeline (follows explicit deps)
   transport/{tcp,usb}.zig         #   server byte-pipes
   mem/{slab,cma,fake}.zig         #   slab interface + CMA (real) + bytearray (test)
-  ps/{rmsnorm,rope,softmax,glue,q1a8_merge}.zig   #   ARM kernels (pure fns)
-  pl/{matmul,matmul_ref,mmio,dma,fpga}.zig        #   fabric driver + scalar ref + HAL
+  ps/{matmul_q1a8,rmsnorm,rope,softmax,glue,q1a8_merge}.zig   #   ARM kernels (pure fns)
+  pl/{matmul,mmio,dma,fpga}.zig                   #   fabric driver + HAL
 
 fpga/                             # ── gateware: Verilog/Vivado/Verilator; NOT zig build ──
   rtl/
@@ -92,7 +92,7 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
   declares its input/output handles. `schedule.zig` *follows* deps — no on-device
   inference, no reliance on ggml arena invariants.
 - **Direct `switch` on op tag**, no kernel registry (closed op set).
-- **Slab interface** (cma/fake) and **matmul/matmul_ref** are the justified seams:
+- **Slab interface** (cma/fake) and **PL/PS matmul implementations** are the justified seams:
   both exist to run the whole runtime on a laptop and to give a bit-exact oracle.
 - **server/runtime split exists for tests and deployment** — `server` owns transport
   and framing; `runtime` is directly testable with fake memory/reference kernels.
@@ -113,7 +113,7 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 
 ## Numerics & testing
 
-- **Integer matmul is bit-exact** — test `==` against `matmul_ref.zig` (and the same
+- **Integer matmul is bit-exact** — test `==` against `ps/matmul_q1a8.zig` (and the same
   ref drives the Verilator RTL test, so it validates software, gateware, *and* the
   packing contract). Float glue ops (rmsnorm/softmax/rope/silu) use tolerance.
 - Test tiers by what they need: T0 pure units (colocated) · T1 in-process integration
