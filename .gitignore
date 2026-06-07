@@ -2,7 +2,11 @@
 .DS_Store
 .zig-cache/
 zig-out/
+models/
 
 # Nix
 result
 result-*
+
+# verilator output
+obj_dir/
