@@ -82,7 +82,7 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
   (libusb host / FunctionFS gadget device). Adding a real board transport = two files
   + a `--device` case; nothing above the transport line changes. USB is noop for now.
   TCP is the real hardware target.
-- Topology is a flag: `penzai run --device fake|tcp:host:port|usb:VID:PID`.
+- Topology is a flag: `penzai run -m model.gguf --device fake|tcp:host:port|usb:VID:PID`.
   Hardware deployment = `penzaid` on the board plus `penzai --device tcp:board:port`
   on the host.
 

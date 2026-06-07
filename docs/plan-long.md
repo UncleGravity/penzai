@@ -201,7 +201,7 @@ host packer, the device merge kernel, and the FPGA decoder — see §10. When te
 
 ## 7. Host (`host/`) — the penzai binary
 
-`penzai` is the binary you run. Flow of `penzai run model.gguf --device tcp:host:port`:
+`penzai` is the binary you run. Flow of `penzai run -m model.gguf --device tcp:host:port`:
 
 ```
 main.zig:  parse args, --device, profiling flags
@@ -267,7 +267,7 @@ and `device/server.zig`.
   whose justification is future, not present — built the day USB is real, not on spec.
 
 **Topology is a flag, not an architecture.**
-`penzai run --device fake | tcp:host:port | usb:VID:PID`. Real hardware runs as two
+`penzai run -m model.gguf --device fake | tcp:host:port | usb:VID:PID`. Real hardware runs as two
 processes: `penzai` on the host and `penzaid` on the board. Because weights are resident
 and per-token traffic is tiny, the choice of board transport never gates decode throughput
 — it only ever carries control traffic.
@@ -562,9 +562,9 @@ One codebase, one schema, topology chosen by a flag:
 
 | Command | Where | Transport | Notes |
 |---|---|---|---|
-| `penzaid` + `penzai run model.gguf --device tcp:board:port` | board + host | tcp | real PYNQ-Z1 hardware |
-| `penzai run model.gguf --device usb:VID:PID` | board + host | usb | future hardware transport |
-| `penzai run model.gguf --device fake` | host only | RAM byte-pipe | full-stack test with `mem/fake` + `ps/matmul_q1a8` |
+| `penzaid` + `penzai run -m model.gguf --device tcp:board:port` | board + host | tcp | real PYNQ-Z1 hardware |
+| `penzai run -m model.gguf --device usb:VID:PID` | board + host | usb | future hardware transport |
+| `penzai run -m model.gguf --device fake` | host only | RAM byte-pipe | full-stack test with `mem/fake` + `ps/matmul_q1a8` |
 
 `penzaid` is the only board-side process. llama.cpp and ggml stay on the host.
 
