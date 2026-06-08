@@ -64,10 +64,11 @@ pub fn lowerGraph(
 }
 
 fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
-    if (op.*.op != c.GGML_OP_MUL_MAT or op.*.@"type" != c.GGML_TYPE_F32) return false;
-    const weights = op.*.src[0] orelse return false;
-    const acts = op.*.src[1] orelse return false;
-    if (weights.*.@"type" != c.GGML_TYPE_Q1_0 or acts.*.@"type" != c.GGML_TYPE_F32) return false;
+    if (op.*.op != c.GGML_OP_MUL_MAT or op.*.type != c.GGML_TYPE_F32) return false;
+    const weights: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    const acts: *const c.ggml_tensor = op.*.src[1] orelse return false;
+    if (weights.*.type != c.GGML_TYPE_Q1_0 or acts.*.type != c.GGML_TYPE_F32) return false;
+    if (!c.ggml_is_contiguous(weights) or !c.ggml_is_contiguous(acts) or !c.ggml_is_contiguous(op)) return false;
     if (dim(weights, 0) <= 0 or dim(weights, 1) <= 0 or dim(acts, 1) <= 0) return false;
     if (dim(weights, 0) != dim(acts, 0)) return false;
     if (dim(op, 0) != dim(weights, 1) or dim(op, 1) != dim(acts, 1)) return false;
@@ -79,8 +80,8 @@ fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
 }
 
 fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
-    const weights = node.*.src[0] orelse return error.InvalidShape;
-    const acts = node.*.src[1] orelse return error.InvalidShape;
+    const weights: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const acts: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
 
     const rows = try u32Dim(dim(weights, 1));
     const cols = try u32Dim(dim(acts, 1));

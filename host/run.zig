@@ -43,6 +43,7 @@ pub const LlamaOptions = struct {
     prompt: []const u8 = "Hello",
     max_tokens: u32 = 16,
     heap_mib: u32 = 768,
+    census: bool = false,
 };
 
 pub fn runFakeLlama(
@@ -59,6 +60,7 @@ pub fn runFakeLlama(
         .model_path = options.model_path,
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
+        .census = options.census,
     });
 }
 
@@ -77,6 +79,7 @@ pub fn runTcpLlama(
         .model_path = options.model_path,
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
+        .census = options.census,
     });
 }
 

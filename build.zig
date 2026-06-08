@@ -23,6 +23,7 @@ const ModuleSet = struct {
     link: *std.Build.Module,
     llama: ?*std.Build.Module,
     lower: ?*std.Build.Module,
+    census: ?*std.Build.Module,
     backend: ?*std.Build.Module,
     run: *std.Build.Module,
 };
@@ -152,6 +153,7 @@ fn createModules(
     const link = b.createModule(.{ .root_source_file = b.path("host/link.zig"), .target = target, .optimize = optimize });
     const llama = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/llama.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const lower = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/lower.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
+    const census = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/census.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const backend = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const run = b.createModule(.{ .root_source_file = b.path("host/run.zig"), .target = target, .optimize = optimize });
 
@@ -186,6 +188,7 @@ fn createModules(
         m.addImport("build_options", build_options);
         m.addImport("c", c_mod.?);
         m.addImport("backend", backend.?);
+        m.addImport("census", census.?);
         m.addImport("link", link);
     }
     if (lower) |m| {
@@ -193,12 +196,17 @@ fn createModules(
         m.addImport("q1a8", q1a8);
         m.addImport("wire", wire);
     }
+    if (census) |m| {
+        m.addImport("c", c_mod.?);
+        m.addImport("lower", lower.?);
+    }
     if (backend) |m| {
         m.addImport("c", c_mod.?);
         m.addImport("q1a8", q1a8);
         m.addImport("wire", wire);
         m.addImport("link", link);
         m.addImport("lower", lower.?);
+        m.addImport("census", census.?);
     }
     run.addImport("build_options", build_options);
     run.addImport("q1a8", q1a8);
@@ -232,6 +240,7 @@ fn createModules(
         .link = link,
         .llama = llama,
         .lower = lower,
+        .census = census,
         .backend = backend,
         .run = run,
     };
@@ -259,6 +268,7 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("link", modules.link);
     if (modules.llama) |m| mod.addImport("llama", m);
     if (modules.lower) |m| mod.addImport("lower", m);
+    if (modules.census) |m| mod.addImport("census", m);
     if (modules.backend) |m| mod.addImport("backend", m);
     mod.addImport("run", modules.run);
 }

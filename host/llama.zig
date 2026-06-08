@@ -2,6 +2,7 @@ const std = @import("std");
 const c = @import("c");
 const build_options = @import("build_options");
 const backend_mod = @import("backend");
+const census_mod = @import("census");
 const link_mod = @import("link");
 
 pub const Error = error{
@@ -20,6 +21,7 @@ pub const Options = struct {
     model_path: []const u8 = build_options.default_model_path,
     prompt: []const u8 = "Hello",
     max_tokens: u32 = 16,
+    census: bool = false,
     n_ctx: u32 = 128,
     n_batch: u32 = 32,
     n_ubatch: u32 = 16,
@@ -34,7 +36,11 @@ pub fn runPrompt(
 ) Error!void {
     if (options.model_path.len == 0) return error.MissingModel;
 
-    var device = backend_mod.Device.init(allocator, link) catch return error.BackendHandshakeFailed;
+    const device = backend_mod.Device.create(allocator, link) catch return error.BackendHandshakeFailed;
+    defer device.destroy();
+    var census: census_mod.Census = .{};
+    if (options.census) device.census = &census;
+
     const model_path = try allocator.dupeZ(u8, options.model_path);
     defer allocator.free(model_path);
 
@@ -93,12 +99,17 @@ pub fn runPrompt(
         c.llama_sampler_accept(sampler, token);
         if (c.llama_vocab_is_eog(vocab, token)) break;
 
-        try writePiece(writer, vocab, token);
+        if (!options.census) try writePiece(writer, vocab, token);
         tokens[n_past] = token;
         n_past += 1;
         try decodeTokens(ctx, tokens[n_past - 1 .. n_past], n_past - 1, true);
     }
-    try writer.writeByte('\n');
+
+    if (options.census) {
+        try census.report(writer);
+    } else {
+        try writer.writeByte('\n');
+    }
 }
 
 fn decodeTokens(ctx: *c.llama_context, tokens: []c.llama_token, start_pos: usize, want_logits: bool) Error!void {

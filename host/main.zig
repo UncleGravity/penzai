@@ -10,6 +10,8 @@ const CliError = error{
     UnsupportedDevice,
 } || protocol_transport.ParseError || run_mod.RunError || std.process.Args.Iterator.InitError || std.Io.Writer.Error;
 
+const LlamaMode = enum { generate, census };
+
 pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
     var stderr_buf: [4096]u8 = undefined;
@@ -44,7 +46,11 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
     }
 
     if (std.mem.eql(u8, command, "run")) {
-        try runLlamaCommand(init, &args, stdout);
+        try runLlamaCommand(init, &args, stdout, .generate);
+        return;
+    }
+    if (std.mem.eql(u8, command, "census")) {
+        try runLlamaCommand(init, &args, stdout, .census);
         return;
     }
     if (std.mem.eql(u8, command, "matmul")) {
@@ -58,8 +64,13 @@ fn runLlamaCommand(
     init: std.process.Init,
     args: *std.process.Args.Iterator,
     stdout: *std.Io.Writer,
+    mode: LlamaMode,
 ) CliError!void {
     var options: run_mod.LlamaOptions = .{};
+    if (mode == .census) {
+        options.max_tokens = 2;
+        options.census = true;
+    }
     var device: []const u8 = "fake";
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--device")) {
@@ -179,11 +190,13 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
         \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N]
+        \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
         \\
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
+        \\  census   report the actual ggml graph_compute op surface
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  help     show this help
         \\

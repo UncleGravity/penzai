@@ -4,6 +4,7 @@ const q1a8 = @import("q1a8");
 const wire = @import("wire");
 const link_mod = @import("link");
 const lower = @import("lower");
+const census_mod = @import("census");
 
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;
@@ -12,6 +13,7 @@ const fill_chunk = 4096;
 
 pub const BackendError = error{
     HandshakeFailed,
+    OutOfMemory,
 };
 
 pub const Counters = struct {
@@ -36,14 +38,23 @@ pub const Device = struct {
     reg: c.ggml_backend_reg = undefined,
     buft: c.ggml_backend_buffer_type = undefined,
     counters: Counters = .{},
+    census: ?*census_mod.Census = null,
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",
 
-    pub fn init(allocator: std.mem.Allocator, link: link_mod.Client) BackendError!Self {
+    // Device holds ggml vtable structs (reg/device/buft/backend) whose context
+    // and cross-link fields point back into itself. It is therefore pinned:
+    // heap it and pass it only as *Device; never copy or move it after wiring.
+    pub fn create(allocator: std.mem.Allocator, link: link_mod.Client) BackendError!*Self {
         link.hello() catch return error.HandshakeFailed;
-        var self: Self = .{ .allocator = allocator, .link = link };
+        const self = try allocator.create(Self);
+        self.* = .{ .allocator = allocator, .link = link };
         self.wire();
         return self;
+    }
+
+    pub fn destroy(self: *Self) void {
+        self.allocator.destroy(self);
     }
 
     pub fn ggmlDevice(self: *Self) c.ggml_backend_dev_t {
@@ -58,6 +69,36 @@ pub const Device = struct {
     }
 };
 
+/// A page reservation: virtual address space with no committed pages and no
+/// access. ggml needs a stable base pointer for tensor->data arithmetic; the
+/// real bytes live on-device under the remote handle.
+const Reservation = struct {
+    ptr: [*]align(std.heap.page_size_min) u8,
+    len: usize,
+
+    fn reserve(len: usize) ?Reservation {
+        const n = @max(len, 1);
+        const prot_none: std.posix.PROT = @bitCast(@as(u32, 0));
+        const m = std.posix.mmap(
+            null,
+            n,
+            prot_none,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1,
+            0,
+        ) catch return null;
+        return .{ .ptr = m.ptr, .len = n };
+    }
+
+    fn base(self: Reservation) *anyopaque {
+        return self.ptr;
+    }
+
+    fn release(self: Reservation) void {
+        std.posix.munmap(self.ptr[0..self.len]);
+    }
+};
+
 const RemoteBinding = struct {
     tensor: *const c.ggml_tensor,
     range: wire.TensorRange,
@@ -68,7 +109,7 @@ const RemoteBinding = struct {
 const RemoteBuffer = struct {
     magic: u64,
     dev: *Device,
-    base: ?*anyopaque,
+    reservation: Reservation,
     remote: wire.TensorRange,
     bindings_len: usize,
     bindings: [MaxBindings]RemoteBinding,
@@ -131,7 +172,7 @@ fn effectiveAllocSize(tensor: *const c.ggml_tensor) usize {
 }
 
 fn isRepackableQ1_0(tensor: *const c.ggml_tensor) bool {
-    return tensor.*.@"type" == c.GGML_TYPE_Q1_0 and
+    return tensor.*.type == c.GGML_TYPE_Q1_0 and
         dim(tensor, 0) > 0 and
         dim(tensor, 1) > 0 and
         dim(tensor, 2) == 1 and
@@ -154,7 +195,7 @@ fn rangeValid(binding: RemoteBinding, offset: usize, size: usize) bool {
 
 fn tensorOffsetInBuffer(remote: *RemoteBuffer, tensor: *const c.ggml_tensor) ?usize {
     if (remote.remote.nbytes == 0) return if (effectiveAllocSize(tensor) == 0) 0 else null;
-    const base = remote.base orelse return null;
+    const base = remote.reservation.base();
     const data = tensor.*.data orelse return null;
     const base_addr = @intFromPtr(base);
     const data_addr = @intFromPtr(data);
@@ -166,7 +207,7 @@ fn tensorOffsetInBuffer(remote: *RemoteBuffer, tensor: *const c.ggml_tensor) ?us
 }
 
 fn bufGetBase(buf: c.ggml_backend_buffer_t) callconv(.c) ?*anyopaque {
-    return remoteOf(buf).base;
+    return remoteOf(buf).reservation.base();
 }
 
 fn bufFree(buf: c.ggml_backend_buffer_t) callconv(.c) void {
@@ -174,7 +215,7 @@ fn bufFree(buf: c.ggml_backend_buffer_t) callconv(.c) void {
     if (remote.remote.handle != 0) {
         remote.dev.link.free(remote.remote) catch {};
     }
-    std.c.free(remote.base);
+    remote.reservation.release();
     std.c.free(remote);
 }
 
@@ -286,6 +327,10 @@ fn bufClear(buf: c.ggml_backend_buffer_t, value: u8) callconv(.c) void {
     uploadFill(remote.dev, remote.remote.handle, 0, @intCast(remote.remote.nbytes), value) catch return;
 }
 
+fn bufReset(buf: c.ggml_backend_buffer_t) callconv(.c) void {
+    remoteOf(buf).bindings_len = 0;
+}
+
 fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) link_mod.LinkError!void {
     var buf: [fill_chunk]u8 = undefined;
     @memset(&buf, value);
@@ -313,7 +358,7 @@ const buffer_iface = c.ggml_backend_buffer_i{
     .get_tensor_2d = null,
     .cpy_tensor = null,
     .clear = &bufClear,
-    .reset = null,
+    .reset = &bufReset,
 };
 
 fn buftGetName(buft: c.ggml_backend_buffer_type_t) callconv(.c) [*c]const u8 {
@@ -324,9 +369,9 @@ fn buftAllocBuffer(buft: c.ggml_backend_buffer_type_t, size: usize) callconv(.c)
     const dev = devOf(buft.?.*.context);
     dev.counters.alloc_buffer += 1;
 
-    const base = std.c.malloc(if (size == 0) 1 else size) orelse return null;
+    const reservation = Reservation.reserve(size) orelse return null;
     const remote_raw = std.c.malloc(@sizeOf(RemoteBuffer)) orelse {
-        std.c.free(base);
+        reservation.release();
         return null;
     };
     const remote: *RemoteBuffer = @ptrCast(@alignCast(remote_raw));
@@ -334,14 +379,14 @@ fn buftAllocBuffer(buft: c.ggml_backend_buffer_type_t, size: usize) callconv(.c)
         .{ .handle = 0, .offset = 0, .nbytes = 0 }
     else
         dev.link.alloc(@intCast(size), alignment) catch {
-            std.c.free(base);
+            reservation.release();
             std.c.free(remote_raw);
             return null;
         };
     remote.* = .{
         .magic = RemoteMagic,
         .dev = dev,
-        .base = base,
+        .reservation = reservation,
         .remote = remote_range,
         .bindings_len = 0,
         .bindings = undefined,
@@ -350,7 +395,7 @@ fn buftAllocBuffer(buft: c.ggml_backend_buffer_type_t, size: usize) callconv(.c)
     const buffer = c.ggml_backend_buffer_init(buft, buffer_iface, remote, size);
     if (buffer == null) {
         if (remote_range.handle != 0) dev.link.free(remote_range) catch {};
-        std.c.free(base);
+        reservation.release();
         std.c.free(remote_raw);
         return null;
     }
@@ -393,8 +438,12 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
     const dev = devOf(backend.?.*.context);
     dev.counters.graph_compute += 1;
     const g = graph orelse return c.GGML_STATUS_FAILED;
-    var marker: u8 = 0;
-    const lookup = lower.Lookup{ .ctx = &marker, .findFn = lookupBinding };
+    const lookup = lower.Lookup{ .ctx = backend.?.*.context.?, .findFn = lookupBinding };
+    if (dev.census) |census| {
+        census.recordGraph(g, lookup);
+        return c.GGML_STATUS_SUCCESS;
+    }
+
     const commands = lower.lowerGraph(dev.allocator, g, lookup) catch {
         dev.counters.unsupported_graphs += 1;
         return c.GGML_STATUS_FAILED;
@@ -447,10 +496,10 @@ fn devGetType(dev: c.ggml_backend_dev_t) callconv(.c) c.enum_ggml_backend_dev_ty
 fn devGetProps(dev: c.ggml_backend_dev_t, props: [*c]c.ggml_backend_dev_props) callconv(.c) void {
     props.*.name = devGetName(dev);
     props.*.description = devGetDescription(dev);
-    props.*.@"type" = devGetType(dev);
+    props.*.type = devGetType(dev);
     props.*.device_id = null;
     devGetMemory(dev, &props.*.memory_free, &props.*.memory_total);
-    props.*.caps = .{ .@"async" = false, .host_buffer = false, .buffer_from_host_ptr = false, .events = false };
+    props.*.caps = .{ .async = false, .host_buffer = false, .buffer_from_host_ptr = false, .events = false };
 }
 
 fn devInitBackend(dev: c.ggml_backend_dev_t, params: [*c]const u8) callconv(.c) c.ggml_backend_t {
@@ -463,7 +512,8 @@ fn devGetBufferType(dev: c.ggml_backend_dev_t) callconv(.c) c.ggml_backend_buffe
 }
 
 fn devSupportsOp(dev: c.ggml_backend_dev_t, op: ?*const c.ggml_tensor) callconv(.c) bool {
-    _ = dev;
+    const d = devOf(dev.?.*.context);
+    if (d.census != null) return op != null;
     return lower.supportsOp(op);
 }
 
@@ -473,7 +523,8 @@ fn devSupportsBuft(dev: c.ggml_backend_dev_t, buft: c.ggml_backend_buffer_type_t
 }
 
 fn devOffloadOp(dev: c.ggml_backend_dev_t, op: ?*const c.ggml_tensor) callconv(.c) bool {
-    _ = dev;
+    const d = devOf(dev.?.*.context);
+    if (d.census != null) return op != null;
     const tensor = op orelse return false;
     return !lower.isMetadataOp(tensor.*.op) and lower.supportsOp(op);
 }
