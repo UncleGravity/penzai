@@ -1,4 +1,5 @@
 const std = @import("std");
+const q1a8 = @import("q1a8");
 const wire = @import("wire");
 
 pub const RowsError = error{
@@ -7,6 +8,84 @@ pub const RowsError = error{
     NegativeIndex,
     OutOfBounds,
 };
+
+pub fn getRowsF32Bytes(command: wire.GetRows, src: []const u8, indices: []const u8, dst: []u8) RowsError!void {
+    const row_width: usize = try positive(command.row_width);
+    const src_rows: usize = try positive(command.src_rows);
+    const ne10: usize = try positive(command.ne10);
+    const ne11: usize = try positive(command.ne11);
+    const ne12: usize = try positive(command.ne12);
+    const row_bytes = try checkedMul(row_width, @sizeOf(f32));
+    const indices_row_bytes = try checkedMul(ne10, @sizeOf(i32));
+
+    if (command.src_type == .f32) try validateStride(command.src_nb1, row_bytes);
+    try validateStride(command.indices_nb1, indices_row_bytes);
+    try validateStride(command.dst_nb1, row_bytes);
+
+    for (0..ne12) |d12| {
+        for (0..ne11) |d11| {
+            for (0..ne10) |d10| {
+                const index_offset = try checkedAdd(
+                    try checkedMul(d10, @sizeOf(i32)),
+                    try checkedAdd(
+                        try checkedMul(d11, command.indices_nb1),
+                        try checkedMul(d12, command.indices_nb2),
+                    ),
+                );
+                if (index_offset > indices.len or @sizeOf(i32) > indices.len - index_offset) return error.OutOfBounds;
+
+                const row = try readIndex(.i32, indices[index_offset..][0..@sizeOf(i32)]);
+                if (row >= src_rows) return error.OutOfBounds;
+
+                const dst_offset = try checkedAdd(
+                    try checkedMul(d10, command.dst_nb1),
+                    try checkedAdd(
+                        try checkedMul(d11, command.dst_nb2),
+                        try checkedMul(d12, command.dst_nb3),
+                    ),
+                );
+                if (dst_offset > dst.len or row_bytes > dst.len - dst_offset) return error.OutOfBounds;
+                switch (command.src_type) {
+                    .f32 => {
+                        const src_offset = try checkedAdd(
+                            try checkedMul(row, command.src_nb1),
+                            try checkedAdd(
+                                try checkedMul(d11, command.src_nb2),
+                                try checkedMul(d12, command.src_nb3),
+                            ),
+                        );
+                        if (src_offset > src.len or row_bytes > src.len - src_offset) return error.OutOfBounds;
+                        @memcpy(dst[dst_offset..][0..row_bytes], src[src_offset..][0..row_bytes]);
+                    },
+                    .q1_0 => {
+                        if (d11 != 0 or d12 != 0) return error.InvalidShape;
+                        // Q1_0 tensors are uploaded in q1a8's resident packed layout.
+                        // src_nb* describes ggml's raw tensor strides and is not used here.
+                        try dequantizePackedQ1Row(src, dst[dst_offset..][0..row_bytes], src_rows, row_width, row);
+                    },
+                }
+            }
+        }
+    }
+}
+
+fn dequantizePackedQ1Row(src: []const u8, dst: []u8, rows: usize, k: usize, row: usize) RowsError!void {
+    const q1_blocks = q1a8.blocksPerRow(k) catch return error.InvalidShape;
+    if (src.len != (q1a8.packedWeightBytes(rows, k) catch return error.InvalidShape)) return error.OutOfBounds;
+    if (dst.len != try checkedMul(k, @sizeOf(f32))) return error.InvalidShape;
+
+    for (0..q1_blocks) |q1| {
+        const scale: f32 = @floatCast(q1a8.packedWeightScale(src, rows, k, row, q1) catch return error.OutOfBounds);
+        for (0..q1a8.q8_subblocks) |sub| {
+            const bits = q1a8.packedWeightBits(src, rows, k, row, q1, sub) catch return error.OutOfBounds;
+            const base = q1 * q1a8.q1_block + sub * q1a8.q8_block;
+            for (0..q1a8.q8_block) |i| {
+                const value = if (((bits >> @intCast(i)) & 1) != 0) scale else -scale;
+                writeF32(dst, base + i, value);
+            }
+        }
+    }
+}
 
 pub fn setRowsF32ToF16Bytes(command: wire.SetRows, src: []const u8, indices: []const u8, dst: []u8) RowsError!void {
     const head_dim: usize = try positive(command.head_dim);
@@ -138,6 +217,140 @@ fn writeI32(bytes: []u8, index: usize, value: i32) void {
 
 fn expectApprox(expected: f32, actual: f32, tolerance: f32) !void {
     try std.testing.expect(@abs(expected - actual) <= tolerance);
+}
+
+test "get_rows gathers indexed f32 rows across index planes" {
+    const row_width = 3;
+    const src_nb1 = row_width * @sizeOf(f32);
+    const src_nb2 = src_nb1 * 4;
+    var src: [src_nb2 * 2]u8 = undefined;
+    @memset(&src, 0);
+    for (0..24) |i| writeF32(&src, i, @floatFromInt(i + 1));
+
+    const indices_nb1 = 2 * @sizeOf(i32);
+    const indices_nb2 = indices_nb1 * 2;
+    var indices: [indices_nb2]u8 = undefined;
+    writeI32(&indices, 0, 2);
+    writeI32(&indices, 1, 0);
+    writeI32(&indices, 2, 1);
+    writeI32(&indices, 3, 3);
+
+    const dst_nb1 = row_width * @sizeOf(f32);
+    const dst_nb2 = dst_nb1 * 2;
+    var dst: [dst_nb2 * 2]u8 = undefined;
+    @memset(&dst, 0);
+
+    try getRowsF32Bytes(.{
+        .src = .{ .handle = 1, .offset = 0, .nbytes = src.len },
+        .indices = .{ .handle = 2, .offset = 0, .nbytes = indices.len },
+        .dst = .{ .handle = 3, .offset = 0, .nbytes = dst.len },
+        .src_type = .f32,
+        .row_width = row_width,
+        .src_rows = 4,
+        .ne10 = 2,
+        .ne11 = 2,
+        .ne12 = 1,
+        .src_nb1 = src_nb1,
+        .src_nb2 = src_nb2,
+        .src_nb3 = src_nb2 * 2,
+        .indices_nb1 = indices_nb1,
+        .indices_nb2 = indices_nb2,
+        .dst_nb1 = dst_nb1,
+        .dst_nb2 = dst_nb2,
+        .dst_nb3 = dst_nb2 * 2,
+    }, &src, &indices, &dst);
+
+    try expectApprox(7.0, readF32(&dst, 0), 0.0);
+    try expectApprox(1.0, readF32(&dst, 3), 0.0);
+    try expectApprox(16.0, readF32(&dst, 6), 0.0);
+    try expectApprox(22.0, readF32(&dst, 9), 0.0);
+}
+
+test "get_rows rejects negative and out of range indices" {
+    var src: [4]u8 = undefined;
+    writeF32(&src, 0, 1.0);
+    var indices: [4]u8 = undefined;
+    var dst: [4]u8 = undefined;
+
+    writeI32(&indices, 0, -1);
+    try std.testing.expectError(error.NegativeIndex, getRowsF32Bytes(.{
+        .src = .{ .handle = 1, .offset = 0, .nbytes = src.len },
+        .indices = .{ .handle = 2, .offset = 0, .nbytes = indices.len },
+        .dst = .{ .handle = 3, .offset = 0, .nbytes = dst.len },
+        .src_type = .f32,
+        .row_width = 1,
+        .src_rows = 1,
+        .ne10 = 1,
+        .ne11 = 1,
+        .ne12 = 1,
+        .src_nb1 = 4,
+        .src_nb2 = 4,
+        .src_nb3 = 4,
+        .indices_nb1 = 4,
+        .indices_nb2 = 4,
+        .dst_nb1 = 4,
+        .dst_nb2 = 4,
+        .dst_nb3 = 4,
+    }, &src, &indices, &dst));
+
+    writeI32(&indices, 0, 1);
+    try std.testing.expectError(error.OutOfBounds, getRowsF32Bytes(.{
+        .src = .{ .handle = 1, .offset = 0, .nbytes = src.len },
+        .indices = .{ .handle = 2, .offset = 0, .nbytes = indices.len },
+        .dst = .{ .handle = 3, .offset = 0, .nbytes = dst.len },
+        .src_type = .f32,
+        .row_width = 1,
+        .src_rows = 1,
+        .ne10 = 1,
+        .ne11 = 1,
+        .ne12 = 1,
+        .src_nb1 = 4,
+        .src_nb2 = 4,
+        .src_nb3 = 4,
+        .indices_nb1 = 4,
+        .indices_nb2 = 4,
+        .dst_nb1 = 4,
+        .dst_nb2 = 4,
+        .dst_nb3 = 4,
+    }, &src, &indices, &dst));
+}
+
+test "get_rows dequantizes resident q1_0 packed rows" {
+    const rows = 2;
+    const k = q1a8.q1_block;
+    const packed_len = comptime q1a8.packedWeightBytes(rows, k) catch unreachable;
+    var bits = [_]u128{ 0, std.math.maxInt(u128) };
+    var scales = [_]f16{ 1, 2 };
+    var src: [packed_len]u8 = undefined;
+    try q1a8.packWeightsFromLogical(rows, k, &bits, &scales, &src);
+
+    var indices: [@sizeOf(i32)]u8 = undefined;
+    writeI32(&indices, 0, 1);
+    var dst: [k * @sizeOf(f32)]u8 = undefined;
+    @memset(&dst, 0);
+
+    try getRowsF32Bytes(.{
+        .src = .{ .handle = 1, .offset = 0, .nbytes = src.len },
+        .indices = .{ .handle = 2, .offset = 0, .nbytes = indices.len },
+        .dst = .{ .handle = 3, .offset = 0, .nbytes = dst.len },
+        .src_type = .q1_0,
+        .row_width = k,
+        .src_rows = rows,
+        .ne10 = 1,
+        .ne11 = 1,
+        .ne12 = 1,
+        .src_nb1 = q1a8.packed_per_q1_block,
+        .src_nb2 = src.len,
+        .src_nb3 = src.len,
+        .indices_nb1 = @sizeOf(i32),
+        .indices_nb2 = @sizeOf(i32),
+        .dst_nb1 = dst.len,
+        .dst_nb2 = dst.len,
+        .dst_nb3 = dst.len,
+    }, &src, &indices, &dst);
+
+    try expectApprox(2.0, readF32(&dst, 0), 0.0);
+    try expectApprox(2.0, readF32(&dst, k - 1), 0.0);
 }
 
 test "set_rows writes indexed f32 rows into f16 backing span" {

@@ -162,6 +162,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const dst = self.heap.bytes(set_rows.dst) catch |err| return mapHeapError(err);
                     ps_rows.setRowsF32ToF16Bytes(set_rows, src, indices, dst) catch |err| return mapKernelError(err);
                 },
+                .get_rows => |get_rows| {
+                    const src = self.heap.read(get_rows.src) catch |err| return mapHeapError(err);
+                    const indices = self.heap.read(get_rows.indices) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(get_rows.dst) catch |err| return mapHeapError(err);
+                    ps_rows.getRowsF32Bytes(get_rows, src, indices, dst) catch |err| return mapKernelError(err);
+                },
             }
         }
     };
@@ -212,6 +218,7 @@ test "runtime dispatches ps f32 command variants" {
     const a = try tensor(&runtime, 2);
     const b = try tensor(&runtime, 2);
     const weight = try tensor(&runtime, 2);
+    const get_rows_src = try tensor(&runtime, 4);
     const out_rms = try tensor(&runtime, 2);
     const out_rope = try tensor(&runtime, 2);
     const out_softmax = try tensor(&runtime, 2);
@@ -223,10 +230,12 @@ test "runtime dispatches ps f32 command variants" {
     const out_add_scaled = try tensor(&runtime, 2);
     const indices = try rawTensor(&runtime, @sizeOf(i32), @alignOf(i32));
     const out_rows = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
+    const out_get_rows = try tensor(&runtime, 2);
 
     try writeTensor(&runtime, a, &.{ 3, 4 });
     try writeTensor(&runtime, b, &.{ 1, 2 });
     try writeTensor(&runtime, weight, &.{ 1, 1 });
+    try writeTensor(&runtime, get_rows_src, &.{ 1, 2, 3, 4 });
     try writeI32Tensor(&runtime, indices, &.{1});
 
     const commands = [_]wire.Command{
@@ -259,6 +268,25 @@ test "runtime dispatches ps f32 command variants" {
             .dst_nb2 = 4 * @sizeOf(f16),
             .dst_nb3 = 4 * @sizeOf(f16),
         } },
+        .{ .get_rows = .{
+            .src = get_rows_src,
+            .indices = indices,
+            .dst = out_get_rows,
+            .src_type = .f32,
+            .row_width = 2,
+            .src_rows = 2,
+            .ne10 = 1,
+            .ne11 = 1,
+            .ne12 = 1,
+            .src_nb1 = 2 * @sizeOf(f32),
+            .src_nb2 = 2 * @sizeOf(f32),
+            .src_nb3 = 2 * @sizeOf(f32),
+            .indices_nb1 = @sizeOf(i32),
+            .indices_nb2 = @sizeOf(i32),
+            .dst_nb1 = 2 * @sizeOf(f32),
+            .dst_nb2 = 2 * @sizeOf(f32),
+            .dst_nb3 = 2 * @sizeOf(f32),
+        } },
     };
     var command_bytes: [1024]u8 = undefined;
     const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
@@ -280,6 +308,7 @@ test "runtime dispatches ps f32 command variants" {
     try expectTensor(&runtime, out_scale, &.{ 0.5, 1 });
     try expectTensor(&runtime, out_add_scaled, &.{ 3.5, 5 });
     try expectF16TensorAt(&runtime, out_rows, 2, &.{ 3, 4 });
+    try expectTensor(&runtime, out_get_rows, &.{ 3, 4 });
 }
 
 fn tensor(runtime: *Runtime, len: usize) !wire.TensorRange {

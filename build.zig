@@ -166,6 +166,7 @@ fn createModules(
     xrt_bo.addImport("wire", wire);
     xrt_bo.addImport("xrt", xrt);
     ps_matmul_q1a8.addImport("q1a8", q1a8);
+    ps_rows.addImport("q1a8", q1a8);
     ps_rows.addImport("wire", wire);
     runtime.addImport("wire", wire);
     runtime.addImport("heap", heap);

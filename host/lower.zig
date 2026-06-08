@@ -35,7 +35,7 @@ pub fn isMetadataOp(op: anytype) bool {
 pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
     const tensor = op orelse return false;
     if (isMetadataOp(tensor.*.op)) return true;
-    return supportsMatmulQ1A8(tensor) or supportsSetRows(tensor);
+    return supportsMatmulQ1A8(tensor) or supportsSetRows(tensor) or supportsGetRows(tensor);
 }
 
 pub fn lowerGraph(
@@ -59,6 +59,10 @@ pub fn lowerGraph(
         }
         if (supportsSetRows(node)) {
             try commands.append(allocator, try lowerSetRows(node, lookup));
+            continue;
+        }
+        if (supportsGetRows(node)) {
+            try commands.append(allocator, try lowerGetRows(node, lookup));
             continue;
         }
 
@@ -101,6 +105,22 @@ fn supportsSetRows(op: *const c.ggml_tensor) bool {
     return true;
 }
 
+fn supportsGetRows(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_GET_ROWS) return false;
+    const src0: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    const src1: *const c.ggml_tensor = op.*.src[1] orelse return false;
+    if ((src0.*.type != c.GGML_TYPE_F32 and src0.*.type != c.GGML_TYPE_Q1_0) or src1.*.type != c.GGML_TYPE_I32 or op.*.type != c.GGML_TYPE_F32) return false;
+    if (dim(src0, 0) <= 0 or dim(src0, 1) <= 0 or dim(src0, 2) <= 0 or dim(src0, 3) <= 0) return false;
+    if (dim(src1, 0) <= 0 or dim(src1, 1) <= 0 or dim(src1, 2) <= 0 or dim(src1, 3) != 1) return false;
+    if (src0.*.type == c.GGML_TYPE_F32 and src0.*.nb[0] != @sizeOf(f32)) return false;
+    if (src0.*.type == c.GGML_TYPE_Q1_0 and (src0.*.nb[0] != q1a8.q1_block_bytes or @mod(@as(usize, @intCast(dim(src0, 0))), q1a8.q1_block) != 0)) return false;
+    if (src1.*.nb[0] != @sizeOf(i32) or op.*.nb[0] != @sizeOf(f32)) return false;
+    if (src0.*.type == c.GGML_TYPE_Q1_0 and (dim(src0, 2) != 1 or dim(src0, 3) != 1)) return false;
+    if (dim(src0, 2) != dim(src1, 1) or dim(src0, 3) != dim(src1, 2)) return false;
+    if (dim(op, 0) != dim(src0, 0) or dim(op, 1) != dim(src1, 0) or dim(op, 2) != dim(src1, 1) or dim(op, 3) != dim(src1, 2)) return false;
+    return true;
+}
+
 fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
     const weights: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
     const acts: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
@@ -124,6 +144,73 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
         .rows = rows,
         .cols = cols,
         .k = k,
+    } };
+}
+
+fn lowerGetRows(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src0: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const src1: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
+
+    const src0_binding = lookup.find(src0) orelse return error.MissingBinding;
+    const src1_binding = lookup.find(src1) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    const row_width = try u32Dim(dim(src0, 0));
+    const src_rows = try u32Dim(dim(src0, 1));
+    const ne10 = try u32Dim(dim(src1, 0));
+    const ne11 = try u32Dim(dim(src1, 1));
+    const ne12 = try u32Dim(dim(src1, 2));
+    const src_type: wire.GetRowsSrcType = if (src0.*.type == c.GGML_TYPE_Q1_0) .q1_0 else .f32;
+
+    const src_span = switch (src_type) {
+        .f32 => try stridedSpan(
+            try checkedMul(@as(usize, @intCast(row_width)), @sizeOf(f32)),
+            src_rows,
+            try u32Dim(dim(src0, 2)),
+            try u32Dim(dim(src0, 3)),
+            src0.*.nb[1],
+            src0.*.nb[2],
+            src0.*.nb[3],
+        ),
+        .q1_0 => q1a8.packedWeightBytes(src_rows, row_width) catch return error.InvalidShape,
+    };
+    const indices_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(ne10)), @sizeOf(i32)),
+        1,
+        ne11,
+        ne12,
+        @sizeOf(i32),
+        src1.*.nb[1],
+        src1.*.nb[2],
+    );
+    const dst_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(row_width)), @sizeOf(f32)),
+        ne10,
+        ne11,
+        ne12,
+        node.*.nb[1],
+        node.*.nb[2],
+        node.*.nb[3],
+    );
+
+    return .{ .get_rows = .{
+        .src = try backingRange(src0_binding, src_span),
+        .indices = try backingRange(src1_binding, indices_span),
+        .dst = try backingRange(dst_binding, dst_span),
+        .src_type = src_type,
+        .row_width = row_width,
+        .src_rows = src_rows,
+        .ne10 = ne10,
+        .ne11 = ne11,
+        .ne12 = ne12,
+        .src_nb1 = @intCast(src0.*.nb[1]),
+        .src_nb2 = @intCast(src0.*.nb[2]),
+        .src_nb3 = @intCast(src0.*.nb[3]),
+        .indices_nb1 = @intCast(src1.*.nb[1]),
+        .indices_nb2 = @intCast(src1.*.nb[2]),
+        .dst_nb1 = @intCast(node.*.nb[1]),
+        .dst_nb2 = @intCast(node.*.nb[2]),
+        .dst_nb3 = @intCast(node.*.nb[3]),
     } };
 }
 

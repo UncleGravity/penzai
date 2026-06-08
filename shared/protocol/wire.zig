@@ -25,6 +25,7 @@ pub const OpTag = enum(u16) {
     scale_f32 = 10,
     add_scaled_f32 = 11,
     set_rows = 12,
+    get_rows = 13,
 };
 
 pub const Status = enum(u16) {
@@ -63,6 +64,11 @@ pub const TensorRange = struct {
 pub const IndexType = enum(u32) {
     i32 = 1,
     i64 = 2,
+};
+
+pub const GetRowsSrcType = enum(u32) {
+    f32 = 1,
+    q1_0 = 2,
 };
 
 pub const AllocRequest = struct {
@@ -180,6 +186,28 @@ pub const SetRows = struct {
     dst_nb3: u64,
 };
 
+pub const GetRows = struct {
+    src: TensorRange,
+    indices: TensorRange,
+    dst: TensorRange,
+    src_type: GetRowsSrcType,
+    row_width: u32,
+    src_rows: u32,
+    ne10: u32,
+    ne11: u32,
+    ne12: u32,
+    /// Used as byte strides for .f32 sources. For .q1_0, src is resident
+    /// q1a8-packed data and the device derives row addresses from q1a8 layout.
+    src_nb1: u64,
+    src_nb2: u64,
+    src_nb3: u64,
+    indices_nb1: u64,
+    indices_nb2: u64,
+    dst_nb1: u64,
+    dst_nb2: u64,
+    dst_nb3: u64,
+};
+
 pub const Command = union(OpTag) {
     copy: Copy,
     matmul_q1a8: MatmulQ1A8,
@@ -193,6 +221,7 @@ pub const Command = union(OpTag) {
     scale_f32: ScaleF32,
     add_scaled_f32: AddScaledF32,
     set_rows: SetRows,
+    get_rows: GetRows,
 };
 
 pub const ResponseMeta = struct {
@@ -330,6 +359,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .scale_f32 => 4 + rangeLen * 2 + 8,
             .add_scaled_f32 => 4 + rangeLen * 3 + 8,
             .set_rows => 4 + rangeLen * 3 + 32 + 64,
+            .get_rows => 4 + rangeLen * 3 + 32 + 64,
         };
     }
     return len;
@@ -448,6 +478,29 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU64(out, &cursor, set_rows.dst_nb2);
             putU64(out, &cursor, set_rows.dst_nb3);
         },
+        .get_rows => |get_rows| {
+            putU16(out, &cursor, @intFromEnum(OpTag.get_rows));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, get_rows.src);
+            putRange(out, &cursor, get_rows.indices);
+            putRange(out, &cursor, get_rows.dst);
+            putU32(out, &cursor, @intFromEnum(get_rows.src_type));
+            putU32(out, &cursor, get_rows.row_width);
+            putU32(out, &cursor, get_rows.src_rows);
+            putU32(out, &cursor, get_rows.ne10);
+            putU32(out, &cursor, get_rows.ne11);
+            putU32(out, &cursor, get_rows.ne12);
+            putU32(out, &cursor, 0);
+            putU32(out, &cursor, 0);
+            putU64(out, &cursor, get_rows.src_nb1);
+            putU64(out, &cursor, get_rows.src_nb2);
+            putU64(out, &cursor, get_rows.src_nb3);
+            putU64(out, &cursor, get_rows.indices_nb1);
+            putU64(out, &cursor, get_rows.indices_nb2);
+            putU64(out, &cursor, get_rows.dst_nb1);
+            putU64(out, &cursor, get_rows.dst_nb2);
+            putU64(out, &cursor, get_rows.dst_nb3);
+        },
     };
     return cursor;
 }
@@ -530,6 +583,38 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                     .ne01 = ne01,
                     .ne02 = ne02,
                     .ne03 = ne03,
+                    .ne11 = ne11,
+                    .ne12 = ne12,
+                    .src_nb1 = try takeU64(bytes, &cursor),
+                    .src_nb2 = try takeU64(bytes, &cursor),
+                    .src_nb3 = try takeU64(bytes, &cursor),
+                    .indices_nb1 = try takeU64(bytes, &cursor),
+                    .indices_nb2 = try takeU64(bytes, &cursor),
+                    .dst_nb1 = try takeU64(bytes, &cursor),
+                    .dst_nb2 = try takeU64(bytes, &cursor),
+                    .dst_nb3 = try takeU64(bytes, &cursor),
+                } };
+            },
+            .get_rows => blk: {
+                const src = try takeRange(bytes, &cursor);
+                const indices = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const src_type = enumFromInt(GetRowsSrcType, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                const row_width = try takeU32(bytes, &cursor);
+                const src_rows = try takeU32(bytes, &cursor);
+                const ne10 = try takeU32(bytes, &cursor);
+                const ne11 = try takeU32(bytes, &cursor);
+                const ne12 = try takeU32(bytes, &cursor);
+                _ = try takeU32(bytes, &cursor);
+                _ = try takeU32(bytes, &cursor);
+                break :blk .{ .get_rows = .{
+                    .src = src,
+                    .indices = indices,
+                    .dst = dst,
+                    .src_type = src_type,
+                    .row_width = row_width,
+                    .src_rows = src_rows,
+                    .ne10 = ne10,
                     .ne11 = ne11,
                     .ne12 = ne12,
                     .src_nb1 = try takeU64(bytes, &cursor),
@@ -694,8 +779,27 @@ test "command buffer roundtrip" {
             .dst_nb2 = 64,
             .dst_nb3 = 192,
         } },
+        .{ .get_rows = .{
+            .src = a,
+            .indices = b,
+            .dst = c,
+            .src_type = .f32,
+            .row_width = 4,
+            .src_rows = 8,
+            .ne10 = 2,
+            .ne11 = 3,
+            .ne12 = 1,
+            .src_nb1 = 16,
+            .src_nb2 = 128,
+            .src_nb3 = 384,
+            .indices_nb1 = 8,
+            .indices_nb2 = 24,
+            .dst_nb1 = 16,
+            .dst_nb2 = 32,
+            .dst_nb3 = 96,
+        } },
     };
-    var buf: [1024]u8 = undefined;
+    var buf: [2048]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
     const got = try decodeCommandBuffer(std.testing.allocator, buf[0..n]);
     defer std.testing.allocator.free(got);
@@ -713,4 +817,6 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[10].add_scaled_f32.rhs_scale, got[10].add_scaled_f32.rhs_scale);
     try std.testing.expectEqual(commands[11].set_rows.index_type, got[11].set_rows.index_type);
     try std.testing.expectEqual(commands[11].set_rows.dst_nb3, got[11].set_rows.dst_nb3);
+    try std.testing.expectEqual(commands[12].get_rows.src_rows, got[12].get_rows.src_rows);
+    try std.testing.expectEqual(commands[12].get_rows.dst_nb3, got[12].get_rows.dst_nb3);
 }
