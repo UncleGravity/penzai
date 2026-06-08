@@ -68,7 +68,6 @@ test "fake link ps f32 command graph" {
 
     const a = try allocTensor(&link, 2);
     const b = try allocTensor(&link, 2);
-    const weight = try allocTensor(&link, 2);
     const out_rms = try allocTensor(&link, 2);
     const out_rope = try allocTensor(&link, 2);
     const out_softmax = try allocTensor(&link, 2);
@@ -81,16 +80,15 @@ test "fake link ps f32 command graph" {
 
     try uploadTensor(&link, a, &.{ 3, 4 });
     try uploadTensor(&link, b, &.{ 1, 2 });
-    try uploadTensor(&link, weight, &.{ 1, 1 });
 
     try link.runGraph(&.{
-        .{ .rmsnorm = .{ .input = a, .weight = weight, .dst = out_rms, .eps = 0 } },
+        .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
         .{ .rope = .{ .input = b, .dst = out_rope, .position = 1, .theta = 10000 } },
         .{ .softmax = .{ .src = b, .dst = out_softmax } },
         .{ .silu = .{ .src = b, .dst = out_silu } },
         .{ .swiglu = .{ .lhs = b, .rhs = a, .dst = out_swiglu } },
-        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add } },
-        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul } },
+        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add, .rows = 2, .cols = 1, .mode = .same_shape } },
+        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul, .rows = 2, .cols = 1, .mode = .same_shape } },
         .{ .scale_f32 = .{ .src = b, .dst = out_scale, .scale = 0.5 } },
         .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = out_add_scaled, .rhs_scale = 0.5 } },
     });

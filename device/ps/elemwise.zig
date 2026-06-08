@@ -62,6 +62,14 @@ pub fn mulBytes(lhs: []const u8, rhs: []const u8, dst: []u8) ElemwiseError!void 
     }
 }
 
+pub fn add2dBytes(lhs: []const u8, rhs: []const u8, dst: []u8, rows: u32, cols: u32, rhs_row_broadcast: bool) ElemwiseError!void {
+    try binary2dBytes(.add, lhs, rhs, dst, rows, cols, rhs_row_broadcast);
+}
+
+pub fn mul2dBytes(lhs: []const u8, rhs: []const u8, dst: []u8, rows: u32, cols: u32, rhs_row_broadcast: bool) ElemwiseError!void {
+    try binary2dBytes(.mul, lhs, rhs, dst, rows, cols, rhs_row_broadcast);
+}
+
 pub fn scaleBytes(input: []const u8, scale: f32, dst: []u8) ElemwiseError!void {
     const count = try f32Count(input);
     if (dst.len != input.len) return error.InvalidLength;
@@ -81,6 +89,42 @@ pub fn addScaledBytes(lhs: []const u8, rhs: []const u8, rhs_scale: f32, dst: []u
 fn f32Count(bytes: []const u8) ElemwiseError!usize {
     if (bytes.len % @sizeOf(f32) != 0) return error.InvalidLength;
     return bytes.len / @sizeOf(f32);
+}
+
+const BinaryOp = enum { add, mul };
+
+fn binary2dBytes(
+    comptime op: BinaryOp,
+    lhs: []const u8,
+    rhs: []const u8,
+    dst: []u8,
+    rows_raw: u32,
+    cols_raw: u32,
+    rhs_row_broadcast: bool,
+) ElemwiseError!void {
+    if (rows_raw == 0 or cols_raw == 0) return error.InvalidLength;
+    const rows: usize = @intCast(rows_raw);
+    const cols: usize = @intCast(cols_raw);
+    const elements = std.math.mul(usize, rows, cols) catch return error.InvalidLength;
+    const total_bytes = std.math.mul(usize, elements, @sizeOf(f32)) catch return error.InvalidLength;
+    const rhs_elements = if (rhs_row_broadcast) rows else elements;
+    const rhs_bytes = std.math.mul(usize, rhs_elements, @sizeOf(f32)) catch return error.InvalidLength;
+    if (lhs.len != total_bytes or rhs.len != rhs_bytes or dst.len != total_bytes) return error.InvalidLength;
+
+    for (0..cols) |col| {
+        const base = col * rows;
+        for (0..rows) |row| {
+            const index = base + row;
+            const rhs_index = if (rhs_row_broadcast) row else index;
+            const a = readF32(lhs, index);
+            const b = readF32(rhs, rhs_index);
+            const value = switch (op) {
+                .add => a + b,
+                .mul => a * b,
+            };
+            writeF32(dst, index, value);
+        }
+    }
 }
 
 fn readF32(bytes: []const u8, index: usize) f32 {
@@ -135,4 +179,25 @@ test "elemwise byte wrappers use little-endian f32 values" {
 
     try expectApprox(11, readF32(&dst, 0), 0.000001);
     try expectApprox(22, readF32(&dst, 1), 0.000001);
+}
+
+test "elemwise 2d byte wrappers support rhs row broadcast" {
+    var lhs: [6 * @sizeOf(f32)]u8 = undefined;
+    var rhs: [3 * @sizeOf(f32)]u8 = undefined;
+    var dst: [6 * @sizeOf(f32)]u8 = undefined;
+    for (&[_]f32{ 1, 2, 3, 10, 20, 30 }, 0..) |value, i| {
+        writeF32(&lhs, i, value);
+    }
+    for (&[_]f32{ 100, 200, 300 }, 0..) |value, i| {
+        writeF32(&rhs, i, value);
+    }
+
+    try add2dBytes(&lhs, &rhs, &dst, 3, 2, true);
+
+    try expectApprox(101, readF32(&dst, 0), 0.000001);
+    try expectApprox(202, readF32(&dst, 1), 0.000001);
+    try expectApprox(303, readF32(&dst, 2), 0.000001);
+    try expectApprox(110, readF32(&dst, 3), 0.000001);
+    try expectApprox(220, readF32(&dst, 4), 0.000001);
+    try expectApprox(330, readF32(&dst, 5), 0.000001);
 }

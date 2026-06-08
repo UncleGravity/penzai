@@ -108,9 +108,8 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 },
                 .rmsnorm => |rmsnorm| {
                     const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
-                    const weight = self.heap.read(rmsnorm.weight) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(rmsnorm.dst) catch |err| return mapHeapError(err);
-                    ps_rmsnorm.runBytes(input, weight, dst, rmsnorm.eps) catch |err| return mapKernelError(err);
+                    ps_rmsnorm.runBytes(input, dst, rmsnorm.rows, rmsnorm.cols, rmsnorm.eps) catch |err| return mapKernelError(err);
                 },
                 .rope => |rope| {
                     const input = self.heap.read(rope.input) catch |err| return mapHeapError(err);
@@ -137,13 +136,13 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const lhs = self.heap.read(add.lhs) catch |err| return mapHeapError(err);
                     const rhs = self.heap.read(add.rhs) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(add.dst) catch |err| return mapHeapError(err);
-                    ps_elemwise.addBytes(lhs, rhs, dst) catch |err| return mapKernelError(err);
+                    ps_elemwise.add2dBytes(lhs, rhs, dst, add.rows, add.cols, rhsRowBroadcast(add.mode)) catch |err| return mapKernelError(err);
                 },
                 .mul_f32 => |mul| {
                     const lhs = self.heap.read(mul.lhs) catch |err| return mapHeapError(err);
                     const rhs = self.heap.read(mul.rhs) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(mul.dst) catch |err| return mapHeapError(err);
-                    ps_elemwise.mulBytes(lhs, rhs, dst) catch |err| return mapKernelError(err);
+                    ps_elemwise.mul2dBytes(lhs, rhs, dst, mul.rows, mul.cols, rhsRowBroadcast(mul.mode)) catch |err| return mapKernelError(err);
                 },
                 .scale_f32 => |scale| {
                     const src = self.heap.read(scale.src) catch |err| return mapHeapError(err);
@@ -193,6 +192,13 @@ fn ok(request_id: u64) wire.ResponseMeta {
     return .{ .request_id = request_id, .status = .ok };
 }
 
+fn rhsRowBroadcast(mode: wire.BinaryF32Mode) bool {
+    return switch (mode) {
+        .same_shape => false,
+        .rhs_row_broadcast => true,
+    };
+}
+
 fn mapHeapError(err: anyerror) RuntimeError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -217,7 +223,6 @@ test "runtime dispatches ps f32 command variants" {
 
     const a = try tensor(&runtime, 2);
     const b = try tensor(&runtime, 2);
-    const weight = try tensor(&runtime, 2);
     const get_rows_src = try tensor(&runtime, 4);
     const out_rms = try tensor(&runtime, 2);
     const out_rope = try tensor(&runtime, 2);
@@ -234,18 +239,17 @@ test "runtime dispatches ps f32 command variants" {
 
     try writeTensor(&runtime, a, &.{ 3, 4 });
     try writeTensor(&runtime, b, &.{ 1, 2 });
-    try writeTensor(&runtime, weight, &.{ 1, 1 });
     try writeTensor(&runtime, get_rows_src, &.{ 1, 2, 3, 4 });
     try writeI32Tensor(&runtime, indices, &.{1});
 
     const commands = [_]wire.Command{
-        .{ .rmsnorm = .{ .input = a, .weight = weight, .dst = out_rms, .eps = 0 } },
+        .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
         .{ .rope = .{ .input = b, .dst = out_rope, .position = 0, .theta = 10000 } },
         .{ .softmax = .{ .src = b, .dst = out_softmax } },
         .{ .silu = .{ .src = b, .dst = out_silu } },
         .{ .swiglu = .{ .lhs = b, .rhs = a, .dst = out_swiglu } },
-        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add } },
-        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul } },
+        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add, .rows = 2, .cols = 1, .mode = .same_shape } },
+        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul, .rows = 2, .cols = 1, .mode = .same_shape } },
         .{ .scale_f32 = .{ .src = b, .dst = out_scale, .scale = 0.5 } },
         .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = out_add_scaled, .rhs_scale = 0.5 } },
         .{ .set_rows = .{

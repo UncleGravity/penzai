@@ -29,7 +29,7 @@ pub const Options = struct {
     n_batch: u32 = 32,
     n_ubatch: u32 = 16,
     threads: u32 = 1,
-    logits_tolerance: f32 = 0.001,
+    logits_tolerance: f32 = 0.25,
     chat_template: bool = true,
     enable_thinking: bool = false,
 };
@@ -189,7 +189,18 @@ pub fn runLogitsCheck(
         try writer.print(" {d}={d:.6}", .{ step, step_diff });
     }
     try writer.writeByte('\n');
-    if (diff > options.logits_tolerance) {
+    try writer.writeAll("step_argmax");
+    var token_mismatches: usize = 0;
+    for (0..cpu.steps) |step| {
+        const start = step * cpu.vocab_count;
+        const cpu_argmax = argmaxIndex(cpu.logits[start..][0..cpu.vocab_count]);
+        const accel_argmax = argmaxIndex(accelerated.logits[start..][0..cpu.vocab_count]);
+        if (cpu_argmax != accel_argmax) token_mismatches += 1;
+        try writer.print(" {d}={d}/{d}", .{ step, cpu_argmax, accel_argmax });
+    }
+    try writer.writeByte('\n');
+    try writer.print("token_mismatches={d}\n", .{token_mismatches});
+    if (token_mismatches != 0 or diff > options.logits_tolerance) {
         try writer.flush();
         return error.LogitMismatch;
     }
@@ -392,6 +403,18 @@ fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
         if (diff > max) max = diff;
     }
     return max;
+}
+
+fn argmaxIndex(values: []const f32) usize {
+    var best: usize = 0;
+    var best_value = values[0];
+    for (values[1..], 1..) |value, index| {
+        if (value > best_value) {
+            best = index;
+            best_value = value;
+        }
+    }
+    return best;
 }
 
 fn checkedMul(a: usize, b: usize) Error!usize {

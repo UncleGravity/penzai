@@ -35,7 +35,12 @@ pub fn isMetadataOp(op: anytype) bool {
 pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
     const tensor = op orelse return false;
     if (isMetadataOp(tensor.*.op)) return true;
-    return supportsMatmulQ1A8(tensor) or supportsSetRows(tensor) or supportsGetRows(tensor);
+    return supportsMatmulQ1A8(tensor) or
+        supportsBinaryF32(tensor) or
+        supportsRmsNormF32(tensor) or
+        supportsSwigluF32(tensor) or
+        supportsSetRows(tensor) or
+        supportsGetRows(tensor);
 }
 
 pub fn lowerGraph(
@@ -55,6 +60,18 @@ pub fn lowerGraph(
 
         if (supportsMatmulQ1A8(node)) {
             try commands.append(allocator, try lowerMatmulQ1A8(node, lookup));
+            continue;
+        }
+        if (supportsBinaryF32(node)) {
+            try commands.append(allocator, try lowerBinaryF32(node, lookup));
+            continue;
+        }
+        if (supportsRmsNormF32(node)) {
+            try commands.append(allocator, try lowerRmsNormF32(node, lookup));
+            continue;
+        }
+        if (supportsSwigluF32(node)) {
+            try commands.append(allocator, try lowerSwigluF32(node, lookup));
             continue;
         }
         if (supportsSetRows(node)) {
@@ -86,6 +103,47 @@ fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
         if (dimAt(weights, axis) != 1 or dimAt(acts, axis) != 1 or dimAt(op, axis) != 1) return false;
     }
     return true;
+}
+
+const BinaryF32Lowering = struct {
+    lhs: *const c.ggml_tensor,
+    rhs: *const c.ggml_tensor,
+    mode: wire.BinaryF32Mode,
+};
+
+fn supportsBinaryF32(op: *const c.ggml_tensor) bool {
+    return binaryF32Lowering(op) != null;
+}
+
+fn binaryF32Lowering(op: *const c.ggml_tensor) ?BinaryF32Lowering {
+    if ((op.*.op != c.GGML_OP_ADD and op.*.op != c.GGML_OP_MUL) or !isContiguousF32(op)) return null;
+    const src0: *const c.ggml_tensor = op.*.src[0] orelse return null;
+    const src1: *const c.ggml_tensor = op.*.src[1] orelse return null;
+    if (!isContiguousF32(src0) or !isContiguousF32(src1)) return null;
+
+    if (sameShape(src0, op) and sameShape(src1, op)) {
+        return .{ .lhs = src0, .rhs = src1, .mode = .same_shape };
+    }
+    if (sameShape(src0, op) and isRowBroadcastFor(src1, op)) {
+        return .{ .lhs = src0, .rhs = src1, .mode = .rhs_row_broadcast };
+    }
+    if (sameShape(src1, op) and isRowBroadcastFor(src0, op)) {
+        return .{ .lhs = src1, .rhs = src0, .mode = .rhs_row_broadcast };
+    }
+    return null;
+}
+
+fn supportsRmsNormF32(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_RMS_NORM or !isContiguousF32(op)) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    return isContiguousF32(src) and sameShape(src, op);
+}
+
+fn supportsSwigluF32(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_GLU or c.ggml_get_glu_op(op) != c.GGML_GLU_OP_SWIGLU or !isContiguousF32(op)) return false;
+    const src0: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    const src1: *const c.ggml_tensor = op.*.src[1] orelse return false;
+    return isContiguousF32(src0) and isContiguousF32(src1) and sameShape(src0, op) and sameShape(src1, op);
 }
 
 fn supportsSetRows(op: *const c.ggml_tensor) bool {
@@ -144,6 +202,71 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
         .rows = rows,
         .cols = cols,
         .k = k,
+    } };
+}
+
+fn lowerBinaryF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const lowering = binaryF32Lowering(node) orelse return error.InvalidShape;
+    const rows = try u32Dim(dim(node, 0));
+    const cols = try flattenedCols(node, rows);
+    const total_bytes = try f32MatrixBytes(rows, cols);
+    const rhs_bytes = switch (lowering.mode) {
+        .same_shape => total_bytes,
+        .rhs_row_broadcast => try f32MatrixBytes(rows, 1),
+    };
+
+    const lhs_binding = lookup.find(lowering.lhs) orelse return error.MissingBinding;
+    const rhs_binding = lookup.find(lowering.rhs) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+    const command: wire.BinaryBroadcastF32 = .{
+        .lhs = try backingRange(lhs_binding, total_bytes),
+        .rhs = try backingRange(rhs_binding, rhs_bytes),
+        .dst = try backingRange(dst_binding, total_bytes),
+        .rows = rows,
+        .cols = cols,
+        .mode = lowering.mode,
+    };
+
+    return switch (node.*.op) {
+        c.GGML_OP_ADD => .{ .add_f32 = command },
+        c.GGML_OP_MUL => .{ .mul_f32 = command },
+        else => error.InvalidShape,
+    };
+}
+
+fn lowerRmsNormF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const rows = try u32Dim(dim(node, 0));
+    const cols = try flattenedCols(node, rows);
+    const total_bytes = try f32MatrixBytes(rows, cols);
+
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    return .{ .rmsnorm = .{
+        .input = try backingRange(src_binding, total_bytes),
+        .dst = try backingRange(dst_binding, total_bytes),
+        .rows = rows,
+        .cols = cols,
+        .eps = opParamF32(node, 0),
+    } };
+}
+
+fn lowerSwigluF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src0: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const src1: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
+    const rows = try u32Dim(dim(node, 0));
+    const cols = try flattenedCols(node, rows);
+    const total_bytes = try f32MatrixBytes(rows, cols);
+
+    const src0_binding = lookup.find(src0) orelse return error.MissingBinding;
+    const src1_binding = lookup.find(src1) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    return .{ .swiglu = .{
+        .lhs = try backingRange(src0_binding, total_bytes),
+        .rhs = try backingRange(src1_binding, total_bytes),
+        .dst = try backingRange(dst_binding, total_bytes),
     } };
 }
 
@@ -312,6 +435,44 @@ fn tensorElements(tensor: *const c.ggml_tensor) usize {
     const raw = c.ggml_nelements(@constCast(tensor));
     if (raw <= 0) return 0;
     return @intCast(raw);
+}
+
+fn isContiguousF32(tensor: *const c.ggml_tensor) bool {
+    return tensor.*.type == c.GGML_TYPE_F32 and dim(tensor, 0) > 0 and tensorElements(tensor) > 0 and c.ggml_is_contiguous(tensor);
+}
+
+fn sameShape(lhs: *const c.ggml_tensor, rhs: *const c.ggml_tensor) bool {
+    for (0..4) |axis| {
+        if (dimAt(lhs, axis) != dimAt(rhs, axis)) return false;
+    }
+    return true;
+}
+
+fn isRowBroadcastFor(src: *const c.ggml_tensor, dst: *const c.ggml_tensor) bool {
+    if (!isContiguousF32(src) or !isContiguousF32(dst) or dim(src, 0) != dim(dst, 0)) return false;
+    for (1..4) |axis| {
+        if (dimAt(src, axis) != 1) return false;
+    }
+    return true;
+}
+
+fn flattenedCols(tensor: *const c.ggml_tensor, rows: u32) LowerError!u32 {
+    const elements = tensorElements(tensor);
+    if (rows == 0 or elements == 0 or @mod(elements, @as(usize, @intCast(rows))) != 0) return error.InvalidShape;
+    const cols = elements / @as(usize, @intCast(rows));
+    if (cols == 0 or cols > std.math.maxInt(u32)) return error.InvalidShape;
+    return @intCast(cols);
+}
+
+fn f32MatrixBytes(rows: u32, cols: u32) LowerError!usize {
+    const elements = try checkedMul(@as(usize, @intCast(rows)), @as(usize, @intCast(cols)));
+    return try checkedMul(elements, @sizeOf(f32));
+}
+
+fn opParamF32(tensor: *const c.ggml_tensor, index: usize) f32 {
+    const bytes = std.mem.asBytes(&tensor.*.op_params);
+    const offset = index * @sizeOf(f32);
+    return @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
 }
 
 fn dim(tensor: anytype, index: comptime_int) i64 {

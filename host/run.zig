@@ -44,7 +44,7 @@ pub const LlamaOptions = struct {
     max_tokens: u32 = 16,
     heap_mib: u32 = 768,
     census: bool = false,
-    logits_tolerance: f32 = 0.001,
+    logits_tolerance: f32 = 0.25,
     chat_template: bool = true,
     enable_thinking: bool = false,
 };

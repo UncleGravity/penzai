@@ -222,7 +222,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
         \\  census   report the actual ggml graph_compute op surface
-        \\  logits   compare penzai logits against llama.cpp CPU logits
+        \\  logits   compare token choices and report logit drift against llama.cpp CPU
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  help     show this help
         \\

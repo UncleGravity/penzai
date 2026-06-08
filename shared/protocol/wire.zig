@@ -71,6 +71,11 @@ pub const GetRowsSrcType = enum(u32) {
     q1_0 = 2,
 };
 
+pub const BinaryF32Mode = enum(u32) {
+    same_shape = 1,
+    rhs_row_broadcast = 2,
+};
+
 pub const AllocRequest = struct {
     request_id: u64,
     nbytes: u64,
@@ -138,10 +143,20 @@ pub const BinaryF32 = struct {
     dst: TensorRange,
 };
 
+pub const BinaryBroadcastF32 = struct {
+    lhs: TensorRange,
+    rhs: TensorRange,
+    dst: TensorRange,
+    rows: u32,
+    cols: u32,
+    mode: BinaryF32Mode,
+};
+
 pub const RmsNorm = struct {
     input: TensorRange,
-    weight: TensorRange,
     dst: TensorRange,
+    rows: u32,
+    cols: u32,
     eps: f32,
 };
 
@@ -216,8 +231,8 @@ pub const Command = union(OpTag) {
     softmax: UnaryF32,
     silu: UnaryF32,
     swiglu: BinaryF32,
-    add_f32: BinaryF32,
-    mul_f32: BinaryF32,
+    add_f32: BinaryBroadcastF32,
+    mul_f32: BinaryBroadcastF32,
     scale_f32: ScaleF32,
     add_scaled_f32: AddScaledF32,
     set_rows: SetRows,
@@ -352,10 +367,11 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
         len += switch (command) {
             .copy => 4 + rangeLen * 2,
             .matmul_q1a8 => 4 + rangeLen * 3 + 16,
-            .rmsnorm => 4 + rangeLen * 3 + 8,
+            .rmsnorm => 4 + rangeLen * 2 + 16,
             .rope => 4 + rangeLen * 2 + 8,
             .softmax, .silu => 4 + rangeLen * 2,
-            .swiglu, .add_f32, .mul_f32 => 4 + rangeLen * 3,
+            .swiglu => 4 + rangeLen * 3,
+            .add_f32, .mul_f32 => 4 + rangeLen * 3 + 16,
             .scale_f32 => 4 + rangeLen * 2 + 8,
             .add_scaled_f32 => 4 + rangeLen * 3 + 8,
             .set_rows => 4 + rangeLen * 3 + 32 + 64,
@@ -392,8 +408,9 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU16(out, &cursor, @intFromEnum(OpTag.rmsnorm));
             putU16(out, &cursor, 0);
             putRange(out, &cursor, rmsnorm.input);
-            putRange(out, &cursor, rmsnorm.weight);
             putRange(out, &cursor, rmsnorm.dst);
+            putU32(out, &cursor, rmsnorm.rows);
+            putU32(out, &cursor, rmsnorm.cols);
             putF32(out, &cursor, rmsnorm.eps);
             putU32(out, &cursor, 0);
         },
@@ -430,6 +447,10 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putRange(out, &cursor, binary.lhs);
             putRange(out, &cursor, binary.rhs);
             putRange(out, &cursor, binary.dst);
+            putU32(out, &cursor, binary.rows);
+            putU32(out, &cursor, binary.cols);
+            putU32(out, &cursor, @intFromEnum(binary.mode));
+            putU32(out, &cursor, 0);
         },
         .mul_f32 => |binary| {
             putU16(out, &cursor, @intFromEnum(OpTag.mul_f32));
@@ -437,6 +458,10 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putRange(out, &cursor, binary.lhs);
             putRange(out, &cursor, binary.rhs);
             putRange(out, &cursor, binary.dst);
+            putU32(out, &cursor, binary.rows);
+            putU32(out, &cursor, binary.cols);
+            putU32(out, &cursor, @intFromEnum(binary.mode));
+            putU32(out, &cursor, 0);
         },
         .scale_f32 => |scale| {
             putU16(out, &cursor, @intFromEnum(OpTag.scale_f32));
@@ -529,11 +554,12 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
             },
             .rmsnorm => blk: {
                 const input = try takeRange(bytes, &cursor);
-                const weight = try takeRange(bytes, &cursor);
                 const dst = try takeRange(bytes, &cursor);
+                const rows = try takeU32(bytes, &cursor);
+                const cols = try takeU32(bytes, &cursor);
                 const eps = try takeF32(bytes, &cursor);
                 _ = try takeU32(bytes, &cursor);
-                break :blk .{ .rmsnorm = .{ .input = input, .weight = weight, .dst = dst, .eps = eps } };
+                break :blk .{ .rmsnorm = .{ .input = input, .dst = dst, .rows = rows, .cols = cols, .eps = eps } };
             },
             .rope => blk: {
                 const input = try takeRange(bytes, &cursor);
@@ -545,8 +571,26 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
             .softmax => .{ .softmax = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
             .silu => .{ .silu = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
             .swiglu => .{ .swiglu = .{ .lhs = try takeRange(bytes, &cursor), .rhs = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
-            .add_f32 => .{ .add_f32 = .{ .lhs = try takeRange(bytes, &cursor), .rhs = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
-            .mul_f32 => .{ .mul_f32 = .{ .lhs = try takeRange(bytes, &cursor), .rhs = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
+            .add_f32 => blk: {
+                const lhs = try takeRange(bytes, &cursor);
+                const rhs = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const rows = try takeU32(bytes, &cursor);
+                const cols = try takeU32(bytes, &cursor);
+                const mode = enumFromInt(BinaryF32Mode, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                _ = try takeU32(bytes, &cursor);
+                break :blk .{ .add_f32 = .{ .lhs = lhs, .rhs = rhs, .dst = dst, .rows = rows, .cols = cols, .mode = mode } };
+            },
+            .mul_f32 => blk: {
+                const lhs = try takeRange(bytes, &cursor);
+                const rhs = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const rows = try takeU32(bytes, &cursor);
+                const cols = try takeU32(bytes, &cursor);
+                const mode = enumFromInt(BinaryF32Mode, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                _ = try takeU32(bytes, &cursor);
+                break :blk .{ .mul_f32 = .{ .lhs = lhs, .rhs = rhs, .dst = dst, .rows = rows, .cols = cols, .mode = mode } };
+            },
             .scale_f32 => blk: {
                 const src = try takeRange(bytes, &cursor);
                 const dst = try takeRange(bytes, &cursor);
@@ -750,13 +794,13 @@ test "command buffer roundtrip" {
             .cols = 1,
             .k = 128,
         } },
-        .{ .rmsnorm = .{ .input = a, .weight = b, .dst = c, .eps = 0.00001 } },
+        .{ .rmsnorm = .{ .input = a, .dst = c, .rows = 4, .cols = 2, .eps = 0.00001 } },
         .{ .rope = .{ .input = a, .dst = b, .position = 7, .theta = 10000 } },
         .{ .softmax = .{ .src = a, .dst = b } },
         .{ .silu = .{ .src = a, .dst = b } },
         .{ .swiglu = .{ .lhs = a, .rhs = b, .dst = c } },
-        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = c } },
-        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = c } },
+        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = c, .rows = 4, .cols = 1, .mode = .same_shape } },
+        .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = c, .rows = 4, .cols = 2, .mode = .rhs_row_broadcast } },
         .{ .scale_f32 = .{ .src = a, .dst = b, .scale = 0.5 } },
         .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = c, .rhs_scale = 0.25 } },
         .{ .set_rows = .{
@@ -812,7 +856,10 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[5].silu.src.handle, got[5].silu.src.handle);
     try std.testing.expectEqual(commands[6].swiglu.rhs.handle, got[6].swiglu.rhs.handle);
     try std.testing.expectEqual(commands[7].add_f32.dst.handle, got[7].add_f32.dst.handle);
+    try std.testing.expectEqual(commands[7].add_f32.mode, got[7].add_f32.mode);
     try std.testing.expectEqual(commands[8].mul_f32.lhs.offset, got[8].mul_f32.lhs.offset);
+    try std.testing.expectEqual(commands[8].mul_f32.cols, got[8].mul_f32.cols);
+    try std.testing.expectEqual(commands[8].mul_f32.mode, got[8].mul_f32.mode);
     try std.testing.expectEqual(commands[9].scale_f32.scale, got[9].scale_f32.scale);
     try std.testing.expectEqual(commands[10].add_scaled_f32.rhs_scale, got[10].add_scaled_f32.rhs_scale);
     try std.testing.expectEqual(commands[11].set_rows.index_type, got[11].set_rows.index_type);
