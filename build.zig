@@ -13,6 +13,7 @@ const ModuleSet = struct {
     ps_activations: *std.Build.Module,
     ps_elemwise: *std.Build.Module,
     ps_matmul_q1a8: *std.Build.Module,
+    ps_flash_attn: *std.Build.Module,
     ps_rmsnorm: *std.Build.Module,
     ps_rows: *std.Build.Module,
     ps_rope: *std.Build.Module,
@@ -71,6 +72,7 @@ pub fn build(b: *std.Build) void {
     addTest(b, test_step, "device/runtime.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/activations.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/elemwise.zig", target, optimize, modules);
+    addTest(b, test_step, "device/ps/flash_attn.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/matmul_q1a8.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/rmsnorm.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/rows.zig", target, optimize, modules);
@@ -145,6 +147,7 @@ fn createModules(
     const xrt_bo = b.createModule(.{ .root_source_file = b.path("device/mem/xrt_bo.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const ps_activations = b.createModule(.{ .root_source_file = b.path("device/ps/activations.zig"), .target = target, .optimize = optimize });
     const ps_elemwise = b.createModule(.{ .root_source_file = b.path("device/ps/elemwise.zig"), .target = target, .optimize = optimize });
+    const ps_flash_attn = b.createModule(.{ .root_source_file = b.path("device/ps/flash_attn.zig"), .target = target, .optimize = optimize });
     const ps_matmul_q1a8 = b.createModule(.{ .root_source_file = b.path("device/ps/matmul_q1a8.zig"), .target = target, .optimize = optimize });
     const ps_rmsnorm = b.createModule(.{ .root_source_file = b.path("device/ps/rmsnorm.zig"), .target = target, .optimize = optimize });
     const ps_rows = b.createModule(.{ .root_source_file = b.path("device/ps/rows.zig"), .target = target, .optimize = optimize });
@@ -172,6 +175,7 @@ fn createModules(
     runtime.addImport("heap", heap);
     runtime.addImport("ps_activations", ps_activations);
     runtime.addImport("ps_elemwise", ps_elemwise);
+    runtime.addImport("ps_flash_attn", ps_flash_attn);
     runtime.addImport("ps_matmul_q1a8", ps_matmul_q1a8);
     runtime.addImport("ps_rmsnorm", ps_rmsnorm);
     runtime.addImport("ps_rows", ps_rows);
@@ -237,6 +241,7 @@ fn createModules(
         .xrt_bo = xrt_bo,
         .ps_activations = ps_activations,
         .ps_elemwise = ps_elemwise,
+        .ps_flash_attn = ps_flash_attn,
         .ps_matmul_q1a8 = ps_matmul_q1a8,
         .ps_rmsnorm = ps_rmsnorm,
         .ps_rows = ps_rows,
@@ -266,6 +271,7 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("xrt_bo", modules.xrt_bo);
     mod.addImport("ps_activations", modules.ps_activations);
     mod.addImport("ps_elemwise", modules.ps_elemwise);
+    mod.addImport("ps_flash_attn", modules.ps_flash_attn);
     mod.addImport("ps_matmul_q1a8", modules.ps_matmul_q1a8);
     mod.addImport("ps_rmsnorm", modules.ps_rmsnorm);
     mod.addImport("ps_rows", modules.ps_rows);

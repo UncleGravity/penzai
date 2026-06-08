@@ -46,6 +46,15 @@ pub fn copyBytes(src: []const u8, dst: []u8) ElemwiseError!void {
     }
 }
 
+pub fn f32ToF16Bytes(src: []const u8, dst: []u8) ElemwiseError!void {
+    const count = try f32Count(src);
+    if (dst.len != count * @sizeOf(f16)) return error.InvalidLength;
+    for (0..count) |i| {
+        const value: f16 = @floatCast(readF32(src, i));
+        std.mem.writeInt(u16, dst[i * @sizeOf(f16) ..][0..2], @bitCast(value), .little);
+    }
+}
+
 pub fn addBytes(lhs: []const u8, rhs: []const u8, dst: []u8) ElemwiseError!void {
     const count = try f32Count(lhs);
     if (rhs.len != lhs.len or dst.len != lhs.len) return error.InvalidLength;
@@ -179,6 +188,20 @@ test "elemwise byte wrappers use little-endian f32 values" {
 
     try expectApprox(11, readF32(&dst, 0), 0.000001);
     try expectApprox(22, readF32(&dst, 1), 0.000001);
+}
+
+test "elemwise converts little-endian f32 bytes to f16 bytes" {
+    var src: [8]u8 = undefined;
+    var dst: [4]u8 = undefined;
+    writeF32(&src, 0, 1.5);
+    writeF32(&src, 1, -2);
+
+    try f32ToF16Bytes(&src, &dst);
+
+    const a: f16 = @bitCast(std.mem.readInt(u16, dst[0..2], .little));
+    const b: f16 = @bitCast(std.mem.readInt(u16, dst[2..4], .little));
+    try expectApprox(1.5, @floatCast(a), 0);
+    try expectApprox(-2, @floatCast(b), 0);
 }
 
 test "elemwise 2d byte wrappers support rhs row broadcast" {

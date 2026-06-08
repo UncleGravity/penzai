@@ -107,7 +107,7 @@ pub fn runPrompt(
     ctx_params.n_seq_max = 1;
     ctx_params.n_threads = @intCast(options.threads);
     ctx_params.n_threads_batch = @intCast(options.threads);
-    ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_ENABLED;
     ctx_params.op_offload = true;
 
     const ctx = c.llama_init_from_model(model, ctx_params) orelse return error.ContextInitFailed;
@@ -235,7 +235,7 @@ fn collectTrace(
     ctx_params.n_seq_max = 1;
     ctx_params.n_threads = @intCast(options.threads);
     ctx_params.n_threads_batch = @intCast(options.threads);
-    ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_DISABLED;
+    ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_ENABLED;
     ctx_params.op_offload = true;
 
     const ctx = c.llama_init_from_model(model, ctx_params) orelse return error.ContextInitFailed;

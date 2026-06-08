@@ -15,6 +15,8 @@ pub const Binding = struct {
     handle_nbytes: u64,
 };
 
+const max_flash_head_dim = 256;
+
 pub const Lookup = struct {
     ctx: *anyopaque,
     findFn: *const fn (*anyopaque, ?*const c.ggml_tensor) ?Binding,
@@ -35,10 +37,13 @@ pub fn isMetadataOp(op: anytype) bool {
 pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
     const tensor = op orelse return false;
     if (isMetadataOp(tensor.*.op)) return true;
-    return supportsMatmulQ1A8(tensor) or
+    return supportsCopy(tensor) or
+        supportsCopyF32ToF16(tensor) or
+        supportsMatmulQ1A8(tensor) or
         supportsBinaryF32(tensor) or
         supportsRmsNormF32(tensor) or
         supportsRopeF32(tensor) or
+        supportsFlashAttnF32(tensor) or
         supportsSwigluF32(tensor) or
         supportsSetRows(tensor) or
         supportsGetRows(tensor);
@@ -59,6 +64,14 @@ pub fn lowerGraph(
         if (isMetadataOp(node.*.op)) continue;
         if (tensorElements(node) == 0) continue;
 
+        if (supportsCopy(node)) {
+            try commands.append(allocator, try lowerCopy(node, lookup));
+            continue;
+        }
+        if (supportsCopyF32ToF16(node)) {
+            try commands.append(allocator, try lowerCopyF32ToF16(node, lookup));
+            continue;
+        }
         if (supportsMatmulQ1A8(node)) {
             try commands.append(allocator, try lowerMatmulQ1A8(node, lookup));
             continue;
@@ -73,6 +86,10 @@ pub fn lowerGraph(
         }
         if (supportsRopeF32(node)) {
             try commands.append(allocator, try lowerRopeF32(node, lookup));
+            continue;
+        }
+        if (supportsFlashAttnF32(node)) {
+            try commands.append(allocator, try lowerFlashAttnF32(node, lookup));
             continue;
         }
         if (supportsSwigluF32(node)) {
@@ -92,6 +109,22 @@ pub fn lowerGraph(
     }
 
     return try commands.toOwnedSlice(allocator);
+}
+
+fn supportsCopy(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_CPY) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    if (src.*.type != op.*.type) return false;
+    if (!c.ggml_is_contiguous(src) or !c.ggml_is_contiguous(op)) return false;
+    return tensorNbytes(src) == tensorNbytes(op);
+}
+
+fn supportsCopyF32ToF16(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_CPY) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    if (src.*.type != c.GGML_TYPE_F32 or op.*.type != c.GGML_TYPE_F16) return false;
+    if (!c.ggml_is_contiguous(src) or !c.ggml_is_contiguous(op)) return false;
+    return tensorElements(src) == tensorElements(op);
 }
 
 fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
@@ -170,6 +203,36 @@ fn supportsRopeF32(op: *const c.ggml_tensor) bool {
     return true;
 }
 
+fn supportsFlashAttnF32(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_FLASH_ATTN_EXT or op.*.type != c.GGML_TYPE_F32) return false;
+    const q: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    const k: *const c.ggml_tensor = op.*.src[1] orelse return false;
+    const v: *const c.ggml_tensor = op.*.src[2] orelse return false;
+    const mask: ?*const c.ggml_tensor = op.*.src[3];
+    if (op.*.src[4] != null) return false;
+
+    if (q.*.type != c.GGML_TYPE_F32 or k.*.type != c.GGML_TYPE_F16 or v.*.type != c.GGML_TYPE_F16) return false;
+    if (mask) |m| {
+        if (m.*.type != c.GGML_TYPE_F16 or m.*.nb[0] != @sizeOf(f16)) return false;
+        if (dim(m, 0) < dim(k, 1) or dim(m, 1) < dim(q, 1)) return false;
+    }
+
+    if (op.*.nb[0] != @sizeOf(f32) or q.*.nb[0] != @sizeOf(f32) or k.*.nb[0] != @sizeOf(f16) or v.*.nb[0] != @sizeOf(f16)) return false;
+    if (dim(q, 3) != 1 or dim(k, 3) != 1 or dim(v, 3) != 1 or dim(op, 3) != 1) return false;
+    if (dim(q, 0) != dim(k, 0)) return false;
+    if (dim(q, 0) <= 0 or dim(v, 0) <= 0) return false;
+    if (dim(q, 0) > max_flash_head_dim or dim(v, 0) > max_flash_head_dim) return false;
+    if (dim(k, 1) <= 0 or dim(k, 1) != dim(v, 1)) return false;
+    if (dim(k, 2) <= 0 or dim(k, 2) != dim(v, 2)) return false;
+    if (dim(q, 1) <= 0 or dim(q, 2) <= 0) return false;
+    if (@mod(dim(q, 2), dim(k, 2)) != 0) return false;
+    if (dim(op, 0) != dim(v, 0) or dim(op, 1) != dim(q, 2) or dim(op, 2) != dim(q, 1)) return false;
+    if (!std.math.isFinite(opParamF32(op, 0))) return false;
+    if (opParamF32(op, 1) != 0 or opParamF32(op, 2) != 0) return false;
+    if (dim(k, 1) > 8192) return false;
+    return true;
+}
+
 fn supportsSwigluF32(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_GLU or c.ggml_get_glu_op(op) != c.GGML_GLU_OP_SWIGLU or !isContiguousF32(op)) return false;
     const src0: *const c.ggml_tensor = op.*.src[0] orelse return false;
@@ -208,6 +271,27 @@ fn supportsGetRows(op: *const c.ggml_tensor) bool {
     if (dim(src0, 2) != dim(src1, 1) or dim(src0, 3) != dim(src1, 2)) return false;
     if (dim(op, 0) != dim(src0, 0) or dim(op, 1) != dim(src1, 0) or dim(op, 2) != dim(src1, 1) or dim(op, 3) != dim(src1, 2)) return false;
     return true;
+}
+
+fn lowerCopy(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const nbytes = tensorNbytes(node);
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+    return .{ .copy = .{
+        .src = try backingRange(src_binding, nbytes),
+        .dst = try backingRange(dst_binding, nbytes),
+    } };
+}
+
+fn lowerCopyF32ToF16(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+    return .{ .cpy_f32_to_f16 = .{
+        .src = try backingRange(src_binding, tensorNbytes(src)),
+        .dst = try backingRange(dst_binding, tensorNbytes(node)),
+    } };
 }
 
 fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
@@ -321,6 +405,97 @@ fn lowerRopeF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Comm
         .attn_factor = opParamF32(node, 8),
         .beta_fast = opParamF32(node, 9),
         .beta_slow = opParamF32(node, 10),
+    } };
+}
+
+fn lowerFlashAttnF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const q: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const k: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
+    const v: *const c.ggml_tensor = node.*.src[2] orelse return error.InvalidShape;
+    const mask: ?*const c.ggml_tensor = node.*.src[3];
+
+    const head_dim_q = try u32Dim(dim(q, 0));
+    const head_dim_v = try u32Dim(dim(v, 0));
+    const n_tokens = try u32Dim(dim(q, 1));
+    const n_heads = try u32Dim(dim(q, 2));
+    const n_kv = try u32Dim(dim(k, 1));
+    const n_head_kv = try u32Dim(dim(k, 2));
+
+    const q_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(head_dim_q)), @sizeOf(f32)),
+        n_tokens,
+        n_heads,
+        1,
+        q.*.nb[1],
+        q.*.nb[2],
+        q.*.nb[2],
+    );
+    const k_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(head_dim_q)), @sizeOf(f16)),
+        n_kv,
+        n_head_kv,
+        1,
+        k.*.nb[1],
+        k.*.nb[2],
+        k.*.nb[2],
+    );
+    const v_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(head_dim_v)), @sizeOf(f16)),
+        n_kv,
+        n_head_kv,
+        1,
+        v.*.nb[1],
+        v.*.nb[2],
+        v.*.nb[2],
+    );
+    const dst_span = try stridedSpan(
+        try checkedMul(@as(usize, @intCast(head_dim_v)), @sizeOf(f32)),
+        n_heads,
+        n_tokens,
+        1,
+        node.*.nb[1],
+        node.*.nb[2],
+        node.*.nb[2],
+    );
+
+    const q_binding = lookup.find(q) orelse return error.MissingBinding;
+    const k_binding = lookup.find(k) orelse return error.MissingBinding;
+    const v_binding = lookup.find(v) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    var mask_range: wire.TensorRange = .{ .handle = 0, .offset = 0, .nbytes = 0 };
+    var mask_nb1: u64 = 0;
+    if (mask) |m| {
+        const mask_row_bytes = try checkedMul(@as(usize, @intCast(n_kv)), @sizeOf(f16));
+        const mask_span = try stridedSpan(mask_row_bytes, n_tokens, 1, 1, m.*.nb[1], mask_row_bytes, mask_row_bytes);
+        const mask_binding = lookup.find(m) orelse return error.MissingBinding;
+        mask_range = try backingRange(mask_binding, mask_span);
+        mask_nb1 = @intCast(m.*.nb[1]);
+    }
+
+    return .{ .flash_attn_f32 = .{
+        .q = try backingRange(q_binding, q_span),
+        .k = try backingRange(k_binding, k_span),
+        .v = try backingRange(v_binding, v_span),
+        .mask = mask_range,
+        .dst = try backingRange(dst_binding, dst_span),
+        .has_mask = mask != null,
+        .head_dim_q = head_dim_q,
+        .head_dim_v = head_dim_v,
+        .n_heads = n_heads,
+        .n_head_kv = n_head_kv,
+        .n_kv = n_kv,
+        .n_tokens = n_tokens,
+        .scale = opParamF32(node, 0),
+        .q_nb1 = @intCast(q.*.nb[1]),
+        .q_nb2 = @intCast(q.*.nb[2]),
+        .k_nb1 = @intCast(k.*.nb[1]),
+        .k_nb2 = @intCast(k.*.nb[2]),
+        .v_nb1 = @intCast(v.*.nb[1]),
+        .v_nb2 = @intCast(v.*.nb[2]),
+        .mask_nb1 = mask_nb1,
+        .dst_nb1 = @intCast(node.*.nb[1]),
+        .dst_nb2 = @intCast(node.*.nb[2]),
     } };
 }
 
@@ -507,6 +682,10 @@ fn tensorElements(tensor: *const c.ggml_tensor) usize {
     const raw = c.ggml_nelements(@constCast(tensor));
     if (raw <= 0) return 0;
     return @intCast(raw);
+}
+
+fn tensorNbytes(tensor: *const c.ggml_tensor) usize {
+    return @intCast(c.ggml_nbytes(@constCast(tensor)));
 }
 
 fn isContiguousF32(tensor: *const c.ggml_tensor) bool {

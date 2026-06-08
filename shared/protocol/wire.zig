@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 2;
+pub const version: u16 = 4;
 pub const response_meta_len: usize = 48;
 
 pub const RequestTag = enum(u16) {
@@ -26,6 +26,8 @@ pub const OpTag = enum(u16) {
     add_scaled_f32 = 11,
     set_rows = 12,
     get_rows = 13,
+    flash_attn_f32 = 14,
+    cpy_f32_to_f16 = 15,
 };
 
 pub const Status = enum(u16) {
@@ -128,6 +130,11 @@ pub const Copy = struct {
     dst: TensorRange,
 };
 
+pub const CpyF32ToF16 = struct {
+    src: TensorRange,
+    dst: TensorRange,
+};
+
 pub const MatmulQ1A8 = struct {
     weights: TensorRange,
     acts: TensorRange,
@@ -181,6 +188,31 @@ pub const Rope = struct {
     attn_factor: f32,
     beta_fast: f32,
     beta_slow: f32,
+};
+
+pub const FlashAttnF32 = struct {
+    q: TensorRange,
+    k: TensorRange,
+    v: TensorRange,
+    mask: TensorRange,
+    dst: TensorRange,
+    has_mask: bool,
+    head_dim_q: u32,
+    head_dim_v: u32,
+    n_heads: u32,
+    n_head_kv: u32,
+    n_kv: u32,
+    n_tokens: u32,
+    scale: f32,
+    q_nb1: u64,
+    q_nb2: u64,
+    k_nb1: u64,
+    k_nb2: u64,
+    v_nb1: u64,
+    v_nb2: u64,
+    mask_nb1: u64,
+    dst_nb1: u64,
+    dst_nb2: u64,
 };
 
 pub const ScaleF32 = struct {
@@ -253,6 +285,8 @@ pub const Command = union(OpTag) {
     add_scaled_f32: AddScaledF32,
     set_rows: SetRows,
     get_rows: GetRows,
+    flash_attn_f32: FlashAttnF32,
+    cpy_f32_to_f16: CpyF32ToF16,
 };
 
 pub const ResponseMeta = struct {
@@ -382,6 +416,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
     for (commands) |command| {
         len += switch (command) {
             .copy => 4 + rangeLen * 2,
+            .cpy_f32_to_f16 => 4 + rangeLen * 2,
             .matmul_q1a8 => 4 + rangeLen * 3 + 16,
             .rmsnorm => 4 + rangeLen * 2 + 16,
             .rope => 4 + rangeLen * 3 + 48,
@@ -392,6 +427,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .add_scaled_f32 => 4 + rangeLen * 3 + 8,
             .set_rows => 4 + rangeLen * 3 + 32 + 64,
             .get_rows => 4 + rangeLen * 3 + 32 + 64,
+            .flash_attn_f32 => 4 + rangeLen * 5 + 32 + 72,
         };
     }
     return len;
@@ -405,6 +441,12 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
     for (commands) |command| switch (command) {
         .copy => |copy| {
             putU16(out, &cursor, @intFromEnum(OpTag.copy));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, copy.src);
+            putRange(out, &cursor, copy.dst);
+        },
+        .cpy_f32_to_f16 => |copy| {
+            putU16(out, &cursor, @intFromEnum(OpTag.cpy_f32_to_f16));
             putU16(out, &cursor, 0);
             putRange(out, &cursor, copy.src);
             putRange(out, &cursor, copy.dst);
@@ -553,6 +595,32 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU64(out, &cursor, get_rows.dst_nb2);
             putU64(out, &cursor, get_rows.dst_nb3);
         },
+        .flash_attn_f32 => |attn| {
+            putU16(out, &cursor, @intFromEnum(OpTag.flash_attn_f32));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, attn.q);
+            putRange(out, &cursor, attn.k);
+            putRange(out, &cursor, attn.v);
+            putRange(out, &cursor, attn.mask);
+            putRange(out, &cursor, attn.dst);
+            putU32(out, &cursor, if (attn.has_mask) 1 else 0);
+            putU32(out, &cursor, attn.head_dim_q);
+            putU32(out, &cursor, attn.head_dim_v);
+            putU32(out, &cursor, attn.n_heads);
+            putU32(out, &cursor, attn.n_head_kv);
+            putU32(out, &cursor, attn.n_kv);
+            putU32(out, &cursor, attn.n_tokens);
+            putF32(out, &cursor, attn.scale);
+            putU64(out, &cursor, attn.q_nb1);
+            putU64(out, &cursor, attn.q_nb2);
+            putU64(out, &cursor, attn.k_nb1);
+            putU64(out, &cursor, attn.k_nb2);
+            putU64(out, &cursor, attn.v_nb1);
+            putU64(out, &cursor, attn.v_nb2);
+            putU64(out, &cursor, attn.mask_nb1);
+            putU64(out, &cursor, attn.dst_nb1);
+            putU64(out, &cursor, attn.dst_nb2);
+        },
     };
     return cursor;
 }
@@ -569,6 +637,7 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
         const tag = enumFromInt(OpTag, raw_tag) orelse return error.InvalidTag;
         command.* = switch (tag) {
             .copy => .{ .copy = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
+            .cpy_f32_to_f16 => .{ .cpy_f32_to_f16 = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
             .matmul_q1a8 => blk: {
                 const weights = try takeRange(bytes, &cursor);
                 const acts = try takeRange(bytes, &cursor);
@@ -725,6 +794,46 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                     .dst_nb3 = try takeU64(bytes, &cursor),
                 } };
             },
+            .flash_attn_f32 => blk: {
+                const q = try takeRange(bytes, &cursor);
+                const k = try takeRange(bytes, &cursor);
+                const v = try takeRange(bytes, &cursor);
+                const mask = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const has_mask_raw = try takeU32(bytes, &cursor);
+                if (has_mask_raw > 1) return error.InvalidTag;
+                const head_dim_q = try takeU32(bytes, &cursor);
+                const head_dim_v = try takeU32(bytes, &cursor);
+                const n_heads = try takeU32(bytes, &cursor);
+                const n_head_kv = try takeU32(bytes, &cursor);
+                const n_kv = try takeU32(bytes, &cursor);
+                const n_tokens = try takeU32(bytes, &cursor);
+                const scale = try takeF32(bytes, &cursor);
+                break :blk .{ .flash_attn_f32 = .{
+                    .q = q,
+                    .k = k,
+                    .v = v,
+                    .mask = mask,
+                    .dst = dst,
+                    .has_mask = has_mask_raw == 1,
+                    .head_dim_q = head_dim_q,
+                    .head_dim_v = head_dim_v,
+                    .n_heads = n_heads,
+                    .n_head_kv = n_head_kv,
+                    .n_kv = n_kv,
+                    .n_tokens = n_tokens,
+                    .scale = scale,
+                    .q_nb1 = try takeU64(bytes, &cursor),
+                    .q_nb2 = try takeU64(bytes, &cursor),
+                    .k_nb1 = try takeU64(bytes, &cursor),
+                    .k_nb2 = try takeU64(bytes, &cursor),
+                    .v_nb1 = try takeU64(bytes, &cursor),
+                    .v_nb2 = try takeU64(bytes, &cursor),
+                    .mask_nb1 = try takeU64(bytes, &cursor),
+                    .dst_nb1 = try takeU64(bytes, &cursor),
+                    .dst_nb2 = try takeU64(bytes, &cursor),
+                } };
+            },
         };
     }
     if (cursor != bytes.len) return error.TrailingBytes;
@@ -840,6 +949,10 @@ test "command buffer roundtrip" {
             .src = a,
             .dst = b,
         } },
+        .{ .cpy_f32_to_f16 = .{
+            .src = a,
+            .dst = b,
+        } },
         .{ .matmul_q1a8 = .{
             .weights = .{ .handle = 1, .offset = 0, .nbytes = 144 },
             .acts = .{ .handle = 2, .offset = 0, .nbytes = 512 },
@@ -912,6 +1025,30 @@ test "command buffer roundtrip" {
             .dst_nb2 = 32,
             .dst_nb3 = 96,
         } },
+        .{ .flash_attn_f32 = .{
+            .q = a,
+            .k = b,
+            .v = c,
+            .mask = a,
+            .dst = b,
+            .has_mask = true,
+            .head_dim_q = 4,
+            .head_dim_v = 4,
+            .n_heads = 8,
+            .n_head_kv = 2,
+            .n_kv = 16,
+            .n_tokens = 3,
+            .scale = 0.5,
+            .q_nb1 = 16,
+            .q_nb2 = 48,
+            .k_nb1 = 8,
+            .k_nb2 = 128,
+            .v_nb1 = 8,
+            .v_nb2 = 128,
+            .mask_nb1 = 32,
+            .dst_nb1 = 16,
+            .dst_nb2 = 128,
+        } },
     };
     var buf: [2048]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
@@ -919,23 +1056,28 @@ test "command buffer roundtrip" {
     defer std.testing.allocator.free(got);
     try std.testing.expectEqual(commands.len, got.len);
     try std.testing.expectEqual(commands[0].copy.src.handle, got[0].copy.src.handle);
-    try std.testing.expectEqual(commands[1].matmul_q1a8.k, got[1].matmul_q1a8.k);
-    try std.testing.expectEqual(commands[2].rmsnorm.eps, got[2].rmsnorm.eps);
-    try std.testing.expectEqual(commands[3].rope.positions.handle, got[3].rope.positions.handle);
-    try std.testing.expectEqual(commands[3].rope.mode, got[3].rope.mode);
-    try std.testing.expectEqual(commands[3].rope.freq_base, got[3].rope.freq_base);
-    try std.testing.expectEqual(commands[4].softmax.dst.offset, got[4].softmax.dst.offset);
-    try std.testing.expectEqual(commands[5].silu.src.handle, got[5].silu.src.handle);
-    try std.testing.expectEqual(commands[6].swiglu.rhs.handle, got[6].swiglu.rhs.handle);
-    try std.testing.expectEqual(commands[7].add_f32.dst.handle, got[7].add_f32.dst.handle);
-    try std.testing.expectEqual(commands[7].add_f32.mode, got[7].add_f32.mode);
-    try std.testing.expectEqual(commands[8].mul_f32.lhs.offset, got[8].mul_f32.lhs.offset);
-    try std.testing.expectEqual(commands[8].mul_f32.cols, got[8].mul_f32.cols);
-    try std.testing.expectEqual(commands[8].mul_f32.mode, got[8].mul_f32.mode);
-    try std.testing.expectEqual(commands[9].scale_f32.scale, got[9].scale_f32.scale);
-    try std.testing.expectEqual(commands[10].add_scaled_f32.rhs_scale, got[10].add_scaled_f32.rhs_scale);
-    try std.testing.expectEqual(commands[11].set_rows.index_type, got[11].set_rows.index_type);
-    try std.testing.expectEqual(commands[11].set_rows.dst_nb3, got[11].set_rows.dst_nb3);
-    try std.testing.expectEqual(commands[12].get_rows.src_rows, got[12].get_rows.src_rows);
-    try std.testing.expectEqual(commands[12].get_rows.dst_nb3, got[12].get_rows.dst_nb3);
+    try std.testing.expectEqual(commands[1].cpy_f32_to_f16.dst.handle, got[1].cpy_f32_to_f16.dst.handle);
+    try std.testing.expectEqual(commands[2].matmul_q1a8.k, got[2].matmul_q1a8.k);
+    try std.testing.expectEqual(commands[3].rmsnorm.eps, got[3].rmsnorm.eps);
+    try std.testing.expectEqual(commands[4].rope.positions.handle, got[4].rope.positions.handle);
+    try std.testing.expectEqual(commands[4].rope.mode, got[4].rope.mode);
+    try std.testing.expectEqual(commands[4].rope.freq_base, got[4].rope.freq_base);
+    try std.testing.expectEqual(commands[5].softmax.dst.offset, got[5].softmax.dst.offset);
+    try std.testing.expectEqual(commands[6].silu.src.handle, got[6].silu.src.handle);
+    try std.testing.expectEqual(commands[7].swiglu.rhs.handle, got[7].swiglu.rhs.handle);
+    try std.testing.expectEqual(commands[8].add_f32.dst.handle, got[8].add_f32.dst.handle);
+    try std.testing.expectEqual(commands[8].add_f32.mode, got[8].add_f32.mode);
+    try std.testing.expectEqual(commands[9].mul_f32.lhs.offset, got[9].mul_f32.lhs.offset);
+    try std.testing.expectEqual(commands[9].mul_f32.cols, got[9].mul_f32.cols);
+    try std.testing.expectEqual(commands[9].mul_f32.mode, got[9].mul_f32.mode);
+    try std.testing.expectEqual(commands[10].scale_f32.scale, got[10].scale_f32.scale);
+    try std.testing.expectEqual(commands[11].add_scaled_f32.rhs_scale, got[11].add_scaled_f32.rhs_scale);
+    try std.testing.expectEqual(commands[12].set_rows.index_type, got[12].set_rows.index_type);
+    try std.testing.expectEqual(commands[12].set_rows.dst_nb3, got[12].set_rows.dst_nb3);
+    try std.testing.expectEqual(commands[13].get_rows.src_rows, got[13].get_rows.src_rows);
+    try std.testing.expectEqual(commands[13].get_rows.dst_nb3, got[13].get_rows.dst_nb3);
+    try std.testing.expectEqual(commands[14].flash_attn_f32.has_mask, got[14].flash_attn_f32.has_mask);
+    try std.testing.expectEqual(commands[14].flash_attn_f32.n_head_kv, got[14].flash_attn_f32.n_head_kv);
+    try std.testing.expectEqual(commands[14].flash_attn_f32.scale, got[14].flash_attn_f32.scale);
+    try std.testing.expectEqual(commands[14].flash_attn_f32.dst_nb2, got[14].flash_attn_f32.dst_nb2);
 }

@@ -3,6 +3,7 @@ const wire = @import("wire");
 const heap_mod = @import("heap");
 const ps_activations = @import("ps_activations");
 const ps_elemwise = @import("ps_elemwise");
+const ps_flash_attn = @import("ps_flash_attn");
 const ps_matmul_q1a8 = @import("ps_matmul_q1a8");
 const ps_rmsnorm = @import("ps_rmsnorm");
 const ps_rows = @import("ps_rows");
@@ -97,6 +98,11 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const src = self.heap.read(copy.src) catch |err| return mapHeapError(err);
                     self.heap.write(copy.dst, src) catch |err| return mapHeapError(err);
                 },
+                .cpy_f32_to_f16 => |copy| {
+                    const src = self.heap.read(copy.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(copy.dst) catch |err| return mapHeapError(err);
+                    ps_elemwise.f32ToF16Bytes(src, dst) catch |err| return mapKernelError(err);
+                },
                 .matmul_q1a8 => |matmul| {
                     const weights = self.heap.read(matmul.weights) catch |err| return mapHeapError(err);
                     const acts = self.heap.read(matmul.acts) catch |err| return mapHeapError(err);
@@ -181,6 +187,31 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const dst = self.heap.bytes(get_rows.dst) catch |err| return mapHeapError(err);
                     ps_rows.getRowsF32Bytes(get_rows, src, indices, dst) catch |err| return mapKernelError(err);
                 },
+                .flash_attn_f32 => |attn| {
+                    const q = self.heap.read(attn.q) catch |err| return mapHeapError(err);
+                    const k = self.heap.read(attn.k) catch |err| return mapHeapError(err);
+                    const v = self.heap.read(attn.v) catch |err| return mapHeapError(err);
+                    const mask = if (attn.has_mask) self.heap.read(attn.mask) catch |err| return mapHeapError(err) else null;
+                    const dst = self.heap.bytes(attn.dst) catch |err| return mapHeapError(err);
+                    ps_flash_attn.runBytes(q, k, v, mask, dst, .{
+                        .head_dim_q = attn.head_dim_q,
+                        .head_dim_v = attn.head_dim_v,
+                        .n_heads = attn.n_heads,
+                        .n_head_kv = attn.n_head_kv,
+                        .n_kv = attn.n_kv,
+                        .n_tokens = attn.n_tokens,
+                        .scale = attn.scale,
+                        .q_nb1 = attn.q_nb1,
+                        .q_nb2 = attn.q_nb2,
+                        .k_nb1 = attn.k_nb1,
+                        .k_nb2 = attn.k_nb2,
+                        .v_nb1 = attn.v_nb1,
+                        .v_nb2 = attn.v_nb2,
+                        .mask_nb1 = attn.mask_nb1,
+                        .dst_nb1 = attn.dst_nb1,
+                        .dst_nb2 = attn.dst_nb2,
+                    }) catch |err| return mapKernelError(err);
+                },
             }
         }
     };
@@ -245,6 +276,9 @@ test "runtime dispatches ps f32 command variants" {
     const a = try tensor(&runtime, 2);
     const b = try tensor(&runtime, 2);
     const get_rows_src = try tensor(&runtime, 4);
+    const flash_q = try tensor(&runtime, 2);
+    const flash_k = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
+    const flash_v = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
     const out_rms = try tensor(&runtime, 2);
     const out_rope = try tensor(&runtime, 2);
     const out_softmax = try tensor(&runtime, 2);
@@ -254,6 +288,7 @@ test "runtime dispatches ps f32 command variants" {
     const out_mul = try tensor(&runtime, 2);
     const out_scale = try tensor(&runtime, 2);
     const out_add_scaled = try tensor(&runtime, 2);
+    const out_flash = try tensor(&runtime, 2);
     const indices = try rawTensor(&runtime, @sizeOf(i32), @alignOf(i32));
     const out_rows = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
     const out_get_rows = try tensor(&runtime, 2);
@@ -261,6 +296,9 @@ test "runtime dispatches ps f32 command variants" {
     try writeTensor(&runtime, a, &.{ 3, 4 });
     try writeTensor(&runtime, b, &.{ 1, 2 });
     try writeTensor(&runtime, get_rows_src, &.{ 1, 2, 3, 4 });
+    try writeTensor(&runtime, flash_q, &.{ 1, 0 });
+    try writeF16Tensor(&runtime, flash_k, &.{ 1, 0, 0, 1 });
+    try writeF16Tensor(&runtime, flash_v, &.{ 10, 20, 30, 40 });
     try writeI32Tensor(&runtime, indices, &.{1});
 
     const commands = [_]wire.Command{
@@ -328,6 +366,30 @@ test "runtime dispatches ps f32 command variants" {
             .dst_nb2 = 2 * @sizeOf(f32),
             .dst_nb3 = 2 * @sizeOf(f32),
         } },
+        .{ .flash_attn_f32 = .{
+            .q = flash_q,
+            .k = flash_k,
+            .v = flash_v,
+            .mask = .{ .handle = 0, .offset = 0, .nbytes = 0 },
+            .dst = out_flash,
+            .has_mask = false,
+            .head_dim_q = 2,
+            .head_dim_v = 2,
+            .n_heads = 1,
+            .n_head_kv = 1,
+            .n_kv = 2,
+            .n_tokens = 1,
+            .scale = 1,
+            .q_nb1 = 2 * @sizeOf(f32),
+            .q_nb2 = 2 * @sizeOf(f32),
+            .k_nb1 = 2 * @sizeOf(f16),
+            .k_nb2 = 4 * @sizeOf(f16),
+            .v_nb1 = 2 * @sizeOf(f16),
+            .v_nb2 = 4 * @sizeOf(f16),
+            .mask_nb1 = 0,
+            .dst_nb1 = 2 * @sizeOf(f32),
+            .dst_nb2 = 2 * @sizeOf(f32),
+        } },
     };
     var command_bytes: [2048]u8 = undefined;
     const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
@@ -350,6 +412,9 @@ test "runtime dispatches ps f32 command variants" {
     try expectTensor(&runtime, out_add_scaled, &.{ 3.5, 5 });
     try expectF16TensorAt(&runtime, out_rows, 2, &.{ 3, 4 });
     try expectTensor(&runtime, out_get_rows, &.{ 3, 4 });
+    const w0 = @exp(@as(f32, 1)) / (@exp(@as(f32, 1)) + 1.0);
+    const w1 = 1.0 - w0;
+    try expectTensorApprox(&runtime, out_flash, &.{ w0 * 10 + w1 * 30, w0 * 20 + w1 * 40 }, 0.00001);
 }
 
 fn tensor(runtime: *Runtime, len: usize) !wire.TensorRange {
@@ -376,11 +441,23 @@ fn writeI32Tensor(runtime: *Runtime, range: wire.TensorRange, values: []const i3
     }
 }
 
+fn writeF16Tensor(runtime: *Runtime, range: wire.TensorRange, values: []const f16) !void {
+    const bytes = try runtime.heap.bytes(range);
+    try std.testing.expectEqual(values.len * @sizeOf(f16), bytes.len);
+    for (values, 0..) |value, i| {
+        std.mem.writeInt(u16, bytes[i * @sizeOf(f16) ..][0..2], @bitCast(value), .little);
+    }
+}
+
 fn expectTensor(runtime: *Runtime, range: wire.TensorRange, expected: []const f32) !void {
+    try expectTensorApprox(runtime, range, expected, 0.000001);
+}
+
+fn expectTensorApprox(runtime: *Runtime, range: wire.TensorRange, expected: []const f32, tolerance: f32) !void {
     const bytes = try runtime.heap.read(range);
     try std.testing.expectEqual(expected.len * @sizeOf(f32), bytes.len);
     for (expected, 0..) |value, i| {
-        try std.testing.expect(@abs(value - readF32(bytes, i)) <= 0.000001);
+        try std.testing.expect(@abs(value - readF32(bytes, i)) <= tolerance);
     }
 }
 
