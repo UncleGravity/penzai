@@ -148,7 +148,7 @@ fn findTensorBinding(tensor: ?*const c.ggml_tensor) ?RemoteBinding {
 fn lookupBinding(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?lower.Binding {
     _ = ctx;
     const binding = findTensorBinding(tensor) orelse return null;
-    return .{ .range = binding.range };
+    return .{ .range = binding.range, .handle_nbytes = binding.handle_nbytes };
 }
 
 fn tensorNbytes(tensor: *const c.ggml_tensor) usize {

@@ -45,7 +45,7 @@ pub fn runQ1A8(
         q1a8.quantizeQ8_0(column, quants, act_scales) catch return error.InvalidShape;
 
         for (0..rows_usize) |row| {
-            var acc: f32 = 0;
+            var acc_lanes = [_]f32{ 0, 0, 0, 0 };
             for (0..q1_blocks) |q1| {
                 const weight_scale: f32 = @floatCast(q1a8.packedWeightScale(packed_weights, rows_usize, k_usize, row, q1) catch return error.InvalidLength);
                 if (weight_scale == 0) continue;
@@ -53,14 +53,23 @@ pub fn runQ1A8(
                     const act_scale: f32 = @floatCast(act_scales[q1 * q1a8.q8_subblocks + sub]);
                     if (act_scale == 0) continue;
                     const bits = q1a8.packedWeightBits(packed_weights, rows_usize, k_usize, row, q1, sub) catch return error.InvalidLength;
-                    var sum: i32 = 0;
-                    for (0..q1a8.q8_block) |i| {
-                        const act: i32 = quants[q1 * q1a8.q1_block + sub * q1a8.q8_block + i];
-                        sum += if (((bits >> @intCast(i)) & 1) != 0) act else -act;
+                    const base = q1 * q1a8.q1_block + sub * q1a8.q8_block;
+                    const scale = weight_scale * act_scale;
+                    for (0..4) |lane| {
+                        var sum: i32 = 0;
+                        for (0..4) |i| {
+                            const lo = lane * 4 + i;
+                            const hi = lo + 16;
+                            const act_lo: i32 = quants[base + lo];
+                            const act_hi: i32 = quants[base + hi];
+                            sum += if (((bits >> @intCast(lo)) & 1) != 0) act_lo else -act_lo;
+                            sum += if (((bits >> @intCast(hi)) & 1) != 0) act_hi else -act_hi;
+                        }
+                        acc_lanes[lane] = @mulAdd(f32, @as(f32, @floatFromInt(sum)), scale, acc_lanes[lane]);
                     }
-                    acc += weight_scale * act_scale * @as(f32, @floatFromInt(sum));
                 }
             }
+            const acc = (acc_lanes[0] + acc_lanes[1]) + (acc_lanes[2] + acc_lanes[3]);
             writeF32(dst_f32, (col * rows_usize + row) * @sizeOf(f32), acc);
         }
     }

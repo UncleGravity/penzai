@@ -193,19 +193,23 @@ pub fn quantizeQ8_0(column: []const f32, out_quants: []i8, out_scales: []f16) La
             continue;
         }
 
-        const scale: f16 = @floatCast(amax / 127.0);
-        out_scales[block_index] = scale;
-        const inv_scale: f32 = 1.0 / @as(f32, @floatCast(scale));
+        const scale = amax / 127.0;
+        out_scales[block_index] = @floatCast(scale);
+        const inv_scale: f32 = 1.0 / scale;
         for (column[base..][0..q8_block], 0..) |value, i| {
-            const quantized = roundHalfAwayFromZero(value * inv_scale);
+            const quantized = roundNearestEven(value * inv_scale);
             out_quants[base + i] = @intCast(std.math.clamp(quantized, -128, 127));
         }
     }
 }
 
-fn roundHalfAwayFromZero(value: f32) i32 {
-    if (value >= 0) return @intFromFloat(value + 0.5);
-    return @intFromFloat(value - 0.5);
+fn roundNearestEven(value: f32) i32 {
+    const floored = @floor(value);
+    const whole: i32 = @intFromFloat(floored);
+    const frac = value - floored;
+    if (frac < 0.5) return whole;
+    if (frac > 0.5) return whole + 1;
+    return if (@mod(whole, 2) == 0) whole else whole + 1;
 }
 
 fn putU64(out: []u8, cursor: *usize, value: u64) void {
@@ -271,4 +275,31 @@ test "quantize exact scale when amax is 127" {
     try quantizeQ8_0(&column, &quants, &scales);
     for (quants) |q| try std.testing.expectEqual(@as(i8, 127), q);
     for (scales) |s| try std.testing.expectEqual(@as(f16, 1), s);
+}
+
+test "quantize uses unrounded scale reciprocal" {
+    var column = [_]f32{0} ** q1_block;
+    column[0] = 0.001;
+    column[1] = 0.0000118094488;
+    var quants: [q1_block]i8 = undefined;
+    var scales: [q8_subblocks]f16 = undefined;
+
+    try quantizeQ8_0(&column, &quants, &scales);
+
+    try std.testing.expectEqual(@as(i8, 127), quants[0]);
+    try std.testing.expectEqual(@as(i8, 1), quants[1]);
+}
+
+test "quantize rounds ties to nearest even" {
+    var column = [_]f32{0} ** q1_block;
+    column[0] = 127;
+    column[1] = 2.5;
+    column[2] = -2.5;
+    var quants: [q1_block]i8 = undefined;
+    var scales: [q8_subblocks]f16 = undefined;
+
+    try quantizeQ8_0(&column, &quants, &scales);
+
+    try std.testing.expectEqual(@as(i8, 2), quants[1]);
+    try std.testing.expectEqual(@as(i8, -2), quants[2]);
 }

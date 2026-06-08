@@ -10,7 +10,7 @@ const CliError = error{
     UnsupportedDevice,
 } || protocol_transport.ParseError || run_mod.RunError || std.process.Args.Iterator.InitError || std.Io.Writer.Error;
 
-const LlamaMode = enum { generate, census };
+const LlamaMode = enum { generate, census, logits };
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -53,6 +53,10 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         try runLlamaCommand(init, &args, stdout, .census);
         return;
     }
+    if (std.mem.eql(u8, command, "logits")) {
+        try runLlamaCommand(init, &args, stdout, .logits);
+        return;
+    }
     if (std.mem.eql(u8, command, "matmul")) {
         try runMatmulCommand(init, &args, stdout);
         return;
@@ -70,6 +74,8 @@ fn runLlamaCommand(
     if (mode == .census) {
         options.max_tokens = 2;
         options.census = true;
+    } else if (mode == .logits) {
+        options.max_tokens = 1;
     }
     var device: []const u8 = "fake";
     while (args.next()) |arg| {
@@ -93,6 +99,12 @@ fn runLlamaCommand(
             options.heap_mib = try parseU32(try requireValue(args, "--heap-mib"));
         } else if (std.mem.startsWith(u8, arg, "--heap-mib=")) {
             options.heap_mib = try parseU32(arg["--heap-mib=".len..]);
+        } else if (std.mem.eql(u8, arg, "--tolerance")) {
+            options.logits_tolerance = try parseF32(try requireValue(args, "--tolerance"));
+        } else if (std.mem.startsWith(u8, arg, "--tolerance=")) {
+            options.logits_tolerance = try parseF32(arg["--tolerance=".len..]);
+        } else if (std.mem.eql(u8, arg, "--raw-prompt")) {
+            options.chat_template = false;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -102,9 +114,15 @@ fn runLlamaCommand(
     }
 
     const device_spec = try protocol_transport.parseDeviceSpec(device);
-    switch (device_spec) {
-        .fake => try run_mod.runFakeLlama(init.gpa, stdout, options),
-        .tcp => |tcp| try run_mod.runTcpLlama(init.io, init.gpa, stdout, tcp, options),
+    switch (mode) {
+        .generate, .census => switch (device_spec) {
+            .fake => try run_mod.runFakeLlama(init.gpa, stdout, options),
+            .tcp => |tcp| try run_mod.runTcpLlama(init.io, init.gpa, stdout, tcp, options),
+        },
+        .logits => switch (device_spec) {
+            .fake => try run_mod.runFakeLogitsCheck(init.gpa, stdout, options),
+            .tcp => |tcp| try run_mod.runTcpLogitsCheck(init.io, init.gpa, stdout, tcp, options),
+        },
     }
 }
 
@@ -186,17 +204,23 @@ fn parseU32(value: []const u8) CliError!u32 {
     return std.fmt.parseInt(u32, value, 10) catch return error.InvalidNumber;
 }
 
+fn parseF32(value: []const u8) CliError!f32 {
+    return std.fmt.parseFloat(f32, value) catch return error.InvalidNumber;
+}
+
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N]
-        \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt]
+        \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt]
+        \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
         \\
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
         \\  census   report the actual ggml graph_compute op surface
+        \\  logits   compare penzai logits against llama.cpp CPU logits
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  help     show this help
         \\

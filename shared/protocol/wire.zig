@@ -24,6 +24,7 @@ pub const OpTag = enum(u16) {
     mul_f32 = 9,
     scale_f32 = 10,
     add_scaled_f32 = 11,
+    set_rows = 12,
 };
 
 pub const Status = enum(u16) {
@@ -57,6 +58,11 @@ pub const TensorRange = struct {
     handle: u64,
     offset: u64,
     nbytes: u64,
+};
+
+pub const IndexType = enum(u32) {
+    i32 = 1,
+    i64 = 2,
 };
 
 pub const AllocRequest = struct {
@@ -153,6 +159,27 @@ pub const AddScaledF32 = struct {
     rhs_scale: f32,
 };
 
+pub const SetRows = struct {
+    src: TensorRange,
+    indices: TensorRange,
+    dst: TensorRange,
+    index_type: IndexType,
+    head_dim: u32,
+    ne01: u32,
+    ne02: u32,
+    ne03: u32,
+    ne11: u32,
+    ne12: u32,
+    src_nb1: u64,
+    src_nb2: u64,
+    src_nb3: u64,
+    indices_nb1: u64,
+    indices_nb2: u64,
+    dst_nb1: u64,
+    dst_nb2: u64,
+    dst_nb3: u64,
+};
+
 pub const Command = union(OpTag) {
     copy: Copy,
     matmul_q1a8: MatmulQ1A8,
@@ -165,6 +192,7 @@ pub const Command = union(OpTag) {
     mul_f32: BinaryF32,
     scale_f32: ScaleF32,
     add_scaled_f32: AddScaledF32,
+    set_rows: SetRows,
 };
 
 pub const ResponseMeta = struct {
@@ -301,6 +329,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .swiglu, .add_f32, .mul_f32 => 4 + rangeLen * 3,
             .scale_f32 => 4 + rangeLen * 2 + 8,
             .add_scaled_f32 => 4 + rangeLen * 3 + 8,
+            .set_rows => 4 + rangeLen * 3 + 32 + 64,
         };
     }
     return len;
@@ -396,6 +425,29 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putF32(out, &cursor, add_scaled.rhs_scale);
             putU32(out, &cursor, 0);
         },
+        .set_rows => |set_rows| {
+            putU16(out, &cursor, @intFromEnum(OpTag.set_rows));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, set_rows.src);
+            putRange(out, &cursor, set_rows.indices);
+            putRange(out, &cursor, set_rows.dst);
+            putU32(out, &cursor, @intFromEnum(set_rows.index_type));
+            putU32(out, &cursor, set_rows.head_dim);
+            putU32(out, &cursor, set_rows.ne01);
+            putU32(out, &cursor, set_rows.ne02);
+            putU32(out, &cursor, set_rows.ne03);
+            putU32(out, &cursor, set_rows.ne11);
+            putU32(out, &cursor, set_rows.ne12);
+            putU32(out, &cursor, 0);
+            putU64(out, &cursor, set_rows.src_nb1);
+            putU64(out, &cursor, set_rows.src_nb2);
+            putU64(out, &cursor, set_rows.src_nb3);
+            putU64(out, &cursor, set_rows.indices_nb1);
+            putU64(out, &cursor, set_rows.indices_nb2);
+            putU64(out, &cursor, set_rows.dst_nb1);
+            putU64(out, &cursor, set_rows.dst_nb2);
+            putU64(out, &cursor, set_rows.dst_nb3);
+        },
     };
     return cursor;
 }
@@ -456,6 +508,39 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                 const rhs_scale = try takeF32(bytes, &cursor);
                 _ = try takeU32(bytes, &cursor);
                 break :blk .{ .add_scaled_f32 = .{ .lhs = lhs, .rhs = rhs, .dst = dst, .rhs_scale = rhs_scale } };
+            },
+            .set_rows => blk: {
+                const src = try takeRange(bytes, &cursor);
+                const indices = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const index_type = enumFromInt(IndexType, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                const head_dim = try takeU32(bytes, &cursor);
+                const ne01 = try takeU32(bytes, &cursor);
+                const ne02 = try takeU32(bytes, &cursor);
+                const ne03 = try takeU32(bytes, &cursor);
+                const ne11 = try takeU32(bytes, &cursor);
+                const ne12 = try takeU32(bytes, &cursor);
+                _ = try takeU32(bytes, &cursor);
+                break :blk .{ .set_rows = .{
+                    .src = src,
+                    .indices = indices,
+                    .dst = dst,
+                    .index_type = index_type,
+                    .head_dim = head_dim,
+                    .ne01 = ne01,
+                    .ne02 = ne02,
+                    .ne03 = ne03,
+                    .ne11 = ne11,
+                    .ne12 = ne12,
+                    .src_nb1 = try takeU64(bytes, &cursor),
+                    .src_nb2 = try takeU64(bytes, &cursor),
+                    .src_nb3 = try takeU64(bytes, &cursor),
+                    .indices_nb1 = try takeU64(bytes, &cursor),
+                    .indices_nb2 = try takeU64(bytes, &cursor),
+                    .dst_nb1 = try takeU64(bytes, &cursor),
+                    .dst_nb2 = try takeU64(bytes, &cursor),
+                    .dst_nb3 = try takeU64(bytes, &cursor),
+                } };
             },
         };
     }
@@ -589,6 +674,26 @@ test "command buffer roundtrip" {
         .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = c } },
         .{ .scale_f32 = .{ .src = a, .dst = b, .scale = 0.5 } },
         .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = c, .rhs_scale = 0.25 } },
+        .{ .set_rows = .{
+            .src = a,
+            .indices = b,
+            .dst = c,
+            .index_type = .i32,
+            .head_dim = 4,
+            .ne01 = 2,
+            .ne02 = 3,
+            .ne03 = 1,
+            .ne11 = 1,
+            .ne12 = 1,
+            .src_nb1 = 16,
+            .src_nb2 = 32,
+            .src_nb3 = 96,
+            .indices_nb1 = 8,
+            .indices_nb2 = 8,
+            .dst_nb1 = 8,
+            .dst_nb2 = 64,
+            .dst_nb3 = 192,
+        } },
     };
     var buf: [1024]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
@@ -606,4 +711,6 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[8].mul_f32.lhs.offset, got[8].mul_f32.lhs.offset);
     try std.testing.expectEqual(commands[9].scale_f32.scale, got[9].scale_f32.scale);
     try std.testing.expectEqual(commands[10].add_scaled_f32.rhs_scale, got[10].add_scaled_f32.rhs_scale);
+    try std.testing.expectEqual(commands[11].set_rows.index_type, got[11].set_rows.index_type);
+    try std.testing.expectEqual(commands[11].set_rows.dst_nb3, got[11].set_rows.dst_nb3);
 }

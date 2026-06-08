@@ -44,6 +44,8 @@ pub const LlamaOptions = struct {
     max_tokens: u32 = 16,
     heap_mib: u32 = 768,
     census: bool = false,
+    logits_tolerance: f32 = 0.001,
+    chat_template: bool = true,
 };
 
 pub fn runFakeLlama(
@@ -61,6 +63,8 @@ pub fn runFakeLlama(
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
         .census = options.census,
+        .logits_tolerance = options.logits_tolerance,
+        .chat_template = options.chat_template,
     });
 }
 
@@ -80,6 +84,47 @@ pub fn runTcpLlama(
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
         .census = options.census,
+        .logits_tolerance = options.logits_tolerance,
+        .chat_template = options.chat_template,
+    });
+}
+
+pub fn runFakeLogitsCheck(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: LlamaOptions,
+) RunError!void {
+    if (!build_options.enable_llama) return error.LlamaDisabled;
+    var runtime = try runtime_mod.Runtime.init(allocator, try heapBytes(options.heap_mib));
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(allocator, &runtime);
+    const client = link_mod.Client.init(&link);
+    return llama_mod.runLogitsCheck(allocator, writer, client, .{
+        .model_path = options.model_path,
+        .prompt = options.prompt,
+        .max_tokens = options.max_tokens,
+        .logits_tolerance = options.logits_tolerance,
+        .chat_template = options.chat_template,
+    });
+}
+
+pub fn runTcpLogitsCheck(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    spec: protocol_transport.TcpSpec,
+    options: LlamaOptions,
+) RunError!void {
+    if (!build_options.enable_llama) return error.LlamaDisabled;
+    var link = try link_mod.TcpLink.connect(allocator, io, spec);
+    defer link.deinit();
+    const client = link_mod.Client.init(&link);
+    return llama_mod.runLogitsCheck(allocator, writer, client, .{
+        .model_path = options.model_path,
+        .prompt = options.prompt,
+        .max_tokens = options.max_tokens,
+        .logits_tolerance = options.logits_tolerance,
+        .chat_template = options.chat_template,
     });
 }
 

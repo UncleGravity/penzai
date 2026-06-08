@@ -14,6 +14,7 @@ const ModuleSet = struct {
     ps_elemwise: *std.Build.Module,
     ps_matmul_q1a8: *std.Build.Module,
     ps_rmsnorm: *std.Build.Module,
+    ps_rows: *std.Build.Module,
     ps_rope: *std.Build.Module,
     ps_softmax: *std.Build.Module,
     runtime: *std.Build.Module,
@@ -72,6 +73,7 @@ pub fn build(b: *std.Build) void {
     addTest(b, test_step, "device/ps/elemwise.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/matmul_q1a8.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/rmsnorm.zig", target, optimize, modules);
+    addTest(b, test_step, "device/ps/rows.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/rope.zig", target, optimize, modules);
     addTest(b, test_step, "device/ps/softmax.zig", target, optimize, modules);
     addTest(b, test_step, "host/run.zig", target, optimize, modules);
@@ -144,6 +146,7 @@ fn createModules(
     const ps_elemwise = b.createModule(.{ .root_source_file = b.path("device/ps/elemwise.zig"), .target = target, .optimize = optimize });
     const ps_matmul_q1a8 = b.createModule(.{ .root_source_file = b.path("device/ps/matmul_q1a8.zig"), .target = target, .optimize = optimize });
     const ps_rmsnorm = b.createModule(.{ .root_source_file = b.path("device/ps/rmsnorm.zig"), .target = target, .optimize = optimize });
+    const ps_rows = b.createModule(.{ .root_source_file = b.path("device/ps/rows.zig"), .target = target, .optimize = optimize });
     const ps_rope = b.createModule(.{ .root_source_file = b.path("device/ps/rope.zig"), .target = target, .optimize = optimize });
     const ps_softmax = b.createModule(.{ .root_source_file = b.path("device/ps/softmax.zig"), .target = target, .optimize = optimize });
     const runtime = b.createModule(.{ .root_source_file = b.path("device/runtime.zig"), .target = target, .optimize = optimize });
@@ -162,12 +165,14 @@ fn createModules(
     xrt_bo.addImport("wire", wire);
     xrt_bo.addImport("xrt", xrt);
     ps_matmul_q1a8.addImport("q1a8", q1a8);
+    ps_rows.addImport("wire", wire);
     runtime.addImport("wire", wire);
     runtime.addImport("heap", heap);
     runtime.addImport("ps_activations", ps_activations);
     runtime.addImport("ps_elemwise", ps_elemwise);
     runtime.addImport("ps_matmul_q1a8", ps_matmul_q1a8);
     runtime.addImport("ps_rmsnorm", ps_rmsnorm);
+    runtime.addImport("ps_rows", ps_rows);
     runtime.addImport("ps_rope", ps_rope);
     runtime.addImport("ps_softmax", ps_softmax);
     server.addImport("framing", framing);
@@ -231,6 +236,7 @@ fn createModules(
         .ps_elemwise = ps_elemwise,
         .ps_matmul_q1a8 = ps_matmul_q1a8,
         .ps_rmsnorm = ps_rmsnorm,
+        .ps_rows = ps_rows,
         .ps_rope = ps_rope,
         .ps_softmax = ps_softmax,
         .runtime = runtime,
@@ -259,6 +265,7 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("ps_elemwise", modules.ps_elemwise);
     mod.addImport("ps_matmul_q1a8", modules.ps_matmul_q1a8);
     mod.addImport("ps_rmsnorm", modules.ps_rmsnorm);
+    mod.addImport("ps_rows", modules.ps_rows);
     mod.addImport("ps_rope", modules.ps_rope);
     mod.addImport("ps_softmax", modules.ps_softmax);
     mod.addImport("runtime", modules.runtime);

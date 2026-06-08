@@ -5,6 +5,7 @@ const ps_activations = @import("ps_activations");
 const ps_elemwise = @import("ps_elemwise");
 const ps_matmul_q1a8 = @import("ps_matmul_q1a8");
 const ps_rmsnorm = @import("ps_rmsnorm");
+const ps_rows = @import("ps_rows");
 const ps_rope = @import("ps_rope");
 const ps_softmax = @import("ps_softmax");
 
@@ -155,6 +156,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const dst = self.heap.bytes(add_scaled.dst) catch |err| return mapHeapError(err);
                     ps_elemwise.addScaledBytes(lhs, rhs, add_scaled.rhs_scale, dst) catch |err| return mapKernelError(err);
                 },
+                .set_rows => |set_rows| {
+                    const src = self.heap.read(set_rows.src) catch |err| return mapHeapError(err);
+                    const indices = self.heap.read(set_rows.indices) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(set_rows.dst) catch |err| return mapHeapError(err);
+                    ps_rows.setRowsF32ToF16Bytes(set_rows, src, indices, dst) catch |err| return mapKernelError(err);
+                },
             }
         }
     };
@@ -214,10 +221,13 @@ test "runtime dispatches ps f32 command variants" {
     const out_mul = try tensor(&runtime, 2);
     const out_scale = try tensor(&runtime, 2);
     const out_add_scaled = try tensor(&runtime, 2);
+    const indices = try rawTensor(&runtime, @sizeOf(i32), @alignOf(i32));
+    const out_rows = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
 
     try writeTensor(&runtime, a, &.{ 3, 4 });
     try writeTensor(&runtime, b, &.{ 1, 2 });
     try writeTensor(&runtime, weight, &.{ 1, 1 });
+    try writeI32Tensor(&runtime, indices, &.{1});
 
     const commands = [_]wire.Command{
         .{ .rmsnorm = .{ .input = a, .weight = weight, .dst = out_rms, .eps = 0 } },
@@ -229,6 +239,26 @@ test "runtime dispatches ps f32 command variants" {
         .{ .mul_f32 = .{ .lhs = a, .rhs = b, .dst = out_mul } },
         .{ .scale_f32 = .{ .src = b, .dst = out_scale, .scale = 0.5 } },
         .{ .add_scaled_f32 = .{ .lhs = a, .rhs = b, .dst = out_add_scaled, .rhs_scale = 0.5 } },
+        .{ .set_rows = .{
+            .src = a,
+            .indices = indices,
+            .dst = out_rows,
+            .index_type = .i32,
+            .head_dim = 2,
+            .ne01 = 1,
+            .ne02 = 1,
+            .ne03 = 1,
+            .ne11 = 1,
+            .ne12 = 1,
+            .src_nb1 = 2 * @sizeOf(f32),
+            .src_nb2 = 2 * @sizeOf(f32),
+            .src_nb3 = 2 * @sizeOf(f32),
+            .indices_nb1 = @sizeOf(i32),
+            .indices_nb2 = @sizeOf(i32),
+            .dst_nb1 = 2 * @sizeOf(f16),
+            .dst_nb2 = 4 * @sizeOf(f16),
+            .dst_nb3 = 4 * @sizeOf(f16),
+        } },
     };
     var command_bytes: [1024]u8 = undefined;
     const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
@@ -249,10 +279,15 @@ test "runtime dispatches ps f32 command variants" {
     try expectTensor(&runtime, out_mul, &.{ 3, 8 });
     try expectTensor(&runtime, out_scale, &.{ 0.5, 1 });
     try expectTensor(&runtime, out_add_scaled, &.{ 3.5, 5 });
+    try expectF16TensorAt(&runtime, out_rows, 2, &.{ 3, 4 });
 }
 
 fn tensor(runtime: *Runtime, len: usize) !wire.TensorRange {
     return runtime.heap.allocate(len * @sizeOf(f32), @alignOf(f32));
+}
+
+fn rawTensor(runtime: *Runtime, len: usize, tensor_alignment: u32) !wire.TensorRange {
+    return runtime.heap.allocate(len, tensor_alignment);
 }
 
 fn writeTensor(runtime: *Runtime, range: wire.TensorRange, values: []const f32) !void {
@@ -263,11 +298,28 @@ fn writeTensor(runtime: *Runtime, range: wire.TensorRange, values: []const f32) 
     }
 }
 
+fn writeI32Tensor(runtime: *Runtime, range: wire.TensorRange, values: []const i32) !void {
+    const bytes = try runtime.heap.bytes(range);
+    try std.testing.expectEqual(values.len * @sizeOf(i32), bytes.len);
+    for (values, 0..) |value, i| {
+        std.mem.writeInt(i32, bytes[i * @sizeOf(i32) ..][0..4], value, .little);
+    }
+}
+
 fn expectTensor(runtime: *Runtime, range: wire.TensorRange, expected: []const f32) !void {
     const bytes = try runtime.heap.read(range);
     try std.testing.expectEqual(expected.len * @sizeOf(f32), bytes.len);
     for (expected, 0..) |value, i| {
         try std.testing.expect(@abs(value - readF32(bytes, i)) <= 0.000001);
+    }
+}
+
+fn expectF16TensorAt(runtime: *Runtime, range: wire.TensorRange, start_index: usize, expected: []const f32) !void {
+    const bytes = try runtime.heap.read(range);
+    for (expected, 0..) |value, i| {
+        const index = start_index + i;
+        const half: f16 = @bitCast(std.mem.readInt(u16, bytes[index * @sizeOf(f16) ..][0..2], .little));
+        try std.testing.expect(@abs(value - @as(f32, @floatCast(half))) <= 0.000001);
     }
 }
 
