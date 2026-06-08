@@ -1,6 +1,8 @@
 const std = @import("std");
 
 const ModuleSet = struct {
+    build_options: *std.Build.Module,
+    c: ?*std.Build.Module,
     q1a8: *std.Build.Module,
     framing: *std.Build.Module,
     protocol_transport: *std.Build.Module,
@@ -19,6 +21,9 @@ const ModuleSet = struct {
     host_tcp: *std.Build.Module,
     device_tcp: *std.Build.Module,
     link: *std.Build.Module,
+    llama: ?*std.Build.Module,
+    lower: ?*std.Build.Module,
+    backend: ?*std.Build.Module,
     run: *std.Build.Module,
 };
 
@@ -26,7 +31,34 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const modules = createModules(b, target, optimize);
+    const llama_src = b.option(
+        []const u8,
+        "llama-src",
+        "Path to the pinned llama.cpp source tree",
+    ) orelse "";
+    const llama_lib = b.option(
+        []const u8,
+        "llama-lib",
+        "Path to the pinned llama.cpp install/library derivation",
+    ) orelse "";
+    const model_path = b.option(
+        []const u8,
+        "model",
+        "Default GGUF model path for zig build run",
+    ) orelse "";
+    if ((llama_src.len == 0) != (llama_lib.len == 0)) {
+        @panic("pass both -Dllama-src=/path/to/llama.cpp and -Dllama-lib=/path/to/llama-install, or neither");
+    }
+    const enable_llama = llama_src.len != 0;
+
+    const options = b.addOptions();
+    options.addOption(bool, "enable_llama", enable_llama);
+    options.addOption([]const u8, "default_model_path", model_path);
+    const options_mod = options.createModule();
+
+    const c_mod = if (enable_llama) createLlamaCModule(b, target, llama_src) else null;
+
+    const modules = createModules(b, target, optimize, options_mod, c_mod);
 
     const test_step = b.step("test", "Run host-only unit and fake full-stack tests");
     addTest(b, test_step, "shared/protocol/framing.zig", target, optimize, modules);
@@ -54,6 +86,7 @@ pub fn build(b: *std.Build) void {
         .name = "penzai",
         .root_module = host_mod,
     });
+    if (enable_llama) linkLlama(b, host_mod, llama_lib);
     b.installArtifact(host_exe);
 
     const kr260_target = b.resolveTargetQuery(.{
@@ -62,7 +95,7 @@ pub fn build(b: *std.Build) void {
         .abi = .gnu,
         .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.cortex_a53 },
     });
-    const kr260_modules = createModules(b, kr260_target, optimize);
+    const kr260_modules = createModules(b, kr260_target, optimize, options_mod, null);
     const device_mod = b.createModule(.{
         .root_source_file = b.path("device/main.zig"),
         .target = kr260_target,
@@ -96,6 +129,8 @@ fn createModules(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Module,
+    c_mod: ?*std.Build.Module,
 ) ModuleSet {
     const q1a8 = b.createModule(.{ .root_source_file = b.path("shared/q1a8.zig"), .target = target, .optimize = optimize });
     const framing = b.createModule(.{ .root_source_file = b.path("shared/protocol/framing.zig"), .target = target, .optimize = optimize });
@@ -115,6 +150,9 @@ fn createModules(
     const host_tcp = b.createModule(.{ .root_source_file = b.path("host/transport/tcp.zig"), .target = target, .optimize = optimize });
     const device_tcp = b.createModule(.{ .root_source_file = b.path("device/transport/tcp.zig"), .target = target, .optimize = optimize });
     const link = b.createModule(.{ .root_source_file = b.path("host/link.zig"), .target = target, .optimize = optimize });
+    const llama = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/llama.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
+    const lower = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/lower.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
+    const backend = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const run = b.createModule(.{ .root_source_file = b.path("host/run.zig"), .target = target, .optimize = optimize });
 
     protocol_transport.addImport("framing", framing);
@@ -144,13 +182,36 @@ fn createModules(
     link.addImport("runtime", runtime);
     link.addImport("server", server);
     link.addImport("host_tcp", host_tcp);
+    if (llama) |m| {
+        m.addImport("build_options", build_options);
+        m.addImport("c", c_mod.?);
+        m.addImport("backend", backend.?);
+        m.addImport("link", link);
+    }
+    if (lower) |m| {
+        m.addImport("c", c_mod.?);
+        m.addImport("q1a8", q1a8);
+        m.addImport("wire", wire);
+    }
+    if (backend) |m| {
+        m.addImport("c", c_mod.?);
+        m.addImport("q1a8", q1a8);
+        m.addImport("wire", wire);
+        m.addImport("link", link);
+        m.addImport("lower", lower.?);
+    }
+    run.addImport("build_options", build_options);
     run.addImport("q1a8", q1a8);
     run.addImport("protocol_transport", protocol_transport);
     run.addImport("wire", wire);
     run.addImport("runtime", runtime);
     run.addImport("link", link);
+    if (llama) |m| run.addImport("llama", m);
+    if (backend) |m| run.addImport("backend", m);
 
     return .{
+        .build_options = build_options,
+        .c = c_mod,
         .q1a8 = q1a8,
         .framing = framing,
         .protocol_transport = protocol_transport,
@@ -169,11 +230,15 @@ fn createModules(
         .host_tcp = host_tcp,
         .device_tcp = device_tcp,
         .link = link,
+        .llama = llama,
+        .lower = lower,
+        .backend = backend,
         .run = run,
     };
 }
 
 fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
+    mod.addImport("build_options", modules.build_options);
     mod.addImport("q1a8", modules.q1a8);
     mod.addImport("framing", modules.framing);
     mod.addImport("protocol_transport", modules.protocol_transport);
@@ -192,6 +257,9 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("host_tcp", modules.host_tcp);
     mod.addImport("device_tcp", modules.device_tcp);
     mod.addImport("link", modules.link);
+    if (modules.llama) |m| mod.addImport("llama", m);
+    if (modules.lower) |m| mod.addImport("lower", m);
+    if (modules.backend) |m| mod.addImport("backend", m);
     mod.addImport("run", modules.run);
 }
 
@@ -211,4 +279,31 @@ fn addTest(
     attachCommon(mod, modules);
     const test_exe = b.addTest(.{ .root_module = mod });
     step.dependOn(&b.addRunArtifact(test_exe).step);
+}
+
+fn createLlamaCModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    llama_src: []const u8,
+) *std.Build.Module {
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("host/c_api.h"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "include" }) });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "src" }) });
+    return translate_c.createModule();
+}
+
+fn linkLlama(b: *std.Build, mod: *std.Build.Module, llama_lib: []const u8) void {
+    const lib_path = b.pathJoin(&.{ llama_lib, "lib" });
+    mod.addLibraryPath(.{ .cwd_relative = lib_path });
+    mod.addRPath(.{ .cwd_relative = lib_path });
+    mod.linkSystemLibrary("llama", .{});
+    mod.linkSystemLibrary("ggml", .{});
+    mod.linkSystemLibrary("ggml-base", .{});
+    mod.linkSystemLibrary("ggml-cpu", .{});
 }

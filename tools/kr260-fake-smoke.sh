@@ -61,7 +61,7 @@ SSH_PID=$!
 echo "== run host smoke -> $HOST_DEVICE =="
 ok=0
 for _ in $(seq 1 30); do
-  if ./zig-out/bin/penzai run \
+  if ./zig-out/bin/penzai matmul \
     --device "$HOST_DEVICE" \
     --rows "$PENZAI_ROWS" \
     --cols "$PENZAI_COLS" \

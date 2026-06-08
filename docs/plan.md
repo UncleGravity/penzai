@@ -18,23 +18,23 @@ Targets W1A8 (1-bit) now, W1.58A8 (ternary) later.
 ## File tree
 
 ```
-build.zig  build.zig.zon          # two artifacts: penzai (native), penzaid (arm cross-compile)
+build.zig  build.zig.zon          # penzai native, penzaid verified board target, tests
 
 shared/                           # ── compiled into BOTH binaries; comptime; no OS/ggml ──
   protocol/
-    transport.zig                 #   byte-pipe interface (writeAll/readExact)
+    transport.zig                 #   byte-pipe shape (read/write exact bytes; I/O at edges)
     framing.zig                   #   message delimiting (envelope)
-    wire.zig                      #   message schema + command buffer (THE contract; grows)
+    wire.zig                      #   schema + command buffer + explicit codecs (THE contract)
   q1a8.zig                        #   1-bit weight pack/merge layout  (q158.zig later)
   trace.zig                       #   comptime-gated diagnostics (custom std.log sink)
   profiling.zig                   #   Span record + ring buffer + clock + merge
 
 host/                             # ── runs wherever llama.cpp runs ──
-  main.zig                        #   `penzai run|prof`: args, --device, profiling flags
+  main.zig                        #   `penzai run|prof`: main(init), --device, profiling flags
   run.zig                         #   decode loop: tokenize → llama_decode → sample → emit
-  llama.zig                       #   thin @cImport("llama.h") wrapper
+  llama.zig                       #   wrapper over build-translated llama/ggml C headers
   backend.zig                     #   ggml vtables; registered in-process
-  lower.zig                       #   ggml node → wire command (table-driven; op registry)
+  lower.zig                       #   ggml node → wire command (table-driven; closed op table)
   link.zig                        #   generic Link: framing+wire over any transport
   transport/{fake,tcp,usb}.zig    #   client byte-pipes (fake = host-side no-hardware device)
   prof_report.zig                 #   `penzai prof`: JSONL rollup + Chrome-trace export
@@ -69,8 +69,9 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 2. **The wire schema is the host↔device contract**, not a Zig vtable. Host produces
    command buffers; device consumes them. `device/` never imports ggml/llama, so it
    is frontend-agnostic.
-3. **Binary wire format**, not JSON. The device collects fixed-size records; the host
-   formats. JSON only for HELLO/trace.
+3. **Binary wire format**, not JSON. Use fixed-width fields and explicit
+   encode/decode helpers; never native layout or pointer-cast parsing. The device
+   collects fixed-size records; the host formats. JSON only for HELLO/trace.
 4. **Single source of truth schema** in `wire.zig` (comptime, shared) and a generated
    `regmap` for the RTL↔driver register contract. No tri-lingual drift.
 5. **llama in-process**, no `.so`/env/rpath dance.
@@ -91,7 +92,7 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 - **Explicit dependencies in the command buffer.** Host owns the graph, so each op
   declares its input/output handles. `schedule.zig` *follows* deps — no on-device
   inference, no reliance on ggml arena invariants.
-- **Direct `switch` on op tag**, no kernel registry (closed op set).
+- **Direct `switch` on op tag**, no runtime kernel registry (closed op set).
 - **Slab interface** (cma/fake) and **PL/PS matmul implementations** are the justified seams:
   both exist to run the whole runtime on a laptop and to give a bit-exact oracle.
 - **server/runtime split exists for tests and deployment** — `server` owns transport
@@ -125,6 +126,10 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
 ## Build
 
 - `zig build` → penzai + penzaid (+ `test`, fast, no hardware).
+- Pin one exact Zig version. If using Zig 0.16.x, design entry points around
+  `std.process.Init` and pass `std.Io` down to code that performs I/O.
+- Verify the PYNQ-Z1 target triple, libc, CPU features, and minimum kernel
+  version in `build.zig`; do not treat the board target as an implicit default.
 - `zig build test-rtl` → Verilator (free/fast/local) over `fpga/rtl/`, driven by Zig.
 - `zig build test-golden` / `test-board` / `bench` for the heavier tiers.
 - **Vivado bitstreams are out-of-band**: `fpga/bitstreams/<name>/build.sh`
@@ -139,4 +144,3 @@ test/{golden,kernels,alloc,fullstack}.zig   # host-side, no hardware
   (`overhead = round_trip − device_total`). PL hardware counters (compute vs stall
   cycles → array utilization) are first-class.
 - Mechanism lives in `shared/`; content is inline scoped calls; both comptime-gated.
-```

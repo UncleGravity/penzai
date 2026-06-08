@@ -101,6 +101,57 @@ pub fn packWeightsFromLogical(
     }
 }
 
+pub fn packWeightsFromGgmlQ1_0(
+    rows: usize,
+    k: usize,
+    q1_0_weights: []const u8,
+    out: []u8,
+) LayoutError!void {
+    const q1_blocks = try blocksPerRow(k);
+    if (q1_0_weights.len != rows * q1_blocks * q1_block_bytes) return error.InvalidLength;
+    if (out.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
+
+    @memset(out, 0);
+    var cursor: usize = 0;
+    const source_row_bytes = q1_blocks * q1_block_bytes;
+    for (0..rowblocksFor(rows)) |rb| {
+        const row_start = rb * rows_per_block;
+        const row_count = @min(rows_per_block, rows - row_start);
+        for (0..q1_blocks) |q1| {
+            for (0..scale_beats) |beat| {
+                var word: u64 = 0;
+                for (0..4) |local| {
+                    const lane = beat * 4 + local;
+                    if (lane < row_count) {
+                        const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
+                        const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
+                        word |= @as(u64, scale) << @intCast(local * 16);
+                    }
+                }
+                putU64(out, &cursor, word);
+            }
+
+            for (0..q8_subblocks) |sub| {
+                for (0..wbits_beats) |beat| {
+                    var word: u64 = 0;
+                    for (0..2) |local| {
+                        const lane = beat * 2 + local;
+                        if (lane < row_count) {
+                            const source_offset = (row_start + lane) * source_row_bytes +
+                                q1 * q1_block_bytes +
+                                @sizeOf(f16) +
+                                sub * (q8_block / 8);
+                            const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
+                            word |= @as(u64, bits) << @intCast(local * 32);
+                        }
+                    }
+                    putU64(out, &cursor, word);
+                }
+            }
+        }
+    }
+}
+
 pub fn packedWeightScale(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize) LayoutError!f16 {
     const q1_blocks = try blocksPerRow(k);
     if (weights.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
@@ -183,6 +234,34 @@ test "pack logical weights and read back lanes" {
     try std.testing.expectEqual(scales[0], try packedWeightScale(&packed_buf, rows, k, 0, 0));
     try std.testing.expectEqual(@as(u32, 0xFFFF_FFFF), try packedWeightBits(&packed_buf, rows, k, 0, 0, 0));
     try std.testing.expectEqual(scales[rows - 1], try packedWeightScale(&packed_buf, rows, k, rows - 1, 0));
+}
+
+test "pack ggml q1_0 bytes matches logical packer" {
+    const rows = rows_per_block + 1;
+    const k = q1_block;
+    const q1_blocks = comptime blocksPerRow(k) catch unreachable;
+    const logical_len = rows * q1_blocks;
+    const raw_len = rows * q1_blocks * q1_block_bytes;
+    const packed_len = comptime packedWeightBytes(rows, k) catch unreachable;
+
+    var bits: [logical_len]u128 = undefined;
+    var scales: [logical_len]f16 = undefined;
+    var raw: [raw_len]u8 = undefined;
+    for (0..logical_len) |i| {
+        bits[i] = (@as(u128, 0xABCD_EF01) << 96) | (@as(u128, i + 1) << 32) | 0xFFFF_FFFF;
+        scales[i] = @floatCast(@as(f32, @floatFromInt(i + 1)));
+        const off = i * q1_block_bytes;
+        std.mem.writeInt(u16, raw[off..][0..2], @bitCast(scales[i]), .little);
+        for (0..4) |sub| {
+            std.mem.writeInt(u32, raw[off + 2 + sub * 4 ..][0..4], @truncate(bits[i] >> @intCast(sub * 32)), .little);
+        }
+    }
+
+    var from_logical: [packed_len]u8 = undefined;
+    var from_raw: [packed_len]u8 = undefined;
+    try packWeightsFromLogical(rows, k, &bits, &scales, &from_logical);
+    try packWeightsFromGgmlQ1_0(rows, k, &raw, &from_raw);
+    try std.testing.expectEqualSlices(u8, &from_logical, &from_raw);
 }
 
 test "quantize exact scale when amax is 127" {

@@ -43,29 +43,86 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         return;
     }
 
-    if (!std.mem.eql(u8, command, "run")) return error.InvalidCommand;
+    if (std.mem.eql(u8, command, "run")) {
+        try runLlamaCommand(init, &args, stdout);
+        return;
+    }
+    if (std.mem.eql(u8, command, "matmul")) {
+        try runMatmulCommand(init, &args, stdout);
+        return;
+    }
+    return error.InvalidCommand;
+}
 
+fn runLlamaCommand(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+) CliError!void {
+    var options: run_mod.LlamaOptions = .{};
+    var device: []const u8 = "fake";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--device")) {
+            device = try requireValue(args, "--device");
+        } else if (std.mem.startsWith(u8, arg, "--device=")) {
+            device = arg["--device=".len..];
+        } else if (std.mem.eql(u8, arg, "-m") or std.mem.eql(u8, arg, "--model")) {
+            options.model_path = try requireValue(args, arg);
+        } else if (std.mem.startsWith(u8, arg, "--model=")) {
+            options.model_path = arg["--model=".len..];
+        } else if (std.mem.eql(u8, arg, "--prompt")) {
+            options.prompt = try requireValue(args, "--prompt");
+        } else if (std.mem.startsWith(u8, arg, "--prompt=")) {
+            options.prompt = arg["--prompt=".len..];
+        } else if (std.mem.eql(u8, arg, "--max-tokens")) {
+            options.max_tokens = try parseU32(try requireValue(args, "--max-tokens"));
+        } else if (std.mem.startsWith(u8, arg, "--max-tokens=")) {
+            options.max_tokens = try parseU32(arg["--max-tokens=".len..]);
+        } else if (std.mem.eql(u8, arg, "--heap-mib")) {
+            options.heap_mib = try parseU32(try requireValue(args, "--heap-mib"));
+        } else if (std.mem.startsWith(u8, arg, "--heap-mib=")) {
+            options.heap_mib = try parseU32(arg["--heap-mib=".len..]);
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try writeUsage(stdout);
+            return;
+        } else {
+            return error.InvalidOption;
+        }
+    }
+
+    const device_spec = try protocol_transport.parseDeviceSpec(device);
+    switch (device_spec) {
+        .fake => try run_mod.runFakeLlama(init.gpa, stdout, options),
+        .tcp => |tcp| try run_mod.runTcpLlama(init.io, init.gpa, stdout, tcp, options),
+    }
+}
+
+fn runMatmulCommand(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+) CliError!void {
     var options: run_mod.RunOptions = .{};
     var device: []const u8 = "fake";
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--device")) {
-            device = try requireValue(&args, "--device");
+            device = try requireValue(args, "--device");
         } else if (std.mem.startsWith(u8, arg, "--device=")) {
             device = arg["--device=".len..];
         } else if (std.mem.eql(u8, arg, "--rows")) {
-            options.rows = try parseU32(try requireValue(&args, "--rows"));
+            options.rows = try parseU32(try requireValue(args, "--rows"));
         } else if (std.mem.startsWith(u8, arg, "--rows=")) {
             options.rows = try parseU32(arg["--rows=".len..]);
         } else if (std.mem.eql(u8, arg, "--cols")) {
-            options.cols = try parseU32(try requireValue(&args, "--cols"));
+            options.cols = try parseU32(try requireValue(args, "--cols"));
         } else if (std.mem.startsWith(u8, arg, "--cols=")) {
             options.cols = try parseU32(arg["--cols=".len..]);
         } else if (std.mem.eql(u8, arg, "--k")) {
-            options.k = try parseU32(try requireValue(&args, "--k"));
+            options.k = try parseU32(try requireValue(args, "--k"));
         } else if (std.mem.startsWith(u8, arg, "--k=")) {
             options.k = try parseU32(arg["--k=".len..]);
         } else if (std.mem.eql(u8, arg, "--heap-mib")) {
-            options.heap_mib = try parseU32(try requireValue(&args, "--heap-mib"));
+            options.heap_mib = try parseU32(try requireValue(args, "--heap-mib"));
         } else if (std.mem.startsWith(u8, arg, "--heap-mib=")) {
             options.heap_mib = try parseU32(arg["--heap-mib=".len..]);
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -81,7 +138,7 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         .fake => try run_mod.runFakeMatmul(init.gpa, options),
         .tcp => |tcp| try run_mod.runTcpMatmul(init.io, init.gpa, tcp, options),
     };
-    try stdout.print("penzai run\n", .{});
+    try stdout.print("penzai matmul\n", .{});
     switch (device_spec) {
         .fake => try stdout.print("device=fake rows={d} cols={d} k={d} commands={d}\n", .{
             result.rows,
@@ -121,11 +178,13 @@ fn parseU32(value: []const u8) CliError!u32 {
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
-        \\  penzai run --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N]
+        \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
+        \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
         \\
         \\commands:
-        \\  run      execute the Q1A8 smoke path through fake or TCP device
+        \\  run      generate text through llama.cpp and the penzai backend
+        \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  help     show this help
         \\
     );

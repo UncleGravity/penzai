@@ -1,9 +1,14 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const q1a8 = @import("q1a8");
 const protocol_transport = @import("protocol_transport");
 const wire = @import("wire");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
+const llama_mod = if (build_options.enable_llama) @import("llama") else struct {
+    pub const Error = error{};
+    pub const Options = struct {};
+};
 
 pub const RunError = error{
     InvalidShape,
@@ -11,7 +16,8 @@ pub const RunError = error{
     Protocol,
     RemoteFailed,
     Transport,
-};
+    LlamaDisabled,
+} || llama_mod.Error;
 
 pub const RunOptions = struct {
     rows: u32 = @intCast(q1a8.rows_per_block),
@@ -31,6 +37,48 @@ pub const RunResult = struct {
     expected: f32,
     max_abs_diff: f32,
 };
+
+pub const LlamaOptions = struct {
+    model_path: []const u8 = build_options.default_model_path,
+    prompt: []const u8 = "Hello",
+    max_tokens: u32 = 16,
+    heap_mib: u32 = 768,
+};
+
+pub fn runFakeLlama(
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    options: LlamaOptions,
+) RunError!void {
+    if (!build_options.enable_llama) return error.LlamaDisabled;
+    var runtime = try runtime_mod.Runtime.init(allocator, try heapBytes(options.heap_mib));
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(allocator, &runtime);
+    const client = link_mod.Client.init(&link);
+    return llama_mod.runPrompt(allocator, writer, client, .{
+        .model_path = options.model_path,
+        .prompt = options.prompt,
+        .max_tokens = options.max_tokens,
+    });
+}
+
+pub fn runTcpLlama(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    writer: *std.Io.Writer,
+    spec: protocol_transport.TcpSpec,
+    options: LlamaOptions,
+) RunError!void {
+    if (!build_options.enable_llama) return error.LlamaDisabled;
+    var link = try link_mod.TcpLink.connect(allocator, io, spec);
+    defer link.deinit();
+    const client = link_mod.Client.init(&link);
+    return llama_mod.runPrompt(allocator, writer, client, .{
+        .model_path = options.model_path,
+        .prompt = options.prompt,
+        .max_tokens = options.max_tokens,
+    });
+}
 
 pub fn runFakeMatmul(allocator: std.mem.Allocator, options: RunOptions) RunError!RunResult {
     var runtime = try runtime_mod.Runtime.init(allocator, try heapBytes(options.heap_mib));

@@ -13,6 +13,97 @@ pub const LinkError = error{
     Transport,
 };
 
+pub const Client = struct {
+    const Self = @This();
+
+    ctx: *anyopaque,
+    vtable: *const VTable,
+
+    const VTable = struct {
+        hello: *const fn (*anyopaque) LinkError!void,
+        alloc: *const fn (*anyopaque, u64, u32) LinkError!wire.TensorRange,
+        free: *const fn (*anyopaque, wire.TensorRange) LinkError!void,
+        upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!void,
+        download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!void,
+        run_graph: *const fn (*anyopaque, []const wire.Command) LinkError!void,
+    };
+
+    pub fn init(link: anytype) Self {
+        const Ptr = @TypeOf(link);
+        const info = @typeInfo(Ptr);
+        if (info != .pointer) @compileError("Link.Client.init expects a pointer");
+        const Child = info.pointer.child;
+
+        const adapter = struct {
+            fn ptr(ctx: *anyopaque) *Child {
+                return @ptrCast(@alignCast(ctx));
+            }
+
+            fn callHello(ctx: *anyopaque) LinkError!void {
+                return ptr(ctx).hello();
+            }
+
+            fn callAlloc(ctx: *anyopaque, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+                return ptr(ctx).alloc(nbytes, alignment);
+            }
+
+            fn callFree(ctx: *anyopaque, range: wire.TensorRange) LinkError!void {
+                return ptr(ctx).free(range);
+            }
+
+            fn callUpload(ctx: *anyopaque, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+                return ptr(ctx).upload(range, bytes);
+            }
+
+            fn callDownload(ctx: *anyopaque, range: wire.TensorRange, out: []u8) LinkError!void {
+                return ptr(ctx).download(range, out);
+            }
+
+            fn callRunGraph(ctx: *anyopaque, commands: []const wire.Command) LinkError!void {
+                return ptr(ctx).runGraph(commands);
+            }
+
+            const vtable = VTable{
+                .hello = callHello,
+                .alloc = callAlloc,
+                .free = callFree,
+                .upload = callUpload,
+                .download = callDownload,
+                .run_graph = callRunGraph,
+            };
+        };
+
+        return .{
+            .ctx = @ptrCast(link),
+            .vtable = &adapter.vtable,
+        };
+    }
+
+    pub fn hello(self: Self) LinkError!void {
+        return self.vtable.hello(self.ctx);
+    }
+
+    pub fn alloc(self: Self, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+        return self.vtable.alloc(self.ctx, nbytes, alignment);
+    }
+
+    pub fn free(self: Self, range: wire.TensorRange) LinkError!void {
+        return self.vtable.free(self.ctx, range);
+    }
+
+    pub fn upload(self: Self, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+        return self.vtable.upload(self.ctx, range, bytes);
+    }
+
+    pub fn download(self: Self, range: wire.TensorRange, out: []u8) LinkError!void {
+        return self.vtable.download(self.ctx, range, out);
+    }
+
+    pub fn runGraph(self: Self, commands: []const wire.Command) LinkError!void {
+        return self.vtable.run_graph(self.ctx, commands);
+    }
+};
+
 pub const FakeLink = struct {
     const Self = @This();
 
