@@ -68,6 +68,7 @@ test "fake link ps f32 command graph" {
 
     const a = try allocTensor(&link, 2);
     const b = try allocTensor(&link, 2);
+    const positions = try link.alloc(@sizeOf(i32), @alignOf(i32));
     const out_rms = try allocTensor(&link, 2);
     const out_rope = try allocTensor(&link, 2);
     const out_softmax = try allocTensor(&link, 2);
@@ -80,10 +81,29 @@ test "fake link ps f32 command graph" {
 
     try uploadTensor(&link, a, &.{ 3, 4 });
     try uploadTensor(&link, b, &.{ 1, 2 });
+    var position_bytes: [4]u8 = undefined;
+    writeI32(&position_bytes, 0, 1);
+    try link.upload(positions, &position_bytes);
 
     try link.runGraph(&.{
         .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
-        .{ .rope = .{ .input = b, .dst = out_rope, .position = 1, .theta = 10000 } },
+        .{ .rope = .{
+            .input = b,
+            .positions = positions,
+            .dst = out_rope,
+            .head_dim = 2,
+            .n_heads = 1,
+            .n_tokens = 1,
+            .n_dims = 2,
+            .mode = .normal,
+            .n_ctx_orig = 0,
+            .freq_base = 10000,
+            .freq_scale = 1,
+            .ext_factor = 0,
+            .attn_factor = 1,
+            .beta_fast = 0,
+            .beta_slow = 0,
+        } },
         .{ .softmax = .{ .src = b, .dst = out_softmax } },
         .{ .silu = .{ .src = b, .dst = out_silu } },
         .{ .swiglu = .{ .lhs = b, .rhs = a, .dst = out_swiglu } },
@@ -132,6 +152,10 @@ fn expectApprox(expected: f32, actual: f32, tolerance: f32) !void {
 
 fn writeF32(bytes: []u8, offset: usize, value: f32) void {
     std.mem.writeInt(u32, bytes[offset..][0..4], @bitCast(value), .little);
+}
+
+fn writeI32(bytes: []u8, offset: usize, value: i32) void {
+    std.mem.writeInt(i32, bytes[offset..][0..4], value, .little);
 }
 
 fn readF32(bytes: []const u8, offset: usize) f32 {

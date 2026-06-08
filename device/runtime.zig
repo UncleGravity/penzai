@@ -113,8 +113,22 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 },
                 .rope => |rope| {
                     const input = self.heap.read(rope.input) catch |err| return mapHeapError(err);
+                    const positions = self.heap.read(rope.positions) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(rope.dst) catch |err| return mapHeapError(err);
-                    ps_rope.applyBytes(input, dst, rope.position, rope.theta) catch |err| return mapKernelError(err);
+                    ps_rope.applyBytes(input, positions, dst, .{
+                        .head_dim = rope.head_dim,
+                        .n_heads = rope.n_heads,
+                        .n_tokens = rope.n_tokens,
+                        .n_dims = rope.n_dims,
+                        .mode = ropeMode(rope.mode),
+                        .n_ctx_orig = rope.n_ctx_orig,
+                        .freq_base = rope.freq_base,
+                        .freq_scale = rope.freq_scale,
+                        .ext_factor = rope.ext_factor,
+                        .attn_factor = rope.attn_factor,
+                        .beta_fast = rope.beta_fast,
+                        .beta_slow = rope.beta_slow,
+                    }) catch |err| return mapKernelError(err);
                 },
                 .softmax => |softmax| {
                     const src = self.heap.read(softmax.src) catch |err| return mapHeapError(err);
@@ -199,6 +213,13 @@ fn rhsRowBroadcast(mode: wire.BinaryF32Mode) bool {
     };
 }
 
+fn ropeMode(mode: wire.RopeMode) ps_rope.Mode {
+    return switch (mode) {
+        .normal => .normal,
+        .neox => .neox,
+    };
+}
+
 fn mapHeapError(err: anyerror) RuntimeError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
@@ -244,7 +265,23 @@ test "runtime dispatches ps f32 command variants" {
 
     const commands = [_]wire.Command{
         .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
-        .{ .rope = .{ .input = b, .dst = out_rope, .position = 0, .theta = 10000 } },
+        .{ .rope = .{
+            .input = b,
+            .positions = indices,
+            .dst = out_rope,
+            .head_dim = 2,
+            .n_heads = 1,
+            .n_tokens = 1,
+            .n_dims = 2,
+            .mode = .normal,
+            .n_ctx_orig = 0,
+            .freq_base = 10000,
+            .freq_scale = 1,
+            .ext_factor = 0,
+            .attn_factor = 1,
+            .beta_fast = 0,
+            .beta_slow = 0,
+        } },
         .{ .softmax = .{ .src = b, .dst = out_softmax } },
         .{ .silu = .{ .src = b, .dst = out_silu } },
         .{ .swiglu = .{ .lhs = b, .rhs = a, .dst = out_swiglu } },
@@ -292,7 +329,7 @@ test "runtime dispatches ps f32 command variants" {
             .dst_nb3 = 2 * @sizeOf(f32),
         } },
     };
-    var command_bytes: [1024]u8 = undefined;
+    var command_bytes: [2048]u8 = undefined;
     const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
 
     const result = try runtime.dispatch(.{ .run_graph = .{
@@ -303,7 +340,7 @@ test "runtime dispatches ps f32 command variants" {
     try std.testing.expectEqual(@as(u64, commands.len), result.meta.value0);
 
     try expectTensor(&runtime, out_rms, &.{ 0.84852815, 1.1313709 });
-    try expectTensor(&runtime, out_rope, &.{ 1, 2 });
+    try expectTensor(&runtime, out_rope, &.{ -1.1426396, 1.9220756 });
     try expectTensor(&runtime, out_softmax, &.{ 0.26894143, 0.7310586 });
     try expectTensor(&runtime, out_silu, &.{ 0.7310586, 1.761594 });
     try expectTensor(&runtime, out_swiglu, &.{ 2.1931758, 7.046376 });

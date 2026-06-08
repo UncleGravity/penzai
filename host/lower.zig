@@ -38,6 +38,7 @@ pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
     return supportsMatmulQ1A8(tensor) or
         supportsBinaryF32(tensor) or
         supportsRmsNormF32(tensor) or
+        supportsRopeF32(tensor) or
         supportsSwigluF32(tensor) or
         supportsSetRows(tensor) or
         supportsGetRows(tensor);
@@ -68,6 +69,10 @@ pub fn lowerGraph(
         }
         if (supportsRmsNormF32(node)) {
             try commands.append(allocator, try lowerRmsNormF32(node, lookup));
+            continue;
+        }
+        if (supportsRopeF32(node)) {
+            try commands.append(allocator, try lowerRopeF32(node, lookup));
             continue;
         }
         if (supportsSwigluF32(node)) {
@@ -137,6 +142,32 @@ fn supportsRmsNormF32(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_RMS_NORM or !isContiguousF32(op)) return false;
     const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
     return isContiguousF32(src) and sameShape(src, op);
+}
+
+fn supportsRopeF32(op: *const c.ggml_tensor) bool {
+    if (op.*.op != c.GGML_OP_ROPE or !isContiguousF32(op)) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    const positions: *const c.ggml_tensor = op.*.src[1] orelse return false;
+    if (op.*.src[2] != null) return false;
+    if (!isContiguousF32(src) or positions.*.type != c.GGML_TYPE_I32 or !c.ggml_is_contiguous(positions)) return false;
+    if (src.*.nb[0] != @sizeOf(f32) or positions.*.nb[0] != @sizeOf(i32)) return false;
+    if (dim(src, 3) != 1 or dim(op, 3) != 1) return false;
+    if (dim(src, 0) != dim(op, 0) or dim(src, 1) != dim(op, 1) or dim(src, 2) != dim(op, 2)) return false;
+    if (dim(src, 0) <= 0 or dim(src, 1) <= 0 or dim(src, 2) <= 0) return false;
+    if (dim(positions, 0) < dim(src, 2)) return false;
+    const n_dims = opParamI32(op, 1);
+    if (n_dims <= 0 or @mod(n_dims, 2) != 0 or n_dims > dim(src, 0)) return false;
+    if (ropeMode(opParamI32(op, 2)) == null) return false;
+    const freq_base = opParamF32(op, 5);
+    const freq_scale = opParamF32(op, 6);
+    const ext_factor = opParamF32(op, 7);
+    const attn_factor = opParamF32(op, 8);
+    const beta_fast = opParamF32(op, 9);
+    const beta_slow = opParamF32(op, 10);
+    if (!finitePositive(freq_base) or !finitePositive(freq_scale)) return false;
+    if (!std.math.isFinite(ext_factor) or !std.math.isFinite(attn_factor) or !std.math.isFinite(beta_fast) or !std.math.isFinite(beta_slow)) return false;
+    if (ext_factor != 0 and (beta_fast <= 0 or beta_slow <= 0)) return false;
+    return true;
 }
 
 fn supportsSwigluF32(op: *const c.ggml_tensor) bool {
@@ -249,6 +280,47 @@ fn lowerRmsNormF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
         .rows = rows,
         .cols = cols,
         .eps = opParamF32(node, 0),
+    } };
+}
+
+fn lowerRopeF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const positions: *const c.ggml_tensor = node.*.src[1] orelse return error.InvalidShape;
+    const head_dim = try u32Dim(dim(src, 0));
+    const n_heads = try u32Dim(dim(src, 1));
+    const n_tokens = try u32Dim(dim(src, 2));
+    const n_dims = try u32Dim(opParamI32(node, 1));
+    const mode = ropeMode(opParamI32(node, 2)) orelse return error.InvalidShape;
+    const n_ctx_orig_i32 = opParamI32(node, 4);
+    if (n_ctx_orig_i32 < 0) return error.InvalidShape;
+
+    const total_elements = try checkedMul(
+        try checkedMul(@as(usize, @intCast(head_dim)), @as(usize, @intCast(n_heads))),
+        @as(usize, @intCast(n_tokens)),
+    );
+    const total_bytes = try checkedMul(total_elements, @sizeOf(f32));
+    const positions_bytes = try checkedMul(@as(usize, @intCast(n_tokens)), @sizeOf(i32));
+
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const positions_binding = lookup.find(positions) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    return .{ .rope = .{
+        .input = try backingRange(src_binding, total_bytes),
+        .positions = try backingRange(positions_binding, positions_bytes),
+        .dst = try backingRange(dst_binding, total_bytes),
+        .head_dim = head_dim,
+        .n_heads = n_heads,
+        .n_tokens = n_tokens,
+        .n_dims = n_dims,
+        .mode = mode,
+        .n_ctx_orig = @intCast(n_ctx_orig_i32),
+        .freq_base = opParamF32(node, 5),
+        .freq_scale = opParamF32(node, 6),
+        .ext_factor = opParamF32(node, 7),
+        .attn_factor = opParamF32(node, 8),
+        .beta_fast = opParamF32(node, 9),
+        .beta_slow = opParamF32(node, 10),
     } };
 }
 
@@ -473,6 +545,24 @@ fn opParamF32(tensor: *const c.ggml_tensor, index: usize) f32 {
     const bytes = std.mem.asBytes(&tensor.*.op_params);
     const offset = index * @sizeOf(f32);
     return @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
+}
+
+fn opParamI32(tensor: *const c.ggml_tensor, index: usize) i32 {
+    const bytes = std.mem.asBytes(&tensor.*.op_params);
+    const offset = index * @sizeOf(i32);
+    return std.mem.readInt(i32, bytes[offset..][0..4], .little);
+}
+
+fn ropeMode(ggml_mode: i32) ?wire.RopeMode {
+    return switch (ggml_mode) {
+        0 => .normal,
+        2 => .neox,
+        else => null,
+    };
+}
+
+fn finitePositive(value: f32) bool {
+    return value > 0 and std.math.isFinite(value);
 }
 
 fn dim(tensor: anytype, index: comptime_int) i64 {

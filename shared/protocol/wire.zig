@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 pub const response_meta_len: usize = 48;
 
 pub const RequestTag = enum(u16) {
@@ -74,6 +74,11 @@ pub const GetRowsSrcType = enum(u32) {
 pub const BinaryF32Mode = enum(u32) {
     same_shape = 1,
     rhs_row_broadcast = 2,
+};
+
+pub const RopeMode = enum(u32) {
+    normal = 1,
+    neox = 2,
 };
 
 pub const AllocRequest = struct {
@@ -162,9 +167,20 @@ pub const RmsNorm = struct {
 
 pub const Rope = struct {
     input: TensorRange,
+    positions: TensorRange,
     dst: TensorRange,
-    position: u32,
-    theta: f32,
+    head_dim: u32,
+    n_heads: u32,
+    n_tokens: u32,
+    n_dims: u32,
+    mode: RopeMode,
+    n_ctx_orig: u32,
+    freq_base: f32,
+    freq_scale: f32,
+    ext_factor: f32,
+    attn_factor: f32,
+    beta_fast: f32,
+    beta_slow: f32,
 };
 
 pub const ScaleF32 = struct {
@@ -368,7 +384,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .copy => 4 + rangeLen * 2,
             .matmul_q1a8 => 4 + rangeLen * 3 + 16,
             .rmsnorm => 4 + rangeLen * 2 + 16,
-            .rope => 4 + rangeLen * 2 + 8,
+            .rope => 4 + rangeLen * 3 + 48,
             .softmax, .silu => 4 + rangeLen * 2,
             .swiglu => 4 + rangeLen * 3,
             .add_f32, .mul_f32 => 4 + rangeLen * 3 + 16,
@@ -418,9 +434,20 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU16(out, &cursor, @intFromEnum(OpTag.rope));
             putU16(out, &cursor, 0);
             putRange(out, &cursor, rope.input);
+            putRange(out, &cursor, rope.positions);
             putRange(out, &cursor, rope.dst);
-            putU32(out, &cursor, rope.position);
-            putF32(out, &cursor, rope.theta);
+            putU32(out, &cursor, rope.head_dim);
+            putU32(out, &cursor, rope.n_heads);
+            putU32(out, &cursor, rope.n_tokens);
+            putU32(out, &cursor, rope.n_dims);
+            putU32(out, &cursor, @intFromEnum(rope.mode));
+            putU32(out, &cursor, rope.n_ctx_orig);
+            putF32(out, &cursor, rope.freq_base);
+            putF32(out, &cursor, rope.freq_scale);
+            putF32(out, &cursor, rope.ext_factor);
+            putF32(out, &cursor, rope.attn_factor);
+            putF32(out, &cursor, rope.beta_fast);
+            putF32(out, &cursor, rope.beta_slow);
         },
         .softmax => |unary| {
             putU16(out, &cursor, @intFromEnum(OpTag.softmax));
@@ -563,10 +590,37 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
             },
             .rope => blk: {
                 const input = try takeRange(bytes, &cursor);
+                const positions = try takeRange(bytes, &cursor);
                 const dst = try takeRange(bytes, &cursor);
-                const position = try takeU32(bytes, &cursor);
-                const theta = try takeF32(bytes, &cursor);
-                break :blk .{ .rope = .{ .input = input, .dst = dst, .position = position, .theta = theta } };
+                const head_dim = try takeU32(bytes, &cursor);
+                const n_heads = try takeU32(bytes, &cursor);
+                const n_tokens = try takeU32(bytes, &cursor);
+                const n_dims = try takeU32(bytes, &cursor);
+                const mode = enumFromInt(RopeMode, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                const n_ctx_orig = try takeU32(bytes, &cursor);
+                const freq_base = try takeF32(bytes, &cursor);
+                const freq_scale = try takeF32(bytes, &cursor);
+                const ext_factor = try takeF32(bytes, &cursor);
+                const attn_factor = try takeF32(bytes, &cursor);
+                const beta_fast = try takeF32(bytes, &cursor);
+                const beta_slow = try takeF32(bytes, &cursor);
+                break :blk .{ .rope = .{
+                    .input = input,
+                    .positions = positions,
+                    .dst = dst,
+                    .head_dim = head_dim,
+                    .n_heads = n_heads,
+                    .n_tokens = n_tokens,
+                    .n_dims = n_dims,
+                    .mode = mode,
+                    .n_ctx_orig = n_ctx_orig,
+                    .freq_base = freq_base,
+                    .freq_scale = freq_scale,
+                    .ext_factor = ext_factor,
+                    .attn_factor = attn_factor,
+                    .beta_fast = beta_fast,
+                    .beta_slow = beta_slow,
+                } };
             },
             .softmax => .{ .softmax = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
             .silu => .{ .silu = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
@@ -795,7 +849,23 @@ test "command buffer roundtrip" {
             .k = 128,
         } },
         .{ .rmsnorm = .{ .input = a, .dst = c, .rows = 4, .cols = 2, .eps = 0.00001 } },
-        .{ .rope = .{ .input = a, .dst = b, .position = 7, .theta = 10000 } },
+        .{ .rope = .{
+            .input = a,
+            .positions = b,
+            .dst = c,
+            .head_dim = 8,
+            .n_heads = 2,
+            .n_tokens = 3,
+            .n_dims = 8,
+            .mode = .neox,
+            .n_ctx_orig = 4096,
+            .freq_base = 10000,
+            .freq_scale = 1,
+            .ext_factor = 0,
+            .attn_factor = 1,
+            .beta_fast = 32,
+            .beta_slow = 1,
+        } },
         .{ .softmax = .{ .src = a, .dst = b } },
         .{ .silu = .{ .src = a, .dst = b } },
         .{ .swiglu = .{ .lhs = a, .rhs = b, .dst = c } },
@@ -851,7 +921,9 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[0].copy.src.handle, got[0].copy.src.handle);
     try std.testing.expectEqual(commands[1].matmul_q1a8.k, got[1].matmul_q1a8.k);
     try std.testing.expectEqual(commands[2].rmsnorm.eps, got[2].rmsnorm.eps);
-    try std.testing.expectEqual(commands[3].rope.position, got[3].rope.position);
+    try std.testing.expectEqual(commands[3].rope.positions.handle, got[3].rope.positions.handle);
+    try std.testing.expectEqual(commands[3].rope.mode, got[3].rope.mode);
+    try std.testing.expectEqual(commands[3].rope.freq_base, got[3].rope.freq_base);
     try std.testing.expectEqual(commands[4].softmax.dst.offset, got[4].softmax.dst.offset);
     try std.testing.expectEqual(commands[5].silu.src.handle, got[5].silu.src.handle);
     try std.testing.expectEqual(commands[6].swiglu.rhs.handle, got[6].swiglu.rhs.handle);
