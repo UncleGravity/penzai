@@ -31,15 +31,17 @@ pub const Options = struct {
     threads: u32 = 1,
     logits_tolerance: f32 = 0.001,
     chat_template: bool = true,
+    enable_thinking: bool = false,
 };
 
 const PreparedPrompt = struct {
     allocator: std.mem.Allocator,
-    bytes: []u8,
+    allocation: []u8,
+    bytes: []const u8,
     parse_special: bool,
 
     fn deinit(self: PreparedPrompt) void {
-        self.allocator.free(self.bytes);
+        self.allocator.free(self.allocation);
     }
 };
 
@@ -114,7 +116,7 @@ pub fn runPrompt(
     const sampler = c.llama_sampler_init_greedy() orelse return error.SamplerInitFailed;
     defer c.llama_sampler_free(sampler);
 
-    const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template);
+    const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template, options.enable_thinking);
     defer prepared.deinit();
 
     var token_buffer = try tokenizePrompt(allocator, vocab, prepared, @intCast(options.max_tokens));
@@ -238,7 +240,7 @@ fn collectTrace(
     const generated = try allocator.alloc(c.llama_token, max_decode_tokens);
     errdefer allocator.free(generated);
 
-    const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template);
+    const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template, options.enable_thinking);
     defer prepared.deinit();
 
     var token_buffer = try tokenizePrompt(allocator, vocab, prepared, max_decode_tokens);
@@ -280,74 +282,48 @@ fn preparePrompt(
     model: *const c.llama_model,
     prompt: []const u8,
     use_chat_template: bool,
+    enable_thinking: bool,
 ) Error!PreparedPrompt {
     if (!use_chat_template) {
-        return .{
-            .allocator = allocator,
-            .bytes = try allocator.dupe(u8, prompt),
-            .parse_special = false,
-        };
-    }
-
-    const tmpl = c.llama_model_chat_template(model, null) orelse {
-        return .{
-            .allocator = allocator,
-            .bytes = try allocator.dupe(u8, prompt),
-            .parse_special = false,
-        };
-    };
-
-    if (try formatThinkingChatmlPrompt(allocator, std.mem.span(tmpl), prompt)) |bytes| {
-        return .{
-            .allocator = allocator,
-            .bytes = bytes,
-            .parse_special = true,
-        };
+        return rawPrompt(allocator, prompt);
     }
 
     const prompt_z = try allocator.dupeZ(u8, prompt);
     defer allocator.free(prompt_z);
 
-    var messages = [_]c.llama_chat_message{.{
-        .role = "user",
-        .content = prompt_z.ptr,
-    }};
-    const needed_raw = c.llama_chat_apply_template(tmpl, &messages, messages.len, true, null, 0);
-    if (needed_raw <= 0) return error.ChatTemplateFailed;
+    const needed_raw = c.penzai_chat_format_user(model, prompt_z.ptr, enable_thinking, null, 0);
+    if (needed_raw == c.PENZAI_CHAT_NO_TEMPLATE) return rawPrompt(allocator, prompt);
+    if (needed_raw < 0) return error.ChatTemplateFailed;
     const needed: usize = @intCast(needed_raw);
-    const bytes = try allocator.alloc(u8, needed);
-    errdefer allocator.free(bytes);
 
-    const written = c.llama_chat_apply_template(
-        tmpl,
-        &messages,
-        messages.len,
-        true,
-        @ptrCast(bytes.ptr),
-        try i32Len(needed),
+    const allocation = try allocator.alloc(u8, try checkedAdd(needed, 1));
+    errdefer allocator.free(allocation);
+
+    const out_len = std.math.cast(c_int, allocation.len) orelse return error.ChatTemplateFailed;
+    const written = c.penzai_chat_format_user(
+        model,
+        prompt_z.ptr,
+        enable_thinking,
+        @ptrCast(allocation.ptr),
+        out_len,
     );
     if (written != needed_raw) return error.ChatTemplateFailed;
     return .{
         .allocator = allocator,
-        .bytes = bytes,
+        .allocation = allocation,
+        .bytes = allocation[0..needed],
         .parse_special = true,
     };
 }
 
-fn formatThinkingChatmlPrompt(
-    allocator: std.mem.Allocator,
-    tmpl: []const u8,
-    prompt: []const u8,
-) Error!?[]u8 {
-    const assistant_prefix = "<|im_start|>assistant\n<think>\n\n</think>\n\n";
-    const escaped_assistant_prefix = "<|im_start|>assistant\\n<think>\\n\\n</think>\\n\\n";
-    if (std.mem.indexOf(u8, tmpl, assistant_prefix) == null and
-        std.mem.indexOf(u8, tmpl, escaped_assistant_prefix) == null) return null;
-    return try std.fmt.allocPrint(
-        allocator,
-        "<|im_start|>user\n{s}<|im_end|>\n{s}",
-        .{ prompt, assistant_prefix },
-    );
+fn rawPrompt(allocator: std.mem.Allocator, prompt: []const u8) Error!PreparedPrompt {
+    const allocation = try allocator.dupe(u8, prompt);
+    return .{
+        .allocator = allocator,
+        .allocation = allocation,
+        .bytes = allocation,
+        .parse_special = false,
+    };
 }
 
 fn tokenizePrompt(

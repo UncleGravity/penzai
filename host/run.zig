@@ -46,6 +46,7 @@ pub const LlamaOptions = struct {
     census: bool = false,
     logits_tolerance: f32 = 0.001,
     chat_template: bool = true,
+    enable_thinking: bool = false,
 };
 
 pub fn runFakeLlama(
@@ -65,6 +66,7 @@ pub fn runFakeLlama(
         .census = options.census,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
+        .enable_thinking = options.enable_thinking,
     });
 }
 
@@ -86,6 +88,7 @@ pub fn runTcpLlama(
         .census = options.census,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
+        .enable_thinking = options.enable_thinking,
     });
 }
 
@@ -105,6 +108,7 @@ pub fn runFakeLogitsCheck(
         .max_tokens = options.max_tokens,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
+        .enable_thinking = options.enable_thinking,
     });
 }
 
@@ -125,6 +129,7 @@ pub fn runTcpLogitsCheck(
         .max_tokens = options.max_tokens,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
+        .enable_thinking = options.enable_thinking,
     });
 }
 

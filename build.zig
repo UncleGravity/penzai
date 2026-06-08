@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
 
     const c_mod = if (enable_llama) createLlamaCModule(b, target, llama_src) else null;
 
-    const modules = createModules(b, target, optimize, options_mod, c_mod);
+    const modules = createModules(b, target, optimize, options_mod, c_mod, llama_src);
 
     const test_step = b.step("test", "Run host-only unit and fake full-stack tests");
     addTest(b, test_step, "shared/protocol/framing.zig", target, optimize, modules);
@@ -98,7 +98,7 @@ pub fn build(b: *std.Build) void {
         .abi = .gnu,
         .cpu_model = .{ .explicit = &std.Target.aarch64.cpu.cortex_a53 },
     });
-    const kr260_modules = createModules(b, kr260_target, optimize, options_mod, null);
+    const kr260_modules = createModules(b, kr260_target, optimize, options_mod, null, "");
     const device_mod = b.createModule(.{
         .root_source_file = b.path("device/main.zig"),
         .target = kr260_target,
@@ -134,6 +134,7 @@ fn createModules(
     optimize: std.builtin.OptimizeMode,
     build_options: *std.Build.Module,
     c_mod: ?*std.Build.Module,
+    llama_src: []const u8,
 ) ModuleSet {
     const q1a8 = b.createModule(.{ .root_source_file = b.path("shared/q1a8.zig"), .target = target, .optimize = optimize });
     const framing = b.createModule(.{ .root_source_file = b.path("shared/protocol/framing.zig"), .target = target, .optimize = optimize });
@@ -190,6 +191,7 @@ fn createModules(
     link.addImport("server", server);
     link.addImport("host_tcp", host_tcp);
     if (llama) |m| {
+        addChatShim(b, m, llama_src);
         m.addImport("build_options", build_options);
         m.addImport("c", c_mod.?);
         m.addImport("backend", backend.?);
@@ -309,16 +311,33 @@ fn createLlamaCModule(
         .optimize = .Debug,
         .link_libc = true,
     });
+    translate_c.addIncludePath(b.path("host"));
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "include" }) });
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "src" }) });
     return translate_c.createModule();
 }
 
+fn addChatShim(b: *std.Build, mod: *std.Build.Module, llama_src: []const u8) void {
+    mod.addCSourceFile(.{
+        .file = b.path("host/chat.cpp"),
+        .flags = &.{"-std=c++17"},
+    });
+    mod.addIncludePath(b.path("host"));
+    mod.addIncludePath(.{ .cwd_relative = llama_src });
+    mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
+    mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "common" }) });
+    // common/chat.h reaches into llama.cpp's vendored nlohmann headers.
+    mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "vendor" }) });
+    mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "include" }) });
+    mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "src" }) });
+}
+
 fn linkLlama(b: *std.Build, mod: *std.Build.Module, llama_lib: []const u8) void {
     const lib_path = b.pathJoin(&.{ llama_lib, "lib" });
     mod.addLibraryPath(.{ .cwd_relative = lib_path });
     mod.addRPath(.{ .cwd_relative = lib_path });
+    mod.linkSystemLibrary("llama-common", .{});
     mod.linkSystemLibrary("llama", .{});
     mod.linkSystemLibrary("ggml", .{});
     mod.linkSystemLibrary("ggml-base", .{});

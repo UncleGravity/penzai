@@ -105,6 +105,8 @@ fn runLlamaCommand(
             options.logits_tolerance = try parseF32(arg["--tolerance=".len..]);
         } else if (std.mem.eql(u8, arg, "--raw-prompt")) {
             options.chat_template = false;
+        } else if (std.mem.eql(u8, arg, "--think")) {
+            options.enable_thinking = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -211,9 +213,9 @@ fn parseF32(value: []const u8) CliError!f32 {
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt]
-        \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt]
-        \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
+        \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
+        \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
         \\

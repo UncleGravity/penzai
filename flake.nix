@@ -61,7 +61,7 @@
             cmakeFlags = [
               "-DBUILD_SHARED_LIBS=ON"
               "-DGGML_BACKEND_DL=OFF"
-              "-DLLAMA_BUILD_COMMON=OFF"
+              "-DLLAMA_BUILD_COMMON=ON"
               "-DLLAMA_BUILD_TOOLS=OFF"
               "-DLLAMA_BUILD_TESTS=OFF"
               "-DLLAMA_BUILD_EXAMPLES=OFF"
@@ -74,7 +74,7 @@
 
             buildPhase = ''
               runHook preBuild
-              cmake --build . --target llama
+              cmake --build . --target llama llama-common
               runHook postBuild
             '';
 
