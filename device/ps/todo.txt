@@ -1,7 +1,7 @@
 Optional. Look into using SIMD for some ops:
-https://ziglang.org/documentation/master/#Vectors
+https://ziglang.org/documentation/master/#Vectors (LONG page)
 
-Snippet:
+Relevant snippet:
 ----------------------------------------------------------------------
 Vectors
 A vector is a group of booleans, Integers, Floats, or Pointers which are operated on in parallel, using SIMD instructions if possible. Vector types are created with the builtin function @Vector.
