@@ -178,6 +178,17 @@ pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, 
 }
 
 pub fn quantizeQ8_0(column: []const f32, out_quants: []i8, out_scales: []f16) LayoutError!void {
+    return quantizeQ8_0WithScaleType(f16, column, out_quants, out_scales);
+}
+
+pub fn quantizeQ8_0F32Scales(column: []const f32, out_quants: []i8, out_scales: []f32) LayoutError!void {
+    return quantizeQ8_0WithScaleType(f32, column, out_quants, out_scales);
+}
+
+fn quantizeQ8_0WithScaleType(comptime Scale: type, column: []const f32, out_quants: []i8, out_scales: []Scale) LayoutError!void {
+    comptime {
+        if (Scale != f16 and Scale != f32) @compileError("unsupported q8 scale type");
+    }
     if (column.len == 0 or column.len % q8_block != 0) return error.InvalidK;
     if (out_quants.len != column.len or out_scales.len != column.len / q8_block) return error.InvalidLength;
 
@@ -194,7 +205,8 @@ pub fn quantizeQ8_0(column: []const f32, out_quants: []i8, out_scales: []f16) La
         }
 
         const scale = amax / 127.0;
-        out_scales[block_index] = @floatCast(scale);
+        const scale_f16: f16 = @floatCast(scale);
+        out_scales[block_index] = if (Scale == f16) scale_f16 else @floatCast(scale_f16);
         const inv_scale: f32 = 1.0 / scale;
         for (column[base..][0..q8_block], 0..) |value, i| {
             const quantized = roundNearestEven(value * inv_scale);
@@ -275,6 +287,25 @@ test "quantize exact scale when amax is 127" {
     try quantizeQ8_0(&column, &quants, &scales);
     for (quants) |q| try std.testing.expectEqual(@as(i8, 127), q);
     for (scales) |s| try std.testing.expectEqual(@as(f16, 1), s);
+}
+
+test "quantize f32 scales match f16 scale output" {
+    var column = [_]f32{0} ** q1_block;
+    for (&column, 0..) |*value, i| {
+        value.* = @as(f32, @floatFromInt(@as(i32, @intCast(i % 19)) - 9)) * 0.03125;
+    }
+    var quants_f16: [q1_block]i8 = undefined;
+    var quants_f32: [q1_block]i8 = undefined;
+    var scales_f16: [q8_subblocks]f16 = undefined;
+    var scales_f32: [q8_subblocks]f32 = undefined;
+
+    try quantizeQ8_0(&column, &quants_f16, &scales_f16);
+    try quantizeQ8_0F32Scales(&column, &quants_f32, &scales_f32);
+
+    try std.testing.expectEqualSlices(i8, &quants_f16, &quants_f32);
+    for (scales_f16, scales_f32) |scale_f16, scale_f32| {
+        try std.testing.expectEqual(@as(f32, @floatCast(scale_f16)), scale_f32);
+    }
 }
 
 test "quantize uses unrounded scale reciprocal" {
