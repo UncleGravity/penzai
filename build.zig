@@ -8,6 +8,9 @@ const ModuleSet = struct {
     protocol_transport: *std.Build.Module,
     wire: *std.Build.Module,
     profiling: *std.Build.Module,
+    profile: *std.Build.Module,
+    prof_report: *std.Build.Module,
+    trace: *std.Build.Module,
     heap: *std.Build.Module,
     xrt: *std.Build.Module,
     xrt_bo: *std.Build.Module,
@@ -55,8 +58,11 @@ pub fn build(b: *std.Build) void {
     }
     const enable_llama = llama_src.len != 0;
 
+    const enable_profiling = b.option(bool, "profiling", "Compile device-side profiling collection (default true)") orelse true;
+
     const options = b.addOptions();
     options.addOption(bool, "enable_llama", enable_llama);
+    options.addOption(bool, "enable_profiling", enable_profiling);
     options.addOption([]const u8, "default_model_path", model_path);
     const options_mod = options.createModule();
 
@@ -69,6 +75,8 @@ pub fn build(b: *std.Build) void {
     addTest(b, test_step, "shared/protocol/transport.zig", target, optimize, modules);
     addTest(b, test_step, "shared/protocol/wire.zig", target, optimize, modules);
     addTest(b, test_step, "shared/profiling.zig", target, optimize, modules);
+    addTest(b, test_step, "device/profile.zig", target, optimize, modules);
+    addTest(b, test_step, "host/trace.zig", target, optimize, modules);
     addTest(b, test_step, "shared/q1a8.zig", target, optimize, modules);
     addTest(b, test_step, "device/mem/heap.zig", target, optimize, modules);
     addTest(b, test_step, "device/runtime.zig", target, optimize, modules);
@@ -145,6 +153,7 @@ fn createModules(
     const protocol_transport = b.createModule(.{ .root_source_file = b.path("shared/protocol/transport.zig"), .target = target, .optimize = optimize });
     const wire = b.createModule(.{ .root_source_file = b.path("shared/protocol/wire.zig"), .target = target, .optimize = optimize });
     const profiling = b.createModule(.{ .root_source_file = b.path("shared/profiling.zig"), .target = target, .optimize = optimize });
+    const profile = b.createModule(.{ .root_source_file = b.path("device/profile.zig"), .target = target, .optimize = optimize });
     const heap = b.createModule(.{ .root_source_file = b.path("device/mem/heap.zig"), .target = target, .optimize = optimize });
     const xrt = b.createModule(.{ .root_source_file = b.path("device/xrt.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const xrt_bo = b.createModule(.{ .root_source_file = b.path("device/mem/xrt_bo.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -165,6 +174,8 @@ fn createModules(
     const lower = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/lower.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const census = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/census.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
     const backend = if (c_mod != null) b.createModule(.{ .root_source_file = b.path("host/backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true }) else null;
+    const prof_report = b.createModule(.{ .root_source_file = b.path("host/prof_report.zig"), .target = target, .optimize = optimize });
+    const trace = b.createModule(.{ .root_source_file = b.path("host/trace.zig"), .target = target, .optimize = optimize });
     const run = b.createModule(.{ .root_source_file = b.path("host/run.zig"), .target = target, .optimize = optimize });
 
     protocol_transport.addImport("framing", framing);
@@ -174,9 +185,13 @@ fn createModules(
     ps_matmul_q1a8.addImport("q1a8", q1a8);
     ps_rows.addImport("q1a8", q1a8);
     ps_rows.addImport("wire", wire);
+    profile.addImport("wire", wire);
+    profile.addImport("profiling", profiling);
+    profile.addImport("q1a8", q1a8);
+    runtime.addImport("build_options", build_options);
     runtime.addImport("wire", wire);
     runtime.addImport("profiling", profiling);
-    runtime.addImport("q1a8", q1a8);
+    runtime.addImport("profile", profile);
     runtime.addImport("heap", heap);
     runtime.addImport("ps_activations", ps_activations);
     runtime.addImport("ps_elemwise", ps_elemwise);
@@ -201,6 +216,12 @@ fn createModules(
     link.addImport("runtime", runtime);
     link.addImport("server", server);
     link.addImport("host_tcp", host_tcp);
+    prof_report.addImport("wire", wire);
+    prof_report.addImport("profiling", profiling);
+    prof_report.addImport("link", link);
+    trace.addImport("wire", wire);
+    trace.addImport("profiling", profiling);
+    trace.addImport("prof_report", prof_report);
     if (llama) |m| {
         addChatShim(b, m, llama_src);
         m.addImport("build_options", build_options);
@@ -208,6 +229,7 @@ fn createModules(
         m.addImport("backend", backend.?);
         m.addImport("census", census.?);
         m.addImport("link", link);
+        m.addImport("trace", trace);
     }
     if (lower) |m| {
         m.addImport("c", c_mod.?);
@@ -223,6 +245,8 @@ fn createModules(
         m.addImport("q1a8", q1a8);
         m.addImport("wire", wire);
         m.addImport("profiling", profiling);
+        m.addImport("prof_report", prof_report);
+        m.addImport("trace", trace);
         m.addImport("link", link);
         m.addImport("lower", lower.?);
         m.addImport("census", census.?);
@@ -230,6 +254,9 @@ fn createModules(
     run.addImport("build_options", build_options);
     run.addImport("q1a8", q1a8);
     run.addImport("protocol_transport", protocol_transport);
+    run.addImport("profiling", profiling);
+    run.addImport("prof_report", prof_report);
+    run.addImport("trace", trace);
     run.addImport("wire", wire);
     run.addImport("runtime", runtime);
     run.addImport("link", link);
@@ -244,6 +271,9 @@ fn createModules(
         .protocol_transport = protocol_transport,
         .wire = wire,
         .profiling = profiling,
+        .profile = profile,
+        .prof_report = prof_report,
+        .trace = trace,
         .heap = heap,
         .xrt = xrt,
         .xrt_bo = xrt_bo,
@@ -275,6 +305,9 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("protocol_transport", modules.protocol_transport);
     mod.addImport("wire", modules.wire);
     mod.addImport("profiling", modules.profiling);
+    mod.addImport("profile", modules.profile);
+    mod.addImport("prof_report", modules.prof_report);
+    mod.addImport("trace", modules.trace);
     mod.addImport("heap", modules.heap);
     mod.addImport("xrt", modules.xrt);
     mod.addImport("xrt_bo", modules.xrt_bo);

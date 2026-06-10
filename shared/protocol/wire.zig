@@ -52,6 +52,7 @@ pub const DecodeError = error{
     InvalidStatus,
     InvalidErrorCode,
     InvalidLength,
+    InvalidFlags,
     TrailingBytes,
 };
 
@@ -100,10 +101,37 @@ pub const TransferRequest = struct {
     bytes: []const u8 = &.{},
 };
 
+/// What a run_graph request asks the device to collect.
+/// `aggregate` accrues per-op totals (cheap, fixed size); `trace` additionally
+/// records per-command spans (O(commands), opt-in). Wire flags: bit0 = aggregate,
+/// bit1 = spans. Spans imply aggregate, so 0b10 alone is invalid.
+pub const ProfileTier = enum(u8) {
+    off,
+    aggregate,
+    trace,
+
+    fn flags(self: ProfileTier) u32 {
+        return switch (self) {
+            .off => 0,
+            .aggregate => 0b01,
+            .trace => 0b11,
+        };
+    }
+
+    fn fromFlags(value: u32) ?ProfileTier {
+        return switch (value) {
+            0 => .off,
+            0b01 => .aggregate,
+            0b11 => .trace,
+            else => null,
+        };
+    }
+};
+
 pub const RunGraphRequest = struct {
     request_id: u64,
     command_bytes: []const u8,
-    profile: bool = false,
+    tier: ProfileTier = .off,
 };
 
 pub const Request = union(RequestTag) {
@@ -330,11 +358,11 @@ pub fn encodeDownload(out: []u8, request_id: u64, range: TensorRange) EncodeErro
     return encodeRangeRequest(out, .download, request_id, range);
 }
 
-pub fn encodeRunGraph(out: []u8, request_id: u64, profile: bool) EncodeError!usize {
+pub fn encodeRunGraph(out: []u8, request_id: u64, tier: ProfileTier) EncodeError!usize {
     const len = 24;
     if (out.len < len) return error.OutputTooSmall;
     var cursor = try encodeHeader(out, .run_graph, request_id);
-    putU32(out, &cursor, if (profile) 1 else 0);
+    putU32(out, &cursor, tier.flags());
     putU32(out, &cursor, 0);
     return cursor;
 }
@@ -376,14 +404,15 @@ pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Requ
             break :blk .{ .download = .{ .request_id = request_id, .range = range } };
         },
         .run_graph => blk: {
-            var profile = false;
+            var tier: ProfileTier = .off;
             if (cursor != metadata.len) {
                 const flags = try takeU32(metadata, &cursor);
-                _ = try takeU32(metadata, &cursor);
+                const reserved = try takeU32(metadata, &cursor);
                 if (cursor != metadata.len) return error.InvalidLength;
-                profile = (flags & 1) != 0;
+                if (reserved != 0) return error.InvalidFlags;
+                tier = ProfileTier.fromFlags(flags) orelse return error.InvalidFlags;
             }
-            break :blk .{ .run_graph = .{ .request_id = request_id, .command_bytes = payload, .profile = profile } };
+            break :blk .{ .run_graph = .{ .request_id = request_id, .command_bytes = payload, .tier = tier } };
         },
     };
 }
@@ -941,6 +970,34 @@ fn takeU64(bytes: []const u8, cursor: *usize) DecodeError!u64 {
     const value = std.mem.readInt(u64, bytes[cursor.*..][0..8], .little);
     cursor.* += 8;
     return value;
+}
+
+test "run_graph profile tier roundtrip and rejection" {
+    var meta: [32]u8 = undefined;
+
+    // Legacy 16-byte header (no flag word) decodes with tier = off.
+    const legacy_len = try encodeHeader(&meta, .run_graph, 1);
+    try std.testing.expectEqual(ProfileTier.off, (try decodeRequest(meta[0..legacy_len], "")).run_graph.tier);
+
+    // Each tier round-trips through its flag bits.
+    inline for (.{ ProfileTier.off, ProfileTier.aggregate, ProfileTier.trace }) |tier| {
+        const len = try encodeRunGraph(&meta, 2, tier);
+        try std.testing.expectEqual(tier, (try decodeRequest(meta[0..len], "")).run_graph.tier);
+    }
+
+    const len = try encodeRunGraph(&meta, 2, .trace);
+
+    // Spans-without-aggregate (0b10) and unknown bits are rejected, not coerced.
+    var bad_flags = meta;
+    std.mem.writeInt(u32, bad_flags[16..20], 0b10, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_flags[0..len], ""));
+    std.mem.writeInt(u32, bad_flags[16..20], 0b100, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_flags[0..len], ""));
+
+    // Reserved word must be zero.
+    var bad_reserved = meta;
+    std.mem.writeInt(u32, bad_reserved[20..24], 1, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_reserved[0..len], ""));
 }
 
 test "alloc request roundtrip" {

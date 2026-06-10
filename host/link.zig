@@ -27,7 +27,7 @@ pub const Client = struct {
         upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!void,
         download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!void,
         run_graph: *const fn (*anyopaque, []const wire.Command) LinkError!void,
-        run_graph_profile: *const fn (*anyopaque, []const wire.Command) LinkError!ProfiledRunGraph,
+        run_graph_profile: *const fn (*anyopaque, []const wire.Command, wire.ProfileTier) LinkError!ProfiledRunGraph,
     };
 
     pub fn init(link: anytype) Self {
@@ -65,8 +65,8 @@ pub const Client = struct {
                 return ptr(ctx).runGraph(commands);
             }
 
-            fn callRunGraphProfile(ctx: *anyopaque, commands: []const wire.Command) LinkError!ProfiledRunGraph {
-                return ptr(ctx).runGraphProfile(commands);
+            fn callRunGraphProfile(ctx: *anyopaque, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+                return ptr(ctx).runGraphProfile(commands, tier);
             }
 
             const vtable = VTable{
@@ -110,8 +110,8 @@ pub const Client = struct {
         return self.vtable.run_graph(self.ctx, commands);
     }
 
-    pub fn runGraphProfile(self: Self, commands: []const wire.Command) LinkError!ProfiledRunGraph {
-        return self.vtable.run_graph_profile(self.ctx, commands);
+    pub fn runGraphProfile(self: Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return self.vtable.run_graph_profile(self.ctx, commands, tier);
     }
 };
 
@@ -197,45 +197,11 @@ pub const FakeLink = struct {
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
-        const command_len = wire.commandBufferLen(commands) catch return error.Protocol;
-        const command_bytes = try self.allocator.alloc(u8, command_len);
-        defer self.allocator.free(command_bytes);
-        _ = wire.encodeCommandBuffer(commands, command_bytes) catch return error.Protocol;
-
-        var meta: [32]u8 = undefined;
-        const id = self.nextId();
-        const meta_len = wire.encodeRunGraph(&meta, id, false) catch return error.Protocol;
-        var response = try self.call(meta[0..meta_len], command_bytes);
-        defer response.deinit(self.allocator);
-        try response.expectOk(id);
+        return runGraphImpl(self, commands);
     }
 
-    pub fn runGraphProfile(self: *Self, commands: []const wire.Command) LinkError!ProfiledRunGraph {
-        const command_len = wire.commandBufferLen(commands) catch return error.Protocol;
-        const command_bytes = try self.allocator.alloc(u8, command_len);
-        defer self.allocator.free(command_bytes);
-        _ = wire.encodeCommandBuffer(commands, command_bytes) catch return error.Protocol;
-
-        var meta: [32]u8 = undefined;
-        const id = self.nextId();
-        const meta_len = wire.encodeRunGraph(&meta, id, true) catch return error.Protocol;
-        const request_len = framing.encodedLen(meta_len, command_bytes.len) catch return error.Protocol;
-        const start_ns = nowNs(self.io);
-        var response = try self.call(meta[0..meta_len], command_bytes);
-        const end_ns = nowNs(self.io);
-        defer response.deinit(self.allocator);
-        try response.expectOk(id);
-        var report = profiling.decodeAlloc(self.allocator, response.payload) catch return error.Protocol;
-        errdefer report.deinit(self.allocator);
-        return .{
-            .allocator = self.allocator,
-            .rpc = .{
-                .request_bytes = @intCast(request_len),
-                .response_bytes = @intCast(response.frame.len),
-                .round_trip_ns = elapsed(start_ns, end_ns),
-            },
-            .report = report,
-        };
+    pub fn runGraphProfile(self: *Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return runGraphProfileImpl(self, self.io, commands, tier);
     }
 
     fn call(self: *Self, metadata: []const u8, payload: []const u8) LinkError!Response {
@@ -331,45 +297,11 @@ pub const TcpLink = struct {
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
-        const command_len = wire.commandBufferLen(commands) catch return error.Protocol;
-        const command_bytes = try self.allocator.alloc(u8, command_len);
-        defer self.allocator.free(command_bytes);
-        _ = wire.encodeCommandBuffer(commands, command_bytes) catch return error.Protocol;
-
-        var meta: [32]u8 = undefined;
-        const id = self.nextId();
-        const meta_len = wire.encodeRunGraph(&meta, id, false) catch return error.Protocol;
-        var response = try self.call(meta[0..meta_len], command_bytes);
-        defer response.deinit(self.allocator);
-        try response.expectOk(id);
+        return runGraphImpl(self, commands);
     }
 
-    pub fn runGraphProfile(self: *Self, commands: []const wire.Command) LinkError!ProfiledRunGraph {
-        const command_len = wire.commandBufferLen(commands) catch return error.Protocol;
-        const command_bytes = try self.allocator.alloc(u8, command_len);
-        defer self.allocator.free(command_bytes);
-        _ = wire.encodeCommandBuffer(commands, command_bytes) catch return error.Protocol;
-
-        var meta: [32]u8 = undefined;
-        const id = self.nextId();
-        const meta_len = wire.encodeRunGraph(&meta, id, true) catch return error.Protocol;
-        const request_len = framing.encodedLen(meta_len, command_bytes.len) catch return error.Protocol;
-        const start_ns = nowNs(self.endpoint.io);
-        var response = try self.call(meta[0..meta_len], command_bytes);
-        const end_ns = nowNs(self.endpoint.io);
-        defer response.deinit(self.allocator);
-        try response.expectOk(id);
-        var report = profiling.decodeAlloc(self.allocator, response.payload) catch return error.Protocol;
-        errdefer report.deinit(self.allocator);
-        return .{
-            .allocator = self.allocator,
-            .rpc = .{
-                .request_bytes = @intCast(request_len),
-                .response_bytes = @intCast(response.frame.len),
-                .round_trip_ns = elapsed(start_ns, end_ns),
-            },
-            .report = report,
-        };
+    pub fn runGraphProfile(self: *Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return runGraphProfileImpl(self, self.endpoint.io, commands, tier);
     }
 
     fn call(self: *Self, metadata: []const u8, payload: []const u8) LinkError!Response {
@@ -396,14 +328,52 @@ pub const TcpLink = struct {
     }
 };
 
-fn nowNs(io: ?std.Io) u64 {
-    const active = io orelse return 0;
-    const ns = std.Io.Timestamp.now(active, .awake).nanoseconds;
-    return std.math.cast(u64, ns) orelse 0;
+// Shared run_graph bodies for FakeLink and TcpLink. They differ only in their
+// transport (`self.call`) and io source, so the encode/RPC/decode logic lives here.
+fn encodeCommands(allocator: std.mem.Allocator, commands: []const wire.Command) LinkError![]u8 {
+    const command_len = wire.commandBufferLen(commands) catch return error.Protocol;
+    const command_bytes = try allocator.alloc(u8, command_len);
+    errdefer allocator.free(command_bytes);
+    _ = wire.encodeCommandBuffer(commands, command_bytes) catch return error.Protocol;
+    return command_bytes;
 }
 
-fn elapsed(start_ns: u64, end_ns: u64) u64 {
-    return if (end_ns >= start_ns) end_ns - start_ns else 0;
+fn runGraphImpl(self: anytype, commands: []const wire.Command) LinkError!void {
+    const command_bytes = try encodeCommands(self.allocator, commands);
+    defer self.allocator.free(command_bytes);
+
+    var meta: [32]u8 = undefined;
+    const id = self.nextId();
+    const meta_len = wire.encodeRunGraph(&meta, id, .off) catch return error.Protocol;
+    var response = try self.call(meta[0..meta_len], command_bytes);
+    defer response.deinit(self.allocator);
+    try response.expectOk(id);
+}
+
+fn runGraphProfileImpl(self: anytype, io: ?std.Io, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+    const command_bytes = try encodeCommands(self.allocator, commands);
+    defer self.allocator.free(command_bytes);
+
+    var meta: [32]u8 = undefined;
+    const id = self.nextId();
+    const meta_len = wire.encodeRunGraph(&meta, id, tier) catch return error.Protocol;
+    const request_len = framing.encodedLen(meta_len, command_bytes.len) catch return error.Protocol;
+    const start_ns = profiling.nowNs(io);
+    var response = try self.call(meta[0..meta_len], command_bytes);
+    const end_ns = profiling.nowNs(io);
+    defer response.deinit(self.allocator);
+    try response.expectOk(id);
+    var report = profiling.decodeAlloc(self.allocator, response.payload) catch return error.Protocol;
+    errdefer report.deinit(self.allocator);
+    return .{
+        .allocator = self.allocator,
+        .rpc = .{
+            .request_bytes = @intCast(request_len),
+            .response_bytes = @intCast(response.frame.len),
+            .round_trip_ns = profiling.elapsed(start_ns, end_ns),
+        },
+        .report = report,
+    };
 }
 
 const Response = struct {

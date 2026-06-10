@@ -3,6 +3,8 @@ const c = @import("c");
 const q1a8 = @import("q1a8");
 const wire = @import("wire");
 const profiling = @import("profiling");
+const prof_report = @import("prof_report");
+const trace_mod = @import("trace");
 const link_mod = @import("link");
 const lower = @import("lower");
 const census_mod = @import("census");
@@ -47,27 +49,18 @@ pub const Profile = struct {
     download_count: u64 = 0,
     download_bytes: u64 = 0,
     download_ns: u64 = 0,
-    run_graph_count: u64 = 0,
-    command_count: u64 = 0,
-    host_run_graph_ns: u64 = 0,
-    run_graph_request_bytes: u64 = 0,
-    run_graph_response_bytes: u64 = 0,
-    device_total_ns: u64 = 0,
-    device_decode_ns: u64 = 0,
-    device_execute_ns: u64 = 0,
-    span_dropped: u64 = 0,
-    op_totals: [profiling.max_op_tag + 1]profiling.Aggregate = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
+    rg: prof_report.RunGraphTotals = .{},
 
     pub fn init(io: std.Io) Profile {
         return .{ .io = io };
     }
 
     pub fn now(self: *const Profile) u64 {
-        return nowNs(self.io);
+        return profiling.nowNs(self.io);
     }
 
     pub fn elapsedSince(self: *const Profile, start_ns: u64) u64 {
-        return elapsed(start_ns, self.now());
+        return profiling.elapsed(start_ns, self.now());
     }
 
     pub fn recordAlloc(self: *Profile, nbytes: u64, ns: u64) void {
@@ -89,90 +82,41 @@ pub const Profile = struct {
     }
 
     pub fn recordRunGraph(self: *Profile, profiled: link_mod.ProfiledRunGraph) void {
-        self.run_graph_count += 1;
-        self.command_count += profiled.report.summary.command_count;
-        self.host_run_graph_ns += profiled.rpc.round_trip_ns;
-        self.run_graph_request_bytes += profiled.rpc.request_bytes;
-        self.run_graph_response_bytes += profiled.rpc.response_bytes;
-        self.device_total_ns += profiled.report.summary.device_total_ns;
-        self.device_decode_ns += profiled.report.summary.decode_ns;
-        self.device_execute_ns += profiled.report.summary.execute_ns;
-        self.span_dropped += profiled.report.summary.span_dropped;
-        for (profiled.report.aggregates) |aggregate| {
-            const index: usize = aggregate.tag;
-            if (index >= self.op_totals.len) continue;
-            var total = &self.op_totals[index];
-            total.tag = aggregate.tag;
-            total.count += aggregate.count;
-            total.total_ns += aggregate.total_ns;
-            total.bytes += aggregate.bytes;
-        }
+        self.rg.record(profiled);
     }
 
     pub fn report(self: *const Profile, writer: *std.Io.Writer, counters: Counters) std.Io.Writer.Error!void {
         try writer.print("penzai profile\n", .{});
         try writer.print("setup model_load_ms={d:.3} context_init_ms={d:.3} alloc_count={d} alloc_bytes={d} alloc_ms={d:.3} upload_count={d} upload_bytes={d} upload_ms={d:.3} upload_mib_s={d:.3} download_count={d} download_bytes={d} download_ms={d:.3}\n", .{
-            nsToMs(self.model_load_ns),
-            nsToMs(self.context_init_ns),
+            prof_report.nsToMs(self.model_load_ns),
+            prof_report.nsToMs(self.context_init_ns),
             self.alloc_count,
             self.alloc_bytes,
-            nsToMs(self.alloc_ns),
+            prof_report.nsToMs(self.alloc_ns),
             self.upload_count,
             self.upload_bytes,
-            nsToMs(self.upload_ns),
-            mibPerSecond(self.upload_bytes, self.upload_ns),
+            prof_report.nsToMs(self.upload_ns),
+            prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
             self.download_count,
             self.download_bytes,
-            nsToMs(self.download_ns),
+            prof_report.nsToMs(self.download_ns),
         });
         try writer.print("decode generated_tokens={d} prefill_ms={d:.3} first_token_decode_ms={d:.3} steady_tokens={d} steady_decode_avg_ms={d:.3} steady_tok_s={d:.6}\n", .{
             self.generated_tokens,
-            nsToMs(self.prefill_ns),
-            nsToMs(self.first_decode_ns),
+            prof_report.nsToMs(self.prefill_ns),
+            prof_report.nsToMs(self.first_decode_ns),
             self.steady_decode_count,
-            avgMs(self.steady_decode_ns, self.steady_decode_count),
-            perSecond(self.steady_decode_count, self.steady_decode_ns),
+            prof_report.avgMs(self.steady_decode_ns, self.steady_decode_count),
+            prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
         });
-        const transport_ns = self.host_run_graph_ns -| self.device_total_ns;
-        const device_op_ns = self.opTotalNs();
-        const device_runtime_ns = self.device_total_ns -| device_op_ns;
-        try writer.print("run_graph calls={d} commands={d} host_rpc_ms={d:.3} device_total_ms={d:.3} device_op_ms={d:.3} device_runtime_ms={d:.3} transport_ms={d:.3} request_bytes={d} response_bytes={d} spans_dropped={d}\n", .{
-            self.run_graph_count,
-            self.command_count,
-            nsToMs(self.host_run_graph_ns),
-            nsToMs(self.device_total_ns),
-            nsToMs(device_op_ns),
-            nsToMs(device_runtime_ns),
-            nsToMs(transport_ns),
-            self.run_graph_request_bytes,
-            self.run_graph_response_bytes,
-            self.span_dropped,
-        });
+        try prof_report.writeRunGraphLine(writer, &self.rg);
         try writer.print("backend graph_compute={d} lowered_commands={d} upload_bytes={d} download_bytes={d}\n", .{
             counters.graph_compute,
             counters.lowered_commands,
             counters.upload_bytes,
             counters.download_bytes,
         });
-        try writer.writeAll("op                 count    total_ms      avg_ms   device_%        bytes       GB/s\n");
-        for (self.op_totals) |aggregate| {
-            if (aggregate.count == 0) continue;
-            try writer.print("{s:<16} {d:>7} {d:>11.3} {d:>11.3} {d:>10.2} {d:>12} {d:>10.3}\n", .{
-                opName(aggregate.tag),
-                aggregate.count,
-                nsToMs(aggregate.total_ns),
-                avgMs(aggregate.total_ns, aggregate.count),
-                percent(aggregate.total_ns, self.device_total_ns),
-                aggregate.bytes,
-                gbPerSecond(aggregate.bytes, aggregate.total_ns),
-            });
-        }
-    }
-
-    fn opTotalNs(self: *const Profile) u64 {
-        var total: u64 = 0;
-        for (self.op_totals) |aggregate| total += aggregate.total_ns;
-        return total;
+        try prof_report.writeOpTable(writer, &self.rg.op_totals, self.rg.device_total_ns);
     }
 };
 
@@ -188,6 +132,7 @@ pub const Device = struct {
     counters: Counters = .{},
     census: ?*census_mod.Census = null,
     profile: ?*Profile = null,
+    trace: ?*trace_mod.Capture = null,
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",
 
@@ -619,9 +564,13 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
     defer dev.allocator.free(commands);
     if (commands.len == 0) return c.GGML_STATUS_SUCCESS;
     if (dev.profile) |profile| {
-        var profiled = dev.link.runGraphProfile(commands) catch return c.GGML_STATUS_FAILED;
+        // Trace requests per-command spans; otherwise aggregate-only.
+        const tier: wire.ProfileTier = if (dev.trace != null) .trace else .aggregate;
+        const host_base_ns = profile.now();
+        var profiled = dev.link.runGraphProfile(commands, tier) catch return c.GGML_STATUS_FAILED;
         defer profiled.deinit();
         profile.recordRunGraph(profiled);
+        if (dev.trace) |cap| cap.append(profiled.report, host_base_ns) catch {};
     } else {
         dev.link.runGraph(commands) catch return c.GGML_STATUS_FAILED;
     }
@@ -741,65 +690,6 @@ const reg_iface = c.ggml_backend_reg_i{
     .get_device = &regDevGet,
     .get_proc_address = null,
 };
-
-fn nowNs(io: std.Io) u64 {
-    const ns = std.Io.Timestamp.now(io, .awake).nanoseconds;
-    return std.math.cast(u64, ns) orelse 0;
-}
-
-fn elapsed(start_ns: u64, end_ns: u64) u64 {
-    return if (end_ns >= start_ns) end_ns - start_ns else 0;
-}
-
-fn nsToMs(ns: u64) f64 {
-    return @as(f64, @floatFromInt(ns)) / 1_000_000.0;
-}
-
-fn avgMs(total_ns: u64, count: u64) f64 {
-    if (count == 0) return 0;
-    return nsToMs(total_ns) / @as(f64, @floatFromInt(count));
-}
-
-fn perSecond(count: u64, total_ns: u64) f64 {
-    if (count == 0 or total_ns == 0) return 0;
-    return @as(f64, @floatFromInt(count)) * 1_000_000_000.0 / @as(f64, @floatFromInt(total_ns));
-}
-
-fn mibPerSecond(bytes: u64, total_ns: u64) f64 {
-    if (bytes == 0 or total_ns == 0) return 0;
-    return (@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)) * 1_000_000_000.0 / @as(f64, @floatFromInt(total_ns));
-}
-
-fn gbPerSecond(bytes: u64, total_ns: u64) f64 {
-    if (bytes == 0 or total_ns == 0) return 0;
-    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(total_ns));
-}
-
-fn percent(part_ns: u64, total_ns: u64) f64 {
-    if (part_ns == 0 or total_ns == 0) return 0;
-    return @as(f64, @floatFromInt(part_ns)) * 100.0 / @as(f64, @floatFromInt(total_ns));
-}
-
-fn opName(tag: u16) []const u8 {
-    return switch (tag) {
-        1 => "copy",
-        2 => "matmul_q1a8",
-        3 => "rmsnorm",
-        4 => "rope",
-        5 => "softmax",
-        6 => "silu",
-        7 => "swiglu",
-        8 => "add_f32",
-        9 => "mul_f32",
-        10 => "scale_f32",
-        11 => "add_scaled_f32",
-        12 => "set_rows",
-        13 => "get_rows",
-        14 => "flash_attn_f32",
-        15 => "cpy_f32_to_f16",
-        else => "unknown",
-    };
-}
 
 fn dim(tensor: anytype, index: comptime_int) i64 {
     return tensor.*.ne[index];

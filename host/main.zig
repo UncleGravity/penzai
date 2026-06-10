@@ -1,6 +1,8 @@
 const std = @import("std");
 const protocol_transport = @import("protocol_transport");
 const run_mod = @import("run");
+const prof_report = @import("prof_report");
+const trace_mod = @import("trace");
 
 const CliError = error{
     InvalidCommand,
@@ -8,6 +10,7 @@ const CliError = error{
     InvalidNumber,
     MissingValue,
     UnsupportedDevice,
+    TraceFailed,
 } || protocol_transport.ParseError || run_mod.RunError || std.process.Args.Iterator.InitError || std.Io.Writer.Error;
 
 const LlamaMode = enum { generate, census, logits };
@@ -61,7 +64,52 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         try runMatmulCommand(init, &args, stdout);
         return;
     }
+    if (std.mem.eql(u8, command, "bench")) {
+        try runBenchCommand(init, &args, stdout);
+        return;
+    }
+    if (std.mem.eql(u8, command, "prof")) {
+        try runProfCommand(init, &args, stdout);
+        return;
+    }
     return error.InvalidCommand;
+}
+
+fn runProfCommand(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+) CliError!void {
+    var in_path: ?[]const u8 = null;
+    var out_path: ?[]const u8 = null;
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--out")) {
+            out_path = try requireValue(args, "-o");
+        } else if (std.mem.startsWith(u8, arg, "--out=")) {
+            out_path = arg["--out=".len..];
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try writeUsage(stdout);
+            return;
+        } else if (std.mem.startsWith(u8, arg, "-")) {
+            return error.InvalidOption;
+        } else if (in_path == null) {
+            in_path = arg;
+        } else {
+            return error.InvalidCommand;
+        }
+    }
+    const path = in_path orelse return error.MissingValue;
+
+    if (out_path) |out| {
+        var file = std.Io.Dir.cwd().createFile(init.io, out, .{}) catch return error.TraceFailed;
+        defer file.close(init.io);
+        var write_buf: [4096]u8 = undefined;
+        var file_writer = file.writerStreaming(init.io, &write_buf);
+        trace_mod.convertFile(init.io, init.gpa, path, &file_writer.interface) catch return error.TraceFailed;
+        file_writer.interface.flush() catch return error.TraceFailed;
+    } else {
+        trace_mod.convertFile(init.io, init.gpa, path, stdout) catch return error.TraceFailed;
+    }
 }
 
 fn runLlamaCommand(
@@ -109,6 +157,10 @@ fn runLlamaCommand(
             options.enable_thinking = true;
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
+        } else if (std.mem.eql(u8, arg, "--prof-trace")) {
+            options.trace_path = try requireValue(args, "--prof-trace");
+        } else if (std.mem.startsWith(u8, arg, "--prof-trace=")) {
+            options.trace_path = arg["--prof-trace=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -199,6 +251,117 @@ fn runMatmulCommand(
     });
 }
 
+fn runBenchCommand(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+) CliError!void {
+    const bench_kind = args.next() orelse {
+        try writeUsage(stdout);
+        return;
+    };
+    if (std.mem.eql(u8, bench_kind, "--help") or std.mem.eql(u8, bench_kind, "-h")) {
+        try writeUsage(stdout);
+        return;
+    }
+    if (!std.mem.eql(u8, bench_kind, "op")) return error.InvalidCommand;
+    const op = args.next() orelse return error.MissingValue;
+    if (!std.mem.eql(u8, op, "matmul-q1a8")) return error.InvalidCommand;
+
+    var options: run_mod.BenchOptions = .{};
+    var device: []const u8 = "fake";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--device")) {
+            device = try requireValue(args, "--device");
+        } else if (std.mem.startsWith(u8, arg, "--device=")) {
+            device = arg["--device=".len..];
+        } else if (std.mem.eql(u8, arg, "--rows")) {
+            options.rows = try parseU32(try requireValue(args, "--rows"));
+        } else if (std.mem.startsWith(u8, arg, "--rows=")) {
+            options.rows = try parseU32(arg["--rows=".len..]);
+        } else if (std.mem.eql(u8, arg, "--cols")) {
+            options.cols = try parseU32(try requireValue(args, "--cols"));
+        } else if (std.mem.startsWith(u8, arg, "--cols=")) {
+            options.cols = try parseU32(arg["--cols=".len..]);
+        } else if (std.mem.eql(u8, arg, "--k")) {
+            options.k = try parseU32(try requireValue(args, "--k"));
+        } else if (std.mem.startsWith(u8, arg, "--k=")) {
+            options.k = try parseU32(arg["--k=".len..]);
+        } else if (std.mem.eql(u8, arg, "--heap-mib")) {
+            options.heap_mib = try parseU32(try requireValue(args, "--heap-mib"));
+        } else if (std.mem.startsWith(u8, arg, "--heap-mib=")) {
+            options.heap_mib = try parseU32(arg["--heap-mib=".len..]);
+        } else if (std.mem.eql(u8, arg, "--warmup")) {
+            options.warmup = try parseU32(try requireValue(args, "--warmup"));
+        } else if (std.mem.startsWith(u8, arg, "--warmup=")) {
+            options.warmup = try parseU32(arg["--warmup=".len..]);
+        } else if (std.mem.eql(u8, arg, "--iters")) {
+            options.iters = try parseU32(try requireValue(args, "--iters"));
+        } else if (std.mem.startsWith(u8, arg, "--iters=")) {
+            options.iters = try parseU32(arg["--iters=".len..]);
+        } else if (std.mem.eql(u8, arg, "--prof")) {
+            options.profile = true;
+        } else if (std.mem.eql(u8, arg, "--prof-trace")) {
+            options.trace_path = try requireValue(args, "--prof-trace");
+            options.profile = true;
+        } else if (std.mem.startsWith(u8, arg, "--prof-trace=")) {
+            options.trace_path = arg["--prof-trace=".len..];
+            options.profile = true;
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try writeUsage(stdout);
+            return;
+        } else {
+            return error.InvalidOption;
+        }
+    }
+
+    const device_spec = try protocol_transport.parseDeviceSpec(device);
+    const result = switch (device_spec) {
+        .fake => try run_mod.benchFakeMatmulQ1A8(init.io, init.gpa, options),
+        .tcp => |tcp| try run_mod.benchTcpMatmulQ1A8(init.io, init.gpa, tcp, options),
+    };
+
+    try stdout.print("penzai bench op matmul-q1a8\n", .{});
+    switch (device_spec) {
+        .fake => try stdout.print("device=fake rows={d} cols={d} k={d} warmup={d} iters={d} prof={}\n", .{
+            result.rows,
+            result.cols,
+            result.k,
+            result.warmup,
+            result.iters,
+            result.profiled,
+        }),
+        .tcp => |tcp| try stdout.print("device=tcp host={s} port={d} rows={d} cols={d} k={d} warmup={d} iters={d} prof={}\n", .{
+            tcp.host,
+            tcp.port,
+            result.rows,
+            result.cols,
+            result.k,
+            result.warmup,
+            result.iters,
+            result.profiled,
+        }),
+    }
+    try stdout.print("bytes weights={d} acts={d} dst={d}\n", .{
+        result.weights_nbytes,
+        result.acts_nbytes,
+        result.dst_nbytes,
+    });
+    try stdout.print("host total_ms={d:.3} avg_ms={d:.3} min_ms={d:.3} max_ms={d:.3} ops_s={d:.3}\n", .{
+        prof_report.nsToMs(result.host_total_ns),
+        prof_report.avgMs(result.host_total_ns, result.iters),
+        prof_report.nsToMs(result.host_min_ns),
+        prof_report.nsToMs(result.host_max_ns),
+        prof_report.perSecond(result.iters, result.host_total_ns),
+    });
+    try stdout.print("check=ok expected={d:.3} max_abs_diff={d:.6}\n", .{
+        result.expected,
+        result.max_abs_diff,
+    });
+    if (result.profiled) try writeBenchProfile(stdout, result.profile);
+    if (options.trace_path) |path| try stdout.print("trace written {s} (convert with: penzai prof {s})\n", .{ path, path });
+}
+
 fn requireValue(args: *std.process.Args.Iterator, option: []const u8) CliError![]const u8 {
     _ = option;
     return args.next() orelse error.MissingValue;
@@ -212,20 +375,29 @@ fn parseF32(value: []const u8) CliError!f32 {
     return std.fmt.parseFloat(f32, value) catch return error.InvalidNumber;
 }
 
+fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.Io.Writer.Error!void {
+    try prof_report.writeRunGraphLine(writer, &profile);
+    try prof_report.writeOpTable(writer, &profile.op_totals, profile.device_total_ns);
+}
+
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof] [--prof-trace FILE]
         \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
         \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
+        \\  penzai bench op matmul-q1a8 --device fake|tcp:HOST:PORT [--rows N] [--cols N] [--k N] [--warmup N] [--iters N] [--prof] [--prof-trace FILE]
+        \\  penzai prof CAPTURE.bin [-o TRACE.json]
         \\
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
         \\  census   report the actual ggml graph_compute op surface
         \\  logits   compare token choices and report logit drift against llama.cpp CPU
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
+        \\  bench    run resident-buffer microbenchmarks
+        \\  prof     convert a --prof-trace capture into a Chrome trace JSON
         \\  help     show this help
         \\
     );

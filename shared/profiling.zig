@@ -58,6 +58,16 @@ pub const Report = struct {
     }
 };
 
+pub fn nowNs(io: ?std.Io) u64 {
+    const active = io orelse return 0;
+    const ns = std.Io.Timestamp.now(active, .awake).nanoseconds;
+    return std.math.cast(u64, ns) orelse 0;
+}
+
+pub fn elapsed(start_ns: u64, end_ns: u64) u64 {
+    return if (end_ns >= start_ns) end_ns - start_ns else 0;
+}
+
 pub fn encodedLen(report: ReportView) usize {
     return header_len + report.aggregates.len * aggregate_len + report.spans.len * span_len;
 }

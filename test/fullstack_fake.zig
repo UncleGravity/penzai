@@ -1,6 +1,7 @@
 const std = @import("std");
 const q1a8 = @import("q1a8");
 const wire = @import("wire");
+const profiling = @import("profiling");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
 
@@ -122,6 +123,47 @@ test "fake link ps f32 command graph" {
     try expectTensor(&link, out_mul, &.{ 3, 8 });
     try expectTensor(&link, out_scale, &.{ 0.5, 1 });
     try expectTensor(&link, out_add_scaled, &.{ 3.5, 5 });
+}
+
+test "fake link runGraphProfile reports per-op aggregates" {
+    var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.initWithIo(std.testing.allocator, &runtime, std.testing.io);
+
+    const a = try allocTensor(&link, 2);
+    const b = try allocTensor(&link, 2);
+    const out_add = try allocTensor(&link, 2);
+    const out_scale = try allocTensor(&link, 2);
+    try uploadTensor(&link, a, &.{ 3, 4 });
+    try uploadTensor(&link, b, &.{ 1, 2 });
+
+    const commands = [_]wire.Command{
+        .{ .add_f32 = .{ .lhs = a, .rhs = b, .dst = out_add, .rows = 2, .cols = 1, .mode = .same_shape } },
+        .{ .scale_f32 = .{ .src = b, .dst = out_scale, .scale = 0.5 } },
+    };
+
+    var profiled = try link.runGraphProfile(&commands, .aggregate);
+    defer profiled.deinit(); // testing.allocator fails the test if the report leaks.
+
+    try std.testing.expectEqual(@as(u32, 2), profiled.report.summary.command_count);
+    try std.testing.expectEqual(@as(u32, 0), profiled.report.summary.span_dropped);
+    try std.testing.expect(profiled.rpc.request_bytes > 0);
+    try std.testing.expect(profiled.rpc.response_bytes > 0);
+
+    const add = findAggregate(profiled.report, @intFromEnum(wire.OpTag.add_f32)) orelse return error.MissingAggregate;
+    try std.testing.expectEqual(@as(u32, 1), add.count);
+    try std.testing.expectEqual(a.nbytes + b.nbytes + out_add.nbytes, add.bytes);
+
+    const scale = findAggregate(profiled.report, @intFromEnum(wire.OpTag.scale_f32)) orelse return error.MissingAggregate;
+    try std.testing.expectEqual(@as(u32, 1), scale.count);
+    try std.testing.expectEqual(b.nbytes + out_scale.nbytes, scale.bytes);
+}
+
+fn findAggregate(report: profiling.Report, tag: u16) ?profiling.Aggregate {
+    for (report.aggregates) |aggregate| {
+        if (aggregate.tag == tag) return aggregate;
+    }
+    return null;
 }
 
 fn allocTensor(link: *link_mod.FakeLink, len: usize) !wire.TensorRange {

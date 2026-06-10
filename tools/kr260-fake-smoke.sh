@@ -28,6 +28,7 @@ fi
 : "${PENZAI_COLS:=1}"
 : "${PENZAI_K:=128}"
 : "${PENZAI_MAX_REQUESTS:=11}"
+: "${PENZAI_OPTIMIZE:=}"
 
 BOARD_HOST="${BOARD_HOST:-${BOARD#*@}}"
 BOARD_HOST="${BOARD_HOST%%:*}"
@@ -47,7 +48,11 @@ cleanup() {
 trap cleanup EXIT
 
 echo "== build host + KR260 daemon =="
-zig build
+build_args=(zig build)
+if [[ -n "$PENZAI_OPTIMIZE" ]]; then
+  build_args+=("-Doptimize=$PENZAI_OPTIMIZE")
+fi
+"${build_args[@]}"
 
 echo "== copy penzaid -> $BOARD:$REMOTE_BIN =="
 ssh "$BOARD" "mkdir -p '$BOARD_TMP'"
