@@ -5,6 +5,7 @@ const backend_mod = @import("backend");
 const census_mod = @import("census");
 const link_mod = @import("link");
 const trace_mod = @import("trace");
+const prof_report = @import("prof_report");
 
 pub const Error = error{
     MissingModel,
@@ -35,6 +36,8 @@ pub const Options = struct {
     chat_template: bool = true,
     enable_thinking: bool = false,
     profile: bool = false,
+    prof_format: prof_report.ProfFormat = .pretty,
+    device_label: []const u8 = "fake",
     trace_path: ?[]const u8 = null,
 };
 
@@ -172,7 +175,7 @@ pub fn runPrompt(
         try census.report(writer);
     } else {
         try writer.writeByte('\n');
-        if (profile) |p| try p.report(writer, device.counters);
+        if (profile) |p| try p.report(writer, device.counters, options.prof_format, options.model_path, options.device_label);
         if (capture) |*cap| if (options.trace_path) |path| {
             cap.writeFile(io, path) catch return error.TraceWriteFailed;
             try writer.print("trace written {s} (convert with: penzai prof {s})\n", .{ path, path });

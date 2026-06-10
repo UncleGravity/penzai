@@ -3,6 +3,10 @@ const wire = @import("wire");
 const profiling = @import("profiling");
 const link_mod = @import("link");
 
+/// Selects how the llama `--prof` summary is rendered. `pretty` is the default
+/// human-facing layout; `json` emits every counter as a machine-readable object.
+pub const ProfFormat = enum { pretty, json };
+
 /// Host-side accumulation of run_graph profiles across many calls, shared by the
 /// llama decode path and the bench harness. Domain-specific summaries (model load,
 /// prefill, warmup/iters, …) live in the consumer; the run_graph + per-op rollup
@@ -45,49 +49,36 @@ pub const RunGraphTotals = struct {
         for (self.op_totals) |aggregate| total += aggregate.total_ns;
         return total;
     }
+
+    /// Host round-trip minus device-measured work. Device timing stops before
+    /// profile serialization and response framing, so this bucket is RPC +
+    /// profiler overhead, not pure wire transport.
+    pub fn rpcOverheadNs(self: *const RunGraphTotals) u64 {
+        return self.host_run_graph_ns -| self.device_total_ns;
+    }
+
+    /// Device time the profiler attributed to no op span (dispatch/scheduling).
+    pub fn deviceRuntimeNs(self: *const RunGraphTotals) u64 {
+        return self.device_total_ns -| self.opTotalNs();
+    }
 };
 
-/// One line summarizing run_graph RPC cost vs measured device work.
-pub fn writeRunGraphLine(writer: *std.Io.Writer, totals: *const RunGraphTotals) std.Io.Writer.Error!void {
-    // Host round-trip minus device-measured work. Device timing stops before profile
-    // serialization and response framing, so this bucket is RPC + profiler overhead,
-    // not pure wire transport.
-    const rpc_overhead_ns = totals.host_run_graph_ns -| totals.device_total_ns;
-    const device_op_ns = totals.opTotalNs();
-    const device_runtime_ns = totals.device_total_ns -| device_op_ns;
-    try writer.print("run_graph calls={d} commands={d} host_rpc_ms={d:.3} device_total_ms={d:.3} device_op_ms={d:.3} device_runtime_ms={d:.3} rpc_overhead_ms={d:.3} request_bytes={d} response_bytes={d} spans_dropped={d}\n", .{
-        totals.run_graph_count,
-        totals.command_count,
-        nsToMs(totals.host_run_graph_ns),
-        nsToMs(totals.device_total_ns),
-        nsToMs(device_op_ns),
-        nsToMs(device_runtime_ns),
-        nsToMs(rpc_overhead_ns),
-        totals.request_bytes,
-        totals.response_bytes,
-        totals.span_dropped,
+/// The `link` section: run_graph RPC cost vs measured device work. Shared by the
+/// llama `--prof` report and the bench harness so there is one rendering of it.
+pub fn writeLinkSection(writer: *std.Io.Writer, totals: *const RunGraphTotals) std.Io.Writer.Error!void {
+    var ovh_buf: [32]u8 = undefined;
+    var req_buf: [32]u8 = undefined;
+    var resp_buf: [32]u8 = undefined;
+    try writer.print("link\n", .{});
+    try writer.print("  graphs           {d}\n", .{totals.run_graph_count});
+    try writer.print("  commands         {d}\n", .{totals.command_count});
+    try writer.print("  rpc overhead     {s} ({d:.1}%)\n", .{
+        formatDuration(&ovh_buf, totals.rpcOverheadNs()),
+        percent(totals.rpcOverheadNs(), totals.host_run_graph_ns),
     });
-}
-
-/// Per-op breakdown table. device_total_ns is the denominator for device_%.
-pub fn writeOpTable(
-    writer: *std.Io.Writer,
-    op_totals: []const profiling.Aggregate,
-    device_total_ns: u64,
-) std.Io.Writer.Error!void {
-    try writer.writeAll("op                 count    total_ms      avg_ms   device_%        bytes       GB/s\n");
-    for (op_totals) |aggregate| {
-        if (aggregate.count == 0) continue;
-        try writer.print("{s:<16} {d:>7} {d:>11.3} {d:>11.3} {d:>10.2} {d:>12} {d:>10.3}\n", .{
-            opName(aggregate.tag),
-            aggregate.count,
-            nsToMs(aggregate.total_ns),
-            avgMs(aggregate.total_ns, aggregate.count),
-            percent(aggregate.total_ns, device_total_ns),
-            aggregate.bytes,
-            gbPerSecond(aggregate.bytes, aggregate.total_ns),
-        });
-    }
+    try writer.print("  request          {s}\n", .{formatBytes(&req_buf, totals.request_bytes)});
+    try writer.print("  response         {s}\n", .{formatBytes(&resp_buf, totals.response_bytes)});
+    try writer.print("  dropped          {d}\n", .{totals.span_dropped});
 }
 
 /// Canonical op name from the wire enum — single source of truth.
@@ -115,13 +106,68 @@ pub fn mibPerSecond(bytes: u64, total_ns: u64) f64 {
     return (@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)) * 1_000_000_000.0 / @as(f64, @floatFromInt(total_ns));
 }
 
-// bytes/ns == GB/s (decimal): 1 byte/ns = 1e9 bytes/s = 1 GB/s.
-pub fn gbPerSecond(bytes: u64, total_ns: u64) f64 {
-    if (bytes == 0 or total_ns == 0) return 0;
-    return @as(f64, @floatFromInt(bytes)) / @as(f64, @floatFromInt(total_ns));
-}
-
 pub fn percent(part_ns: u64, total_ns: u64) f64 {
     if (part_ns == 0 or total_ns == 0) return 0;
     return @as(f64, @floatFromInt(part_ns)) * 100.0 / @as(f64, @floatFromInt(total_ns));
+}
+
+// The format helpers below emit at most ~12 chars, so the 32-byte scratch their
+// callers pass always fits — bufPrint cannot overflow, hence `catch unreachable`.
+
+/// Format a duration with an auto-selected unit (s >= 1s, else ms) into `buf`,
+/// returning the slice. For right-aligned columns, print the result with `{s:>N}`.
+pub fn formatDuration(buf: []u8, ns: u64) []const u8 {
+    const ms = nsToMs(ns);
+    if (ms >= 1000.0) return std.fmt.bufPrint(buf, "{d:.1} s", .{ms / 1000.0}) catch unreachable;
+    if (ms >= 1.0) return std.fmt.bufPrint(buf, "{d:.1} ms", .{ms}) catch unreachable;
+    if (ms > 0.0) return std.fmt.bufPrint(buf, "{d:.2} ms", .{ms}) catch unreachable;
+    return std.fmt.bufPrint(buf, "0 ms", .{}) catch unreachable;
+}
+
+/// Format a byte count with an auto-selected binary unit (GiB/MiB/KiB/B) into `buf`.
+pub fn formatBytes(buf: []u8, n: u64) []const u8 {
+    const f: f64 = @floatFromInt(n);
+    if (n >= 1 << 30) return std.fmt.bufPrint(buf, "{d:.1} GiB", .{f / (1 << 30)}) catch unreachable;
+    if (n >= 1 << 20) return std.fmt.bufPrint(buf, "{d:.1} MiB", .{f / (1 << 20)}) catch unreachable;
+    if (n >= 1 << 10) return std.fmt.bufPrint(buf, "{d:.1} KiB", .{f / (1 << 10)}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d} B", .{n}) catch unreachable;
+}
+
+fn opTotalDesc(_: void, x: profiling.Aggregate, y: profiling.Aggregate) bool {
+    return x.total_ns > y.total_ns;
+}
+
+/// Per-op breakdown, sorted by device time descending, with human units. The
+/// throughput is operand-bytes/op-time (effective traffic, not measured bus
+/// bandwidth) — see commandBytes in device/profile.zig — hence the `eff` label.
+pub fn writeOpTable(
+    writer: *std.Io.Writer,
+    op_totals: []const profiling.Aggregate,
+    device_total_ns: u64,
+) std.Io.Writer.Error!void {
+    var rows: [profiling.max_op_tag + 1]profiling.Aggregate = undefined;
+    var n: usize = 0;
+    for (op_totals) |aggregate| {
+        if (aggregate.count == 0) continue;
+        rows[n] = aggregate;
+        n += 1;
+    }
+    std.mem.sort(profiling.Aggregate, rows[0..n], {}, opTotalDesc);
+
+    var total_buf: [32]u8 = undefined;
+    try writer.print("device ops{s:>33}\n", .{formatDuration(&total_buf, device_total_ns)});
+    try writer.print("  {s:<16} {s:>7} {s:>10} {s:>9} {s:>6} {s:>10}\n", .{ "op", "count", "total", "avg", "dev%", "eff MiB/s" });
+    for (rows[0..n]) |aggregate| {
+        const avg_ns = if (aggregate.count == 0) 0 else aggregate.total_ns / aggregate.count;
+        var tot_buf: [32]u8 = undefined;
+        var avg_buf: [32]u8 = undefined;
+        try writer.print("  {s:<16} {d:>7} {s:>10} {s:>9} {d:>6.1} {d:>10.1}\n", .{
+            opName(aggregate.tag),
+            aggregate.count,
+            formatDuration(&tot_buf, aggregate.total_ns),
+            formatDuration(&avg_buf, avg_ns),
+            percent(aggregate.total_ns, device_total_ns),
+            mibPerSecond(aggregate.bytes, aggregate.total_ns),
+        });
+    }
 }

@@ -200,6 +200,22 @@
                 exec ssh "$BOARD" "'$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
               '';
             };
+
+          mkHello = penzaiPackage:
+            pkgs.writeShellApplication {
+              name = "hello";
+              text = ''
+                set -euo pipefail
+
+                "${penzaiPackage}/bin/penzai" run \
+                  -m ./models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
+                  --device tcp:kria:29092 \
+                  --prompt "hello" \
+                  --max-tokens 7 \
+                  --prof
+                say hello
+              '';
+            };
         in
         rec {
           packages = rec {
@@ -217,6 +233,7 @@
             deploy-penzaid-debug = mkDeploy "deploy-penzaid-debug" "Debug" penzaid-debug;
             deploy-penzaid-releasefast = mkDeploy "deploy-penzaid-releasefast" "ReleaseFast" penzaid-releasefast;
             serve-penzaid = mkServe "serve-penzaid";
+            hello = mkHello penzai;
 
             default = penzai-releasefast;
           };
@@ -232,6 +249,7 @@
             deploy-penzaid-debug = mkApp packages.deploy-penzaid-debug "deploy-penzaid-debug" "Deploy the debug KR260 penzaid daemon";
             deploy-penzaid-releasefast = mkApp packages.deploy-penzaid-releasefast "deploy-penzaid-releasefast" "Deploy the releasefast KR260 penzaid daemon";
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
+            hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
           };
 
           checks = {

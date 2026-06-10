@@ -23,3 +23,16 @@ Local dev:
 nix develop
 zig build test
 ```
+
+## Profiling
+
+```sh
+# 
+nix run .#penzai -- run \
+  -m ./models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
+  --device tcp:kria:29092 \
+  --prompt "hello" \
+  --prof # pretty table
+  # OR view as json
+  # --prof=json 2>/dev/null | tail -1 | jq 
+```

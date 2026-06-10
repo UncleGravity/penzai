@@ -84,6 +84,8 @@ pub const LlamaOptions = struct {
     chat_template: bool = true,
     enable_thinking: bool = false,
     profile: bool = false,
+    prof_format: prof_report.ProfFormat = .pretty,
+    device_label: []const u8 = "fake",
     trace_path: ?[]const u8 = null,
 };
 
@@ -107,6 +109,8 @@ pub fn runFakeLlama(
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
         .profile = options.profile,
+        .prof_format = options.prof_format,
+        .device_label = options.device_label,
         .trace_path = options.trace_path,
     });
 }
@@ -131,6 +135,8 @@ pub fn runTcpLlama(
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
         .profile = options.profile,
+        .prof_format = options.prof_format,
+        .device_label = options.device_label,
         .trace_path = options.trace_path,
     });
 }

@@ -313,6 +313,7 @@ fn createHostModules(
         m.addImport("census", census.?);
         m.addImport("link", link);
         m.addImport("trace", trace);
+        m.addImport("prof_report", prof_report);
     }
     if (lower) |m| {
         m.addImport("c", c_mod.?);

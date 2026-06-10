@@ -85,40 +85,179 @@ pub const Profile = struct {
         self.rg.record(profiled);
     }
 
-    pub fn report(self: *const Profile, writer: *std.Io.Writer, counters: Counters) std.Io.Writer.Error!void {
-        try writer.print("penzai profile\n", .{});
-        try writer.print("setup model_load_ms={d:.3} context_init_ms={d:.3} alloc_count={d} alloc_bytes={d} alloc_ms={d:.3} upload_count={d} upload_bytes={d} upload_ms={d:.3} upload_mib_s={d:.3} download_count={d} download_bytes={d} download_ms={d:.3}\n", .{
-            prof_report.nsToMs(self.model_load_ns),
-            prof_report.nsToMs(self.context_init_ns),
-            self.alloc_count,
-            self.alloc_bytes,
-            prof_report.nsToMs(self.alloc_ns),
+    /// Wall clock as the sum of the phases the pretty report breaks out, so the
+    /// phase table's percentages add to 100. alloc/download are excluded — they
+    /// overlap setup and are sub-percent; the json format still carries them.
+    fn wallNs(self: *const Profile) u64 {
+        return self.model_load_ns + self.context_init_ns + self.upload_ns +
+            self.prefill_ns + self.first_decode_ns + self.steady_decode_ns;
+    }
+
+    fn decodeNs(self: *const Profile) u64 {
+        return self.first_decode_ns + self.steady_decode_ns;
+    }
+
+    pub fn report(
+        self: *const Profile,
+        writer: *std.Io.Writer,
+        counters: Counters,
+        fmt: prof_report.ProfFormat,
+        model_path: []const u8,
+        device_label: []const u8,
+    ) std.Io.Writer.Error!void {
+        switch (fmt) {
+            .pretty => try self.reportPretty(writer, model_path, device_label),
+            .json => try self.reportJson(writer, counters, model_path, device_label),
+        }
+    }
+
+    fn reportPretty(self: *const Profile, writer: *std.Io.Writer, model_path: []const u8, device_label: []const u8) std.Io.Writer.Error!void {
+        const wall_ns = self.wallNs();
+        var buf: [32]u8 = undefined;
+
+        try writer.print("penzai profile\n\n", .{});
+        try writer.print("  model        {s}\n", .{modelName(model_path)});
+        try writer.print("  device       {s}\n", .{device_label});
+        try writer.print("  tokens       {d}\n", .{self.generated_tokens});
+        try writer.print("  throughput   {d:.2} tok/s\n", .{prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns)});
+        try writer.print("  wall         {s}\n\n", .{prof_report.formatDuration(&buf, wall_ns)});
+
+        try writer.print("phases             time    wall%\n", .{});
+        try phaseRow(writer, "model load", self.model_load_ns, wall_ns, "");
+        try phaseRow(writer, "context init", self.context_init_ns, wall_ns, "");
+
+        var up_bytes_buf: [32]u8 = undefined;
+        var up_buf: [96]u8 = undefined;
+        const up_note = std.fmt.bufPrint(&up_buf, "{s}, {d} calls, {d:.1} MiB/s", .{
+            prof_report.formatBytes(&up_bytes_buf, self.upload_bytes),
             self.upload_count,
-            self.upload_bytes,
-            prof_report.nsToMs(self.upload_ns),
             prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
-            self.download_count,
-            self.download_bytes,
-            prof_report.nsToMs(self.download_ns),
-        });
-        try writer.print("decode generated_tokens={d} prefill_ms={d:.3} first_token_decode_ms={d:.3} steady_tokens={d} steady_decode_avg_ms={d:.3} steady_tok_s={d:.6}\n", .{
-            self.generated_tokens,
-            prof_report.nsToMs(self.prefill_ns),
-            prof_report.nsToMs(self.first_decode_ns),
-            self.steady_decode_count,
-            prof_report.avgMs(self.steady_decode_ns, self.steady_decode_count),
-            prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
-        });
-        try prof_report.writeRunGraphLine(writer, &self.rg);
-        try writer.print("backend graph_compute={d} lowered_commands={d} upload_bytes={d} download_bytes={d}\n", .{
-            counters.graph_compute,
-            counters.lowered_commands,
-            counters.upload_bytes,
-            counters.download_bytes,
-        });
+        }) catch unreachable;
+        try phaseRow(writer, "weight upload", self.upload_ns, wall_ns, up_note);
+
+        try phaseRow(writer, "prefill", self.prefill_ns, wall_ns, "");
+
+        var ttft_buf: [32]u8 = undefined;
+        const ttft = prof_report.formatDuration(&ttft_buf, self.first_decode_ns);
+        var steady_buf: [32]u8 = undefined;
+        var dec_buf: [96]u8 = undefined;
+        const dec_note = if (self.steady_decode_count == 0)
+            std.fmt.bufPrint(&dec_buf, "{d} tok, TTFT {s}", .{ self.generated_tokens, ttft }) catch unreachable
+        else
+            std.fmt.bufPrint(&dec_buf, "{d} tok, TTFT {s}, then {s}/tok", .{
+                self.generated_tokens,
+                ttft,
+                prof_report.formatDuration(&steady_buf, self.steady_decode_ns / self.steady_decode_count),
+            }) catch unreachable;
+        try phaseRow(writer, "decode", self.decodeNs(), wall_ns, dec_note);
+
+        var total_buf: [32]u8 = undefined;
+        try writer.print("  {s:<13} {s:>8}   100%\n\n", .{ "total", prof_report.formatDuration(&total_buf, wall_ns) });
+
+        try prof_report.writeLinkSection(writer, &self.rg);
+        try writer.writeByte('\n');
         try prof_report.writeOpTable(writer, &self.rg.op_totals, self.rg.device_total_ns);
     }
+
+    /// Every counter, machine-readable. Built as a value tree and stringified by
+    /// std.json so escaping and comma placement are the library's problem, not
+    /// ours. Carries the fields the pretty view drops (alloc, download, the raw
+    /// host/device timing triplet).
+    fn reportJson(self: *const Profile, writer: *std.Io.Writer, counters: Counters, model_path: []const u8, device_label: []const u8) std.Io.Writer.Error!void {
+        const OpRow = struct {
+            op: []const u8,
+            count: u32,
+            total_ms: f64,
+            avg_ms: f64,
+            dev_pct: f64,
+            bytes: u64,
+            eff_mib_s: f64,
+        };
+        var op_rows: [profiling.max_op_tag + 1]OpRow = undefined;
+        var op_count: usize = 0;
+        for (self.rg.op_totals) |aggregate| {
+            if (aggregate.count == 0) continue;
+            op_rows[op_count] = .{
+                .op = prof_report.opName(aggregate.tag),
+                .count = aggregate.count,
+                .total_ms = prof_report.nsToMs(aggregate.total_ns),
+                .avg_ms = prof_report.avgMs(aggregate.total_ns, aggregate.count),
+                .dev_pct = prof_report.percent(aggregate.total_ns, self.rg.device_total_ns),
+                .bytes = aggregate.bytes,
+                .eff_mib_s = prof_report.mibPerSecond(aggregate.bytes, aggregate.total_ns),
+            };
+            op_count += 1;
+        }
+
+        const payload = .{
+            .model = modelName(model_path),
+            .device = device_label,
+            .tokens = self.generated_tokens,
+            .throughput_tok_s = prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
+            .wall_ms = prof_report.nsToMs(self.wallNs()),
+            .phases = .{
+                .model_load_ms = prof_report.nsToMs(self.model_load_ns),
+                .context_init_ms = prof_report.nsToMs(self.context_init_ns),
+                .upload_ms = prof_report.nsToMs(self.upload_ns),
+                .prefill_ms = prof_report.nsToMs(self.prefill_ns),
+                .first_token_decode_ms = prof_report.nsToMs(self.first_decode_ns),
+                .steady_decode_ms = prof_report.nsToMs(self.steady_decode_ns),
+                .steady_decode_avg_ms = prof_report.avgMs(self.steady_decode_ns, self.steady_decode_count),
+                .decode_ms = prof_report.nsToMs(self.decodeNs()),
+            },
+            .setup = .{
+                .alloc_count = self.alloc_count,
+                .alloc_bytes = self.alloc_bytes,
+                .alloc_ms = prof_report.nsToMs(self.alloc_ns),
+                .upload_count = self.upload_count,
+                .upload_bytes = self.upload_bytes,
+                .upload_ms = prof_report.nsToMs(self.upload_ns),
+                .upload_mib_s = prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
+                .download_count = self.download_count,
+                .download_bytes = self.download_bytes,
+                .download_ms = prof_report.nsToMs(self.download_ns),
+            },
+            .link = .{
+                .graphs = self.rg.run_graph_count,
+                .commands = self.rg.command_count,
+                .host_rpc_ms = prof_report.nsToMs(self.rg.host_run_graph_ns),
+                .device_total_ms = prof_report.nsToMs(self.rg.device_total_ns),
+                .device_op_ms = prof_report.nsToMs(self.rg.opTotalNs()),
+                .device_runtime_ms = prof_report.nsToMs(self.rg.deviceRuntimeNs()),
+                .rpc_overhead_ms = prof_report.nsToMs(self.rg.rpcOverheadNs()),
+                .request_bytes = self.rg.request_bytes,
+                .response_bytes = self.rg.response_bytes,
+                .spans_dropped = self.rg.span_dropped,
+            },
+            .backend = .{
+                .graph_compute = counters.graph_compute,
+                .lowered_commands = counters.lowered_commands,
+                .upload_bytes = counters.upload_bytes,
+                .download_bytes = counters.download_bytes,
+            },
+            .ops = op_rows[0..op_count],
+        };
+
+        try std.json.Stringify.value(payload, .{}, writer);
+        try writer.writeByte('\n');
+    }
 };
+
+/// One phase-table row: label, auto-unit time, share of wall, optional note.
+fn phaseRow(writer: *std.Io.Writer, label: []const u8, ns: u64, wall_ns: u64, note: []const u8) std.Io.Writer.Error!void {
+    var buf: [32]u8 = undefined;
+    try writer.print("  {s:<13} {s:>8} {d:>5.0}%", .{ label, prof_report.formatDuration(&buf, ns), prof_report.percent(ns, wall_ns) });
+    if (note.len > 0) try writer.print("    {s}", .{note});
+    try writer.writeByte('\n');
+}
+
+/// Basename of the model path with the `.gguf` suffix removed, for the header.
+fn modelName(path: []const u8) []const u8 {
+    var name = path;
+    if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name = name[i + 1 ..];
+    if (std.mem.endsWith(u8, name, ".gguf")) name = name[0 .. name.len - 5];
+    return name;
+}
 
 pub const Device = struct {
     const Self = @This();
