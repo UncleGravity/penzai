@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 5;
+pub const version: u16 = 6;
 pub const response_meta_len: usize = 48;
 
 pub const RequestTag = enum(u16) {
@@ -10,6 +10,7 @@ pub const RequestTag = enum(u16) {
     upload = 4,
     download = 5,
     run_graph = 6,
+    fill = 7,
 };
 
 pub const OpTag = enum(u16) {
@@ -101,6 +102,12 @@ pub const TransferRequest = struct {
     bytes: []const u8 = &.{},
 };
 
+pub const FillRequest = struct {
+    request_id: u64,
+    range: TensorRange,
+    value: u8,
+};
+
 /// What a run_graph request asks the device to collect.
 /// `aggregate` accrues per-op totals (cheap, fixed size); `trace` additionally
 /// records per-command spans (O(commands), opt-in). Wire flags: bit0 = aggregate,
@@ -141,6 +148,7 @@ pub const Request = union(RequestTag) {
     upload: TransferRequest,
     download: TransferRequest,
     run_graph: RunGraphRequest,
+    fill: FillRequest,
 
     pub fn requestId(self: Request) u64 {
         return switch (self) {
@@ -150,6 +158,7 @@ pub const Request = union(RequestTag) {
             .upload => |r| r.request_id,
             .download => |r| r.request_id,
             .run_graph => |r| r.request_id,
+            .fill => |r| r.request_id,
         };
     }
 };
@@ -358,6 +367,16 @@ pub fn encodeDownload(out: []u8, request_id: u64, range: TensorRange) EncodeErro
     return encodeRangeRequest(out, .download, request_id, range);
 }
 
+pub fn encodeFill(out: []u8, request_id: u64, range: TensorRange, value: u8) EncodeError!usize {
+    const len = 16 + rangeLen + 8;
+    if (out.len < len) return error.OutputTooSmall;
+    var cursor = try encodeHeader(out, .fill, request_id);
+    putRange(out, &cursor, range);
+    putU32(out, &cursor, value);
+    putU32(out, &cursor, 0);
+    return cursor;
+}
+
 pub fn encodeRunGraph(out: []u8, request_id: u64, tier: ProfileTier) EncodeError!usize {
     const len = 24;
     if (out.len < len) return error.OutputTooSmall;
@@ -402,6 +421,14 @@ pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Requ
             const range = try takeRange(metadata, &cursor);
             if (cursor != metadata.len or payload.len != 0) return error.InvalidLength;
             break :blk .{ .download = .{ .request_id = request_id, .range = range } };
+        },
+        .fill => blk: {
+            const range = try takeRange(metadata, &cursor);
+            const value = try takeU32(metadata, &cursor);
+            const reserved = try takeU32(metadata, &cursor);
+            if (cursor != metadata.len or payload.len != 0) return error.InvalidLength;
+            if (value > std.math.maxInt(u8) or reserved != 0) return error.InvalidFlags;
+            break :blk .{ .fill = .{ .request_id = request_id, .range = range, .value = @intCast(value) } };
         },
         .run_graph => blk: {
             var tier: ProfileTier = .off;
@@ -1007,6 +1034,16 @@ test "alloc request roundtrip" {
     try std.testing.expectEqual(@as(u64, 7), req.requestId());
     try std.testing.expectEqual(@as(u64, 4096), req.alloc.nbytes);
     try std.testing.expectEqual(@as(u32, 64), req.alloc.alignment);
+}
+
+test "fill request roundtrip" {
+    var meta: [64]u8 = undefined;
+    const range: TensorRange = .{ .handle = 3, .offset = 128, .nbytes = 4096 };
+    const n = try encodeFill(&meta, 9, range, 0xab);
+    const req = try decodeRequest(meta[0..n], "");
+    try std.testing.expectEqual(@as(u64, 9), req.requestId());
+    try std.testing.expectEqual(range, req.fill.range);
+    try std.testing.expectEqual(@as(u8, 0xab), req.fill.value);
 }
 
 test "command buffer roundtrip" {

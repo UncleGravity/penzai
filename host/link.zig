@@ -25,6 +25,7 @@ pub const Client = struct {
         alloc: *const fn (*anyopaque, u64, u32) LinkError!wire.TensorRange,
         free: *const fn (*anyopaque, wire.TensorRange) LinkError!void,
         upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!void,
+        fill: *const fn (*anyopaque, wire.TensorRange, u8) LinkError!void,
         download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!void,
         run_graph: *const fn (*anyopaque, []const wire.Command) LinkError!void,
         run_graph_profile: *const fn (*anyopaque, []const wire.Command, wire.ProfileTier) LinkError!ProfiledRunGraph,
@@ -57,6 +58,10 @@ pub const Client = struct {
                 return ptr(ctx).upload(range, bytes);
             }
 
+            fn callFill(ctx: *anyopaque, range: wire.TensorRange, value: u8) LinkError!void {
+                return ptr(ctx).fill(range, value);
+            }
+
             fn callDownload(ctx: *anyopaque, range: wire.TensorRange, out: []u8) LinkError!void {
                 return ptr(ctx).download(range, out);
             }
@@ -74,6 +79,7 @@ pub const Client = struct {
                 .alloc = callAlloc,
                 .free = callFree,
                 .upload = callUpload,
+                .fill = callFill,
                 .download = callDownload,
                 .run_graph = callRunGraph,
                 .run_graph_profile = callRunGraphProfile,
@@ -100,6 +106,10 @@ pub const Client = struct {
 
     pub fn upload(self: Self, range: wire.TensorRange, bytes: []const u8) LinkError!void {
         return self.vtable.upload(self.ctx, range, bytes);
+    }
+
+    pub fn fill(self: Self, range: wire.TensorRange, value: u8) LinkError!void {
+        return self.vtable.fill(self.ctx, range, value);
     }
 
     pub fn download(self: Self, range: wire.TensorRange, out: []u8) LinkError!void {
@@ -181,6 +191,15 @@ pub const FakeLink = struct {
         const id = self.nextId();
         const meta_len = wire.encodeUpload(&meta, id, range) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], bytes);
+        defer response.deinit(self.allocator);
+        try response.expectOk(id);
+    }
+
+    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!void {
+        var meta: [64]u8 = undefined;
+        const id = self.nextId();
+        const meta_len = wire.encodeFill(&meta, id, range, value) catch return error.Protocol;
+        var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
     }
@@ -281,6 +300,15 @@ pub const TcpLink = struct {
         const id = self.nextId();
         const meta_len = wire.encodeUpload(&meta, id, range) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], bytes);
+        defer response.deinit(self.allocator);
+        try response.expectOk(id);
+    }
+
+    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!void {
+        var meta: [64]u8 = undefined;
+        const id = self.nextId();
+        const meta_len = wire.encodeFill(&meta, id, range, value) catch return error.Protocol;
+        var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
     }

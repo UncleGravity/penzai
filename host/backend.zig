@@ -12,7 +12,6 @@ const census_mod = @import("census");
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;
 const alignment = 64;
-const fill_chunk = 64 * 1024;
 
 pub const BackendError = error{
     HandshakeFailed,
@@ -25,6 +24,7 @@ pub const Counters = struct {
     view_bindings: usize = 0,
     normal_bindings: usize = 0,
     upload_bytes: usize = 0,
+    fill_bytes: usize = 0,
     download_bytes: usize = 0,
     graph_compute: usize = 0,
     lowered_commands: usize = 0,
@@ -46,6 +46,9 @@ pub const Profile = struct {
     upload_count: u64 = 0,
     upload_bytes: u64 = 0,
     upload_ns: u64 = 0,
+    fill_count: u64 = 0,
+    fill_bytes: u64 = 0,
+    fill_ns: u64 = 0,
     download_count: u64 = 0,
     download_bytes: u64 = 0,
     download_ns: u64 = 0,
@@ -75,6 +78,12 @@ pub const Profile = struct {
         self.upload_ns += ns;
     }
 
+    pub fn recordFill(self: *Profile, nbytes: u64, ns: u64) void {
+        self.fill_count += 1;
+        self.fill_bytes += nbytes;
+        self.fill_ns += ns;
+    }
+
     pub fn recordDownload(self: *Profile, nbytes: u64, ns: u64) void {
         self.download_count += 1;
         self.download_bytes += nbytes;
@@ -89,7 +98,7 @@ pub const Profile = struct {
     /// phase table's percentages add to 100. alloc/download are excluded — they
     /// overlap setup and are sub-percent; the json format still carries them.
     fn wallNs(self: *const Profile) u64 {
-        return self.model_load_ns + self.context_init_ns + self.upload_ns +
+        return self.model_load_ns + self.context_init_ns + self.upload_ns + self.fill_ns +
             self.prefill_ns + self.first_decode_ns + self.steady_decode_ns;
     }
 
@@ -134,6 +143,14 @@ pub const Profile = struct {
             prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
         }) catch unreachable;
         try phaseRow(writer, "weight upload", self.upload_ns, wall_ns, up_note);
+
+        var fill_bytes_buf: [32]u8 = undefined;
+        var fill_buf: [96]u8 = undefined;
+        const fill_note = std.fmt.bufPrint(&fill_buf, "{s}, {d} calls", .{
+            prof_report.formatBytes(&fill_bytes_buf, self.fill_bytes),
+            self.fill_count,
+        }) catch unreachable;
+        try phaseRow(writer, "remote fill", self.fill_ns, wall_ns, fill_note);
 
         try phaseRow(writer, "prefill", self.prefill_ns, wall_ns, "");
 
@@ -199,6 +216,7 @@ pub const Profile = struct {
                 .model_load_ms = prof_report.nsToMs(self.model_load_ns),
                 .context_init_ms = prof_report.nsToMs(self.context_init_ns),
                 .upload_ms = prof_report.nsToMs(self.upload_ns),
+                .fill_ms = prof_report.nsToMs(self.fill_ns),
                 .prefill_ms = prof_report.nsToMs(self.prefill_ns),
                 .first_token_decode_ms = prof_report.nsToMs(self.first_decode_ns),
                 .steady_decode_ms = prof_report.nsToMs(self.steady_decode_ns),
@@ -213,6 +231,9 @@ pub const Profile = struct {
                 .upload_bytes = self.upload_bytes,
                 .upload_ms = prof_report.nsToMs(self.upload_ns),
                 .upload_mib_s = prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
+                .fill_count = self.fill_count,
+                .fill_bytes = self.fill_bytes,
+                .fill_ms = prof_report.nsToMs(self.fill_ns),
                 .download_count = self.download_count,
                 .download_bytes = self.download_bytes,
                 .download_ms = prof_report.nsToMs(self.download_ns),
@@ -233,6 +254,7 @@ pub const Profile = struct {
                 .graph_compute = counters.graph_compute,
                 .lowered_commands = counters.lowered_commands,
                 .upload_bytes = counters.upload_bytes,
+                .fill_bytes = counters.fill_bytes,
                 .download_bytes = counters.download_bytes,
             },
             .ops = op_rows[0..op_count],
@@ -565,19 +587,12 @@ fn bufReset(buf: c.ggml_backend_buffer_t) callconv(.c) void {
 }
 
 fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) link_mod.LinkError!void {
-    var buf: [fill_chunk]u8 = undefined;
-    @memset(&buf, value);
-    var done: usize = 0;
-    while (done < size) {
-        const n = @min(buf.len, size - done);
-        try timedUpload(dev, .{
-            .handle = handle,
-            .offset = offset + @as(u64, @intCast(done)),
-            .nbytes = @intCast(n),
-        }, buf[0..n]);
-        done += n;
-    }
-    dev.counters.upload_bytes += size;
+    try timedFill(dev, .{
+        .handle = handle,
+        .offset = offset,
+        .nbytes = @intCast(size),
+    }, value);
+    dev.counters.fill_bytes += size;
 }
 
 fn timedAlloc(dev: *Device, nbytes: u64, tensor_alignment: u32) link_mod.LinkError!wire.TensorRange {
@@ -591,6 +606,12 @@ fn timedUpload(dev: *Device, range: wire.TensorRange, bytes: []const u8) link_mo
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     try dev.link.upload(range, bytes);
     if (dev.profile) |profile| profile.recordUpload(@intCast(bytes.len), profile.elapsedSince(start_ns));
+}
+
+fn timedFill(dev: *Device, range: wire.TensorRange, value: u8) link_mod.LinkError!void {
+    const start_ns = if (dev.profile) |profile| profile.now() else 0;
+    try dev.link.fill(range, value);
+    if (dev.profile) |profile| profile.recordFill(range.nbytes, profile.elapsedSince(start_ns));
 }
 
 fn timedDownload(dev: *Device, range: wire.TensorRange, out: []u8) link_mod.LinkError!void {

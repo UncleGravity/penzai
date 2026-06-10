@@ -76,6 +76,11 @@ pub const Heap = struct {
         @memcpy(self.data[abs..][0..src.len], src);
     }
 
+    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) HeapError!void {
+        const abs = try self.absolute(range);
+        @memset(self.data[abs..][0..try checkedUsize(range.nbytes)], value);
+    }
+
     pub fn bytes(self: *Self, range: wire.TensorRange) HeapError![]u8 {
         const abs = try self.absolute(range);
         return self.data[abs..][0..@intCast(range.nbytes)];

@@ -20,6 +20,21 @@ test "fake link alloc upload copy download" {
     try std.testing.expectEqualSlices(u8, "abcdefghijklmnop", &out);
 }
 
+test "fake link fill download" {
+    var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
+
+    const range = try link.alloc(16, 64);
+    try link.fill(.{ .handle = range.handle, .offset = 4, .nbytes = 8 }, 0xab);
+
+    var out: [16]u8 = undefined;
+    try link.download(range, &out);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), out[0..4]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0xab} ** 8), out[4..12]);
+    try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), out[12..16]);
+}
+
 test "fake link q1a8 matmul reference" {
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
     defer runtime.deinit();

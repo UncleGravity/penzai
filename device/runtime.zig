@@ -71,6 +71,14 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         .nbytes = req.bytes.len,
                     } };
                 },
+                .fill => |req| blk: {
+                    self.heap.fill(req.range, req.value) catch |err| return mapHeapError(err);
+                    break :blk .{ .meta = .{
+                        .request_id = req.request_id,
+                        .status = .ok,
+                        .nbytes = req.range.nbytes,
+                    } };
+                },
                 .download => |req| blk: {
                     const bytes = self.heap.read(req.range) catch |err| return mapHeapError(err);
                     break :blk .{ .meta = .{
