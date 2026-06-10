@@ -165,11 +165,12 @@
                 BOARD="''${BOARD:-ubuntu@kria}"
                 BOARD_TMP="''${BOARD_TMP:-/tmp/penzai}"
                 REMOTE_BIN="$BOARD_TMP/penzaid"
+                REMOTE_KILL_PATTERN="$BOARD_TMP/[p]enzaid"
 
                 echo "== deploy ${label} penzaid -> $BOARD:$REMOTE_BIN =="
                 echo "== stop existing penzaid on $BOARD =="
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "pkill -f '$REMOTE_BIN' 2>/dev/null || true"
+                ssh "$BOARD" "pkill -f '$REMOTE_KILL_PATTERN' 2>/dev/null || true"
                 # shellcheck disable=SC2029
                 ssh "$BOARD" "mkdir -p '$BOARD_TMP'"
                 scp "${penzaidPackage}/bin/penzaid" "$BOARD:$REMOTE_BIN"
