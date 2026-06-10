@@ -12,7 +12,7 @@ const census_mod = @import("census");
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;
 const alignment = 64;
-const fill_chunk = 4096;
+const fill_chunk = 64 * 1024;
 
 pub const BackendError = error{
     HandshakeFailed,
