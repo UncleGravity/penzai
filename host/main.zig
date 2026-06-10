@@ -107,6 +107,8 @@ fn runLlamaCommand(
             options.chat_template = false;
         } else if (std.mem.eql(u8, arg, "--think")) {
             options.enable_thinking = true;
+        } else if (std.mem.eql(u8, arg, "--prof")) {
+            options.profile = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -118,7 +120,7 @@ fn runLlamaCommand(
     const device_spec = try protocol_transport.parseDeviceSpec(device);
     switch (mode) {
         .generate, .census => switch (device_spec) {
-            .fake => try run_mod.runFakeLlama(init.gpa, stdout, options),
+            .fake => try run_mod.runFakeLlama(init.io, init.gpa, stdout, options),
             .tcp => |tcp| try run_mod.runTcpLlama(init.io, init.gpa, stdout, tcp, options),
         },
         .logits => switch (device_spec) {
@@ -213,7 +215,7 @@ fn parseF32(value: []const u8) CliError!f32 {
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof]
         \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
         \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]

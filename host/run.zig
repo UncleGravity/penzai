@@ -47,9 +47,11 @@ pub const LlamaOptions = struct {
     logits_tolerance: f32 = 0.25,
     chat_template: bool = true,
     enable_thinking: bool = false,
+    profile: bool = false,
 };
 
 pub fn runFakeLlama(
+    io: std.Io,
     allocator: std.mem.Allocator,
     writer: *std.Io.Writer,
     options: LlamaOptions,
@@ -57,9 +59,9 @@ pub fn runFakeLlama(
     if (!build_options.enable_llama) return error.LlamaDisabled;
     var runtime = try runtime_mod.Runtime.init(allocator, try heapBytes(options.heap_mib));
     defer runtime.deinit();
-    var link = link_mod.FakeLink.init(allocator, &runtime);
+    var link = link_mod.FakeLink.initWithIo(allocator, &runtime, io);
     const client = link_mod.Client.init(&link);
-    return llama_mod.runPrompt(allocator, writer, client, .{
+    return llama_mod.runPrompt(io, allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
@@ -67,6 +69,7 @@ pub fn runFakeLlama(
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
+        .profile = options.profile,
     });
 }
 
@@ -81,7 +84,7 @@ pub fn runTcpLlama(
     var link = try link_mod.TcpLink.connect(allocator, io, spec);
     defer link.deinit();
     const client = link_mod.Client.init(&link);
-    return llama_mod.runPrompt(allocator, writer, client, .{
+    return llama_mod.runPrompt(io, allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
         .max_tokens = options.max_tokens,
@@ -89,6 +92,7 @@ pub fn runTcpLlama(
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
+        .profile = options.profile,
     });
 }
 

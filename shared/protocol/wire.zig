@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 4;
+pub const version: u16 = 5;
 pub const response_meta_len: usize = 48;
 
 pub const RequestTag = enum(u16) {
@@ -103,6 +103,7 @@ pub const TransferRequest = struct {
 pub const RunGraphRequest = struct {
     request_id: u64,
     command_bytes: []const u8,
+    profile: bool = false,
 };
 
 pub const Request = union(RequestTag) {
@@ -329,8 +330,13 @@ pub fn encodeDownload(out: []u8, request_id: u64, range: TensorRange) EncodeErro
     return encodeRangeRequest(out, .download, request_id, range);
 }
 
-pub fn encodeRunGraph(out: []u8, request_id: u64) EncodeError!usize {
-    return encodeHeader(out, .run_graph, request_id);
+pub fn encodeRunGraph(out: []u8, request_id: u64, profile: bool) EncodeError!usize {
+    const len = 24;
+    if (out.len < len) return error.OutputTooSmall;
+    var cursor = try encodeHeader(out, .run_graph, request_id);
+    putU32(out, &cursor, if (profile) 1 else 0);
+    putU32(out, &cursor, 0);
+    return cursor;
 }
 
 pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Request {
@@ -370,8 +376,14 @@ pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Requ
             break :blk .{ .download = .{ .request_id = request_id, .range = range } };
         },
         .run_graph => blk: {
-            if (cursor != metadata.len) return error.InvalidLength;
-            break :blk .{ .run_graph = .{ .request_id = request_id, .command_bytes = payload } };
+            var profile = false;
+            if (cursor != metadata.len) {
+                const flags = try takeU32(metadata, &cursor);
+                _ = try takeU32(metadata, &cursor);
+                if (cursor != metadata.len) return error.InvalidLength;
+                profile = (flags & 1) != 0;
+            }
+            break :blk .{ .run_graph = .{ .request_id = request_id, .command_bytes = payload, .profile = profile } };
         },
     };
 }

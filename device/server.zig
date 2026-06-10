@@ -9,6 +9,7 @@ pub const ServerError = error{
 };
 
 pub fn handleFrame(
+    io: ?std.Io,
     allocator: std.mem.Allocator,
     runtime: anytype,
     frame_bytes: []const u8,
@@ -19,11 +20,12 @@ pub fn handleFrame(
         0,
         .invalid_request,
     );
-    const result = runtime.dispatch(request) catch |err| return encodeError(
+    var result = runtime.dispatch(request, io) catch |err| return encodeError(
         allocator,
         request.requestId(),
         runtime_mod.errorCode(err),
     );
+    defer result.deinit(allocator);
     return encodeResponse(allocator, result.meta, result.payload);
 }
 

@@ -95,7 +95,7 @@ fn serveStream(
             defer frame = undefined;
             defer allocator.free(frame);
 
-            var response = server_mod.handleFrame(allocator, runtime, frame) catch |err| switch (err) {
+            var response = server_mod.handleFrame(io, allocator, runtime, frame) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 error.BadFrame => return error.Protocol,
             };

@@ -1,5 +1,7 @@
 const std = @import("std");
 const wire = @import("wire");
+const profiling = @import("profiling");
+const q1a8 = @import("q1a8");
 const heap_mod = @import("heap");
 const ps_activations = @import("ps_activations");
 const ps_elemwise = @import("ps_elemwise");
@@ -40,7 +42,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
             self.* = undefined;
         }
 
-        pub fn dispatch(self: *Self, request: wire.Request) RuntimeError!DispatchResult {
+        pub fn dispatch(self: *Self, request: wire.Request, io: ?std.Io) RuntimeError!DispatchResult {
             return switch (request) {
                 .hello => |request_id| .{ .meta = ok(request_id) },
                 .alloc => |req| blk: {
@@ -77,17 +79,61 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     }, .payload = bytes };
                 },
                 .run_graph => |req| blk: {
+                    const request_start_ns = nowNs(io);
                     const commands = wire.decodeCommandBuffer(self.allocator, req.command_bytes) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.InvalidRequest,
                     };
+                    const decode_done_ns = nowNs(io);
                     defer self.allocator.free(commands);
-                    for (commands) |command| try self.execute(command);
+                    var profile_payload: []u8 = &.{};
+                    var owns_payload = false;
+                    if (req.profile) {
+                        var spans: [profiling.max_spans]profiling.Span = undefined;
+                        var span_count: u32 = 0;
+                        var span_dropped: u32 = 0;
+                        var aggregates = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1);
+
+                        const execute_start_ns = nowNs(io);
+                        for (commands) |command| {
+                            const tag = commandTag(command);
+                            const bytes = commandBytes(command);
+                            const start_ns = nowNs(io);
+                            try self.execute(command);
+                            const end_ns = nowNs(io);
+                            recordProfile(tag, bytes, request_start_ns, start_ns, end_ns, &aggregates, &spans, &span_count, &span_dropped);
+                        }
+                        const execute_done_ns = nowNs(io);
+
+                        var used_aggregates: [profiling.max_op_tag + 1]profiling.Aggregate = undefined;
+                        var aggregate_count: usize = 0;
+                        for (aggregates) |aggregate| {
+                            if (aggregate.count == 0) continue;
+                            used_aggregates[aggregate_count] = aggregate;
+                            aggregate_count += 1;
+                        }
+                        profile_payload = profiling.encodeAlloc(self.allocator, .{
+                            .summary = .{
+                                .device_total_ns = elapsed(request_start_ns, execute_done_ns),
+                                .decode_ns = elapsed(request_start_ns, decode_done_ns),
+                                .execute_ns = elapsed(execute_start_ns, execute_done_ns),
+                                .command_count = @intCast(commands.len),
+                                .span_count = span_count,
+                                .span_dropped = span_dropped,
+                            },
+                            .aggregates = used_aggregates[0..aggregate_count],
+                            .spans = spans[0..span_count],
+                        }) catch return error.OutOfMemory;
+                        owns_payload = true;
+                    } else {
+                        for (commands) |command| try self.execute(command);
+                    }
                     break :blk .{ .meta = .{
                         .request_id = req.request_id,
                         .status = .ok,
                         .value0 = commands.len,
-                    } };
+                        .nbytes = profile_payload.len,
+                    }, .payload = profile_payload, .owns_payload = owns_payload };
                 },
             };
         }
@@ -220,6 +266,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
 pub const DispatchResult = struct {
     meta: wire.ResponseMeta,
     payload: []const u8 = &.{},
+    owns_payload: bool = false,
+
+    pub fn deinit(self: *DispatchResult, allocator: std.mem.Allocator) void {
+        if (self.owns_payload) allocator.free(@constCast(self.payload));
+        self.* = undefined;
+    }
 };
 
 pub fn errorCode(err: RuntimeError) wire.ErrorCode {
@@ -249,6 +301,130 @@ fn ropeMode(mode: wire.RopeMode) ps_rope.Mode {
         .normal => .normal,
         .neox => .neox,
     };
+}
+
+fn nowNs(io: ?std.Io) u64 {
+    const active = io orelse return 0;
+    const ns = std.Io.Timestamp.now(active, .awake).nanoseconds;
+    return std.math.cast(u64, ns) orelse 0;
+}
+
+fn elapsed(start_ns: u64, end_ns: u64) u64 {
+    return if (end_ns >= start_ns) end_ns - start_ns else 0;
+}
+
+fn recordProfile(
+    tag: wire.OpTag,
+    bytes: u64,
+    request_start_ns: u64,
+    start_ns: u64,
+    end_ns: u64,
+    aggregates: *[profiling.max_op_tag + 1]profiling.Aggregate,
+    spans: *[profiling.max_spans]profiling.Span,
+    span_count: *u32,
+    span_dropped: *u32,
+) void {
+    const raw_tag: u16 = @intFromEnum(tag);
+    const index: usize = raw_tag;
+    if (index < aggregates.len) {
+        var aggregate = &aggregates[index];
+        aggregate.tag = raw_tag;
+        aggregate.count += 1;
+        aggregate.total_ns += elapsed(start_ns, end_ns);
+        aggregate.bytes += bytes;
+    }
+    if (span_count.* < profiling.max_spans) {
+        spans[span_count.*] = .{
+            .tag = raw_tag,
+            .start_ns = elapsed(request_start_ns, start_ns),
+            .end_ns = elapsed(request_start_ns, end_ns),
+            .bytes = bytes,
+        };
+        span_count.* += 1;
+    } else {
+        span_dropped.* += 1;
+    }
+}
+
+fn commandTag(command: wire.Command) wire.OpTag {
+    return switch (command) {
+        .copy => .copy,
+        .cpy_f32_to_f16 => .cpy_f32_to_f16,
+        .matmul_q1a8 => .matmul_q1a8,
+        .rmsnorm => .rmsnorm,
+        .rope => .rope,
+        .softmax => .softmax,
+        .silu => .silu,
+        .swiglu => .swiglu,
+        .add_f32 => .add_f32,
+        .mul_f32 => .mul_f32,
+        .scale_f32 => .scale_f32,
+        .add_scaled_f32 => .add_scaled_f32,
+        .set_rows => .set_rows,
+        .get_rows => .get_rows,
+        .flash_attn_f32 => .flash_attn_f32,
+    };
+}
+
+fn commandBytes(command: wire.Command) u64 {
+    return switch (command) {
+        .copy => |op| op.src.nbytes + op.dst.nbytes,
+        .cpy_f32_to_f16 => |op| op.src.nbytes + op.dst.nbytes,
+        .matmul_q1a8 => |op| op.weights.nbytes + op.acts.nbytes + op.dst.nbytes,
+        .rmsnorm => |op| op.input.nbytes + op.dst.nbytes,
+        .rope => |op| op.input.nbytes + op.positions.nbytes + op.dst.nbytes,
+        .softmax => |op| op.src.nbytes + op.dst.nbytes,
+        .silu => |op| op.src.nbytes + op.dst.nbytes,
+        .swiglu => |op| op.lhs.nbytes + op.rhs.nbytes + op.dst.nbytes,
+        .add_f32 => |op| op.lhs.nbytes + op.rhs.nbytes + op.dst.nbytes,
+        .mul_f32 => |op| op.lhs.nbytes + op.rhs.nbytes + op.dst.nbytes,
+        .scale_f32 => |op| op.src.nbytes + op.dst.nbytes,
+        .add_scaled_f32 => |op| op.lhs.nbytes + op.rhs.nbytes + op.dst.nbytes,
+        .set_rows => |op| setRowsBytes(op),
+        .get_rows => |op| getRowsBytes(op),
+        .flash_attn_f32 => |op| op.q.nbytes + op.k.nbytes + op.v.nbytes + (if (op.has_mask) op.mask.nbytes else 0) + op.dst.nbytes,
+    };
+}
+
+fn setRowsBytes(op: wire.SetRows) u64 {
+    const rows = satMul(satMul(op.ne01, op.ne02), op.ne03);
+    const index_size: u64 = switch (op.index_type) {
+        .i32 => @sizeOf(i32),
+        .i64 => @sizeOf(i64),
+    };
+    const src_row_bytes = satMul(op.head_dim, @sizeOf(f32));
+    const dst_row_bytes = satMul(op.head_dim, @sizeOf(f16));
+    return satMul(rows, satAdd(satAdd(src_row_bytes, index_size), dst_row_bytes));
+}
+
+fn getRowsBytes(op: wire.GetRows) u64 {
+    const rows = satMul(satMul(op.ne10, op.ne11), op.ne12);
+    const index_bytes: u64 = @sizeOf(i32);
+    const dst_row_bytes = satMul(op.row_width, @sizeOf(f32));
+    const src_row_bytes: u64 = switch (op.src_type) {
+        .f32 => satMul(op.row_width, @sizeOf(f32)),
+        .q1_0 => q1GetRowsSourceBytes(op.row_width),
+    };
+    return satMul(rows, satAdd(satAdd(src_row_bytes, index_bytes), dst_row_bytes));
+}
+
+fn q1GetRowsSourceBytes(row_width: u32) u64 {
+    if (row_width == 0) return 0;
+    const blocks = (asU64(row_width) + q1a8.q1_block - 1) / q1a8.q1_block;
+    const bytes_per_block = q1a8.beat_bytes * (1 + q1a8.q8_subblocks);
+    return satMul(blocks, bytes_per_block);
+}
+
+fn satAdd(a: anytype, b: anytype) u64 {
+    return asU64(a) +| asU64(b);
+}
+
+fn satMul(a: anytype, b: anytype) u64 {
+    return asU64(a) *| asU64(b);
+}
+
+fn asU64(value: anytype) u64 {
+    return @intCast(value);
 }
 
 fn mapHeapError(err: anyerror) RuntimeError {
@@ -397,7 +573,7 @@ test "runtime dispatches ps f32 command variants" {
     const result = try runtime.dispatch(.{ .run_graph = .{
         .request_id = 99,
         .command_bytes = command_bytes[0..command_len],
-    } });
+    } }, std.testing.io);
     try std.testing.expectEqual(wire.Status.ok, result.meta.status);
     try std.testing.expectEqual(@as(u64, commands.len), result.meta.value0);
 
@@ -476,4 +652,52 @@ fn writeF32(bytes: []u8, index: usize, value: f32) void {
 
 fn readF32(bytes: []const u8, index: usize) f32 {
     return @bitCast(std.mem.readInt(u32, bytes[index * @sizeOf(f32) ..][0..4], .little));
+}
+
+test "profile byte estimates for row ops count touched rows, not backing spans" {
+    const large = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 1_000_000 };
+    const indices = wire.TensorRange{ .handle = 2, .offset = 0, .nbytes = 4096 };
+    const set_rows = wire.Command{ .set_rows = .{
+        .src = large,
+        .indices = indices,
+        .dst = large,
+        .index_type = .i32,
+        .head_dim = 256,
+        .ne01 = 13,
+        .ne02 = 1,
+        .ne03 = 1,
+        .ne11 = 1,
+        .ne12 = 1,
+        .src_nb1 = 256 * @sizeOf(f32),
+        .src_nb2 = 13 * 256 * @sizeOf(f32),
+        .src_nb3 = 13 * 256 * @sizeOf(f32),
+        .indices_nb1 = 13 * @sizeOf(i32),
+        .indices_nb2 = 13 * @sizeOf(i32),
+        .dst_nb1 = 256 * @sizeOf(f16),
+        .dst_nb2 = 13 * 256 * @sizeOf(f16),
+        .dst_nb3 = 13 * 256 * @sizeOf(f16),
+    } };
+    try std.testing.expectEqual(@as(u64, 13 * (256 * 4 + 4 + 256 * 2)), commandBytes(set_rows));
+
+    const get_rows = wire.Command{ .get_rows = .{
+        .src = large,
+        .indices = indices,
+        .dst = large,
+        .src_type = .q1_0,
+        .row_width = 256,
+        .src_rows = 1024,
+        .ne10 = 2,
+        .ne11 = 3,
+        .ne12 = 1,
+        .src_nb1 = 256 * @sizeOf(f32),
+        .src_nb2 = 256 * @sizeOf(f32),
+        .src_nb3 = 256 * @sizeOf(f32),
+        .indices_nb1 = 2 * @sizeOf(i32),
+        .indices_nb2 = 6 * @sizeOf(i32),
+        .dst_nb1 = 256 * @sizeOf(f32),
+        .dst_nb2 = 2 * 256 * @sizeOf(f32),
+        .dst_nb3 = 6 * 256 * @sizeOf(f32),
+    } };
+    const q1_source_bytes = 2 * q1a8.beat_bytes * (1 + q1a8.q8_subblocks);
+    try std.testing.expectEqual(@as(u64, 6 * (q1_source_bytes + 4 + 256 * 4)), commandBytes(get_rows));
 }

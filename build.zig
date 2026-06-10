@@ -7,6 +7,7 @@ const ModuleSet = struct {
     framing: *std.Build.Module,
     protocol_transport: *std.Build.Module,
     wire: *std.Build.Module,
+    profiling: *std.Build.Module,
     heap: *std.Build.Module,
     xrt: *std.Build.Module,
     xrt_bo: *std.Build.Module,
@@ -67,6 +68,7 @@ pub fn build(b: *std.Build) void {
     addTest(b, test_step, "shared/protocol/framing.zig", target, optimize, modules);
     addTest(b, test_step, "shared/protocol/transport.zig", target, optimize, modules);
     addTest(b, test_step, "shared/protocol/wire.zig", target, optimize, modules);
+    addTest(b, test_step, "shared/profiling.zig", target, optimize, modules);
     addTest(b, test_step, "shared/q1a8.zig", target, optimize, modules);
     addTest(b, test_step, "device/mem/heap.zig", target, optimize, modules);
     addTest(b, test_step, "device/runtime.zig", target, optimize, modules);
@@ -142,6 +144,7 @@ fn createModules(
     const framing = b.createModule(.{ .root_source_file = b.path("shared/protocol/framing.zig"), .target = target, .optimize = optimize });
     const protocol_transport = b.createModule(.{ .root_source_file = b.path("shared/protocol/transport.zig"), .target = target, .optimize = optimize });
     const wire = b.createModule(.{ .root_source_file = b.path("shared/protocol/wire.zig"), .target = target, .optimize = optimize });
+    const profiling = b.createModule(.{ .root_source_file = b.path("shared/profiling.zig"), .target = target, .optimize = optimize });
     const heap = b.createModule(.{ .root_source_file = b.path("device/mem/heap.zig"), .target = target, .optimize = optimize });
     const xrt = b.createModule(.{ .root_source_file = b.path("device/xrt.zig"), .target = target, .optimize = optimize, .link_libc = true });
     const xrt_bo = b.createModule(.{ .root_source_file = b.path("device/mem/xrt_bo.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -172,6 +175,8 @@ fn createModules(
     ps_rows.addImport("q1a8", q1a8);
     ps_rows.addImport("wire", wire);
     runtime.addImport("wire", wire);
+    runtime.addImport("profiling", profiling);
+    runtime.addImport("q1a8", q1a8);
     runtime.addImport("heap", heap);
     runtime.addImport("ps_activations", ps_activations);
     runtime.addImport("ps_elemwise", ps_elemwise);
@@ -192,6 +197,7 @@ fn createModules(
     link.addImport("framing", framing);
     link.addImport("protocol_transport", protocol_transport);
     link.addImport("wire", wire);
+    link.addImport("profiling", profiling);
     link.addImport("runtime", runtime);
     link.addImport("server", server);
     link.addImport("host_tcp", host_tcp);
@@ -216,6 +222,7 @@ fn createModules(
         m.addImport("c", c_mod.?);
         m.addImport("q1a8", q1a8);
         m.addImport("wire", wire);
+        m.addImport("profiling", profiling);
         m.addImport("link", link);
         m.addImport("lower", lower.?);
         m.addImport("census", census.?);
@@ -236,6 +243,7 @@ fn createModules(
         .framing = framing,
         .protocol_transport = protocol_transport,
         .wire = wire,
+        .profiling = profiling,
         .heap = heap,
         .xrt = xrt,
         .xrt_bo = xrt_bo,
@@ -266,6 +274,7 @@ fn attachCommon(mod: *std.Build.Module, modules: ModuleSet) void {
     mod.addImport("framing", modules.framing);
     mod.addImport("protocol_transport", modules.protocol_transport);
     mod.addImport("wire", modules.wire);
+    mod.addImport("profiling", modules.profiling);
     mod.addImport("heap", modules.heap);
     mod.addImport("xrt", modules.xrt);
     mod.addImport("xrt_bo", modules.xrt_bo);
