@@ -379,7 +379,16 @@ fn remoteOf(buf: c.ggml_backend_buffer_t) *RemoteBuffer {
 }
 
 fn findBindingIn(remote: *RemoteBuffer, tensor: *const c.ggml_tensor) ?RemoteBinding {
-    for (remote.bindings[0..remote.bindings_len]) |binding| {
+    if (remote.bindings_len == 0) return null;
+
+    // Bindings are appended in tensor-init order, and callers usually look up
+    // recently initialized tensors (views immediately after their sources, and
+    // graph operands from the current plan).  Search from the tail so repeated
+    // lookups during graph lowering don't repeatedly rescan the whole prefix.
+    var i = remote.bindings_len;
+    while (i > 0) {
+        i -= 1;
+        const binding = remote.bindings[i];
         if (binding.tensor == tensor) return binding;
     }
     return null;
