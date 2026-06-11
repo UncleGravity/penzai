@@ -72,6 +72,109 @@ pub fn build(b: *std.Build) void {
     all.dependOn(&native_device_exe.step);
 
     addTests(b, target, optimize, host_options, host_shared, host_runtime, host_server, host_link, llama_config, host_c);
+    addRtlSteps(b, target, optimize);
+}
+
+// q1a8 RTL file sets (paths relative to the repo root, where `zig build` runs).
+const core_rtl = [_][]const u8{
+    "fpga/rtl/q1a8/q1a8_rowblock.v", "fpga/rtl/q1a8/q1a8_reducer.v",
+    "fpga/rtl/q1a8/fp32_add.v",      "fpga/rtl/q1a8/fp32_mul.v",
+    "fpga/rtl/q1a8/fp16_to_fp32.v",  "fpga/rtl/q1a8/int_to_fp32.v",
+};
+const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
+const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
+
+const core_rtl_args = "fpga/rtl/q1a8/q1a8_rowblock.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
+
+fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    // regmap -> generated Verilog header (single source of register offsets).
+    const emit = b.addExecutable(.{
+        .name = "regmap-emit",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("fpga/regmap/emit.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+    const run_emit = b.addRunArtifact(emit);
+    const generated_vh = run_emit.captureStdOut(.{});
+    const update_vh = b.addUpdateSourceFiles();
+    update_vh.addCopyFileToSource(generated_vh, "fpga/rtl/q1a8/q1a8_regs.vh");
+    b.step("regmap", "Generate fpga/rtl/q1a8/q1a8_regs.vh from fpga/regmap/q1a8.regmap").dependOn(&update_vh.step);
+
+    // Verilator lint of all q1a8 RTL, including kernel_top + the counter bank +
+    // the generated header. This is the structural gate for the gateware that the
+    // cosim (which drives the core) does not exercise.
+    const lint = b.addSystemCommand(&.{
+        "sh", "-c",
+        "verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/q1a8 fpga/rtl/q1a8/q1a8_kernel_top.v fpga/rtl/q1a8/q1a8_kernel.v " ++ core_rtl_args,
+    });
+    b.step("lint-rtl", "Verilator lint the q1a8 RTL").dependOn(&lint.step);
+
+    addCosim(b, target, optimize, "test-rtl", "Verilator cosim: narrow q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl);
+    addCosim(b, target, optimize, "test-rtl-wide", "Verilator cosim: wide q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl);
+}
+
+fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const q1a8 = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/q1a8.zig"), .target = target, .optimize = optimize });
+    const pack = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/pack.zig"), .target = target, .optimize = optimize });
+    const ref = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/matmul_ref.zig"), .target = target, .optimize = optimize });
+    pack.addImport("q1a8", q1a8);
+    ref.addImport("q1a8", q1a8);
+    mod.addImport("q1a8", q1a8);
+    mod.addImport("pack", pack);
+    mod.addImport("matmul_ref", ref);
+}
+
+// Verilator cosim of a kernel top, driven from Zig, checked vs matmul_ref.
+fn addCosim(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    desc: []const u8,
+    top: []const u8,
+    dir: []const u8,
+    rtl: []const []const u8,
+) void {
+    const step = b.step(step_name, desc);
+    const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
+        const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
+        step.dependOn(&msg.step);
+        return;
+    };
+    const vroot = std.mem.trim(u8, b.run(&.{ verilator, "--getenv", "VERILATOR_ROOT" }), " \n\r");
+    const gen = b.fmt("{s}/obj_dir", .{dir});
+
+    const vcmd = b.addSystemCommand(&.{ verilator, "--cc", "--build", "--lib-create" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "--Mdir", gen });
+    vcmd.addArgs(rtl);
+
+    const tb_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}/tb.zig", .{dir})),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    attachCosimSupport(b, tb_mod, target, optimize);
+    tb_mod.addIncludePath(b.path(dir));
+    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
+    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
+    tb_mod.addIncludePath(b.path(gen));
+    tb_mod.addCSourceFile(.{
+        .file = b.path(b.fmt("{s}/shim.cpp", .{dir})),
+        .flags = &.{ "-std=c++17", b.fmt("-I{s}", .{gen}), b.fmt("-I{s}/include", .{vroot}), b.fmt("-I{s}/include/vltstd", .{vroot}) },
+    });
+    tb_mod.addObjectFile(b.path(b.fmt("{s}/lib{s}.a", .{ gen, top })));
+    tb_mod.linkSystemLibrary("pthread", .{});
+    tb_mod.link_libcpp = true;
+
+    const tb = b.addExecutable(.{ .name = b.fmt("{s}-cosim", .{top}), .root_module = tb_mod });
+    tb.step.dependOn(&vcmd.step);
+    step.dependOn(&b.addRunArtifact(tb).step);
 }
 
 fn createBuildOptions(

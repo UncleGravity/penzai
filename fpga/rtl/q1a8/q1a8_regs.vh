@@ -1,0 +1,29 @@
+// Generated from fpga/regmap/q1a8.regmap — do not edit.
+`ifndef Q1A8_REGS_VH
+`define Q1A8_REGS_VH
+localparam [11:0] Q1A8_OFF_ID = 12'h000;
+localparam [11:0] Q1A8_OFF_VERSION = 12'h004;
+localparam [11:0] Q1A8_OFF_CTRL = 12'h008;
+localparam [11:0] Q1A8_OFF_STATUS = 12'h00C;
+localparam [11:0] Q1A8_OFF_NUM_Q1_BLOCKS = 12'h010;
+localparam [11:0] Q1A8_OFF_NUM_ROWBLOCKS = 12'h014;
+localparam [11:0] Q1A8_OFF_CYCLES = 12'h018;
+localparam [11:0] Q1A8_OFF_ROWS = 12'h01C;
+localparam [11:0] Q1A8_OFF_W_STALL = 12'h020;
+localparam [11:0] Q1A8_OFF_A_STALL = 12'h024;
+localparam [11:0] Q1A8_OFF_R_STALL = 12'h028;
+localparam [11:0] Q1A8_OFF_W_BEATS = 12'h02C;
+localparam [11:0] Q1A8_OFF_A_BEATS = 12'h030;
+localparam [11:0] Q1A8_OFF_R_BEATS = 12'h034;
+localparam [31:0] Q1A8_RST_ID = 32'hB05A2000;
+localparam [31:0] Q1A8_RST_VERSION = 32'h00000005;
+localparam [31:0] Q1A8_RST_STATUS = 32'h00000000;
+localparam [31:0] Q1A8_RST_CYCLES = 32'h00000000;
+localparam [31:0] Q1A8_RST_ROWS = 32'h00000008;
+localparam [31:0] Q1A8_RST_W_STALL = 32'h00000000;
+localparam [31:0] Q1A8_RST_A_STALL = 32'h00000000;
+localparam [31:0] Q1A8_RST_R_STALL = 32'h00000000;
+localparam [31:0] Q1A8_RST_W_BEATS = 32'h00000000;
+localparam [31:0] Q1A8_RST_A_BEATS = 32'h00000000;
+localparam [31:0] Q1A8_RST_R_BEATS = 32'h00000000;
+`endif
