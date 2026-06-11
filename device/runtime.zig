@@ -131,7 +131,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         else => return error.InvalidRequest,
                     };
                     defer self.allocator.free(commands);
-                    for (commands) |command| try self.execute(command);
+                    for (commands) |command| try self.execute(command, io);
                     break :blk .{ .meta = .{
                         .request_id = req.request_id,
                         .status = .ok,
@@ -162,7 +162,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
             for (commands) |command| {
                 const start_ns = profiling.nowNs(io);
                 self.pl_last = null;
-                try self.execute(command);
+                try self.execute(command, io);
                 const end_ns = profiling.nowNs(io);
                 collector.record(command, request_start_ns, start_ns, end_ns, self.pl_last);
             }
@@ -209,7 +209,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
             return v.len != 0 and !std.mem.eql(u8, v, "0");
         }
 
-        fn execute(self: *Self, command: wire.Command) RuntimeError!void {
+        fn execute(self: *Self, command: wire.Command, io: ?std.Io) RuntimeError!void {
             switch (command) {
                 .copy => |copy| {
                     const src = self.heap.read(copy.src) catch |err| return mapHeapError(err);
@@ -223,7 +223,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .matmul_q1a8 => |matmul| {
                     if (comptime pl_supported) {
                         if (self.pl) |*backend| {
-                            const maybe = backend.tryMatmul(&self.heap, matmul) catch |err| {
+                            const maybe = backend.tryMatmul(&self.heap, matmul, io) catch |err| {
                                 std.debug.print("pl matmul failed: {s}\n", .{@errorName(err)});
                                 return error.BackendFailure;
                             };

@@ -30,6 +30,26 @@ const result_staging_cap: usize = 8 * 1024 * 1024; // rowblocks up to 262144
 
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
 
+/// Temporary per-segment timing accumulator for localizing per-call overhead.
+const Seg = struct {
+    calls: u64 = 0,
+    quant_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    sync_from_ns: u64 = 0,
+    copy_ns: u64 = 0,
+    cycles: u64 = 0,
+};
+const seg_report_interval: u64 = 200;
+
+fn lapNs(io: ?std.Io, last: *u64) u64 {
+    const now = shared.profiling.nowNs(io);
+    const d = if (now >= last.*) now - last.* else 0;
+    last.* = now;
+    return d;
+}
+
 /// Generic over the heap so the runtime composes it only for heaps with physical
 /// addressing (XRT); the fake heap never instantiates it.
 pub fn Backend(comptime Heap: type) type {
@@ -46,6 +66,7 @@ pub fn Backend(comptime Heap: type) type {
         column: []f32 = &.{},
         quants: []i8 = &.{},
         act_scales: []f16 = &.{},
+        seg: Seg = .{},
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             var kernel = try mmio.Kernel.open(kernel_base);
@@ -85,7 +106,7 @@ pub fn Backend(comptime Heap: type) type {
         /// Run `mm` on the PL if its shape is supported; return counters on
         /// success, null to defer to the PS kernel. Errors are hardware/heap
         /// failures the runtime should surface, not silent fallbacks.
-        pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8) Error!?profile.PlCounters {
+        pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8, io: ?std.Io) Error!?profile.PlCounters {
             if (mm.weight_fmt != .w1a8) return null;
             if (mm.cols != 1) return null; // decode only, for now
             const rows: usize = mm.rows;
@@ -106,6 +127,7 @@ pub fn Backend(comptime Heap: type) type {
             if (act_stream_bytes > acts_staging_cap or result_bytes > result_staging_cap) return null;
 
             try self.ensureScratch(k);
+            var last = shared.profiling.nowNs(io);
 
             // 1. Read the activation column and quantize with the canonical path.
             const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure;
@@ -119,7 +141,9 @@ pub fn Backend(comptime Heap: type) type {
             const acts_dma = subRange(self.acts_staging, act_stream_bytes);
             const acts_staging_buf = heap.bytes(acts_dma) catch return error.HeapFailure;
             packActs(q1_blocks, self.quants[0..k], self.act_scales[0..q8_blocks], acts_staging_buf);
+            const t_quant = lapNs(io, &last);
             heap.syncToDevice(acts_dma) catch return error.HeapFailure;
+            const t_sync_to = lapNs(io, &last);
 
             const result_dma = subRange(self.result_staging, result_bytes);
             const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
@@ -133,20 +157,58 @@ pub fn Backend(comptime Heap: type) type {
             try self.dma_w.startReadFromDdr(weights_phys, weight_bytes);
             try self.dma_a.startReadFromDdr(acts_phys, act_stream_bytes);
             self.kernel.run(@intCast(q1_blocks), @intCast(rowblocks));
+            const t_setup = lapNs(io, &last);
             try self.kernel.waitDone();
             try self.dma_w.waitWriteDone();
+            const t_wait = lapNs(io, &last);
 
             const counters = self.readCounters();
 
             // 4. Pull results back and copy into the destination.
             heap.syncFromDevice(result_dma) catch return error.HeapFailure;
+            const t_sync_from = lapNs(io, &last);
             const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
             const dst_buf = heap.bytes(mm.dst) catch return error.HeapFailure;
             // Single-column result stream is row-major fp32; the first dst_bytes
             // are exactly the destination (padding rows sit past dst_bytes).
             @memcpy(dst_buf[0..dst_bytes], result_buf[0..dst_bytes]);
+            const t_copy = lapNs(io, &last);
+
+            self.seg.calls += 1;
+            self.seg.quant_ns += t_quant;
+            self.seg.sync_to_ns += t_sync_to;
+            self.seg.setup_ns += t_setup;
+            self.seg.wait_ns += t_wait;
+            self.seg.sync_from_ns += t_sync_from;
+            self.seg.copy_ns += t_copy;
+            self.seg.cycles += counters.cycles;
+            if (self.seg.calls % seg_report_interval == 0) self.flushSeg();
 
             return counters;
+        }
+
+        /// Print mean per-segment times for the last window of PL calls to stderr,
+        /// then reset. A temporary diagnostic for localizing per-call overhead.
+        fn flushSeg(self: *Self) void {
+            const s = self.seg;
+            if (s.calls == 0) return;
+            const n: f64 = @floatFromInt(s.calls);
+            const us = struct {
+                fn f(ns: u64, count: f64) f64 {
+                    return @as(f64, @floatFromInt(ns)) / count / 1000.0;
+                }
+            }.f;
+            std.debug.print("pl seg us/call (n={d}): quant={d:.1} sync_to={d:.1} setup={d:.1} wait={d:.1} sync_from={d:.1} copy={d:.1} | kernel_compute={d:.1}\n", .{
+                s.calls,
+                us(s.quant_ns, n),
+                us(s.sync_to_ns, n),
+                us(s.setup_ns, n),
+                us(s.wait_ns, n),
+                us(s.sync_from_ns, n),
+                us(s.copy_ns, n),
+                @as(f64, @floatFromInt(s.cycles)) / n / 100.0, // cycles @ 100 MHz -> us
+            });
+            self.seg = .{};
         }
 
         fn readCounters(self: *Self) profile.PlCounters {
