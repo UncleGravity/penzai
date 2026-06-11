@@ -24,6 +24,7 @@ pub const RunGraphTotals = struct {
     device_execute_ns: u64 = 0,
     span_dropped: u64 = 0,
     op_totals: [profiling.max_op_tag + 1]profiling.Aggregate = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
+    matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
 
     pub fn record(self: *RunGraphTotals, profiled: link_mod.ProfiledRunGraph) void {
         self.run_graph_count += 1;
@@ -43,6 +44,25 @@ pub const RunGraphTotals = struct {
             total.count += aggregate.count;
             total.total_ns += aggregate.total_ns;
             total.bytes += aggregate.bytes;
+        }
+        for (profiled.report.matmul_stats) |stat| {
+            const index: usize = stat.fmt;
+            if (index >= self.matmul_stats.len) continue;
+            var total = &self.matmul_stats[index];
+            total.fmt = stat.fmt;
+            total.count += stat.count;
+            total.macs += stat.macs;
+            total.total_ns += stat.total_ns;
+            total.pl_count += stat.pl_count;
+            total.pl_macs += stat.pl_macs;
+            total.pl_ns += stat.pl_ns;
+            total.cycles += stat.cycles;
+            total.w_stall_cycles += stat.w_stall_cycles;
+            total.a_stall_cycles += stat.a_stall_cycles;
+            total.r_stall_cycles += stat.r_stall_cycles;
+            total.w_beats += stat.w_beats;
+            total.a_beats += stat.a_beats;
+            total.r_beats += stat.r_beats;
         }
     }
 
@@ -137,6 +157,65 @@ pub fn formatBytes(buf: []u8, n: u64) []const u8 {
 
 fn opTotalDesc(_: void, x: profiling.Aggregate, y: profiling.Aggregate) bool {
     return x.total_ns > y.total_ns;
+}
+
+/// Canonical weight-format name from the wire enum (stat.fmt is the raw value).
+pub fn weightFormatName(fmt: u16) []const u8 {
+    const value = std.enums.fromInt(wire.WeightFormat, fmt) orelse return "unknown";
+    return @tagName(value);
+}
+
+/// Billions per second (decimal), for MAC throughput. Returns 0 on no data.
+pub fn giga(count: u64, total_ns: u64) f64 {
+    if (count == 0 or total_ns == 0) return 0;
+    return @as(f64, @floatFromInt(count)) / @as(f64, @floatFromInt(total_ns));
+}
+
+/// Per-(weight format) matmul breakdown. The top line is all matmuls of that
+/// format (CPU + PL): calls, GMAC, wall MAC/s. When some ran on the PL, a `pl`
+/// sub-line reports the PL-executed subset only: its calls, end-to-end MAC/s
+/// (`pl_macs/pl_ns`, includes per-call quantize/DMA/sync overhead), kernel
+/// MAC/cycle (`pl_macs/cycles`, the array's intrinsic rate — clock-independent),
+/// and array utilization `(cycles - max stall)/cycles`. The gap between the
+/// PL MAC/s and MAC/cycle×fclk is the per-call software overhead.
+pub fn writeMatmulDetail(
+    writer: *std.Io.Writer,
+    matmul_stats: []const profiling.MatmulStat,
+) std.Io.Writer.Error!void {
+    var any = false;
+    for (matmul_stats) |stat| {
+        if (stat.count != 0) any = true;
+    }
+    if (!any) return;
+
+    try writer.print("matmul detail\n", .{});
+    try writer.print("  {s:<10} {s:>7} {s:>10} {s:>12} {s:>9} {s:>7}\n", .{ "fmt", "calls", "GMAC", "MAC/s", "MAC/cyc", "util%" });
+    for (matmul_stats) |stat| {
+        if (stat.count == 0) continue;
+        const gmac = @as(f64, @floatFromInt(stat.macs)) / 1_000_000_000.0;
+        var macps_buf: [24]u8 = undefined;
+        try writer.print("  {s:<10} {d:>7} {d:>10.1} {s:>12} {s:>9} {s:>7}\n", .{
+            weightFormatName(stat.fmt),
+            stat.count,
+            gmac,
+            std.fmt.bufPrint(&macps_buf, "{d:.2} G/s", .{giga(stat.macs, stat.total_ns)}) catch unreachable,
+            "-",
+            "-",
+        });
+        if (stat.pl_count == 0) continue;
+        var plps_buf: [24]u8 = undefined;
+        const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles));
+        const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
+        const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
+        try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1}\n", .{
+            "pl",
+            stat.pl_count,
+            "",
+            std.fmt.bufPrint(&plps_buf, "{d:.2} G/s", .{giga(stat.pl_macs, stat.pl_ns)}) catch unreachable,
+            mac_per_cyc,
+            util,
+        });
+    }
 }
 
 /// Per-op breakdown, sorted by device time descending, with human units. The

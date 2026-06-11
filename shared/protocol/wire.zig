@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 6;
+pub const version: u16 = 7;
 pub const response_meta_len: usize = 48;
 
 pub const RequestTag = enum(u16) {
@@ -83,6 +83,14 @@ pub const BinaryF32Mode = enum(u32) {
 pub const RopeMode = enum(u32) {
     normal = 1,
     neox = 2,
+};
+
+/// Weight encoding for a matmul. Tags the command so the device picks the
+/// decoder/kernel path and the host keys per-format profiling. `w1a8` is the
+/// only implemented format; `w158a8` (ternary) is reserved (plan-long §10).
+pub const WeightFormat = enum(u32) {
+    w1a8 = 1,
+    w158a8 = 2,
 };
 
 pub const AllocRequest = struct {
@@ -180,6 +188,7 @@ pub const MatmulQ1A8 = struct {
     rows: u32,
     cols: u32,
     k: u32,
+    weight_fmt: WeightFormat = .w1a8,
 };
 
 pub const UnaryF32 = struct {
@@ -528,7 +537,7 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU32(out, &cursor, matmul.rows);
             putU32(out, &cursor, matmul.cols);
             putU32(out, &cursor, matmul.k);
-            putU32(out, &cursor, 0);
+            putU32(out, &cursor, @intFromEnum(matmul.weight_fmt));
         },
         .rmsnorm => |rmsnorm| {
             putU16(out, &cursor, @intFromEnum(OpTag.rmsnorm));
@@ -713,8 +722,8 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                 const rows = try takeU32(bytes, &cursor);
                 const cols = try takeU32(bytes, &cursor);
                 const k = try takeU32(bytes, &cursor);
-                _ = try takeU32(bytes, &cursor);
-                break :blk .{ .matmul_q1a8 = .{ .weights = weights, .acts = acts, .dst = dst, .rows = rows, .cols = cols, .k = k } };
+                const weight_fmt = enumFromInt(WeightFormat, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                break :blk .{ .matmul_q1a8 = .{ .weights = weights, .acts = acts, .dst = dst, .rows = rows, .cols = cols, .k = k, .weight_fmt = weight_fmt } };
             },
             .rmsnorm => blk: {
                 const input = try takeRange(bytes, &cursor);
@@ -1066,6 +1075,7 @@ test "command buffer roundtrip" {
             .rows = 8,
             .cols = 1,
             .k = 128,
+            .weight_fmt = .w158a8,
         } },
         .{ .rmsnorm = .{ .input = a, .dst = c, .rows = 4, .cols = 2, .eps = 0.00001 } },
         .{ .rope = .{
@@ -1164,6 +1174,7 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[0].copy.src.handle, got[0].copy.src.handle);
     try std.testing.expectEqual(commands[1].cpy_f32_to_f16.dst.handle, got[1].cpy_f32_to_f16.dst.handle);
     try std.testing.expectEqual(commands[2].matmul_q1a8.k, got[2].matmul_q1a8.k);
+    try std.testing.expectEqual(commands[2].matmul_q1a8.weight_fmt, got[2].matmul_q1a8.weight_fmt);
     try std.testing.expectEqual(commands[3].rmsnorm.eps, got[3].rmsnorm.eps);
     try std.testing.expectEqual(commands[4].rope.positions.handle, got[4].rope.positions.handle);
     try std.testing.expectEqual(commands[4].rope.mode, got[4].rope.mode);

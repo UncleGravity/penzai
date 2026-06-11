@@ -1,0 +1,26 @@
+# Q1A8 kernel AXI-Lite register map — single source of truth.
+# Consumed by the Zig MMIO driver (device/pl, P2) and the RTL via the generated
+# Verilog header (fpga/regmap/q1a8.zig emits q1a8_regs.vh). Do not hand-edit the
+# generated header or duplicate these constants; change them here.
+#
+# Format: offset  name  access  reset  description... (one register per line)
+#
+# offset  name            access  reset        description
+0x00      ID              ro      0xB05A2000   kernel identifier
+0x04      VERSION         ro      0x00000005   v5 = dual-stream + counter bank
+0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
+0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
+0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
+0x14      NUM_ROWBLOCKS   rw      0x00000000   ceil(M / ROWS)
+0x18      CYCLES          ro      0x00000000   busy-cycle count of last run
+0x1C      ROWS            ro      0x00000008   lanes per rowblock (constant)
+#
+# Counter bank (latched per run). Stall counters count cycles the kernel is busy
+# but a stream cannot make progress; utilization = (CYCLES - max stall) / CYCLES.
+# Beat counters count AXIS beats moved, for achieved bytes/cycle per stream.
+0x20      W_STALL         ro      0x00000000   cycles busy but weight stream starved
+0x24      A_STALL         ro      0x00000000   cycles busy but act stream starved
+0x28      R_STALL         ro      0x00000000   cycles busy but result stream backpressured
+0x2C      W_BEATS         ro      0x00000000   weight AXIS beats moved last run
+0x30      A_BEATS         ro      0x00000000   act AXIS beats moved last run
+0x34      R_BEATS         ro      0x00000000   result AXIS beats moved last run

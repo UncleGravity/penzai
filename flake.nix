@@ -229,7 +229,8 @@
 
                 echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB =="
                 # shellcheck disable=SC2029
-                exec ssh "$BOARD" "'$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
+                # Must run as root for PL to work
+                exec ssh "$BOARD" "sudo '$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
               '';
             };
 

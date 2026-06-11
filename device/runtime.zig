@@ -11,6 +11,7 @@ const ps_rmsnorm = @import("ps/rmsnorm.zig");
 const ps_rows = @import("ps/rows.zig");
 const ps_rope = @import("ps/rope.zig");
 const ps_softmax = @import("ps/softmax.zig");
+const pl_matmul = @import("pl/matmul.zig");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
@@ -30,17 +31,43 @@ pub fn RuntimeFor(comptime Heap: type) type {
     return struct {
         const Self = @This();
 
+        // The PL matmul backend exists only for heaps with physical addressing
+        // (XRT on the board); the fake heap has none, so it stays PS-only.
+        const pl_supported = @hasDecl(Heap, "deviceAddress");
+        const PlBackend = if (pl_supported) pl_matmul.Backend(Heap) else void;
+
         allocator: std.mem.Allocator,
         heap: Heap,
+        pl: ?PlBackend = null,
+        pl_verify: bool = false,
+        /// PL counters from the most recent matmul, consumed by the profiler.
+        pl_last: ?profile.PlCounters = null,
 
         pub fn init(allocator: std.mem.Allocator, heap_size: usize) !Self {
-            return .{
+            var self: Self = .{
                 .allocator = allocator,
                 .heap = try Heap.init(allocator, heap_size),
             };
+            if (comptime pl_supported) {
+                self.pl_verify = plVerifyEnabled();
+                if (PlBackend.init(allocator, &self.heap)) |backend| {
+                    self.pl = backend;
+                    std.debug.print("pl: q1a8 kernel ready (version {d}, counters {}, verify {})\n", .{
+                        backend.kernel.version, backend.hasCounters(), self.pl_verify,
+                    });
+                } else |err| {
+                    // PL unavailable (non-root /dev/mem, wrong/no bitstream, …) —
+                    // run PS-only rather than failing the daemon.
+                    std.debug.print("pl: unavailable ({s}); falling back to PS matmul\n", .{@errorName(err)});
+                }
+            }
+            return self;
         }
 
         pub fn deinit(self: *Self) void {
+            if (comptime pl_supported) {
+                if (self.pl) |*backend| backend.deinit();
+            }
             self.heap.deinit();
             self.* = undefined;
         }
@@ -134,9 +161,10 @@ pub fn RuntimeFor(comptime Heap: type) type {
             const execute_start_ns = profiling.nowNs(io);
             for (commands) |command| {
                 const start_ns = profiling.nowNs(io);
+                self.pl_last = null;
                 try self.execute(command);
                 const end_ns = profiling.nowNs(io);
-                collector.record(command, request_start_ns, start_ns, end_ns);
+                collector.record(command, request_start_ns, start_ns, end_ns, self.pl_last);
             }
             const execute_done_ns = profiling.nowNs(io);
 
@@ -147,6 +175,38 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .command_count = @intCast(commands.len),
             }) catch return error.OutOfMemory;
             return .{ .payload = payload, .command_count = commands.len };
+        }
+
+        /// Debug cross-check (PENZAI_PL_VERIFY=1): run the PS oracle into scratch
+        /// and compare against the PL result already in `dst`. Logs mismatches
+        /// beyond the documented fp tolerance; never changes results.
+        fn verifyMatmul(self: *Self, mm: wire.MatmulQ1A8) void {
+            const weights = self.heap.read(mm.weights) catch return;
+            const acts = self.heap.read(mm.acts) catch return;
+            const dst = self.heap.bytes(mm.dst) catch return; // holds the PL result
+            const scratch = self.allocator.alloc(u8, dst.len) catch return;
+            defer self.allocator.free(scratch);
+            ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, scratch, mm.rows, mm.cols, mm.k) catch return;
+            var max_abs: f32 = 0;
+            var max_rel: f32 = 0;
+            var nbad: usize = 0;
+            const n = dst.len / @sizeOf(f32);
+            for (0..n) |i| {
+                const a: f32 = @bitCast(std.mem.readInt(u32, dst[i * 4 ..][0..4], .little));
+                const b: f32 = @bitCast(std.mem.readInt(u32, scratch[i * 4 ..][0..4], .little));
+                const d = @abs(a - b);
+                const rel = d / @max(@abs(b), 1e-6);
+                max_abs = @max(max_abs, d);
+                max_rel = @max(max_rel, rel);
+                if (rel > 0.02 and d > 1e-3) nbad += 1;
+            }
+            if (nbad > 0) std.debug.print("pl verify rows={d} k={d}: {d}/{d} mismatch (max_abs={d:.4} max_rel={d:.4})\n", .{ mm.rows, mm.k, nbad, n, max_abs, max_rel });
+        }
+
+        fn plVerifyEnabled() bool {
+            const raw = std.c.getenv("PENZAI_PL_VERIFY") orelse return false;
+            const v = std.mem.span(raw);
+            return v.len != 0 and !std.mem.eql(u8, v, "0");
         }
 
         fn execute(self: *Self, command: wire.Command) RuntimeError!void {
@@ -161,6 +221,19 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     ps_elemwise.f32ToF16Bytes(src, dst) catch |err| return mapKernelError(err);
                 },
                 .matmul_q1a8 => |matmul| {
+                    if (comptime pl_supported) {
+                        if (self.pl) |*backend| {
+                            const maybe = backend.tryMatmul(&self.heap, matmul) catch |err| {
+                                std.debug.print("pl matmul failed: {s}\n", .{@errorName(err)});
+                                return error.BackendFailure;
+                            };
+                            if (maybe) |counters| {
+                                self.pl_last = counters;
+                                if (self.pl_verify) self.verifyMatmul(matmul);
+                                return;
+                            }
+                        }
+                    }
                     const weights = self.heap.read(matmul.weights) catch |err| return mapHeapError(err);
                     const acts = self.heap.read(matmul.acts) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(matmul.dst) catch |err| return mapHeapError(err);

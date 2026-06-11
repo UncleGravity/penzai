@@ -5,6 +5,19 @@ const wire = shared.wire;
 const profiling = shared.profiling;
 const q1a8 = shared.q1a8;
 
+/// Hardware counters read from the PL kernel after a matmul run. Cycle/stall/beat
+/// counts; all zero for a CPU matmul. The PL backend produces these and the
+/// runtime hands them to `Collector.record`.
+pub const PlCounters = struct {
+    cycles: u64 = 0,
+    w_stall: u64 = 0,
+    a_stall: u64 = 0,
+    r_stall: u64 = 0,
+    w_beats: u64 = 0,
+    a_beats: u64 = 0,
+    r_beats: u64 = 0,
+};
+
 /// Device-side per-graph profile collection. The runtime drives a Collector
 /// around its execute loop; the Collector owns the aggregate/span bookkeeping
 /// and produces the wire payload. Aggregates are always accrued (fixed size);
@@ -12,6 +25,10 @@ const q1a8 = shared.q1a8;
 /// command count (no large stack array, no spans on the cheap path).
 pub const Collector = struct {
     aggregates: [profiling.max_op_tag + 1]profiling.Aggregate,
+    /// Per-(weight format) matmul rollup, indexed by the wire.WeightFormat value.
+    /// macs/total_ns are filled here; the PL counter fields stay zero until the
+    /// PL backend reports them (P2).
+    matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat,
     spans: []profiling.Span,
     span_count: u32 = 0,
     span_dropped: u32 = 0,
@@ -24,6 +41,7 @@ pub const Collector = struct {
         const cap: usize = if (tier == .trace) @min(command_count, profiling.max_spans) else 0;
         return .{
             .aggregates = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
+            .matmul_stats = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
             .spans = try allocator.alloc(profiling.Span, cap),
         };
     }
@@ -41,6 +59,7 @@ pub const Collector = struct {
         request_start_ns: u64,
         start_ns: u64,
         end_ns: u64,
+        pl: ?PlCounters,
     ) void {
         const raw_tag: u16 = @intFromEnum(commandTag(command));
         const bytes = commandBytes(command);
@@ -51,6 +70,33 @@ pub const Collector = struct {
             aggregate.count +|= 1;
             aggregate.total_ns +|= profiling.elapsed(start_ns, end_ns);
             aggregate.bytes +|= bytes;
+        }
+        switch (command) {
+            .matmul_q1a8 => |mm| {
+                const fmt: u16 = @intCast(@intFromEnum(mm.weight_fmt));
+                if (fmt < self.matmul_stats.len) {
+                    var stat = &self.matmul_stats[fmt];
+                    stat.fmt = fmt;
+                    stat.count +|= 1;
+                    const macs = mul(mul(mm.rows, mm.cols), mm.k);
+                    const ns = profiling.elapsed(start_ns, end_ns);
+                    stat.macs +|= macs;
+                    stat.total_ns +|= ns;
+                    if (pl) |c| {
+                        stat.pl_count +|= 1;
+                        stat.pl_macs +|= macs;
+                        stat.pl_ns +|= ns;
+                        stat.cycles +|= c.cycles;
+                        stat.w_stall_cycles +|= c.w_stall;
+                        stat.a_stall_cycles +|= c.a_stall;
+                        stat.r_stall_cycles +|= c.r_stall;
+                        stat.w_beats +|= c.w_beats;
+                        stat.a_beats +|= c.a_beats;
+                        stat.r_beats +|= c.r_beats;
+                    }
+                }
+            },
+            else => {},
         }
         if (self.span_count < self.spans.len) {
             self.spans[self.span_count] = .{
@@ -79,6 +125,13 @@ pub const Collector = struct {
             used[n] = aggregate;
             n += 1;
         }
+        var used_stats: [profiling.max_weight_fmt]profiling.MatmulStat = undefined;
+        var sn: usize = 0;
+        for (self.matmul_stats) |stat| {
+            if (stat.count == 0) continue;
+            used_stats[sn] = stat;
+            sn += 1;
+        }
         var filled = summary;
         filled.span_count = self.span_count;
         filled.span_dropped = self.span_dropped;
@@ -86,6 +139,7 @@ pub const Collector = struct {
             .summary = filled,
             .aggregates = used[0..n],
             .spans = self.spans[0..self.span_count],
+            .matmul_stats = used_stats[0..sn],
         });
     }
 };

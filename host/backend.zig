@@ -176,6 +176,10 @@ pub const Profile = struct {
         try prof_report.writeLinkSection(writer, &self.rg);
         try writer.writeByte('\n');
         try prof_report.writeOpTable(writer, &self.rg.op_totals, self.rg.device_total_ns);
+        if (matmulDetailPresent(&self.rg.matmul_stats)) {
+            try writer.writeByte('\n');
+            try prof_report.writeMatmulDetail(writer, &self.rg.matmul_stats);
+        }
     }
 
     /// Every counter, machine-readable. Built as a value tree and stringified by
@@ -206,6 +210,55 @@ pub const Profile = struct {
                 .eff_mib_s = prof_report.mibPerSecond(aggregate.bytes, aggregate.total_ns),
             };
             op_count += 1;
+        }
+
+        const MatmulRow = struct {
+            fmt: []const u8,
+            count: u32,
+            macs: u64,
+            total_ms: f64,
+            mac_per_s: f64,
+            pl_count: u32,
+            pl_macs: u64,
+            pl_ms: f64,
+            pl_mac_per_s: f64,
+            mac_per_cycle: ?f64,
+            util_pct: ?f64,
+            cycles: u64,
+            w_stall_cycles: u64,
+            a_stall_cycles: u64,
+            r_stall_cycles: u64,
+            w_beats: u64,
+            a_beats: u64,
+            r_beats: u64,
+        };
+        var mm_rows: [profiling.max_weight_fmt]MatmulRow = undefined;
+        var mm_count: usize = 0;
+        for (self.rg.matmul_stats) |stat| {
+            if (stat.count == 0) continue;
+            const has_hw = stat.cycles != 0;
+            const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
+            mm_rows[mm_count] = .{
+                .fmt = prof_report.weightFormatName(stat.fmt),
+                .count = stat.count,
+                .macs = stat.macs,
+                .total_ms = prof_report.nsToMs(stat.total_ns),
+                .mac_per_s = prof_report.giga(stat.macs, stat.total_ns) * 1_000_000_000.0,
+                .pl_count = stat.pl_count,
+                .pl_macs = stat.pl_macs,
+                .pl_ms = prof_report.nsToMs(stat.pl_ns),
+                .pl_mac_per_s = prof_report.giga(stat.pl_macs, stat.pl_ns) * 1_000_000_000.0,
+                .mac_per_cycle = if (has_hw) @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles)) else null,
+                .util_pct = if (has_hw) prof_report.percent(stat.cycles -| max_stall, stat.cycles) else null,
+                .cycles = stat.cycles,
+                .w_stall_cycles = stat.w_stall_cycles,
+                .a_stall_cycles = stat.a_stall_cycles,
+                .r_stall_cycles = stat.r_stall_cycles,
+                .w_beats = stat.w_beats,
+                .a_beats = stat.a_beats,
+                .r_beats = stat.r_beats,
+            };
+            mm_count += 1;
         }
 
         const payload = .{
@@ -260,12 +313,20 @@ pub const Profile = struct {
                 .download_bytes = counters.download_bytes,
             },
             .ops = op_rows[0..op_count],
+            .matmul = mm_rows[0..mm_count],
         };
 
         try std.json.Stringify.value(payload, .{}, writer);
         try writer.writeByte('\n');
     }
 };
+
+fn matmulDetailPresent(stats: []const profiling.MatmulStat) bool {
+    for (stats) |stat| {
+        if (stat.count != 0) return true;
+    }
+    return false;
+}
 
 /// One phase-table row: label, auto-unit time, share of wall, optional note.
 fn phaseRow(writer: *std.Io.Writer, label: []const u8, ns: u64, wall_ns: u64, note: []const u8) std.Io.Writer.Error!void {

@@ -160,6 +160,20 @@ fn createSharedModule(
     });
 }
 
+/// The generated register map (offsets/resets parsed from fpga/regmap/q1a8.regmap),
+/// consumed by the device PL driver. A cross-boundary contract module, like shared.
+fn createRegmapModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("fpga/regmap/q1a8.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
 fn createRuntimeModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -173,6 +187,7 @@ fn createRuntimeModule(
         .optimize = optimize,
     });
     addCommonImports(runtime, build_options, shared);
+    runtime.addImport("regmap", createRegmapModule(b, target, optimize));
     return runtime;
 }
 
@@ -261,6 +276,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/protocol/wire.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/profiling.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/q1a8.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "fpga/regmap/q1a8.zig", target, optimize, shared);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/mem/heap.zig", target, optimize, build_options, shared);
@@ -311,8 +327,10 @@ fn addDeviceTest(
         .root_source_file = b.path(path),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
     addCommonImports(mod, build_options, shared);
+    mod.addImport("regmap", createRegmapModule(b, target, optimize));
     const test_exe = b.addTest(.{ .root_module = mod });
     step.dependOn(&b.addRunArtifact(test_exe).step);
 }

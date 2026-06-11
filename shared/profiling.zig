@@ -1,13 +1,17 @@
 const std = @import("std");
 
-pub const version: u16 = 1;
+pub const version: u16 = 2;
 pub const max_spans = 8192;
 pub const max_op_tag = 64;
+/// Distinct weight formats a matmul can carry (wire.WeightFormat values are
+/// 1-based; this bounds the per-format MatmulStat table indexed by that value).
+pub const max_weight_fmt = 8;
 
 const magic: u32 = 0x5046_5250; // "PRFP", little-endian on the wire.
 const header_len: usize = 56;
 const aggregate_len: usize = 24;
 const span_len: usize = 28;
+const matmul_stat_len: usize = 104;
 
 pub const DecodeError = error{
     Truncated,
@@ -40,20 +44,47 @@ pub const Span = struct {
     bytes: u64 = 0,
 };
 
+/// Per-(matmul format) rollup. `count`/`macs`/`total_ns` cover every matmul of
+/// this format (CPU or PL). The `pl_*` fields and the cycle/stall/beat counters
+/// cover only the PL-executed subset — so MAC/cycle (`pl_macs/cycles`) and PL
+/// wall throughput (`pl_macs/pl_ns`) are not polluted by CPU-fallback matmuls
+/// that share the format bucket. All `pl_*` and counter fields stay zero for a
+/// CPU-only run. `fmt` is a wire.WeightFormat value, kept as a raw u16 so shared/
+/// stays free of the wire enum.
+pub const MatmulStat = struct {
+    fmt: u16 = 0,
+    count: u32 = 0,
+    macs: u64 = 0,
+    total_ns: u64 = 0,
+    pl_count: u32 = 0,
+    pl_macs: u64 = 0,
+    pl_ns: u64 = 0,
+    cycles: u64 = 0,
+    w_stall_cycles: u64 = 0,
+    a_stall_cycles: u64 = 0,
+    r_stall_cycles: u64 = 0,
+    w_beats: u64 = 0,
+    a_beats: u64 = 0,
+    r_beats: u64 = 0,
+};
+
 pub const ReportView = struct {
     summary: Summary,
     aggregates: []const Aggregate = &.{},
     spans: []const Span = &.{},
+    matmul_stats: []const MatmulStat = &.{},
 };
 
 pub const Report = struct {
     summary: Summary,
     aggregates: []Aggregate = &.{},
     spans: []Span = &.{},
+    matmul_stats: []MatmulStat = &.{},
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         allocator.free(self.aggregates);
         allocator.free(self.spans);
+        allocator.free(self.matmul_stats);
         self.* = undefined;
     }
 };
@@ -69,7 +100,8 @@ pub fn elapsed(start_ns: u64, end_ns: u64) u64 {
 }
 
 pub fn encodedLen(report: ReportView) usize {
-    return header_len + report.aggregates.len * aggregate_len + report.spans.len * span_len;
+    return header_len + report.aggregates.len * aggregate_len + report.spans.len * span_len +
+        report.matmul_stats.len * matmul_stat_len;
 }
 
 pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
@@ -87,7 +119,7 @@ pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
     putU32(out, &cursor, report.summary.span_dropped);
     putU32(out, &cursor, @intCast(report.aggregates.len));
     putU32(out, &cursor, @intCast(report.spans.len));
-    putU32(out, &cursor, 0);
+    putU32(out, &cursor, @intCast(report.matmul_stats.len));
 
     for (report.aggregates) |aggregate| {
         putU16(out, &cursor, aggregate.tag);
@@ -102,6 +134,24 @@ pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
         putU64(out, &cursor, span.start_ns);
         putU64(out, &cursor, span.end_ns);
         putU64(out, &cursor, span.bytes);
+    }
+    for (report.matmul_stats) |stat| {
+        putU16(out, &cursor, stat.fmt);
+        putU16(out, &cursor, 0);
+        putU32(out, &cursor, stat.count);
+        putU64(out, &cursor, stat.macs);
+        putU64(out, &cursor, stat.total_ns);
+        putU32(out, &cursor, stat.pl_count);
+        putU32(out, &cursor, 0);
+        putU64(out, &cursor, stat.pl_macs);
+        putU64(out, &cursor, stat.pl_ns);
+        putU64(out, &cursor, stat.cycles);
+        putU64(out, &cursor, stat.w_stall_cycles);
+        putU64(out, &cursor, stat.a_stall_cycles);
+        putU64(out, &cursor, stat.r_stall_cycles);
+        putU64(out, &cursor, stat.w_beats);
+        putU64(out, &cursor, stat.a_beats);
+        putU64(out, &cursor, stat.r_beats);
     }
     return cursor;
 }
@@ -129,18 +179,22 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
     };
     const aggregate_count = try takeU32(bytes, &cursor);
     const span_count = try takeU32(bytes, &cursor);
-    _ = try takeU32(bytes, &cursor);
+    const matmul_stat_count = try takeU32(bytes, &cursor);
 
     const aggregate_bytes = std.math.mul(usize, @intCast(aggregate_count), aggregate_len) catch return error.InvalidLength;
     const spans_bytes = std.math.mul(usize, @intCast(span_count), span_len) catch return error.InvalidLength;
-    const expected = std.math.add(usize, header_len, aggregate_bytes) catch return error.InvalidLength;
-    const total = std.math.add(usize, expected, spans_bytes) catch return error.InvalidLength;
+    const matmul_bytes = std.math.mul(usize, @intCast(matmul_stat_count), matmul_stat_len) catch return error.InvalidLength;
+    var total = std.math.add(usize, header_len, aggregate_bytes) catch return error.InvalidLength;
+    total = std.math.add(usize, total, spans_bytes) catch return error.InvalidLength;
+    total = std.math.add(usize, total, matmul_bytes) catch return error.InvalidLength;
     if (bytes.len != total) return error.InvalidLength;
 
     const aggregates = allocator.alloc(Aggregate, @intCast(aggregate_count)) catch return error.OutOfMemory;
     errdefer allocator.free(aggregates);
     const spans = allocator.alloc(Span, @intCast(span_count)) catch return error.OutOfMemory;
     errdefer allocator.free(spans);
+    const matmul_stats = allocator.alloc(MatmulStat, @intCast(matmul_stat_count)) catch return error.OutOfMemory;
+    errdefer allocator.free(matmul_stats);
 
     for (aggregates) |*aggregate| {
         aggregate.* = .{
@@ -164,8 +218,33 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
             .bytes = try takeU64(bytes, &cursor),
         };
     }
+    for (matmul_stats) |*stat| {
+        stat.* = .{
+            .fmt = try takeU16(bytes, &cursor),
+            .count = blk: {
+                _ = try takeU16(bytes, &cursor);
+                break :blk try takeU32(bytes, &cursor);
+            },
+            .macs = try takeU64(bytes, &cursor),
+            .total_ns = try takeU64(bytes, &cursor),
+            .pl_count = blk: {
+                const c = try takeU32(bytes, &cursor);
+                _ = try takeU32(bytes, &cursor);
+                break :blk c;
+            },
+            .pl_macs = try takeU64(bytes, &cursor),
+            .pl_ns = try takeU64(bytes, &cursor),
+            .cycles = try takeU64(bytes, &cursor),
+            .w_stall_cycles = try takeU64(bytes, &cursor),
+            .a_stall_cycles = try takeU64(bytes, &cursor),
+            .r_stall_cycles = try takeU64(bytes, &cursor),
+            .w_beats = try takeU64(bytes, &cursor),
+            .a_beats = try takeU64(bytes, &cursor),
+            .r_beats = try takeU64(bytes, &cursor),
+        };
+    }
 
-    return .{ .summary = summary, .aggregates = aggregates, .spans = spans };
+    return .{ .summary = summary, .aggregates = aggregates, .spans = spans, .matmul_stats = matmul_stats };
 }
 
 fn putU16(out: []u8, cursor: *usize, value: u16) void {
@@ -208,6 +287,9 @@ test "profile report roundtrips" {
     const spans = [_]Span{
         .{ .tag = 2, .start_ns = 10, .end_ns = 20, .bytes = 64 },
     };
+    const matmul_stats = [_]MatmulStat{
+        .{ .fmt = 1, .count = 5, .macs = 9000, .total_ns = 42, .pl_count = 3, .pl_macs = 6000, .pl_ns = 30, .cycles = 1000, .w_stall_cycles = 100, .a_stall_cycles = 20, .r_stall_cycles = 5, .w_beats = 700, .a_beats = 80, .r_beats = 16 },
+    };
     const view = ReportView{
         .summary = .{
             .device_total_ns = 100,
@@ -219,6 +301,7 @@ test "profile report roundtrips" {
         },
         .aggregates = &aggregates,
         .spans = &spans,
+        .matmul_stats = &matmul_stats,
     };
     const encoded = try encodeAlloc(std.testing.allocator, view);
     defer std.testing.allocator.free(encoded);
@@ -228,4 +311,10 @@ test "profile report roundtrips" {
     try std.testing.expectEqual(view.summary.span_dropped, decoded.summary.span_dropped);
     try std.testing.expectEqual(aggregates[0].bytes, decoded.aggregates[0].bytes);
     try std.testing.expectEqual(spans[0].end_ns, decoded.spans[0].end_ns);
+    try std.testing.expectEqual(@as(usize, 1), decoded.matmul_stats.len);
+    try std.testing.expectEqual(matmul_stats[0].macs, decoded.matmul_stats[0].macs);
+    try std.testing.expectEqual(matmul_stats[0].pl_macs, decoded.matmul_stats[0].pl_macs);
+    try std.testing.expectEqual(matmul_stats[0].pl_ns, decoded.matmul_stats[0].pl_ns);
+    try std.testing.expectEqual(matmul_stats[0].w_stall_cycles, decoded.matmul_stats[0].w_stall_cycles);
+    try std.testing.expectEqual(matmul_stats[0].r_beats, decoded.matmul_stats[0].r_beats);
 }
