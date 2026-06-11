@@ -1,8 +1,10 @@
 const std = @import("std");
-const protocol_transport = @import("protocol_transport");
-const run_mod = @import("run");
-const prof_report = @import("prof_report");
-const trace_mod = @import("trace");
+const shared = @import("shared");
+const run_mod = @import("run.zig");
+const prof_report = @import("prof_report.zig");
+const trace_mod = @import("trace.zig");
+
+const protocol_transport = shared.protocol_transport;
 
 const CliError = error{
     InvalidCommand,

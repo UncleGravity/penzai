@@ -1,5 +1,7 @@
 const std = @import("std");
-const protocol_transport = @import("protocol_transport");
+const shared = @import("shared");
+
+const protocol_transport = shared.protocol_transport;
 
 const net = std.Io.net;
 

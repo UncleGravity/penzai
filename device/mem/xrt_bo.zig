@@ -1,6 +1,8 @@
 const std = @import("std");
-const wire = @import("wire");
-const xrt = @import("xrt");
+const shared = @import("shared");
+const xrt = @import("../xrt.zig");
+
+const wire = shared.wire;
 
 pub const HeapError = error{
     OutOfMemory,
@@ -8,6 +10,15 @@ pub const HeapError = error{
     OutOfBounds,
     InvalidAlignment,
     BackendFailure,
+};
+
+pub const InitError = error{
+    XrtOpenFailed,
+    XrtSymbolMissing,
+    XrtDeviceOpenFailed,
+    XrtBOAllocFailed,
+    XrtBOMapFailed,
+    XrtBOSyncFailed,
 };
 
 const Record = struct {
@@ -30,22 +41,25 @@ pub const Heap = struct {
     cursor: u64,
     next_handle: u64,
 
-    pub fn init(allocator: std.mem.Allocator, size: usize) !Self {
-        var x = try xrt.Xrt.open();
+    pub fn init(allocator: std.mem.Allocator, size: usize) InitError!Self {
+        var x = xrt.Xrt.open() catch |err| switch (err) {
+            error.XrtSymbolMissing => return error.XrtSymbolMissing,
+            else => return error.XrtOpenFailed,
+        };
         errdefer x.close();
 
         const dev = x.deviceOpen(0);
-        if (dev == null) return error.DeviceOpen;
+        if (dev == null) return error.XrtDeviceOpenFailed;
         errdefer _ = x.deviceClose(dev);
 
         const bo = x.boAlloc(dev, size, xrt.flags_normal, xrt.group_default);
-        if (bo == null) return error.OutOfMemory;
+        if (bo == null) return error.XrtBOAllocFailed;
         errdefer _ = x.boFree(bo);
 
-        const mapped = x.boMap(bo) orelse return error.BOMapFailed;
+        const mapped = x.boMap(bo) orelse return error.XrtBOMapFailed;
         const data = @as([*]u8, @ptrCast(mapped))[0..size];
         @memset(data, 0);
-        if (x.boSync(bo, xrt.sync_to_device, size, 0) != 0) return error.BOSyncFailed;
+        if (x.boSync(bo, xrt.sync_to_device, size, 0) != 0) return error.XrtBOSyncFailed;
 
         return .{
             .allocator = allocator,

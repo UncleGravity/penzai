@@ -1,6 +1,8 @@
 const std = @import("std");
-const q1a8 = @import("q1a8");
+const shared = @import("shared");
 const simd = @import("matmul_q1a8_simd.zig");
+
+const q1a8 = shared.q1a8;
 
 const q8_lookup_bytes: usize = 256;
 const q8_lookup_lanes: usize = q1a8.q8_block / 8;

@@ -1,6 +1,6 @@
 const std = @import("std");
 const c = @import("c");
-const lower = @import("lower");
+const lower = @import("lower.zig");
 
 const op_count: usize = @intCast(c.GGML_OP_COUNT);
 const max_src: usize = @intCast(c.GGML_MAX_SRC);

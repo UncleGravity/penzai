@@ -1,6 +1,8 @@
 const std = @import("std");
-const q1a8 = @import("q1a8");
-const wire = @import("wire");
+const shared = @import("shared");
+
+const q1a8 = shared.q1a8;
+const wire = shared.wire;
 
 pub const RowsError = error{
     InvalidShape,

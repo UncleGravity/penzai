@@ -1,13 +1,15 @@
 const std = @import("std");
 const c = @import("c");
-const q1a8 = @import("q1a8");
-const wire = @import("wire");
-const profiling = @import("profiling");
-const prof_report = @import("prof_report");
-const trace_mod = @import("trace");
+const shared = @import("shared");
+const prof_report = @import("prof_report.zig");
+const trace_mod = @import("trace.zig");
 const link_mod = @import("link");
-const lower = @import("lower");
-const census_mod = @import("census");
+const lower = @import("lower.zig");
+const census_mod = @import("census.zig");
+
+const q1a8 = shared.q1a8;
+const wire = shared.wire;
+const profiling = shared.profiling;
 
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;

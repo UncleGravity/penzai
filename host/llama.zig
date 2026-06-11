@@ -1,11 +1,11 @@
 const std = @import("std");
 const c = @import("c");
 const build_options = @import("build_options");
-const backend_mod = @import("backend");
-const census_mod = @import("census");
+const backend_mod = @import("backend.zig");
+const census_mod = @import("census.zig");
 const link_mod = @import("link");
-const trace_mod = @import("trace");
-const prof_report = @import("prof_report");
+const trace_mod = @import("trace.zig");
+const prof_report = @import("prof_report.zig");
 
 pub const Error = error{
     MissingModel,

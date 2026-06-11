@@ -1,7 +1,9 @@
 const std = @import("std");
-const wire = @import("wire");
-const profiling = @import("profiling");
-const q1a8 = @import("q1a8");
+const shared = @import("shared");
+
+const wire = shared.wire;
+const profiling = shared.profiling;
+const q1a8 = shared.q1a8;
 
 /// Device-side per-graph profile collection. The runtime drives a Collector
 /// around its execute loop; the Collector owns the aggregate/span bookkeeping

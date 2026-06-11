@@ -1,6 +1,8 @@
 const std = @import("std");
-const protocol_transport = @import("protocol_transport");
-const device_tcp = @import("device_tcp");
+const shared = @import("shared");
+const device_tcp = @import("transport/tcp.zig");
+
+const protocol_transport = shared.protocol_transport;
 
 const CliError = error{
     InvalidCommand,
@@ -112,4 +114,8 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  help     show this help
         \\
     );
+}
+
+test {
+    _ = @import("transport/tcp.zig");
 }

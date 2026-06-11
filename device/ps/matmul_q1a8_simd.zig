@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
-const q1a8 = @import("q1a8");
+const shared = @import("shared");
+
+const q1a8 = shared.q1a8;
 
 pub const available = builtin.cpu.arch == .aarch64;
 

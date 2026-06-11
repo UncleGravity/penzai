@@ -134,6 +134,37 @@
               };
             };
 
+          mkZigCheck =
+            { pname
+            , step
+            , optimize ? "Debug"
+            }:
+            pkgs.stdenv.mkDerivation {
+              inherit pname;
+              version = "0.1.0";
+              src = ./.;
+
+              nativeBuildInputs = [
+                pkgs.zig
+              ];
+
+              dontConfigure = true;
+
+              buildPhase = ''
+                runHook preBuild
+                ${zigCacheSetup}
+                zig build ${step} -Doptimize=${optimize}
+                runHook postBuild
+              '';
+
+              installPhase = ''
+                runHook preInstall
+                mkdir -p "$out"
+                touch "$out/passed"
+                runHook postInstall
+              '';
+            };
+
           mkPenzai = name: optimize: mkZigPackage {
             pname = "penzai-${name}";
             step = "install-penzai";
@@ -253,8 +284,12 @@
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
           };
 
-          checks = {
-            default = packages.penzai-releasefast;
+          checks = rec {
+            default = zig-tests;
+            zig-tests = mkZigCheck {
+              pname = "penzai-zig-tests";
+              step = "test";
+            };
             inherit (packages) penzai-debug penzai-releasefast penzaid-debug penzaid-releasefast;
           };
 

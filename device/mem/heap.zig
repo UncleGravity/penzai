@@ -1,5 +1,7 @@
 const std = @import("std");
-const wire = @import("wire");
+const shared = @import("shared");
+
+const wire = shared.wire;
 
 pub const HeapError = error{
     OutOfMemory,

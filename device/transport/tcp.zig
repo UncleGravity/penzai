@@ -1,8 +1,10 @@
 const std = @import("std");
-const protocol_transport = @import("protocol_transport");
+const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const server_mod = @import("server");
-const xrt_bo = @import("xrt_bo");
+const xrt_bo = @import("../mem/xrt_bo.zig");
+
+const protocol_transport = shared.protocol_transport;
 
 const net = std.Io.net;
 
@@ -12,6 +14,12 @@ pub const ServeError = error{
     InvalidShape,
     Transport,
     Protocol,
+    XrtOpenFailed,
+    XrtSymbolMissing,
+    XrtDeviceOpenFailed,
+    XrtBOAllocFailed,
+    XrtBOMapFailed,
+    XrtBOSyncFailed,
 };
 
 pub const ServeOptions = struct {
@@ -67,8 +75,24 @@ fn serveWithRuntime(
 fn mapInitError(err: anyerror) ServeError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.XrtOpenFailed => error.XrtOpenFailed,
+        error.XrtSymbolMissing => error.XrtSymbolMissing,
+        error.XrtDeviceOpenFailed => error.XrtDeviceOpenFailed,
+        error.XrtBOAllocFailed => error.XrtBOAllocFailed,
+        error.XrtBOMapFailed => error.XrtBOMapFailed,
+        error.XrtBOSyncFailed => error.XrtBOSyncFailed,
         else => error.Transport,
     };
+}
+
+test "runtime init errors preserve XRT causes" {
+    try std.testing.expectEqual(error.XrtOpenFailed, mapInitError(error.XrtOpenFailed));
+    try std.testing.expectEqual(error.XrtSymbolMissing, mapInitError(error.XrtSymbolMissing));
+    try std.testing.expectEqual(error.XrtDeviceOpenFailed, mapInitError(error.XrtDeviceOpenFailed));
+    try std.testing.expectEqual(error.XrtBOAllocFailed, mapInitError(error.XrtBOAllocFailed));
+    try std.testing.expectEqual(error.XrtBOMapFailed, mapInitError(error.XrtBOMapFailed));
+    try std.testing.expectEqual(error.XrtBOSyncFailed, mapInitError(error.XrtBOSyncFailed));
+    try std.testing.expectEqual(error.Transport, mapInitError(error.Unexpected));
 }
 
 fn serveStream(

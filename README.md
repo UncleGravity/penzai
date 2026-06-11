@@ -22,6 +22,7 @@ Local dev:
 ```sh
 nix develop
 zig build test
+zig build all             # host + KR260 daemon + native daemon
 ```
 
 ## Profiling

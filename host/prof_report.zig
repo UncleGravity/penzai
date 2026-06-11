@@ -1,7 +1,9 @@
 const std = @import("std");
-const wire = @import("wire");
-const profiling = @import("profiling");
+const shared = @import("shared");
 const link_mod = @import("link");
+
+const wire = shared.wire;
+const profiling = shared.profiling;
 
 /// Selects how the llama `--prof` summary is rendered. `pretty` is the default
 /// human-facing layout; `json` emits every counter as a machine-readable object.

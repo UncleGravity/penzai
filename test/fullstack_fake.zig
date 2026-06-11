@@ -1,9 +1,11 @@
 const std = @import("std");
-const q1a8 = @import("q1a8");
-const wire = @import("wire");
-const profiling = @import("profiling");
+const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
+
+const q1a8 = shared.q1a8;
+const wire = shared.wire;
+const profiling = shared.profiling;
 
 test "fake link alloc upload copy download" {
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);

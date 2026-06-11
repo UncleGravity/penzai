@@ -1,6 +1,8 @@
 const std = @import("std");
-const profiling = @import("profiling");
-const prof_report = @import("prof_report");
+const shared = @import("shared");
+const prof_report = @import("prof_report.zig");
+
+const profiling = shared.profiling;
 
 // Trace capture file: a small magic header followed by one record per profiled
 // run_graph. Each record is {host_base_ns: u64}{payload_len: u32}{payload}, where
@@ -105,7 +107,7 @@ fn usFromNs(ns: u64) f64 {
 }
 
 test "trace capture roundtrips through chrome json" {
-    const wire = @import("wire");
+    const wire = shared.wire;
     const allocator = std.testing.allocator;
     var capture = Capture.init(allocator);
     defer capture.deinit();

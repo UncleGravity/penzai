@@ -1,17 +1,19 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const wire = @import("wire");
-const profiling = @import("profiling");
-const profile = @import("profile");
-const heap_mod = @import("heap");
-const ps_activations = @import("ps_activations");
-const ps_elemwise = @import("ps_elemwise");
-const ps_flash_attn = @import("ps_flash_attn");
-const ps_matmul_q1a8 = @import("ps_matmul_q1a8");
-const ps_rmsnorm = @import("ps_rmsnorm");
-const ps_rows = @import("ps_rows");
-const ps_rope = @import("ps_rope");
-const ps_softmax = @import("ps_softmax");
+const shared = @import("shared");
+const profile = @import("profile.zig");
+const heap_mod = @import("mem/heap.zig");
+const ps_activations = @import("ps/activations.zig");
+const ps_elemwise = @import("ps/elemwise.zig");
+const ps_flash_attn = @import("ps/flash_attn.zig");
+const ps_matmul_q1a8 = @import("ps/matmul_q1a8.zig");
+const ps_rmsnorm = @import("ps/rmsnorm.zig");
+const ps_rows = @import("ps/rows.zig");
+const ps_rope = @import("ps/rope.zig");
+const ps_softmax = @import("ps/softmax.zig");
+
+const wire = shared.wire;
+const profiling = shared.profiling;
 
 pub const RuntimeError = error{
     InvalidRequest,

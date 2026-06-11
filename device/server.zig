@@ -1,7 +1,9 @@
 const std = @import("std");
-const framing = @import("framing");
-const wire = @import("wire");
+const shared = @import("shared");
 const runtime_mod = @import("runtime");
+
+const framing = shared.framing;
+const wire = shared.wire;
 
 pub const ServerError = error{
     OutOfMemory,

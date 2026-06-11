@@ -1,11 +1,13 @@
 const std = @import("std");
-const framing = @import("framing");
-const protocol_transport = @import("protocol_transport");
-const wire = @import("wire");
-const profiling = @import("profiling");
+const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const server = @import("server");
-const host_tcp = @import("host_tcp");
+const host_tcp = @import("transport/tcp.zig");
+
+const framing = shared.framing;
+const protocol_transport = shared.protocol_transport;
+const wire = shared.wire;
+const profiling = shared.profiling;
 
 pub const LinkError = error{
     OutOfMemory,

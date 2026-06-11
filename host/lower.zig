@@ -1,7 +1,9 @@
 const std = @import("std");
 const c = @import("c");
-const q1a8 = @import("q1a8");
-const wire = @import("wire");
+const shared = @import("shared");
+
+const q1a8 = shared.q1a8;
+const wire = shared.wire;
 
 pub const LowerError = error{
     OutOfMemory,

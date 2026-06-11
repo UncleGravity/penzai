@@ -1,17 +1,19 @@
 const std = @import("std");
 const build_options = @import("build_options");
-const q1a8 = @import("q1a8");
-const protocol_transport = @import("protocol_transport");
-const profiling = @import("profiling");
-const prof_report = @import("prof_report");
-const trace_mod = @import("trace");
-const wire = @import("wire");
+const shared = @import("shared");
+const prof_report = @import("prof_report.zig");
+const trace_mod = @import("trace.zig");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
-const llama_mod = if (build_options.enable_llama) @import("llama") else struct {
+const llama_mod = if (build_options.enable_llama) @import("llama.zig") else struct {
     pub const Error = error{};
     pub const Options = struct {};
 };
+
+const q1a8 = shared.q1a8;
+const protocol_transport = shared.protocol_transport;
+const profiling = shared.profiling;
+const wire = shared.wire;
 
 pub const RunError = error{
     InvalidShape,
