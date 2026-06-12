@@ -12,6 +12,15 @@ pub const Mode = enum {
     neox,
 };
 
+// cos/sin depend on (position, dim) only, not the head, so the byte path computes
+// them once per token and reuses across heads — an n_heads× cut in transcendentals.
+// The neox rotation (contiguous halves) vectorizes; portable @Vector → NEON. Both
+// reuse the exact scalar theta/cos/sin values, so the result is bit-exact.
+const max_head_dim = 256;
+const max_half = max_head_dim / 2;
+const lanes = 16;
+const Vf32 = @Vector(lanes, f32);
+
 pub const Params = struct {
     head_dim: u32,
     n_heads: u32,
@@ -62,18 +71,68 @@ pub fn applyBytes(input: []const u8, positions: []const u8, dst: []u8, params: P
     const n_heads: usize = @intCast(params.n_heads);
     const n_tokens: usize = @intCast(params.n_tokens);
     const n_dims: usize = @intCast(params.n_dims);
+    if (params.head_dim > max_head_dim) return error.InvalidShape;
     const elements = try elementCount(params);
     const input_bytes = try checkedMul(elements, @sizeOf(f32));
     const position_bytes = try checkedMul(n_tokens, @sizeOf(i32));
     if (input.len != input_bytes or dst.len != input_bytes or positions.len != position_bytes) return error.InvalidLength;
 
+    const half = n_dims / 2;
+    const in = std.mem.bytesAsSlice(f32, input);
+    const out = std.mem.bytesAsSlice(f32, dst);
+
+    var cos_t: [max_half]f32 = undefined;
+    var sin_t: [max_half]f32 = undefined;
     for (0..n_tokens) |t| {
         const pos = try positionF32(readI32(positions, t));
+        for (0..half) |j| {
+            const theta = thetaFor(pos, 2 * j, derived);
+            cos_t[j] = @cos(theta) * derived.mscale;
+            sin_t[j] = @sin(theta) * derived.mscale;
+        }
         for (0..n_heads) |h| {
-            const offset = (t * n_heads + h) * head_dim;
-            applyOneBytes(input, dst, offset, head_dim, pos, n_dims, params.mode, derived);
+            const base = (t * n_heads + h) * head_dim;
+            switch (params.mode) {
+                .normal => rotateNormal(in, out, base, half, n_dims, head_dim, &cos_t, &sin_t),
+                .neox => rotateNeox(in, out, base, half, n_dims, head_dim, &cos_t, &sin_t),
+            }
         }
     }
+}
+
+/// Normal pairing rotates adjacent lanes (2j, 2j+1) — interleaved, so scalar; the
+/// win here is the precomputed cos/sin (no transcendentals in this loop).
+fn rotateNormal(in: []align(1) const f32, out: []align(1) f32, base: usize, half: usize, n_dims: usize, head_dim: usize, cos_t: []const f32, sin_t: []const f32) void {
+    for (0..half) |j| {
+        const x0 = in[base + 2 * j];
+        const x1 = in[base + 2 * j + 1];
+        out[base + 2 * j] = x0 * cos_t[j] - x1 * sin_t[j];
+        out[base + 2 * j + 1] = x0 * sin_t[j] + x1 * cos_t[j];
+    }
+    var i = n_dims;
+    while (i < head_dim) : (i += 1) out[base + i] = in[base + i];
+}
+
+/// Neox pairing rotates (j, j+half) — two contiguous halves, so it vectorizes.
+/// In-place safe: the two halves are disjoint and each lane group loads before storing.
+fn rotateNeox(in: []align(1) const f32, out: []align(1) f32, base: usize, half: usize, n_dims: usize, head_dim: usize, cos_t: []const f32, sin_t: []const f32) void {
+    var j: usize = 0;
+    while (j + lanes <= half) : (j += lanes) {
+        const x0: Vf32 = in[base + j ..][0..lanes].*;
+        const x1: Vf32 = in[base + half + j ..][0..lanes].*;
+        const cv: Vf32 = cos_t[j..][0..lanes].*;
+        const sv: Vf32 = sin_t[j..][0..lanes].*;
+        out[base + j ..][0..lanes].* = x0 * cv - x1 * sv;
+        out[base + half + j ..][0..lanes].* = x0 * sv + x1 * cv;
+    }
+    while (j < half) : (j += 1) {
+        const x0 = in[base + j];
+        const x1 = in[base + half + j];
+        out[base + j] = x0 * cos_t[j] - x1 * sin_t[j];
+        out[base + half + j] = x0 * sin_t[j] + x1 * cos_t[j];
+    }
+    var i = n_dims;
+    while (i < head_dim) : (i += 1) out[base + i] = in[base + i];
 }
 
 fn applyOne(input: []const f32, dst: []f32, pos: f32, n_dims: usize, mode: Mode, derived: Derived) void {
@@ -90,23 +149,6 @@ fn applyOne(input: []const f32, dst: []f32, pos: f32, n_dims: usize, mode: Mode,
     }
     while (i < input.len) : (i += 1) {
         dst[i] = input[i];
-    }
-}
-
-fn applyOneBytes(input: []const u8, dst: []u8, offset: usize, head_dim: usize, pos: f32, n_dims: usize, mode: Mode, derived: Derived) void {
-    var i: usize = 0;
-    while (i < n_dims) : (i += 2) {
-        const theta = thetaFor(pos, i, derived);
-        const c = @cos(theta) * derived.mscale;
-        const s = @sin(theta) * derived.mscale;
-        const pair = ropePair(i, n_dims, mode);
-        const x0 = readF32(input, offset + pair.i0);
-        const x1 = readF32(input, offset + pair.i1);
-        writeF32(dst, offset + pair.i0, x0 * c - x1 * s);
-        writeF32(dst, offset + pair.i1, x0 * s + x1 * c);
-    }
-    while (i < head_dim) : (i += 1) {
-        writeF32(dst, offset + i, readF32(input, offset + i));
     }
 }
 
@@ -290,4 +332,42 @@ test "rope byte wrapper reads positions and supports in-place rotation" {
 
     try expectApprox(@cos(@as(f32, 1)), readF32(&values, 0), 0.000001);
     try expectApprox(@sin(@as(f32, 1)), readF32(&values, 1), 0.000001);
+}
+
+test "rope vectorized byte path is bit-exact vs scalar over multi-head wide rotation" {
+    const head_dim = 40; // > 0 tail past n_dims
+    const n_heads = 3; // shared cos/sin table across heads
+    const n_tokens = 2;
+    const n_dims = 36; // half = 18 -> vector (16) + remainder (2)
+    const elems = head_dim * n_heads * n_tokens;
+
+    var in_f: [elems]f32 = undefined;
+    var in_b: [elems * @sizeOf(f32)]u8 = undefined;
+    var positions: [n_tokens]i32 = undefined;
+    var pos_b: [n_tokens * @sizeOf(i32)]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0x209E);
+    const rnd = prng.random();
+    for (0..elems) |i| {
+        const v = rnd.float(f32) * 2 - 1;
+        in_f[i] = v;
+        writeF32(&in_b, i, v);
+    }
+    for (0..n_tokens) |t| {
+        positions[t] = @intCast(t * 7 + 3);
+        writeI32(&pos_b, t, positions[t]);
+    }
+
+    inline for (.{ Mode.normal, Mode.neox }) |mode| {
+        var ref: [elems]f32 = undefined;
+        var out_b: [elems * @sizeOf(f32)]u8 = undefined;
+        var p = normalParams(head_dim, n_dims);
+        p.n_heads = n_heads;
+        p.n_tokens = n_tokens;
+        p.mode = mode;
+
+        try applyF32(&in_f, &positions, &ref, p);
+        try applyBytes(&in_b, &pos_b, &out_b, p);
+
+        for (0..elems) |i| try std.testing.expectEqual(ref[i], readF32(&out_b, i));
+    }
 }

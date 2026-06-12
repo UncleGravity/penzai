@@ -4,6 +4,37 @@ pub const ElemwiseError = error{
     InvalidLength,
 };
 
+// Element-wise f32 kernels vectorize over fixed-width lanes; portable @Vector
+// lowers to NEON on the A53 board. Each lane is an independent IEEE add/mul/scale
+// with no cross-lane reduction, so the vector path is bit-exact vs the scalar one.
+const lanes = 16;
+const Vf32 = @Vector(lanes, f32);
+
+const BinaryOp = enum { add, mul };
+
+/// dst[0..n] = lhs[0..n] (op) rhs[0..n], over little-endian f32 bytes (n elements
+/// from the start of each slice). Tail past the last full lane group runs scalar.
+fn binaryVecBytes(comptime op: BinaryOp, lhs_b: []const u8, rhs_b: []const u8, dst_b: []u8, n: usize) void {
+    const lhs = std.mem.bytesAsSlice(f32, lhs_b);
+    const rhs = std.mem.bytesAsSlice(f32, rhs_b);
+    const dst = std.mem.bytesAsSlice(f32, dst_b);
+    var i: usize = 0;
+    while (i + lanes <= n) : (i += lanes) {
+        const a: Vf32 = lhs[i..][0..lanes].*;
+        const b: Vf32 = rhs[i..][0..lanes].*;
+        dst[i..][0..lanes].* = switch (op) {
+            .add => a + b,
+            .mul => a * b,
+        };
+    }
+    while (i < n) : (i += 1) {
+        dst[i] = switch (op) {
+            .add => lhs[i] + rhs[i],
+            .mul => lhs[i] * rhs[i],
+        };
+    }
+}
+
 pub fn copyF32(src: []const f32, dst: []f32) ElemwiseError!void {
     if (dst.len != src.len) return error.InvalidLength;
     for (src, dst) |x, *out| {
@@ -49,26 +80,27 @@ pub fn copyBytes(src: []const u8, dst: []u8) ElemwiseError!void {
 pub fn f32ToF16Bytes(src: []const u8, dst: []u8) ElemwiseError!void {
     const count = try f32Count(src);
     if (dst.len != count * @sizeOf(f16)) return error.InvalidLength;
-    for (0..count) |i| {
-        const value: f16 = @floatCast(readF32(src, i));
-        std.mem.writeInt(u16, dst[i * @sizeOf(f16) ..][0..2], @bitCast(value), .little);
+    const in = std.mem.bytesAsSlice(f32, src);
+    const out = std.mem.bytesAsSlice(f16, dst);
+    var i: usize = 0;
+    while (i + lanes <= count) : (i += lanes) {
+        const fv: Vf32 = in[i..][0..lanes].*;
+        const hv: @Vector(lanes, f16) = @floatCast(fv);
+        out[i..][0..lanes].* = hv;
     }
+    while (i < count) : (i += 1) out[i] = @floatCast(in[i]);
 }
 
 pub fn addBytes(lhs: []const u8, rhs: []const u8, dst: []u8) ElemwiseError!void {
     const count = try f32Count(lhs);
     if (rhs.len != lhs.len or dst.len != lhs.len) return error.InvalidLength;
-    for (0..count) |i| {
-        writeF32(dst, i, readF32(lhs, i) + readF32(rhs, i));
-    }
+    binaryVecBytes(.add, lhs, rhs, dst, count);
 }
 
 pub fn mulBytes(lhs: []const u8, rhs: []const u8, dst: []u8) ElemwiseError!void {
     const count = try f32Count(lhs);
     if (rhs.len != lhs.len or dst.len != lhs.len) return error.InvalidLength;
-    for (0..count) |i| {
-        writeF32(dst, i, readF32(lhs, i) * readF32(rhs, i));
-    }
+    binaryVecBytes(.mul, lhs, rhs, dst, count);
 }
 
 pub fn add2dBytes(lhs: []const u8, rhs: []const u8, dst: []u8, rows: u32, cols: u32, rhs_row_broadcast: bool) ElemwiseError!void {
@@ -82,25 +114,37 @@ pub fn mul2dBytes(lhs: []const u8, rhs: []const u8, dst: []u8, rows: u32, cols: 
 pub fn scaleBytes(input: []const u8, scale: f32, dst: []u8) ElemwiseError!void {
     const count = try f32Count(input);
     if (dst.len != input.len) return error.InvalidLength;
-    for (0..count) |i| {
-        writeF32(dst, i, readF32(input, i) * scale);
+    const in = std.mem.bytesAsSlice(f32, input);
+    const out = std.mem.bytesAsSlice(f32, dst);
+    const sv: Vf32 = @splat(scale);
+    var i: usize = 0;
+    while (i + lanes <= count) : (i += lanes) {
+        const v: Vf32 = in[i..][0..lanes].*;
+        out[i..][0..lanes].* = v * sv;
     }
+    while (i < count) : (i += 1) out[i] = in[i] * scale;
 }
 
 pub fn addScaledBytes(lhs: []const u8, rhs: []const u8, rhs_scale: f32, dst: []u8) ElemwiseError!void {
     const count = try f32Count(lhs);
     if (rhs.len != lhs.len or dst.len != lhs.len) return error.InvalidLength;
-    for (0..count) |i| {
-        writeF32(dst, i, readF32(lhs, i) + readF32(rhs, i) * rhs_scale);
+    const l = std.mem.bytesAsSlice(f32, lhs);
+    const r = std.mem.bytesAsSlice(f32, rhs);
+    const out = std.mem.bytesAsSlice(f32, dst);
+    const sv: Vf32 = @splat(rhs_scale);
+    var i: usize = 0;
+    while (i + lanes <= count) : (i += lanes) {
+        const a: Vf32 = l[i..][0..lanes].*;
+        const b: Vf32 = r[i..][0..lanes].*;
+        out[i..][0..lanes].* = a + b * sv;
     }
+    while (i < count) : (i += 1) out[i] = l[i] + r[i] * rhs_scale;
 }
 
 fn f32Count(bytes: []const u8) ElemwiseError!usize {
     if (bytes.len % @sizeOf(f32) != 0) return error.InvalidLength;
     return bytes.len / @sizeOf(f32);
 }
-
-const BinaryOp = enum { add, mul };
 
 fn binary2dBytes(
     comptime op: BinaryOp,
@@ -120,19 +164,17 @@ fn binary2dBytes(
     const rhs_bytes = std.math.mul(usize, rhs_elements, @sizeOf(f32)) catch return error.InvalidLength;
     if (lhs.len != total_bytes or rhs.len != rhs_bytes or dst.len != total_bytes) return error.InvalidLength;
 
+    if (!rhs_row_broadcast) {
+        // Same-shape: one flat vectorized pass.
+        binaryVecBytes(op, lhs, rhs, dst, elements);
+        return;
+    }
+    // Row-broadcast: rhs (length `rows`) repeats across columns, so each column is
+    // an independent element-wise op of `rows` elements against the same rhs.
+    const row_bytes = rows * @sizeOf(f32);
     for (0..cols) |col| {
-        const base = col * rows;
-        for (0..rows) |row| {
-            const index = base + row;
-            const rhs_index = if (rhs_row_broadcast) row else index;
-            const a = readF32(lhs, index);
-            const b = readF32(rhs, rhs_index);
-            const value = switch (op) {
-                .add => a + b,
-                .mul => a * b,
-            };
-            writeF32(dst, index, value);
-        }
+        const off = col * row_bytes;
+        binaryVecBytes(op, lhs[off..], rhs, dst[off..], rows);
     }
 }
 
@@ -223,4 +265,60 @@ test "elemwise 2d byte wrappers support rhs row broadcast" {
     try expectApprox(110, readF32(&dst, 3), 0.000001);
     try expectApprox(220, readF32(&dst, 4), 0.000001);
     try expectApprox(330, readF32(&dst, 5), 0.000001);
+}
+
+test "elemwise vector path is bit-exact vs scalar over a 35-wide span (vector + remainder)" {
+    const n = 35; // > lanes (16), with a non-multiple remainder
+    var lhs: [n * @sizeOf(f32)]u8 = undefined;
+    var rhs: [n * @sizeOf(f32)]u8 = undefined;
+    var dst: [n * @sizeOf(f32)]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xE12C0DE);
+    const rnd = prng.random();
+    for (0..n) |i| {
+        writeF32(&lhs, i, rnd.float(f32) * 2 - 1);
+        writeF32(&rhs, i, rnd.float(f32) * 2 - 1);
+    }
+
+    try addBytes(&lhs, &rhs, &dst);
+    for (0..n) |i| try std.testing.expectEqual(readF32(&lhs, i) + readF32(&rhs, i), readF32(&dst, i));
+
+    try mulBytes(&lhs, &rhs, &dst);
+    for (0..n) |i| try std.testing.expectEqual(readF32(&lhs, i) * readF32(&rhs, i), readF32(&dst, i));
+
+    try scaleBytes(&lhs, 0.375, &dst);
+    for (0..n) |i| try std.testing.expectEqual(readF32(&lhs, i) * 0.375, readF32(&dst, i));
+
+    try addScaledBytes(&lhs, &rhs, 0.25, &dst);
+    for (0..n) |i| try std.testing.expectEqual(readF32(&lhs, i) + readF32(&rhs, i) * 0.25, readF32(&dst, i));
+
+    // Same-shape 2d (rows*cols = 35) uses the flat vector pass.
+    try add2dBytes(&lhs, &rhs, &dst, 7, 5, false);
+    for (0..n) |i| try std.testing.expectEqual(readF32(&lhs, i) + readF32(&rhs, i), readF32(&dst, i));
+
+    var half: [n * @sizeOf(f16)]u8 = undefined;
+    try f32ToF16Bytes(&lhs, &half);
+    for (0..n) |i| {
+        const got: f16 = @bitCast(std.mem.readInt(u16, half[i * @sizeOf(f16) ..][0..2], .little));
+        try std.testing.expectEqual(@as(f16, @floatCast(readF32(&lhs, i))), got);
+    }
+}
+
+test "elemwise row-broadcast vector path is bit-exact over wide rows" {
+    const rows = 20; // > lanes, exercises the per-column vector pass
+    const cols = 3;
+    var lhs: [rows * cols * @sizeOf(f32)]u8 = undefined;
+    var rhs: [rows * @sizeOf(f32)]u8 = undefined;
+    var dst: [rows * cols * @sizeOf(f32)]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xB0AD);
+    const rnd = prng.random();
+    for (0..rows * cols) |i| writeF32(&lhs, i, rnd.float(f32) * 2 - 1);
+    for (0..rows) |i| writeF32(&rhs, i, rnd.float(f32) * 2 - 1);
+
+    try mul2dBytes(&lhs, &rhs, &dst, rows, cols, true);
+    for (0..cols) |col| {
+        for (0..rows) |row| {
+            const idx = col * rows + row;
+            try std.testing.expectEqual(readF32(&lhs, idx) * readF32(&rhs, row), readF32(&dst, idx));
+        }
+    }
 }
