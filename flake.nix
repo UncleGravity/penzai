@@ -201,12 +201,14 @@
                 echo "== deploy ${label} penzaid -> $BOARD:$REMOTE_BIN =="
                 echo "== stop existing penzaid on $BOARD =="
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "pkill -f '$REMOTE_KILL_PATTERN' 2>/dev/null || true"
+                ssh "$BOARD" "sudo pkill -f '$REMOTE_KILL_PATTERN' 2>/dev/null || true"
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "mkdir -p '$BOARD_TMP'"
+                ssh "$BOARD" "mkdir -p '$BOARD_TMP' && rm -f '$REMOTE_BIN'"
+
+                echo "== copying penzaid to $BOARD:$REMOTE_BIN =="
                 scp "${penzaidPackage}/bin/penzaid" "$BOARD:$REMOTE_BIN"
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "chmod +x '$REMOTE_BIN'"
+                ssh "$BOARD" "chmod u+w,+x '$REMOTE_BIN'"
                 echo "== deployed $REMOTE_BIN =="
               '';
             };
