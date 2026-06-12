@@ -185,6 +185,108 @@ pub const PhaseAccum = struct {
     }
 };
 
+/// Residency diagnostic: per-(phase, tensor) upload tally. Answers "what is
+/// being uploaded, and in which phase" — e.g. a weight that shows up under the
+/// decode phase is being re-sent every token (a residency bug), distinct from
+/// the same weight legitimately uploaded once under model load. Tensor names are
+/// normalized so per-layer tensors aggregate into one row (see `normalizeName`).
+/// ggml-agnostic: it takes a name string, so this module never imports ggml.
+pub const upload_census_cap = 48;
+const upload_key_max = 40;
+
+const UploadBucket = struct {
+    phase: u8 = 0,
+    key: [upload_key_max]u8 = undefined,
+    key_len: u8 = 0,
+    count: u64 = 0,
+    bytes: u64 = 0,
+};
+
+pub const UploadCensus = struct {
+    buckets: [upload_census_cap]UploadBucket = [_]UploadBucket{.{}} ** upload_census_cap,
+    len: usize = 0,
+    other_count: u64 = 0,
+    other_bytes: u64 = 0,
+
+    pub fn record(self: *UploadCensus, phase: u8, name: []const u8, nbytes: u64) void {
+        var keybuf: [upload_key_max]u8 = undefined;
+        const key = normalizeName(name, &keybuf);
+        for (self.buckets[0..self.len]) |*b| {
+            if (b.phase == phase and std.mem.eql(u8, b.key[0..b.key_len], key)) {
+                b.count += 1;
+                b.bytes += nbytes;
+                return;
+            }
+        }
+        if (self.len < self.buckets.len) {
+            const b = &self.buckets[self.len];
+            b.phase = phase;
+            @memcpy(b.key[0..key.len], key);
+            b.key_len = @intCast(key.len);
+            b.count = 1;
+            b.bytes = nbytes;
+            self.len += 1;
+        } else {
+            self.other_count += 1;
+            self.other_bytes += nbytes;
+        }
+    }
+};
+
+/// Collapse digit runs to '#' so per-layer tensors share a row:
+/// "blk.12.attn_q.weight" -> "blk.#.attn_q.weight", "cache_k_l3" -> "cache_k_l#".
+fn normalizeName(name: []const u8, buf: []u8) []const u8 {
+    var n: usize = 0;
+    var in_digits = false;
+    for (name) |ch| {
+        if (n == buf.len) break;
+        if (ch >= '0' and ch <= '9') {
+            if (!in_digits) {
+                buf[n] = '#';
+                n += 1;
+                in_digits = true;
+            }
+        } else {
+            in_digits = false;
+            buf[n] = ch;
+            n += 1;
+        }
+    }
+    return buf[0..n];
+}
+
+fn bucketBytesDesc(_: void, a: UploadBucket, b: UploadBucket) bool {
+    return a.bytes > b.bytes;
+}
+
+/// Render the upload census, sorted by bytes. Empty when nothing was uploaded.
+pub fn writeUploadCensus(writer: *std.Io.Writer, census: *const UploadCensus) std.Io.Writer.Error!void {
+    if (census.len == 0) return;
+    var rows: [upload_census_cap]UploadBucket = undefined;
+    @memcpy(rows[0..census.len], census.buckets[0..census.len]);
+    std.mem.sort(UploadBucket, rows[0..census.len], {}, bucketBytesDesc);
+
+    try writer.print("  {s:<32} {s:>12} {s:>7} {s:>9} {s:>9}\n", .{ "uploads by tensor", "phase", "calls", "bytes", "avg" });
+    for (rows[0..census.len]) |b| {
+        var bytes_buf: [16]u8 = undefined;
+        var avg_buf: [16]u8 = undefined;
+        const avg = if (b.count == 0) 0 else b.bytes / b.count;
+        try writer.print("  {s:<32} {s:>12} {d:>7} {s:>9} {s:>9}\n", .{
+            b.key[0..b.key_len],
+            (@as(Phase, @enumFromInt(b.phase))).label(),
+            b.count,
+            formatBytes(&bytes_buf, b.bytes),
+            formatBytes(&avg_buf, avg),
+        });
+    }
+    if (census.other_count != 0) {
+        var bytes_buf: [16]u8 = undefined;
+        try writer.print("  {s:<32} {s:>12} {d:>7} {s:>9} {s:>9}\n", .{
+            "(other)", "", census.other_count, formatBytes(&bytes_buf, census.other_bytes), "",
+        });
+    }
+}
+
 /// Phase budget: the headline closed-identity table. Each row reconciles
 /// wall = device + transport + residual; the total row sums the columns.
 pub fn writePhaseBudget(writer: *std.Io.Writer, phases: []const PhaseAccum) std.Io.Writer.Error!void {

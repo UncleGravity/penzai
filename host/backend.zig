@@ -44,6 +44,8 @@ pub const Profile = struct {
     steady_decode_ns: u64 = 0,
     steady_decode_count: u64 = 0,
     generated_tokens: u64 = 0,
+    // Residency diagnostic: which tensors get uploaded, in which phase.
+    upload_census: prof_report.UploadCensus = .{},
 
     pub fn init(io: std.Io) Profile {
         return .{ .io = io };
@@ -94,6 +96,10 @@ pub const Profile = struct {
 
     pub fn recordRunGraph(self: *Profile, profiled: link_mod.ProfiledRunGraph) void {
         self.cur().rg.record(profiled);
+    }
+
+    pub fn recordUploadTensor(self: *Profile, name: []const u8, nbytes: u64) void {
+        self.upload_census.record(@intFromEnum(self.current), name, nbytes);
     }
 
     /// One decode token: extends the decode phase wall and the TTFT/steady split.
@@ -150,6 +156,8 @@ pub const Profile = struct {
         try prof_report.writePhaseBudget(writer, &self.phases);
         try writer.writeByte('\n');
         try prof_report.writeTransfers(writer, &self.phases);
+        try writer.writeByte('\n');
+        try prof_report.writeUploadCensus(writer, &self.upload_census);
 
         // Device-side op + matmul detail, separately per phase that ran graphs —
         // prefill (compute-bound) and decode (bandwidth-bound) have distinct
@@ -605,6 +613,7 @@ fn bufSetTensor(
         q1a8.packWeightsFromGgmlQ1_0(rows, k, src[0..size], packed_weights) catch return;
         timedUpload(remote.dev, binding.range, packed_weights) catch return;
         remote.dev.counters.upload_bytes += packed_weights.len;
+        recordUploadTensor(remote.dev, t, packed_weights.len);
         return;
     }
 
@@ -615,6 +624,7 @@ fn bufSetTensor(
     };
     timedUpload(remote.dev, dst_range, src[0..size]) catch return;
     remote.dev.counters.upload_bytes += size;
+    recordUploadTensor(remote.dev, t, size);
 }
 
 fn bufGetTensor(
@@ -697,6 +707,13 @@ fn timedDownload(dev: *Device, range: wire.TensorRange, out: []u8) link_mod.Link
 /// Best-effort free (teardown / error unwind); discards the error and timing.
 fn freeQuietly(dev: *Device, range: wire.TensorRange) void {
     _ = dev.link.free(range) catch return;
+}
+
+/// Tally an upload against the tensor's ggml name for the residency census.
+fn recordUploadTensor(dev: *Device, tensor: *const c.ggml_tensor, nbytes: u64) void {
+    const profile = dev.profile orelse return;
+    const name = std.mem.sliceTo(@as([*]const u8, @ptrCast(&tensor.*.name)), 0);
+    profile.recordUploadTensor(name, nbytes);
 }
 
 const buffer_iface = c.ggml_backend_buffer_i{

@@ -8,6 +8,9 @@ const protocol_transport = shared.protocol_transport;
 
 const net = std.Io.net;
 
+/// Per-connection stream buffer size. Larger frames still work (drained in chunks).
+const buffer_size = 64 * 1024;
+
 pub const ServeError = error{
     OutOfMemory,
     InvalidAddress,
@@ -102,10 +105,14 @@ fn serveStream(
     stream: net.Stream,
     max_requests: ?u32,
 ) ServeError!u32 {
+    setNoDelay(stream.socket.handle);
     var handled: u32 = 0;
-    var read_buf: [0]u8 = .{};
+    // Persistent per-connection stream buffers (and reader/writer), so request
+    // decode and response framing aren't a syscall per fragment. The reader is
+    // reused across requests so any read-ahead is retained, not stranded.
+    var read_buf: [buffer_size]u8 = undefined;
     var reader = stream.reader(io, &read_buf);
-    var write_buf: [0]u8 = .{};
+    var write_buf: [buffer_size]u8 = undefined;
     var writer = stream.writer(io, &write_buf);
 
     while (max_requests == null or handled < max_requests.?) {
@@ -137,6 +144,14 @@ fn heapBytes(heap_mib: u32) ServeError!usize {
     if (heap_mib == 0) return error.InvalidShape;
     const kib = std.math.mul(usize, @intCast(heap_mib), 1024) catch return error.InvalidShape;
     return std.math.mul(usize, kib, 1024) catch return error.InvalidShape;
+}
+
+/// Disable Nagle on the accepted connection: the host/device protocol is a
+/// request/response ping-pong, so delayed-ACK + Nagle otherwise stalls every
+/// round trip. Best-effort.
+fn setNoDelay(handle: std.posix.socket_t) void {
+    const one: c_int = 1;
+    std.posix.setsockopt(handle, std.posix.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one)) catch {};
 }
 
 fn resolveListenAddress(spec: protocol_transport.TcpSpec) !net.IpAddress {
