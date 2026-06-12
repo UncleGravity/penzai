@@ -215,6 +215,46 @@ fn quantizeQ8_0WithScaleType(comptime Scale: type, column: []const f32, out_quan
     }
 }
 
+/// Vectorized Q8_0 quantizer, bit-identical to `quantizeQ8_0` (round-to-nearest
+/// -even via the magic-number trick, same f32 scale reciprocal). Portable
+/// `@Vector` code: lowers to NEON on the A53 board (where it replaces the scalar
+/// per-element round on the PL activation feed) and to scalar elsewhere. Pinned
+/// equal to the scalar oracle by the fuzz test below, so PL and PS still feed
+/// bit-identical int8.
+pub fn quantizeQ8_0Simd(column: []const f32, out_quants: []i8, out_scales: []f16) LayoutError!void {
+    if (column.len == 0 or column.len % q8_block != 0) return error.InvalidK;
+    if (out_quants.len != column.len or out_scales.len != column.len / q8_block) return error.InvalidLength;
+
+    const Vec = @Vector(q8_block, f32);
+    // 1.5 * 2^23: for |x| < 2^22, (x + magic) - magic rounds x to the nearest
+    // integer using the FPU's default round-to-nearest-even mode.
+    const magic: Vec = @splat(12582912.0);
+    const inf_v: Vec = @splat(std.math.inf(f32));
+    const zero_v: Vec = @splat(@as(f32, 0));
+
+    for (0..out_scales.len) |block_index| {
+        const base = block_index * q8_block;
+        const v: Vec = column[base..][0..q8_block].*;
+        const absv = @abs(v);
+        // Non-finite values do not contribute to amax (abs >= inf is false for
+        // both inf and NaN), matching the scalar isFinite filter.
+        const cand = @select(f32, absv < inf_v, absv, zero_v);
+        const amax = @reduce(.Max, cand);
+        if (amax == 0) {
+            @memset(out_quants[base..][0..q8_block], 0);
+            out_scales[block_index] = 0;
+            continue;
+        }
+        const scale = amax / 127.0;
+        out_scales[block_index] = @floatCast(scale);
+        const inv: Vec = @splat(1.0 / scale);
+        const rounded = (v * inv + magic) - magic;
+        const clamped = @max(@min(rounded, @as(Vec, @splat(@as(f32, 127)))), @as(Vec, @splat(@as(f32, -128))));
+        const ints: @Vector(q8_block, i8) = @intFromFloat(clamped);
+        out_quants[base..][0..q8_block].* = ints;
+    }
+}
+
 fn roundNearestEven(value: f32) i32 {
     const floored = @floor(value);
     const whole: i32 = @intFromFloat(floored);
@@ -319,6 +359,38 @@ test "quantize uses unrounded scale reciprocal" {
 
     try std.testing.expectEqual(@as(i8, 127), quants[0]);
     try std.testing.expectEqual(@as(i8, 1), quants[1]);
+}
+
+test "simd quantizer is bit-identical to scalar across magnitudes" {
+    const blocks = 7;
+    const n = blocks * q8_block;
+    var prng = std.Random.DefaultPrng.init(0xC0DE_8A8);
+    const rnd = prng.random();
+    var col: [n]f32 = undefined;
+    var qs: [n]i8 = undefined;
+    var qv: [n]i8 = undefined;
+    var ss: [blocks]f16 = undefined;
+    var sv: [blocks]f16 = undefined;
+
+    for (0..300) |_| {
+        // Span a wide magnitude range so the round-half-to-even boundary and the
+        // clamp are both exercised hard.
+        for (&col) |*c| {
+            const mag = std.math.pow(f32, 10.0, rnd.float(f32) * 8.0 - 4.0);
+            c.* = (rnd.float(f32) - 0.5) * 2.0 * mag;
+        }
+        try quantizeQ8_0(&col, &qs, &ss);
+        try quantizeQ8_0Simd(&col, &qv, &sv);
+        try std.testing.expectEqualSlices(i8, &qs, &qv);
+        try std.testing.expectEqualSlices(f16, &ss, &sv);
+    }
+
+    // Tie cases land exactly on .5 boundaries (amax = 127 makes scale = 1).
+    for (&col, 0..) |*c, i| c.* = @floatFromInt(@as(i32, @intCast(i % 9)) - 4);
+    col[0] = 127;
+    try quantizeQ8_0(&col, &qs, &ss);
+    try quantizeQ8_0Simd(&col, &qv, &sv);
+    try std.testing.expectEqualSlices(i8, &qs, &qv);
 }
 
 test "quantize rounds ties to nearest even" {

@@ -129,13 +129,13 @@ pub fn Backend(comptime Heap: type) type {
             try self.ensureScratch(k);
             var last = shared.profiling.nowNs(io);
 
-            // 1. Read the activation column and quantize with the canonical path.
+            // 1. Read the activation column and quantize with the vectorized
+            // path (bit-identical to the PS oracle). The board is little-endian,
+            // so the resident f32 acts copy straight into the column buffer.
             const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure;
-            for (0..k) |i| {
-                self.column[i] = @bitCast(std.mem.readInt(u32, acts_bytes[i * 4 ..][0..4], .little));
-            }
+            @memcpy(std.mem.sliceAsBytes(self.column[0..k]), acts_bytes[0 .. k * @sizeOf(f32)]);
             const q8_blocks = q1_blocks * q1a8.q8_subblocks;
-            q1a8.quantizeQ8_0(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
+            q1a8.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
 
             // 2. Pack the activation stream into staging and push it to the device.
             const acts_dma = subRange(self.acts_staging, act_stream_bytes);
