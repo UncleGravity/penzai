@@ -111,9 +111,10 @@ pub fn runPrompt(
     var devices = [_]c.ggml_backend_dev_t{ device.ggmlDevice(), null };
     model_params.devices = &devices;
 
+    if (profile) |p| p.setPhase(.model_load);
     const model_load_start = if (profile) |p| p.now() else 0;
     const model = c.llama_model_load_from_file(model_path.ptr, model_params) orelse return error.ModelLoadFailed;
-    if (profile) |p| p.model_load_ns += p.elapsedSince(model_load_start);
+    if (profile) |p| p.addWall(.model_load, p.elapsedSince(model_load_start));
     defer c.llama_model_free(model);
 
     const vocab = c.llama_model_get_vocab(model) orelse return error.ModelLoadFailed;
@@ -128,9 +129,10 @@ pub fn runPrompt(
     ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_ENABLED;
     ctx_params.op_offload = true;
 
+    if (profile) |p| p.setPhase(.context_init);
     const context_start = if (profile) |p| p.now() else 0;
     const ctx = c.llama_init_from_model(model, ctx_params) orelse return error.ContextInitFailed;
-    if (profile) |p| p.context_init_ns += p.elapsedSince(context_start);
+    if (profile) |p| p.addWall(.context_init, p.elapsedSince(context_start));
     defer c.llama_free(ctx);
 
     const sampler = c.llama_sampler_init_greedy() orelse return error.SamplerInitFailed;
@@ -144,12 +146,17 @@ pub fn runPrompt(
     const tokens = token_buffer.tokens;
     var n_past = token_buffer.prompt_len;
 
+    if (profile) |p| p.setPhase(.prefill);
     const prefill_start = if (profile) |p| p.now() else 0;
     try decodeTokens(ctx, tokens[0..n_past], 0, true);
-    if (profile) |p| p.prefill_ns += p.elapsedSince(prefill_start);
+    if (profile) |p| p.addWall(.prefill, p.elapsedSince(prefill_start));
 
+    if (profile) |p| p.setPhase(.decode);
     var generated: u32 = 0;
     while (generated < options.max_tokens) : (generated += 1) {
+        // Bracket the whole per-token step (sample + detokenize + decode) so the
+        // decode phase wall closes; the non-decode part lands in host residual.
+        const step_start = if (profile) |p| p.now() else 0;
         const token = c.llama_sampler_sample(sampler, ctx, -1);
         c.llama_sampler_accept(sampler, token);
         if (c.llama_vocab_is_eog(vocab, token)) break;
@@ -157,18 +164,8 @@ pub fn runPrompt(
         if (!options.census) try writePiece(writer, vocab, token);
         tokens[n_past] = token;
         n_past += 1;
-        const decode_start = if (profile) |p| p.now() else 0;
         try decodeTokens(ctx, tokens[n_past - 1 .. n_past], n_past - 1, true);
-        if (profile) |p| {
-            const decode_ns = p.elapsedSince(decode_start);
-            if (generated == 0) {
-                p.first_decode_ns += decode_ns;
-            } else {
-                p.steady_decode_ns += decode_ns;
-                p.steady_decode_count += 1;
-            }
-            p.generated_tokens += 1;
-        }
+        if (profile) |p| p.recordDecodeToken(generated == 0, p.elapsedSince(step_start));
     }
 
     if (options.census) {

@@ -221,15 +221,15 @@ fn runMatmulWithLink(allocator: std.mem.Allocator, options: RunOptions, link: an
 
     try link.hello();
 
-    const weights_range = try link.alloc(@intCast(fixture.packed_weights.len), 64);
-    defer link.free(weights_range) catch {};
-    const acts_range = try link.alloc(@intCast(fixture.acts.len), 64);
-    defer link.free(acts_range) catch {};
-    const dst_range = try link.alloc(@intCast(fixture.out.len), 64);
-    defer link.free(dst_range) catch {};
+    const weights_range = (try link.alloc(@intCast(fixture.packed_weights.len), 64)).range;
+    defer freeQuietly(link, weights_range);
+    const acts_range = (try link.alloc(@intCast(fixture.acts.len), 64)).range;
+    defer freeQuietly(link, acts_range);
+    const dst_range = (try link.alloc(@intCast(fixture.out.len), 64)).range;
+    defer freeQuietly(link, dst_range);
 
-    try link.upload(weights_range, fixture.packed_weights);
-    try link.upload(acts_range, fixture.acts);
+    _ = try link.upload(weights_range, fixture.packed_weights);
+    _ = try link.upload(acts_range, fixture.acts);
     try link.runGraph(&.{.{ .matmul_q1a8 = .{
         .weights = weights_range,
         .acts = acts_range,
@@ -238,7 +238,7 @@ fn runMatmulWithLink(allocator: std.mem.Allocator, options: RunOptions, link: an
         .cols = options.cols,
         .k = options.k,
     } }});
-    try link.download(dst_range, fixture.out);
+    _ = try link.download(dst_range, fixture.out);
     const max_abs_diff = fixture.maxAbsDiff();
 
     return .{
@@ -267,15 +267,15 @@ fn benchMatmulQ1A8WithLink(
 
     try link.hello();
 
-    const weights_range = try link.alloc(@intCast(fixture.packed_weights.len), 64);
-    defer link.free(weights_range) catch {};
-    const acts_range = try link.alloc(@intCast(fixture.acts.len), 64);
-    defer link.free(acts_range) catch {};
-    const dst_range = try link.alloc(@intCast(fixture.out.len), 64);
-    defer link.free(dst_range) catch {};
+    const weights_range = (try link.alloc(@intCast(fixture.packed_weights.len), 64)).range;
+    defer freeQuietly(link, weights_range);
+    const acts_range = (try link.alloc(@intCast(fixture.acts.len), 64)).range;
+    defer freeQuietly(link, acts_range);
+    const dst_range = (try link.alloc(@intCast(fixture.out.len), 64)).range;
+    defer freeQuietly(link, dst_range);
 
-    try link.upload(weights_range, fixture.packed_weights);
-    try link.upload(acts_range, fixture.acts);
+    _ = try link.upload(weights_range, fixture.packed_weights);
+    _ = try link.upload(acts_range, fixture.acts);
 
     const commands = [_]wire.Command{.{ .matmul_q1a8 = .{
         .weights = weights_range,
@@ -326,7 +326,7 @@ fn benchMatmulQ1A8WithLink(
         }
     }
 
-    try link.download(dst_range, fixture.out);
+    _ = try link.download(dst_range, fixture.out);
     result.max_abs_diff = fixture.maxAbsDiff();
     if (options.trace_path) |path| {
         if (capture) |*cap| cap.writeFile(io, path) catch return error.TraceWriteFailed;
@@ -401,6 +401,12 @@ const MatmulFixture = struct {
         return max_abs_diff;
     }
 };
+
+/// Best-effort cleanup free: this is the smoke/bench harness, so a failed free
+/// on teardown is not actionable. Discards both the error and the op timing.
+fn freeQuietly(link: anytype, range: wire.TensorRange) void {
+    _ = link.free(range) catch return;
+}
 
 fn recordIteration(self: *BenchResult, ns: u64) void {
     self.host_total_ns += ns;

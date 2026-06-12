@@ -1,7 +1,7 @@
 const std = @import("std");
 
-pub const version: u16 = 7;
-pub const response_meta_len: usize = 48;
+pub const version: u16 = 8;
+pub const response_meta_len: usize = 56;
 
 pub const RequestTag = enum(u16) {
     hello = 1,
@@ -344,6 +344,11 @@ pub const ResponseMeta = struct {
     nbytes: u64 = 0,
     value0: u64 = 0,
     value1: u64 = 0,
+    /// Device wall time spent servicing this request (request decode + dispatch),
+    /// in device-clock ns. Stamped by the device on every response so the host can
+    /// split any op's round trip into device-service vs transport. Zero when the
+    /// device was built with profiling disabled. See device/server.zig.
+    device_service_ns: u64 = 0,
 };
 
 pub fn encodeHello(out: []u8, request_id: u64) EncodeError!usize {
@@ -465,6 +470,7 @@ pub fn encodeResponseMeta(out: []u8, meta: ResponseMeta) EncodeError!usize {
     putU64(out, &cursor, meta.nbytes);
     putU64(out, &cursor, meta.value0);
     putU64(out, &cursor, meta.value1);
+    putU64(out, &cursor, meta.device_service_ns);
     return cursor;
 }
 
@@ -484,6 +490,7 @@ pub fn decodeResponseMeta(bytes: []const u8) DecodeError!ResponseMeta {
         .nbytes = try takeU64(bytes, &cursor),
         .value0 = try takeU64(bytes, &cursor),
         .value1 = try takeU64(bytes, &cursor),
+        .device_service_ns = try takeU64(bytes, &cursor),
     };
 }
 
@@ -1034,6 +1041,22 @@ test "run_graph profile tier roundtrip and rejection" {
     var bad_reserved = meta;
     std.mem.writeInt(u32, bad_reserved[20..24], 1, .little);
     try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_reserved[0..len], ""));
+}
+
+test "response meta roundtrips including device service time" {
+    var buf: [response_meta_len]u8 = undefined;
+    const meta: ResponseMeta = .{
+        .request_id = 42,
+        .status = .ok,
+        .handle = 7,
+        .nbytes = 4096,
+        .value0 = 3,
+        .device_service_ns = 123_456,
+    };
+    const n = try encodeResponseMeta(&buf, meta);
+    try std.testing.expectEqual(response_meta_len, n);
+    const decoded = try decodeResponseMeta(buf[0..n]);
+    try std.testing.expectEqual(meta, decoded);
 }
 
 test "alloc request roundtrip" {

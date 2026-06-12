@@ -12,13 +12,13 @@ test "fake link alloc upload copy download" {
     defer runtime.deinit();
     var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
 
-    const src = try link.alloc(16, 64);
-    const dst = try link.alloc(16, 64);
-    try link.upload(src, "abcdefghijklmnop");
+    const src = (try link.alloc(16, 64)).range;
+    const dst = (try link.alloc(16, 64)).range;
+    _ = try link.upload(src, "abcdefghijklmnop");
     try link.runGraph(&.{.{ .copy = .{ .src = src, .dst = dst } }});
 
     var out: [16]u8 = undefined;
-    try link.download(dst, &out);
+    _ = try link.download(dst, &out);
     try std.testing.expectEqualSlices(u8, "abcdefghijklmnop", &out);
 }
 
@@ -27,11 +27,11 @@ test "fake link fill download" {
     defer runtime.deinit();
     var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
 
-    const range = try link.alloc(16, 64);
-    try link.fill(.{ .handle = range.handle, .offset = 4, .nbytes = 8 }, 0xab);
+    const range = (try link.alloc(16, 64)).range;
+    _ = try link.fill(.{ .handle = range.handle, .offset = 4, .nbytes = 8 }, 0xab);
 
     var out: [16]u8 = undefined;
-    try link.download(range, &out);
+    _ = try link.download(range, &out);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), out[0..4]);
     try std.testing.expectEqualSlices(u8, &([_]u8{0xab} ** 8), out[4..12]);
     try std.testing.expectEqualSlices(u8, &([_]u8{0} ** 4), out[12..16]);
@@ -57,11 +57,11 @@ test "fake link q1a8 matmul reference" {
     var acts: [k * @sizeOf(f32)]u8 = undefined;
     for (0..k) |i| writeF32(&acts, i * @sizeOf(f32), 127);
 
-    const weights_range = try link.alloc(packed_buf.len, 64);
-    const acts_range = try link.alloc(acts.len, 64);
-    const dst_range = try link.alloc(rows * cols * @sizeOf(f32), 64);
-    try link.upload(weights_range, &packed_buf);
-    try link.upload(acts_range, &acts);
+    const weights_range = (try link.alloc(packed_buf.len, 64)).range;
+    const acts_range = (try link.alloc(acts.len, 64)).range;
+    const dst_range = (try link.alloc(rows * cols * @sizeOf(f32), 64)).range;
+    _ = try link.upload(weights_range, &packed_buf);
+    _ = try link.upload(acts_range, &acts);
 
     try link.runGraph(&.{.{ .matmul_q1a8 = .{
         .weights = weights_range,
@@ -73,7 +73,7 @@ test "fake link q1a8 matmul reference" {
     } }});
 
     var out: [rows * @sizeOf(f32)]u8 = undefined;
-    try link.download(dst_range, &out);
+    _ = try link.download(dst_range, &out);
     for (0..rows) |row| {
         try std.testing.expectEqual(@as(f32, 127 * q1a8.q1_block), readF32(&out, row * @sizeOf(f32)));
     }
@@ -86,7 +86,7 @@ test "fake link ps f32 command graph" {
 
     const a = try allocTensor(&link, 2);
     const b = try allocTensor(&link, 2);
-    const positions = try link.alloc(@sizeOf(i32), @alignOf(i32));
+    const positions = (try link.alloc(@sizeOf(i32), @alignOf(i32))).range;
     const out_rms = try allocTensor(&link, 2);
     const out_rope = try allocTensor(&link, 2);
     const out_softmax = try allocTensor(&link, 2);
@@ -101,7 +101,7 @@ test "fake link ps f32 command graph" {
     try uploadTensor(&link, b, &.{ 1, 2 });
     var position_bytes: [4]u8 = undefined;
     writeI32(&position_bytes, 0, 1);
-    try link.upload(positions, &position_bytes);
+    _ = try link.upload(positions, &position_bytes);
 
     try link.runGraph(&.{
         .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
@@ -184,7 +184,7 @@ fn findAggregate(report: profiling.Report, tag: u16) ?profiling.Aggregate {
 }
 
 fn allocTensor(link: *link_mod.FakeLink, len: usize) !wire.TensorRange {
-    return link.alloc(len * @sizeOf(f32), @alignOf(f32));
+    return (try link.alloc(len * @sizeOf(f32), @alignOf(f32))).range;
 }
 
 fn uploadTensor(link: *link_mod.FakeLink, range: wire.TensorRange, values: []const f32) !void {
@@ -193,13 +193,13 @@ fn uploadTensor(link: *link_mod.FakeLink, range: wire.TensorRange, values: []con
     for (values, 0..) |value, i| {
         writeF32(bytes, i * @sizeOf(f32), value);
     }
-    try link.upload(range, bytes);
+    _ = try link.upload(range, bytes);
 }
 
 fn expectTensor(link: *link_mod.FakeLink, range: wire.TensorRange, expected: []const f32) !void {
     const bytes = try std.testing.allocator.alloc(u8, expected.len * @sizeOf(f32));
     defer std.testing.allocator.free(bytes);
-    try link.download(range, bytes);
+    _ = try link.download(range, bytes);
     for (expected, 0..) |value, i| {
         try expectApprox(value, readF32(bytes, i * @sizeOf(f32)), 0.000001);
     }

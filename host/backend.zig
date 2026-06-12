@@ -35,26 +35,15 @@ pub const Counters = struct {
 
 pub const Profile = struct {
     io: std.Io,
-    model_load_ns: u64 = 0,
-    context_init_ns: u64 = 0,
-    prefill_ns: u64 = 0,
+    phases: [prof_report.phase_count]prof_report.PhaseAccum =
+        [_]prof_report.PhaseAccum{.{}} ** prof_report.phase_count,
+    current: prof_report.Phase = .model_load,
+    // Decode throughput split (a subset of the decode phase wall): time to the
+    // first generated token vs the steady-state tokens after it.
     first_decode_ns: u64 = 0,
     steady_decode_ns: u64 = 0,
     steady_decode_count: u64 = 0,
     generated_tokens: u64 = 0,
-    alloc_count: u64 = 0,
-    alloc_bytes: u64 = 0,
-    alloc_ns: u64 = 0,
-    upload_count: u64 = 0,
-    upload_bytes: u64 = 0,
-    upload_ns: u64 = 0,
-    fill_count: u64 = 0,
-    fill_bytes: u64 = 0,
-    fill_ns: u64 = 0,
-    download_count: u64 = 0,
-    download_bytes: u64 = 0,
-    download_ns: u64 = 0,
-    rg: prof_report.RunGraphTotals = .{},
 
     pub fn init(io: std.Io) Profile {
         return .{ .io = io };
@@ -68,44 +57,62 @@ pub const Profile = struct {
         return profiling.elapsed(start_ns, self.now());
     }
 
-    pub fn recordAlloc(self: *Profile, nbytes: u64, ns: u64) void {
-        self.alloc_count += 1;
-        self.alloc_bytes += nbytes;
-        self.alloc_ns += ns;
+    /// Direct subsequent link ops/run_graphs to phase `p`. Set this around each
+    /// phase region so the ggml callbacks firing inside it attribute correctly.
+    pub fn setPhase(self: *Profile, p: prof_report.Phase) void {
+        self.current = p;
     }
 
-    pub fn recordUpload(self: *Profile, nbytes: u64, ns: u64) void {
-        self.upload_count += 1;
-        self.upload_bytes += nbytes;
-        self.upload_ns += ns;
+    /// Add host wall time to a phase (the timer around a phase region).
+    pub fn addWall(self: *Profile, p: prof_report.Phase, ns: u64) void {
+        self.phases[@intFromEnum(p)].wall_ns += ns;
     }
 
-    pub fn recordFill(self: *Profile, nbytes: u64, ns: u64) void {
-        self.fill_count += 1;
-        self.fill_bytes += nbytes;
-        self.fill_ns += ns;
+    fn cur(self: *Profile) *prof_report.PhaseAccum {
+        return &self.phases[@intFromEnum(self.current)];
     }
 
-    pub fn recordDownload(self: *Profile, nbytes: u64, ns: u64) void {
-        self.download_count += 1;
-        self.download_bytes += nbytes;
-        self.download_ns += ns;
+    pub fn recordAlloc(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
+        self.cur().alloc.record(nbytes, host_ns, device_ns);
+    }
+
+    pub fn recordUpload(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
+        self.cur().upload.record(nbytes, host_ns, device_ns);
+    }
+
+    pub fn recordFill(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
+        self.cur().fill.record(nbytes, host_ns, device_ns);
+    }
+
+    pub fn recordDownload(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
+        self.cur().download.record(nbytes, host_ns, device_ns);
+    }
+
+    pub fn recordFree(self: *Profile, host_ns: u64, device_ns: u64) void {
+        self.cur().free.record(0, host_ns, device_ns);
     }
 
     pub fn recordRunGraph(self: *Profile, profiled: link_mod.ProfiledRunGraph) void {
-        self.rg.record(profiled);
+        self.cur().rg.record(profiled);
     }
 
-    /// Wall clock as the sum of the phases the pretty report breaks out, so the
-    /// phase table's percentages add to 100. alloc/download are excluded — they
-    /// overlap setup and are sub-percent; the json format still carries them.
+    /// One decode token: extends the decode phase wall and the TTFT/steady split.
+    pub fn recordDecodeToken(self: *Profile, is_first: bool, ns: u64) void {
+        self.phases[@intFromEnum(prof_report.Phase.decode)].wall_ns += ns;
+        if (is_first) {
+            self.first_decode_ns += ns;
+        } else {
+            self.steady_decode_ns += ns;
+            self.steady_decode_count += 1;
+        }
+        self.generated_tokens += 1;
+    }
+
+    /// Total wall = Σ phase walls. Nothing is excluded; every phase reconciles.
     fn wallNs(self: *const Profile) u64 {
-        return self.model_load_ns + self.context_init_ns + self.upload_ns + self.fill_ns +
-            self.prefill_ns + self.first_decode_ns + self.steady_decode_ns;
-    }
-
-    fn decodeNs(self: *const Profile) u64 {
-        return self.first_decode_ns + self.steady_decode_ns;
+        var total: u64 = 0;
+        for (self.phases) |phase| total += phase.wall_ns;
+        return total;
     }
 
     pub fn report(
@@ -123,62 +130,47 @@ pub const Profile = struct {
     }
 
     fn reportPretty(self: *const Profile, writer: *std.Io.Writer, model_path: []const u8, device_label: []const u8) std.Io.Writer.Error!void {
-        const wall_ns = self.wallNs();
         var buf: [32]u8 = undefined;
-
         try writer.print("penzai profile\n\n", .{});
         try writer.print("  model        {s}\n", .{modelName(model_path)});
         try writer.print("  device       {s}\n", .{device_label});
         try writer.print("  tokens       {d}\n", .{self.generated_tokens});
-        try writer.print("  throughput   {d:.2} tok/s\n", .{prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns)});
-        try writer.print("  wall         {s}\n\n", .{prof_report.formatDuration(&buf, wall_ns)});
+        if (self.steady_decode_count > 0) {
+            var avg_buf: [32]u8 = undefined;
+            var ttft_buf: [32]u8 = undefined;
+            try writer.print("  decode       {s}/tok ({d:.2} tok/s), TTFT {s}\n", .{
+                prof_report.formatDuration(&avg_buf, self.steady_decode_ns / self.steady_decode_count),
+                prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
+                prof_report.formatDuration(&ttft_buf, self.first_decode_ns),
+            });
+        }
+        try writer.print("  wall         {s}\n\n", .{prof_report.formatDuration(&buf, self.wallNs())});
 
-        try writer.print("phases             time    wall%\n", .{});
-        try phaseRow(writer, "model load", self.model_load_ns, wall_ns, "");
-        try phaseRow(writer, "context init", self.context_init_ns, wall_ns, "");
-
-        var up_bytes_buf: [32]u8 = undefined;
-        var up_buf: [96]u8 = undefined;
-        const up_note = std.fmt.bufPrint(&up_buf, "{s}, {d} calls, {d:.1} MiB/s", .{
-            prof_report.formatBytes(&up_bytes_buf, self.upload_bytes),
-            self.upload_count,
-            prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
-        }) catch unreachable;
-        try phaseRow(writer, "weight upload", self.upload_ns, wall_ns, up_note);
-
-        var fill_bytes_buf: [32]u8 = undefined;
-        var fill_buf: [96]u8 = undefined;
-        const fill_note = std.fmt.bufPrint(&fill_buf, "{s}, {d} calls", .{
-            prof_report.formatBytes(&fill_bytes_buf, self.fill_bytes),
-            self.fill_count,
-        }) catch unreachable;
-        try phaseRow(writer, "remote fill", self.fill_ns, wall_ns, fill_note);
-
-        try phaseRow(writer, "prefill", self.prefill_ns, wall_ns, "");
-
-        var ttft_buf: [32]u8 = undefined;
-        const ttft = prof_report.formatDuration(&ttft_buf, self.first_decode_ns);
-        var steady_buf: [32]u8 = undefined;
-        var dec_buf: [96]u8 = undefined;
-        const dec_note = if (self.steady_decode_count == 0)
-            std.fmt.bufPrint(&dec_buf, "{d} tok, TTFT {s}", .{ self.generated_tokens, ttft }) catch unreachable
-        else
-            std.fmt.bufPrint(&dec_buf, "{d} tok, TTFT {s}, then {s}/tok", .{
-                self.generated_tokens,
-                ttft,
-                prof_report.formatDuration(&steady_buf, self.steady_decode_ns / self.steady_decode_count),
-            }) catch unreachable;
-        try phaseRow(writer, "decode", self.decodeNs(), wall_ns, dec_note);
-
-        var total_buf: [32]u8 = undefined;
-        try writer.print("  {s:<13} {s:>8}   100%\n\n", .{ "total", prof_report.formatDuration(&total_buf, wall_ns) });
-
-        try prof_report.writeLinkSection(writer, &self.rg);
+        // The headline: wall = device + transport + residual, per phase.
+        try prof_report.writePhaseBudget(writer, &self.phases);
         try writer.writeByte('\n');
-        try prof_report.writeOpTable(writer, &self.rg.op_totals, self.rg.device_total_ns);
-        if (matmulDetailPresent(&self.rg.matmul_stats)) {
+        try prof_report.writeTransfers(writer, &self.phases);
+
+        // Device-side op + matmul detail, separately per phase that ran graphs —
+        // prefill (compute-bound) and decode (bandwidth-bound) have distinct
+        // rooflines, so a merged op table would be meaningless.
+        for (&self.phases, 0..) |*phase, i| {
+            if (phase.rg.run_graph_count == 0) continue;
+            const label = (@as(prof_report.Phase, @enumFromInt(i))).label();
+            var ops_title: [96]u8 = undefined;
+            var mm_title: [48]u8 = undefined;
             try writer.writeByte('\n');
-            try prof_report.writeMatmulDetail(writer, &self.rg.matmul_stats);
+            try prof_report.writeOpTable(
+                writer,
+                std.fmt.bufPrint(&ops_title, "ops \u{b7} {s}  {d} graphs, {d} cmds", .{ label, phase.rg.run_graph_count, phase.rg.command_count }) catch "ops",
+                &phase.rg.op_totals,
+                phase.rg.device_total_ns,
+            );
+            try prof_report.writeMatmulDetail(
+                writer,
+                std.fmt.bufPrint(&mm_title, "matmul \u{b7} {s}", .{label}) catch "matmul",
+                &phase.rg.matmul_stats,
+            );
         }
     }
 
@@ -196,22 +188,6 @@ pub const Profile = struct {
             bytes: u64,
             eff_mib_s: f64,
         };
-        var op_rows: [profiling.max_op_tag + 1]OpRow = undefined;
-        var op_count: usize = 0;
-        for (self.rg.op_totals) |aggregate| {
-            if (aggregate.count == 0) continue;
-            op_rows[op_count] = .{
-                .op = prof_report.opName(aggregate.tag),
-                .count = aggregate.count,
-                .total_ms = prof_report.nsToMs(aggregate.total_ns),
-                .avg_ms = prof_report.avgMs(aggregate.total_ns, aggregate.count),
-                .dev_pct = prof_report.percent(aggregate.total_ns, self.rg.device_total_ns),
-                .bytes = aggregate.bytes,
-                .eff_mib_s = prof_report.mibPerSecond(aggregate.bytes, aggregate.total_ns),
-            };
-            op_count += 1;
-        }
-
         const MatmulRow = struct {
             fmt: []const u8,
             count: u32,
@@ -232,33 +208,111 @@ pub const Profile = struct {
             a_beats: u64,
             r_beats: u64,
         };
-        var mm_rows: [profiling.max_weight_fmt]MatmulRow = undefined;
-        var mm_count: usize = 0;
-        for (self.rg.matmul_stats) |stat| {
-            if (stat.count == 0) continue;
-            const has_hw = stat.cycles != 0;
-            const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
-            mm_rows[mm_count] = .{
-                .fmt = prof_report.weightFormatName(stat.fmt),
-                .count = stat.count,
-                .macs = stat.macs,
-                .total_ms = prof_report.nsToMs(stat.total_ns),
-                .mac_per_s = prof_report.giga(stat.macs, stat.total_ns) * 1_000_000_000.0,
-                .pl_count = stat.pl_count,
-                .pl_macs = stat.pl_macs,
-                .pl_ms = prof_report.nsToMs(stat.pl_ns),
-                .pl_mac_per_s = prof_report.giga(stat.pl_macs, stat.pl_ns) * 1_000_000_000.0,
-                .mac_per_cycle = if (has_hw) @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles)) else null,
-                .util_pct = if (has_hw) prof_report.percent(stat.cycles -| max_stall, stat.cycles) else null,
-                .cycles = stat.cycles,
-                .w_stall_cycles = stat.w_stall_cycles,
-                .a_stall_cycles = stat.a_stall_cycles,
-                .r_stall_cycles = stat.r_stall_cycles,
-                .w_beats = stat.w_beats,
-                .a_beats = stat.a_beats,
-                .r_beats = stat.r_beats,
+        const TransferRow = struct {
+            kind: []const u8,
+            count: u64,
+            bytes: u64,
+            host_ms: f64,
+            device_ms: f64,
+            eff_mib_s: f64,
+        };
+        const PhaseRow = struct {
+            phase: []const u8,
+            wall_ms: f64,
+            device_ms: f64,
+            transport_ms: f64,
+            residual_ms: f64,
+            graphs: u64,
+            commands: u64,
+            request_bytes: u64,
+            response_bytes: u64,
+            spans_dropped: u64,
+            transfers: []const TransferRow,
+            ops: []const OpRow,
+            matmul: []const MatmulRow,
+        };
+
+        // Backing storage for the per-phase slices; lives until stringify returns.
+        var phase_rows: [prof_report.phase_count]PhaseRow = undefined;
+        var ops_store: [prof_report.phase_count][profiling.max_op_tag + 1]OpRow = undefined;
+        var mm_store: [prof_report.phase_count][profiling.max_weight_fmt]MatmulRow = undefined;
+        var tr_store: [prof_report.phase_count][5]TransferRow = undefined;
+
+        for (&self.phases, 0..) |*phase, i| {
+            var tn: usize = 0;
+            inline for (.{ prof_report.LinkOp.Kind.upload, .download, .fill, .alloc, .free }) |kind| {
+                const link_op = @constCast(phase).op(kind);
+                if (link_op.count != 0) {
+                    tr_store[i][tn] = .{
+                        .kind = prof_report.LinkOp.name(kind),
+                        .count = link_op.count,
+                        .bytes = link_op.bytes,
+                        .host_ms = prof_report.nsToMs(link_op.host_ns),
+                        .device_ms = prof_report.nsToMs(link_op.device_ns),
+                        .eff_mib_s = prof_report.mibPerSecond(link_op.bytes, link_op.host_ns),
+                    };
+                    tn += 1;
+                }
+            }
+
+            var on: usize = 0;
+            for (phase.rg.op_totals) |aggregate| {
+                if (aggregate.count == 0) continue;
+                ops_store[i][on] = .{
+                    .op = prof_report.opName(aggregate.tag),
+                    .count = aggregate.count,
+                    .total_ms = prof_report.nsToMs(aggregate.total_ns),
+                    .avg_ms = prof_report.avgMs(aggregate.total_ns, aggregate.count),
+                    .dev_pct = prof_report.percent(aggregate.total_ns, phase.rg.device_total_ns),
+                    .bytes = aggregate.bytes,
+                    .eff_mib_s = prof_report.mibPerSecond(aggregate.bytes, aggregate.total_ns),
+                };
+                on += 1;
+            }
+
+            var mn: usize = 0;
+            for (phase.rg.matmul_stats) |stat| {
+                if (stat.count == 0) continue;
+                const has_hw = stat.cycles != 0;
+                const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
+                mm_store[i][mn] = .{
+                    .fmt = prof_report.weightFormatName(stat.fmt),
+                    .count = stat.count,
+                    .macs = stat.macs,
+                    .total_ms = prof_report.nsToMs(stat.total_ns),
+                    .mac_per_s = prof_report.giga(stat.macs, stat.total_ns) * 1_000_000_000.0,
+                    .pl_count = stat.pl_count,
+                    .pl_macs = stat.pl_macs,
+                    .pl_ms = prof_report.nsToMs(stat.pl_ns),
+                    .pl_mac_per_s = prof_report.giga(stat.pl_macs, stat.pl_ns) * 1_000_000_000.0,
+                    .mac_per_cycle = if (has_hw) @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles)) else null,
+                    .util_pct = if (has_hw) prof_report.percent(stat.cycles -| max_stall, stat.cycles) else null,
+                    .cycles = stat.cycles,
+                    .w_stall_cycles = stat.w_stall_cycles,
+                    .a_stall_cycles = stat.a_stall_cycles,
+                    .r_stall_cycles = stat.r_stall_cycles,
+                    .w_beats = stat.w_beats,
+                    .a_beats = stat.a_beats,
+                    .r_beats = stat.r_beats,
+                };
+                mn += 1;
+            }
+
+            phase_rows[i] = .{
+                .phase = (@as(prof_report.Phase, @enumFromInt(i))).label(),
+                .wall_ms = prof_report.nsToMs(phase.wall_ns),
+                .device_ms = prof_report.nsToMs(phase.deviceNs()),
+                .transport_ms = prof_report.nsToMs(phase.transportNs()),
+                .residual_ms = prof_report.nsToMs(phase.residualNs()),
+                .graphs = phase.rg.run_graph_count,
+                .commands = phase.rg.command_count,
+                .request_bytes = phase.rg.request_bytes,
+                .response_bytes = phase.rg.response_bytes,
+                .spans_dropped = phase.rg.span_dropped,
+                .transfers = tr_store[i][0..tn],
+                .ops = ops_store[i][0..on],
+                .matmul = mm_store[i][0..mn],
             };
-            mm_count += 1;
         }
 
         const payload = .{
@@ -266,45 +320,9 @@ pub const Profile = struct {
             .device = device_label,
             .tokens = self.generated_tokens,
             .throughput_tok_s = prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
+            .ttft_ms = prof_report.nsToMs(self.first_decode_ns),
+            .steady_decode_avg_ms = prof_report.avgMs(self.steady_decode_ns, self.steady_decode_count),
             .wall_ms = prof_report.nsToMs(self.wallNs()),
-            .phases = .{
-                .model_load_ms = prof_report.nsToMs(self.model_load_ns),
-                .context_init_ms = prof_report.nsToMs(self.context_init_ns),
-                .upload_ms = prof_report.nsToMs(self.upload_ns),
-                .fill_ms = prof_report.nsToMs(self.fill_ns),
-                .prefill_ms = prof_report.nsToMs(self.prefill_ns),
-                .first_token_decode_ms = prof_report.nsToMs(self.first_decode_ns),
-                .steady_decode_ms = prof_report.nsToMs(self.steady_decode_ns),
-                .steady_decode_avg_ms = prof_report.avgMs(self.steady_decode_ns, self.steady_decode_count),
-                .decode_ms = prof_report.nsToMs(self.decodeNs()),
-            },
-            .setup = .{
-                .alloc_count = self.alloc_count,
-                .alloc_bytes = self.alloc_bytes,
-                .alloc_ms = prof_report.nsToMs(self.alloc_ns),
-                .upload_count = self.upload_count,
-                .upload_bytes = self.upload_bytes,
-                .upload_ms = prof_report.nsToMs(self.upload_ns),
-                .upload_mib_s = prof_report.mibPerSecond(self.upload_bytes, self.upload_ns),
-                .fill_count = self.fill_count,
-                .fill_bytes = self.fill_bytes,
-                .fill_ms = prof_report.nsToMs(self.fill_ns),
-                .download_count = self.download_count,
-                .download_bytes = self.download_bytes,
-                .download_ms = prof_report.nsToMs(self.download_ns),
-            },
-            .link = .{
-                .graphs = self.rg.run_graph_count,
-                .commands = self.rg.command_count,
-                .host_rpc_ms = prof_report.nsToMs(self.rg.host_run_graph_ns),
-                .device_total_ms = prof_report.nsToMs(self.rg.device_total_ns),
-                .device_op_ms = prof_report.nsToMs(self.rg.opTotalNs()),
-                .device_runtime_ms = prof_report.nsToMs(self.rg.deviceRuntimeNs()),
-                .rpc_overhead_ms = prof_report.nsToMs(self.rg.rpcOverheadNs()),
-                .request_bytes = self.rg.request_bytes,
-                .response_bytes = self.rg.response_bytes,
-                .spans_dropped = self.rg.span_dropped,
-            },
             .backend = .{
                 .graph_compute = counters.graph_compute,
                 .lowered_commands = counters.lowered_commands,
@@ -312,29 +330,13 @@ pub const Profile = struct {
                 .fill_bytes = counters.fill_bytes,
                 .download_bytes = counters.download_bytes,
             },
-            .ops = op_rows[0..op_count],
-            .matmul = mm_rows[0..mm_count],
+            .phases = phase_rows[0..],
         };
 
         try std.json.Stringify.value(payload, .{}, writer);
         try writer.writeByte('\n');
     }
 };
-
-fn matmulDetailPresent(stats: []const profiling.MatmulStat) bool {
-    for (stats) |stat| {
-        if (stat.count != 0) return true;
-    }
-    return false;
-}
-
-/// One phase-table row: label, auto-unit time, share of wall, optional note.
-fn phaseRow(writer: *std.Io.Writer, label: []const u8, ns: u64, wall_ns: u64, note: []const u8) std.Io.Writer.Error!void {
-    var buf: [32]u8 = undefined;
-    try writer.print("  {s:<13} {s:>8} {d:>5.0}%", .{ label, prof_report.formatDuration(&buf, ns), prof_report.percent(ns, wall_ns) });
-    if (note.len > 0) try writer.print("    {s}", .{note});
-    try writer.writeByte('\n');
-}
 
 /// Basename of the model path with the `.gguf` suffix removed, for the header.
 fn modelName(path: []const u8) []const u8 {
@@ -540,7 +542,7 @@ fn bufGetBase(buf: c.ggml_backend_buffer_t) callconv(.c) ?*anyopaque {
 fn bufFree(buf: c.ggml_backend_buffer_t) callconv(.c) void {
     const remote = remoteOf(buf);
     if (remote.remote.handle != 0) {
-        remote.dev.link.free(remote.remote) catch {};
+        freeQuietly(remote.dev, remote.remote);
     }
     remote.reservation.release();
     std.c.free(remote);
@@ -669,27 +671,32 @@ fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) li
 
 fn timedAlloc(dev: *Device, nbytes: u64, tensor_alignment: u32) link_mod.LinkError!wire.TensorRange {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
-    const range = try dev.link.alloc(nbytes, tensor_alignment);
-    if (dev.profile) |profile| profile.recordAlloc(nbytes, profile.elapsedSince(start_ns));
-    return range;
+    const result = try dev.link.alloc(nbytes, tensor_alignment);
+    if (dev.profile) |profile| profile.recordAlloc(nbytes, profile.elapsedSince(start_ns), result.timing.device_service_ns);
+    return result.range;
 }
 
 fn timedUpload(dev: *Device, range: wire.TensorRange, bytes: []const u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
-    try dev.link.upload(range, bytes);
-    if (dev.profile) |profile| profile.recordUpload(@intCast(bytes.len), profile.elapsedSince(start_ns));
+    const timing = try dev.link.upload(range, bytes);
+    if (dev.profile) |profile| profile.recordUpload(@intCast(bytes.len), profile.elapsedSince(start_ns), timing.device_service_ns);
 }
 
 fn timedFill(dev: *Device, range: wire.TensorRange, value: u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
-    try dev.link.fill(range, value);
-    if (dev.profile) |profile| profile.recordFill(range.nbytes, profile.elapsedSince(start_ns));
+    const timing = try dev.link.fill(range, value);
+    if (dev.profile) |profile| profile.recordFill(range.nbytes, profile.elapsedSince(start_ns), timing.device_service_ns);
 }
 
 fn timedDownload(dev: *Device, range: wire.TensorRange, out: []u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
-    try dev.link.download(range, out);
-    if (dev.profile) |profile| profile.recordDownload(@intCast(out.len), profile.elapsedSince(start_ns));
+    const timing = try dev.link.download(range, out);
+    if (dev.profile) |profile| profile.recordDownload(@intCast(out.len), profile.elapsedSince(start_ns), timing.device_service_ns);
+}
+
+/// Best-effort free (teardown / error unwind); discards the error and timing.
+fn freeQuietly(dev: *Device, range: wire.TensorRange) void {
+    _ = dev.link.free(range) catch return;
 }
 
 const buffer_iface = c.ggml_backend_buffer_i{
@@ -739,7 +746,7 @@ fn buftAllocBuffer(buft: c.ggml_backend_buffer_type_t, size: usize) callconv(.c)
 
     const buffer = c.ggml_backend_buffer_init(buft, buffer_iface, remote, size);
     if (buffer == null) {
-        if (remote_range.handle != 0) dev.link.free(remote_range) catch {};
+        if (remote_range.handle != 0) freeQuietly(dev, remote_range);
         reservation.release();
         std.c.free(remote_raw);
         return null;

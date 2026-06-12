@@ -390,7 +390,7 @@ fn parseProfFormat(value: []const u8) CliError!prof_report.ProfFormat {
 fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.Io.Writer.Error!void {
     try prof_report.writeLinkSection(writer, &profile);
     try writer.writeByte('\n');
-    try prof_report.writeOpTable(writer, &profile.op_totals, profile.device_total_ns);
+    try prof_report.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_total_ns);
 }
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {

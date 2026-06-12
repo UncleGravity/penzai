@@ -16,6 +16,19 @@ pub const LinkError = error{
     Transport,
 };
 
+/// Device-reported service time for one link op (from `wire.ResponseMeta`).
+/// The host pairs it with its own measured round trip to split transport from
+/// device work. Zero when the device was built without profiling.
+pub const OpTiming = struct {
+    device_service_ns: u64 = 0,
+};
+
+/// `alloc` result: the granted range plus the op's service timing.
+pub const AllocResult = struct {
+    range: wire.TensorRange,
+    timing: OpTiming = .{},
+};
+
 pub const Client = struct {
     const Self = @This();
 
@@ -24,11 +37,11 @@ pub const Client = struct {
 
     const VTable = struct {
         hello: *const fn (*anyopaque) LinkError!void,
-        alloc: *const fn (*anyopaque, u64, u32) LinkError!wire.TensorRange,
-        free: *const fn (*anyopaque, wire.TensorRange) LinkError!void,
-        upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!void,
-        fill: *const fn (*anyopaque, wire.TensorRange, u8) LinkError!void,
-        download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!void,
+        alloc: *const fn (*anyopaque, u64, u32) LinkError!AllocResult,
+        free: *const fn (*anyopaque, wire.TensorRange) LinkError!OpTiming,
+        upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!OpTiming,
+        fill: *const fn (*anyopaque, wire.TensorRange, u8) LinkError!OpTiming,
+        download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!OpTiming,
         run_graph: *const fn (*anyopaque, []const wire.Command) LinkError!void,
         run_graph_profile: *const fn (*anyopaque, []const wire.Command, wire.ProfileTier) LinkError!ProfiledRunGraph,
     };
@@ -48,23 +61,23 @@ pub const Client = struct {
                 return ptr(ctx).hello();
             }
 
-            fn callAlloc(ctx: *anyopaque, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+            fn callAlloc(ctx: *anyopaque, nbytes: u64, alignment: u32) LinkError!AllocResult {
                 return ptr(ctx).alloc(nbytes, alignment);
             }
 
-            fn callFree(ctx: *anyopaque, range: wire.TensorRange) LinkError!void {
+            fn callFree(ctx: *anyopaque, range: wire.TensorRange) LinkError!OpTiming {
                 return ptr(ctx).free(range);
             }
 
-            fn callUpload(ctx: *anyopaque, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+            fn callUpload(ctx: *anyopaque, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
                 return ptr(ctx).upload(range, bytes);
             }
 
-            fn callFill(ctx: *anyopaque, range: wire.TensorRange, value: u8) LinkError!void {
+            fn callFill(ctx: *anyopaque, range: wire.TensorRange, value: u8) LinkError!OpTiming {
                 return ptr(ctx).fill(range, value);
             }
 
-            fn callDownload(ctx: *anyopaque, range: wire.TensorRange, out: []u8) LinkError!void {
+            fn callDownload(ctx: *anyopaque, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
                 return ptr(ctx).download(range, out);
             }
 
@@ -98,23 +111,23 @@ pub const Client = struct {
         return self.vtable.hello(self.ctx);
     }
 
-    pub fn alloc(self: Self, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+    pub fn alloc(self: Self, nbytes: u64, alignment: u32) LinkError!AllocResult {
         return self.vtable.alloc(self.ctx, nbytes, alignment);
     }
 
-    pub fn free(self: Self, range: wire.TensorRange) LinkError!void {
+    pub fn free(self: Self, range: wire.TensorRange) LinkError!OpTiming {
         return self.vtable.free(self.ctx, range);
     }
 
-    pub fn upload(self: Self, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+    pub fn upload(self: Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
         return self.vtable.upload(self.ctx, range, bytes);
     }
 
-    pub fn fill(self: Self, range: wire.TensorRange, value: u8) LinkError!void {
+    pub fn fill(self: Self, range: wire.TensorRange, value: u8) LinkError!OpTiming {
         return self.vtable.fill(self.ctx, range, value);
     }
 
-    pub fn download(self: Self, range: wire.TensorRange, out: []u8) LinkError!void {
+    pub fn download(self: Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
         return self.vtable.download(self.ctx, range, out);
     }
 
@@ -169,44 +182,50 @@ pub const FakeLink = struct {
         try response.expectOk(id);
     }
 
-    pub fn alloc(self: *Self, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+    pub fn alloc(self: *Self, nbytes: u64, alignment: u32) LinkError!AllocResult {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeAlloc(&meta, id, nbytes, alignment) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes };
+        return .{
+            .range = .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes },
+            .timing = .{ .device_service_ns = response.meta.device_service_ns },
+        };
     }
 
-    pub fn free(self: *Self, range: wire.TensorRange) LinkError!void {
+    pub fn free(self: *Self, range: wire.TensorRange) LinkError!OpTiming {
         var meta: [32]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeFree(&meta, id, range.handle) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+    pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeUpload(&meta, id, range) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], bytes);
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!void {
+    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeFill(&meta, id, range, value) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!void {
+    pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeDownload(&meta, id, range) catch return error.Protocol;
@@ -215,6 +234,7 @@ pub const FakeLink = struct {
         try response.expectOk(id);
         if (response.payload.len != out.len) return error.Protocol;
         @memcpy(out, response.payload);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
@@ -278,44 +298,50 @@ pub const TcpLink = struct {
         try response.expectOk(id);
     }
 
-    pub fn alloc(self: *Self, nbytes: u64, alignment: u32) LinkError!wire.TensorRange {
+    pub fn alloc(self: *Self, nbytes: u64, alignment: u32) LinkError!AllocResult {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeAlloc(&meta, id, nbytes, alignment) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes };
+        return .{
+            .range = .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes },
+            .timing = .{ .device_service_ns = response.meta.device_service_ns },
+        };
     }
 
-    pub fn free(self: *Self, range: wire.TensorRange) LinkError!void {
+    pub fn free(self: *Self, range: wire.TensorRange) LinkError!OpTiming {
         var meta: [32]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeFree(&meta, id, range.handle) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!void {
+    pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeUpload(&meta, id, range) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], bytes);
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!void {
+    pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeFill(&meta, id, range, value) catch return error.Protocol;
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
-    pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!void {
+    pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeDownload(&meta, id, range) catch return error.Protocol;
@@ -324,6 +350,7 @@ pub const TcpLink = struct {
         try response.expectOk(id);
         if (response.payload.len != out.len) return error.Protocol;
         @memcpy(out, response.payload);
+        return .{ .device_service_ns = response.meta.device_service_ns };
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {

@@ -85,6 +85,177 @@ pub const RunGraphTotals = struct {
     }
 };
 
+/// A run phase. Every nanosecond of host wall time belongs to exactly one phase,
+/// and within a phase the budget closes: wall = device + transport + residual
+/// (see `PhaseAccum`). Setup splits into model_load / context_init because their
+/// link traffic (weight upload vs KV alloc/fill) has very different shape.
+pub const Phase = enum {
+    model_load,
+    context_init,
+    prefill,
+    decode,
+
+    pub fn label(self: Phase) []const u8 {
+        return switch (self) {
+            .model_load => "model load",
+            .context_init => "context init",
+            .prefill => "prefill",
+            .decode => "decode",
+        };
+    }
+};
+
+pub const phase_count = @typeInfo(Phase).@"enum".fields.len;
+
+/// One kind of link op (alloc/upload/fill/download/free) accrued within a phase.
+/// `host_ns` is the host-measured round trip; `device_ns` is the device's own
+/// service time (from `wire.ResponseMeta`). Their difference is transport.
+pub const LinkOp = struct {
+    count: u64 = 0,
+    bytes: u64 = 0,
+    host_ns: u64 = 0,
+    device_ns: u64 = 0,
+
+    pub fn record(self: *LinkOp, bytes: u64, host_ns: u64, device_ns: u64) void {
+        self.count += 1;
+        self.bytes += bytes;
+        self.host_ns += host_ns;
+        self.device_ns += device_ns;
+    }
+
+    pub fn name(kind: Kind) []const u8 {
+        return switch (kind) {
+            .alloc => "alloc",
+            .upload => "upload",
+            .fill => "fill",
+            .download => "download",
+            .free => "free",
+        };
+    }
+
+    pub const Kind = enum { alloc, upload, fill, download, free };
+};
+
+/// Per-phase accounting. The closed identity is the whole point: a phase's wall
+/// time is exactly the device work it triggered, plus wire transport, plus the
+/// host residual (llama graph-build / sampling / file I/O — everything that is
+/// not a link op). No bucket is dropped; `residualNs` is what makes that true.
+pub const PhaseAccum = struct {
+    wall_ns: u64 = 0,
+    alloc: LinkOp = .{},
+    upload: LinkOp = .{},
+    fill: LinkOp = .{},
+    download: LinkOp = .{},
+    free: LinkOp = .{},
+    rg: RunGraphTotals = .{},
+
+    pub fn op(self: *PhaseAccum, kind: LinkOp.Kind) *LinkOp {
+        return switch (kind) {
+            .alloc => &self.alloc,
+            .upload => &self.upload,
+            .fill => &self.fill,
+            .download => &self.download,
+            .free => &self.free,
+        };
+    }
+
+    /// Σ host round trip over every link op (transfers + run_graph). Sequential
+    /// in this synchronous protocol, so it never exceeds wall.
+    pub fn linkHostNs(self: *const PhaseAccum) u64 {
+        return self.alloc.host_ns + self.upload.host_ns + self.fill.host_ns +
+            self.download.host_ns + self.free.host_ns + self.rg.host_run_graph_ns;
+    }
+
+    /// Σ device service over every link op.
+    pub fn deviceNs(self: *const PhaseAccum) u64 {
+        return self.alloc.device_ns + self.upload.device_ns + self.fill.device_ns +
+            self.download.device_ns + self.free.device_ns + self.rg.device_total_ns;
+    }
+
+    pub fn transportNs(self: *const PhaseAccum) u64 {
+        return self.linkHostNs() -| self.deviceNs();
+    }
+
+    pub fn residualNs(self: *const PhaseAccum) u64 {
+        return self.wall_ns -| self.linkHostNs();
+    }
+
+    fn isEmpty(self: *const PhaseAccum) bool {
+        return self.wall_ns == 0 and self.linkHostNs() == 0;
+    }
+};
+
+/// Phase budget: the headline closed-identity table. Each row reconciles
+/// wall = device + transport + residual; the total row sums the columns.
+pub fn writePhaseBudget(writer: *std.Io.Writer, phases: []const PhaseAccum) std.Io.Writer.Error!void {
+    try writer.print("phase            {s:>9} {s:>9} {s:>9} {s:>9}\n", .{ "wall", "device", "transport", "residual" });
+    var tot_wall: u64 = 0;
+    var tot_dev: u64 = 0;
+    var tot_tr: u64 = 0;
+    var tot_res: u64 = 0;
+    for (phases, 0..) |phase, i| {
+        if (phase.isEmpty()) continue;
+        const label = @as(Phase, @enumFromInt(i)).label();
+        try phaseBudgetRow(writer, label, phase.wall_ns, phase.deviceNs(), phase.transportNs(), phase.residualNs());
+        tot_wall += phase.wall_ns;
+        tot_dev += phase.deviceNs();
+        tot_tr += phase.transportNs();
+        tot_res += phase.residualNs();
+    }
+    try phaseBudgetRow(writer, "total", tot_wall, tot_dev, tot_tr, tot_res);
+}
+
+fn phaseBudgetRow(writer: *std.Io.Writer, label: []const u8, wall: u64, device: u64, transport: u64, residual: u64) std.Io.Writer.Error!void {
+    var w: [16]u8 = undefined;
+    var d: [16]u8 = undefined;
+    var t: [16]u8 = undefined;
+    var r: [16]u8 = undefined;
+    try writer.print("  {s:<13} {s:>9} {s:>9} {s:>9} {s:>9}\n", .{
+        label,
+        formatDuration(&w, wall),
+        formatDuration(&d, device),
+        formatDuration(&t, transport),
+        formatDuration(&r, residual),
+    });
+}
+
+/// Per-phase transfer detail. Rows are (phase, op-kind) with nonzero traffic:
+/// calls, bytes, host vs device time, and effective host MiB/s. This is where
+/// the weight-upload anomaly and per-token decode copies become visible.
+pub fn writeTransfers(writer: *std.Io.Writer, phases: []const PhaseAccum) std.Io.Writer.Error!void {
+    var any = false;
+    for (phases) |phase| {
+        inline for (.{ LinkOp.Kind.upload, .download, .fill, .alloc, .free }) |kind| {
+            if (@constCast(&phase).op(kind).count != 0) any = true;
+        }
+    }
+    if (!any) return;
+
+    try writer.print("transfers      {s:>12} {s:>7} {s:>9} {s:>8} {s:>8} {s:>10}\n", .{ "phase", "calls", "bytes", "host", "device", "MiB/s" });
+    for (phases, 0..) |phase, i| {
+        const label = @as(Phase, @enumFromInt(i)).label();
+        inline for (.{ LinkOp.Kind.upload, .download, .fill, .alloc, .free }) |kind| {
+            const link_op = @constCast(&phase).op(kind);
+            if (link_op.count != 0) try transferRow(writer, LinkOp.name(kind), label, link_op.*);
+        }
+    }
+}
+
+fn transferRow(writer: *std.Io.Writer, kind: []const u8, phase_label: []const u8, link_op: LinkOp) std.Io.Writer.Error!void {
+    var bytes_buf: [16]u8 = undefined;
+    var host_buf: [16]u8 = undefined;
+    var dev_buf: [16]u8 = undefined;
+    try writer.print("  {s:<10} {s:>12} {d:>7} {s:>9} {s:>8} {s:>8} {d:>10.1}\n", .{
+        kind,
+        phase_label,
+        link_op.count,
+        formatBytes(&bytes_buf, link_op.bytes),
+        formatDuration(&host_buf, link_op.host_ns),
+        formatDuration(&dev_buf, link_op.device_ns),
+        mibPerSecond(link_op.bytes, link_op.host_ns),
+    });
+}
+
 /// The `link` section: run_graph RPC cost vs measured device work. Shared by the
 /// llama `--prof` report and the bench harness so there is one rendering of it.
 pub fn writeLinkSection(writer: *std.Io.Writer, totals: *const RunGraphTotals) std.Io.Writer.Error!void {
@@ -180,6 +351,7 @@ pub fn giga(count: u64, total_ns: u64) f64 {
 /// PL MAC/s and MAC/cycle×fclk is the per-call software overhead.
 pub fn writeMatmulDetail(
     writer: *std.Io.Writer,
+    title: []const u8,
     matmul_stats: []const profiling.MatmulStat,
 ) std.Io.Writer.Error!void {
     var any = false;
@@ -188,7 +360,7 @@ pub fn writeMatmulDetail(
     }
     if (!any) return;
 
-    try writer.print("matmul detail\n", .{});
+    try writer.print("{s}\n", .{title});
     try writer.print("  {s:<10} {s:>7} {s:>10} {s:>12} {s:>9} {s:>7}\n", .{ "fmt", "calls", "GMAC", "MAC/s", "MAC/cyc", "util%" });
     for (matmul_stats) |stat| {
         if (stat.count == 0) continue;
@@ -223,6 +395,7 @@ pub fn writeMatmulDetail(
 /// bandwidth) — see commandBytes in device/profile.zig — hence the `eff` label.
 pub fn writeOpTable(
     writer: *std.Io.Writer,
+    title: []const u8,
     op_totals: []const profiling.Aggregate,
     device_total_ns: u64,
 ) std.Io.Writer.Error!void {
@@ -236,7 +409,7 @@ pub fn writeOpTable(
     std.mem.sort(profiling.Aggregate, rows[0..n], {}, opTotalDesc);
 
     var total_buf: [32]u8 = undefined;
-    try writer.print("device ops{s:>33}\n", .{formatDuration(&total_buf, device_total_ns)});
+    try writer.print("{s}  ({s} device)\n", .{ title, formatDuration(&total_buf, device_total_ns) });
     try writer.print("  {s:<16} {s:>7} {s:>10} {s:>9} {s:>6} {s:>10}\n", .{ "op", "count", "total", "avg", "dev%", "eff MiB/s" });
     for (rows[0..n]) |aggregate| {
         const avg_ns = if (aggregate.count == 0) 0 else aggregate.total_ns / aggregate.count;

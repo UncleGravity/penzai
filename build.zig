@@ -40,7 +40,7 @@ pub fn build(b: *std.Build) void {
     const host_shared = createSharedModule(b, target, optimize);
     const host_c = if (llama_config.enabled) createLlamaCModule(b, target, llama_config.src) else null;
     const host_runtime = createRuntimeModule(b, target, optimize, host_options, host_shared);
-    const host_server = createServerModule(b, target, optimize, host_shared, host_runtime);
+    const host_server = createServerModule(b, target, optimize, host_options, host_shared, host_runtime);
     const host_link = createHostLinkModule(b, target, optimize, host_shared, host_runtime, host_server);
 
     const host_exe = addPenzai(b, target, optimize, host_options, host_shared, host_runtime, host_server, host_link, llama_config, host_c);
@@ -52,7 +52,7 @@ pub fn build(b: *std.Build) void {
     const device_options = createBuildOptions(b, false, enable_profiling, "");
     const kr260_shared = createSharedModule(b, kr260_target, optimize);
     const kr260_runtime = createRuntimeModule(b, kr260_target, optimize, device_options, kr260_shared);
-    const kr260_server = createServerModule(b, kr260_target, optimize, kr260_shared, kr260_runtime);
+    const kr260_server = createServerModule(b, kr260_target, optimize, device_options, kr260_shared, kr260_runtime);
     const device_exe = addPenzaid(b, kr260_target, optimize, device_options, kr260_shared, kr260_runtime, kr260_server, "penzaid");
     b.step("device", "Cross-compile the KR260 device daemon").dependOn(&device_exe.step);
     const install_penzaid = b.addInstallArtifact(device_exe, .{});
@@ -60,7 +60,7 @@ pub fn build(b: *std.Build) void {
 
     const native_device_options = createBuildOptions(b, false, enable_profiling, "");
     const native_runtime = createRuntimeModule(b, target, optimize, native_device_options, host_shared);
-    const native_server = createServerModule(b, target, optimize, host_shared, native_runtime);
+    const native_server = createServerModule(b, target, optimize, native_device_options, host_shared, native_runtime);
     const native_device_exe = addPenzaid(b, target, optimize, native_device_options, host_shared, native_runtime, native_server, "penzaid-native");
     const install_native_device = b.addInstallArtifact(native_device_exe, .{});
     b.step("device-native", "Build a native penzaid for local TCP smoke tests").dependOn(&native_device_exe.step);
@@ -308,6 +308,7 @@ fn createServerModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    build_options: *std.Build.Module,
     shared: *std.Build.Module,
     runtime: *std.Build.Module,
 ) *std.Build.Module {
@@ -316,6 +317,7 @@ fn createServerModule(
         .target = target,
         .optimize = optimize,
     });
+    server.addImport("build_options", build_options);
     server.addImport("shared", shared);
     server.addImport("runtime", runtime);
     return server;
