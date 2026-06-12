@@ -127,7 +127,10 @@ pub fn runPrompt(
     ctx_params.n_threads = @intCast(options.threads);
     ctx_params.n_threads_batch = @intCast(options.threads);
     ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    ctx_params.op_offload = true;
+    // op_offload copies a CPU-side weight to the device to run one op there. With
+    // resident weights that backfires: the embedding get_rows re-copies the whole
+    // token_embd table every token. Off → get_rows uses the resident table.
+    ctx_params.op_offload = false;
 
     if (profile) |p| p.setPhase(.context_init);
     const context_start = if (profile) |p| p.now() else 0;
@@ -271,7 +274,10 @@ fn collectTrace(
     ctx_params.n_threads = @intCast(options.threads);
     ctx_params.n_threads_batch = @intCast(options.threads);
     ctx_params.flash_attn_type = c.LLAMA_FLASH_ATTN_TYPE_ENABLED;
-    ctx_params.op_offload = true;
+    // op_offload copies a CPU-side weight to the device to run one op there. With
+    // resident weights that backfires: the embedding get_rows re-copies the whole
+    // token_embd table every token. Off → get_rows uses the resident table.
+    ctx_params.op_offload = false;
 
     const ctx = c.llama_init_from_model(model, ctx_params) orelse return error.ContextInitFailed;
     defer c.llama_free(ctx);
