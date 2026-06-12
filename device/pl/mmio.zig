@@ -161,9 +161,10 @@ const CTRL_START: u32 = 1 << 0;
 const STATUS_BUSY: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Minimum kernel VERSION we accept. The currently-loaded bring-up bitstream is
-/// v4 (CYCLES only); the counter bank (W/A/R_STALL, beats) arrives at v5.
-pub const min_version: u32 = 4;
+/// Minimum kernel VERSION the driver accepts. v6 is the multi-column kernel that
+/// reads the wide weight layout; v4/v5 read the old narrow layout and are
+/// incompatible with the resident wide weights, so the PL path requires v6.
+pub const min_version: u32 = 6;
 pub const version_with_counters: u32 = 5;
 pub const expected_id: u32 = 0xB05A2000;
 
@@ -190,9 +191,10 @@ pub const Kernel = struct {
     }
 
     /// Set dims then strobe start. done_latched clears on the strobe.
-    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32) void {
+    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32) void {
         self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
         self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
+        self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
         self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
     }
 

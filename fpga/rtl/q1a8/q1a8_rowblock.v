@@ -4,10 +4,9 @@
 // lanes. Every lane has its own 32 Q1 bits and fp16 weight scale; the 32
 // int8 activations and the fp16 activation scale are shared across lanes.
 //
-// The accumulator `acc_flat` clears on `start` and updates one cycle after
-// each reducer output, so consumers must wait at least REDUCER_LATENCY+1
-// cycles after the last `valid_in && last_in` before reading. Output order
-// is lane-major:
+// The accumulator `acc_flat` clears on `start` and updates when the reducer
+// output is visible to this rowblock. `done` is asserted after that final
+// accumulator update. Output order is lane-major:
 //   results_flat[31:0]  = lane 0 fp32 bits
 //   results_flat[63:32] = lane 1 fp32 bits
 //   ...
@@ -33,7 +32,9 @@ module q1a8_rowblock #(
     output wire [ROWS*32-1:0]    results_flat
 );
 
-    localparam integer REDUCER_LATENCY = 2;
+    // q1a8_reducer pipeline latency plus one cycle for this rowblock to sample
+    // its registered output contribution.
+    localparam integer REDUCER_LATENCY = 4;
 
     wire [ROWS-1:0] reducer_valid;
     wire [ROWS*32-1:0] contributions_flat;

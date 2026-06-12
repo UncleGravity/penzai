@@ -15,6 +15,7 @@ localparam [11:0] Q1A8_OFF_R_STALL = 12'h028;
 localparam [11:0] Q1A8_OFF_W_BEATS = 12'h02C;
 localparam [11:0] Q1A8_OFF_A_BEATS = 12'h030;
 localparam [11:0] Q1A8_OFF_R_BEATS = 12'h034;
+localparam [11:0] Q1A8_OFF_NUM_COLS = 12'h038;
 localparam [31:0] Q1A8_RST_ID = 32'hB05A2000;
 localparam [31:0] Q1A8_RST_VERSION = 32'h00000005;
 localparam [31:0] Q1A8_RST_STATUS = 32'h00000000;

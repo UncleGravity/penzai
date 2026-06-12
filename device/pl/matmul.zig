@@ -25,8 +25,13 @@ const kernel_base: i64 = 0xA002_0000; // kernel AXI-Lite
 
 // Staging capacities, reserved once from the heap at init. Generous vs any real
 // shape; a matmul that would exceed them falls back to PS.
-const acts_staging_cap: usize = 256 * 1024; // q1_blocks up to ~1638 (k up to ~209k)
-const result_staging_cap: usize = 8 * 1024 * 1024; // rowblocks up to 262144
+const acts_staging_cap: usize = 256 * 1024; // COLS_MAX columns of acts
+const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * 32
+
+// Columns multiplied per kernel run. Must match q1a8_kernel_mc COLS_MAX in the
+// loaded bitstream. Prefill matmuls (cols>1) are tiled into groups of this many.
+const mc_cols_max: usize = 8;
+const result_bytes_per_rb: usize = (q1a8.rows_per_block / 2) * q1a8.beat_bytes; // 32
 
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
 
@@ -108,79 +113,101 @@ pub fn Backend(comptime Heap: type) type {
         /// failures the runtime should surface, not silent fallbacks.
         pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8, io: ?std.Io) Error!?profile.PlCounters {
             if (mm.weight_fmt != .w1a8) return null;
-            if (mm.cols != 1) return null; // decode only, for now
             const rows: usize = mm.rows;
+            const cols: usize = mm.cols;
             const k: usize = mm.k;
-            if (rows == 0 or k == 0 or k % q1a8.q1_block != 0) return null;
+            if (rows == 0 or cols == 0 or k == 0 or k % q1a8.q1_block != 0) return null;
 
             const q1_blocks = k / q1a8.q1_block;
-            const rowblocks = q1a8.rowblocksFor(rows);
-            const weight_bytes = rowblocks * q1_blocks * q1a8.packed_per_q1_block;
-            const act_stream_bytes = q1_blocks * q1a8.acts_per_q1_block;
-            const result_bytes = rowblocks * (q1a8.rows_per_block / 2) * q1a8.beat_bytes;
-            const dst_bytes = rows * @sizeOf(f32);
+            const num_rb = q1a8.rowblocksFor(rows);
+            const weight_bytes = num_rb * q1_blocks * q1a8.packed_per_q1_block; // wide layout
+            const act_stream_bytes = q1_blocks * q1a8.acts_per_q1_block; // per column
+            const dst_bytes = rows * cols * @sizeOf(f32);
 
-            // Shape must match the resident packing, and fit the staging windows.
+            // Shapes must match the resident packing and the staging windows must
+            // hold one COLS_MAX group of acts and results.
             if (mm.weights.nbytes != weight_bytes) return null;
-            if (mm.acts.nbytes != k * @sizeOf(f32)) return null;
+            if (mm.acts.nbytes != k * cols * @sizeOf(f32)) return null;
             if (mm.dst.nbytes != dst_bytes) return null;
-            if (act_stream_bytes > acts_staging_cap or result_bytes > result_staging_cap) return null;
+            if (mc_cols_max * act_stream_bytes > acts_staging_cap) return null;
+            if (num_rb * mc_cols_max * result_bytes_per_rb > result_staging_cap) return null;
 
             try self.ensureScratch(k);
+            const q8_blocks = q1_blocks * q1a8.q8_subblocks;
+            const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
+            const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure; // col-major k*cols f32
+            const dst_buf = heap.bytes(mm.dst) catch return error.HeapFailure; // col-major rows*cols f32
+
+            var counters: profile.PlCounters = .{};
+            var seg: Seg = .{};
             var last = shared.profiling.nowNs(io);
 
-            // 1. Read the activation column and quantize with the vectorized
-            // path (bit-identical to the PS oracle). The board is little-endian,
-            // so the resident f32 acts copy straight into the column buffer.
-            const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure;
-            @memcpy(std.mem.sliceAsBytes(self.column[0..k]), acts_bytes[0 .. k * @sizeOf(f32)]);
-            const q8_blocks = q1_blocks * q1a8.q8_subblocks;
-            q1a8.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
+            var col0: usize = 0;
+            while (col0 < cols) {
+                const group = @min(mc_cols_max, cols - col0);
+                const act_total = group * act_stream_bytes;
+                const result_bytes = num_rb * group * result_bytes_per_rb;
+                const acts_dma = subRange(self.acts_staging, act_total);
+                const result_dma = subRange(self.result_staging, result_bytes);
+                const acts_staging_buf = heap.bytes(acts_dma) catch return error.HeapFailure;
 
-            // 2. Pack the activation stream into staging and push it to the device.
-            const acts_dma = subRange(self.acts_staging, act_stream_bytes);
-            const acts_staging_buf = heap.bytes(acts_dma) catch return error.HeapFailure;
-            packActs(q1_blocks, self.quants[0..k], self.act_scales[0..q8_blocks], acts_staging_buf);
-            const t_quant = lapNs(io, &last);
-            heap.syncToDevice(acts_dma) catch return error.HeapFailure;
-            const t_sync_to = lapNs(io, &last);
+                // 1. Quantize + pack each column of the group (acts are col-major,
+                // so each column is a contiguous k*f32 block; LE -> direct copy).
+                for (0..group) |c| {
+                    const src = ((col0 + c) * k) * @sizeOf(f32);
+                    @memcpy(std.mem.sliceAsBytes(self.column[0..k]), acts_bytes[src..][0 .. k * @sizeOf(f32)]);
+                    q1a8.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
+                    packActs(q1_blocks, self.quants[0..k], self.act_scales[0..q8_blocks], acts_staging_buf[c * act_stream_bytes ..][0..act_stream_bytes]);
+                }
+                seg.quant_ns += lapNs(io, &last);
+                heap.syncToDevice(acts_dma) catch return error.HeapFailure;
+                seg.sync_to_ns += lapNs(io, &last);
 
-            const result_dma = subRange(self.result_staging, result_bytes);
-            const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
-            const acts_phys = heap.deviceAddress(acts_dma) catch return error.HeapFailure;
-            const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
+                const acts_phys = heap.deviceAddress(acts_dma) catch return error.HeapFailure;
+                const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
 
-            // 3. Program DMAs (arm result first), run the kernel, wait.
-            try self.dma_w.reset();
-            try self.dma_a.resetMm2s();
-            try self.dma_w.startWriteToDdr(result_phys, result_bytes);
-            try self.dma_w.startReadFromDdr(weights_phys, weight_bytes);
-            try self.dma_a.startReadFromDdr(acts_phys, act_stream_bytes);
-            self.kernel.run(@intCast(q1_blocks), @intCast(rowblocks));
-            const t_setup = lapNs(io, &last);
-            try self.kernel.waitDone();
-            try self.dma_w.waitWriteDone();
-            const t_wait = lapNs(io, &last);
+                // 2. Program DMAs (arm result first), run the kernel, wait. Weights
+                // stream from their resident range once for the whole group.
+                try self.dma_w.reset();
+                try self.dma_a.resetMm2s();
+                try self.dma_w.startWriteToDdr(result_phys, result_bytes);
+                try self.dma_w.startReadFromDdr(weights_phys, weight_bytes);
+                try self.dma_a.startReadFromDdr(acts_phys, act_total);
+                self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group));
+                seg.setup_ns += lapNs(io, &last);
+                try self.kernel.waitDone();
+                try self.dma_w.waitWriteDone();
+                seg.wait_ns += lapNs(io, &last);
 
-            const counters = self.readCounters();
+                accumulateCounters(&counters, self.readCounters());
 
-            // 4. Pull results back and copy into the destination.
-            heap.syncFromDevice(result_dma) catch return error.HeapFailure;
-            const t_sync_from = lapNs(io, &last);
-            const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
-            const dst_buf = heap.bytes(mm.dst) catch return error.HeapFailure;
-            // Single-column result stream is row-major fp32; the first dst_bytes
-            // are exactly the destination (padding rows sit past dst_bytes).
-            @memcpy(dst_buf[0..dst_bytes], result_buf[0..dst_bytes]);
-            const t_copy = lapNs(io, &last);
+                // 3. Gather results: stream is [rowblock][col][row], 8 fp32/rb
+                // lane-major; place into the col-major destination, dropping pad rows.
+                heap.syncFromDevice(result_dma) catch return error.HeapFailure;
+                seg.sync_from_ns += lapNs(io, &last);
+                const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
+                for (0..group) |c| {
+                    const col = col0 + c;
+                    for (0..num_rb) |rb| {
+                        const chunk = (rb * group + c) * result_bytes_per_rb;
+                        const valid = @min(q1a8.rows_per_block, rows - rb * q1a8.rows_per_block);
+                        for (0..valid) |lane| {
+                            const grow = rb * q1a8.rows_per_block + lane;
+                            @memcpy(dst_buf[(col * rows + grow) * 4 ..][0..4], result_buf[chunk + lane * 4 ..][0..4]);
+                        }
+                    }
+                }
+                seg.copy_ns += lapNs(io, &last);
+                col0 += group;
+            }
 
             self.seg.calls += 1;
-            self.seg.quant_ns += t_quant;
-            self.seg.sync_to_ns += t_sync_to;
-            self.seg.setup_ns += t_setup;
-            self.seg.wait_ns += t_wait;
-            self.seg.sync_from_ns += t_sync_from;
-            self.seg.copy_ns += t_copy;
+            self.seg.quant_ns += seg.quant_ns;
+            self.seg.sync_to_ns += seg.sync_to_ns;
+            self.seg.setup_ns += seg.setup_ns;
+            self.seg.wait_ns += seg.wait_ns;
+            self.seg.sync_from_ns += seg.sync_from_ns;
+            self.seg.copy_ns += seg.copy_ns;
             self.seg.cycles += counters.cycles;
             if (self.seg.calls % seg_report_interval == 0) self.flushSeg();
 
@@ -241,6 +268,17 @@ pub fn Backend(comptime Heap: type) type {
 
 fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
     return .{ .handle = staging.handle, .offset = 0, .nbytes = nbytes };
+}
+
+/// Sum the per-group hardware counters into the matmul's total.
+fn accumulateCounters(dst: *profile.PlCounters, src: profile.PlCounters) void {
+    dst.cycles += src.cycles;
+    dst.w_stall += src.w_stall;
+    dst.a_stall += src.a_stall;
+    dst.r_stall += src.r_stall;
+    dst.w_beats += src.w_beats;
+    dst.a_beats += src.a_beats;
+    dst.r_beats += src.r_beats;
 }
 
 /// Pack the activation stream: per Q1 block, per Q8 sub-block, 4 int8 beats then

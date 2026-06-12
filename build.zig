@@ -83,6 +83,15 @@ const core_rtl = [_][]const u8{
 };
 const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
 const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
+// The multi-column kernel uses its own rowblock; the rest of the core is shared.
+const reducer_rtl = [_][]const u8{
+    "fpga/rtl/q1a8/q1a8_reducer.v", "fpga/rtl/q1a8/fp32_add.v",
+    "fpga/rtl/q1a8/fp32_mul.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
+    "fpga/rtl/q1a8/int_to_fp32.v",
+};
+const mc_rtl = [_][]const u8{
+    "fpga/rtl/q1a8/q1a8_kernel_mc.v", "fpga/rtl/q1a8/q1a8_rowblock_mc.v",
+} ++ reducer_rtl;
 
 const core_rtl_args = "fpga/rtl/q1a8/q1a8_rowblock.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
 
@@ -113,6 +122,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     addCosim(b, target, optimize, "test-rtl", "Verilator cosim: narrow q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl);
     addCosim(b, target, optimize, "test-rtl-wide", "Verilator cosim: wide q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl);
+    addCosim(b, target, optimize, "test-rtl-mc", "Verilator cosim: multi-column q1a8_kernel_mc vs matmul_ref", "q1a8_kernel_mc", "fpga/sim/q1a8_kernel_mc", &mc_rtl);
 }
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {

@@ -24,3 +24,6 @@
 0x2C      W_BEATS         ro      0x00000000   weight AXIS beats moved last run
 0x30      A_BEATS         ro      0x00000000   act AXIS beats moved last run
 0x34      R_BEATS         ro      0x00000000   result AXIS beats moved last run
+#
+# Multi-column kernel (v6+): columns multiplied per run (1 for decode, >1 prefill).
+0x38      NUM_COLS        rw      0x00000000   activation columns per matmul

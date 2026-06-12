@@ -8,6 +8,58 @@ pub const FlashAttnError = error{
 
 pub const max_head_dim = 256;
 
+// Head-dim inner loops are vectorized over fixed-width f32 lanes; the K/V tensors
+// are f16, loaded a block at a time and widened. Portable @Vector lowers to NEON
+// on the A53 board. The vector reduce reorders the dot-product sum vs the scalar
+// path, so results match within the op's documented fp tolerance, not bit-exact.
+const vec_w = 16;
+const F32Vec = @Vector(vec_w, f32);
+
+/// Load `vec_w` contiguous f16 values from `bytes[off..]` and widen to f32.
+inline fn loadF16Block(bytes: []const u8, off: usize) F32Vec {
+    var raw: [vec_w]u16 = undefined;
+    @memcpy(std.mem.sliceAsBytes(raw[0..]), bytes[off..][0 .. vec_w * 2]);
+    const half: @Vector(vec_w, f16) = @bitCast(raw);
+    return @floatCast(half);
+}
+
+/// dot(q[0..n], f16(k_bytes[k_off..])), n = head_dim.
+fn dotF32F16(q: []const f32, k_bytes: []const u8, k_off: usize, n: usize) f32 {
+    var acc: F32Vec = @splat(0);
+    var d: usize = 0;
+    while (d + vec_w <= n) : (d += vec_w) {
+        const qv: F32Vec = q[d..][0..vec_w].*;
+        acc += qv * loadF16Block(k_bytes, k_off + d * 2);
+    }
+    var sum = @reduce(.Add, acc);
+    while (d < n) : (d += 1) sum += q[d] * readF16(k_bytes, k_off + d * 2);
+    return sum;
+}
+
+/// acc[d] += scale * f16(v_bytes[v_off..]), d in 0..n.
+fn axpyF16(acc: []f32, scale: f32, v_bytes: []const u8, v_off: usize, n: usize) void {
+    const sv: F32Vec = @splat(scale);
+    var d: usize = 0;
+    while (d + vec_w <= n) : (d += vec_w) {
+        var a: F32Vec = acc[d..][0..vec_w].*;
+        a += sv * loadF16Block(v_bytes, v_off + d * 2);
+        acc[d..][0..vec_w].* = a;
+    }
+    while (d < n) : (d += 1) acc[d] += scale * readF16(v_bytes, v_off + d * 2);
+}
+
+/// acc[d] *= s, d in 0..n.
+fn scaleInPlace(acc: []f32, s: f32, n: usize) void {
+    const sv: F32Vec = @splat(s);
+    var d: usize = 0;
+    while (d + vec_w <= n) : (d += vec_w) {
+        var a: F32Vec = acc[d..][0..vec_w].*;
+        a *= sv;
+        acc[d..][0..vec_w].* = a;
+    }
+    while (d < n) : (d += 1) acc[d] *= s;
+}
+
 pub const Params = struct {
     head_dim_q: u32,
     head_dim_v: u32,
@@ -78,10 +130,7 @@ pub fn runBytes(
                 }
 
                 const k_base = kv * k_nb1 + kv_head * k_nb2;
-                var score: f32 = 0;
-                for (0..head_dim_q) |d| {
-                    score += q_row[d] * readF16(k_data, k_base + d * @sizeOf(f16));
-                }
+                var score = dotF32F16(q_row[0..head_dim_q], k_data, k_base, head_dim_q);
                 score = score * params.scale + mask_value;
 
                 const old_max = max_score;
@@ -90,17 +139,13 @@ pub fn runBytes(
                 if (score > max_score) {
                     max_score = score;
                     max_scale = @exp(old_max - max_score);
-                    for (0..head_dim_v) |d| {
-                        acc[d] *= max_scale;
-                    }
+                    scaleInPlace(acc[0..head_dim_v], max_scale, head_dim_v);
                 } else {
                     value_scale = @exp(score - max_score);
                 }
 
                 const v_base = kv * v_nb1 + kv_head * v_nb2;
-                for (0..head_dim_v) |d| {
-                    acc[d] += value_scale * readF16(v_data, v_base + d * @sizeOf(f16));
-                }
+                axpyF16(acc[0..head_dim_v], value_scale, v_data, v_base, head_dim_v);
                 sum = sum * max_scale + value_scale;
             }
 
@@ -257,6 +302,54 @@ test "flash attention skips negative infinity mask entries" {
 
     try expectApprox(10, readF32(&dst, 0), 0.000001);
     try expectApprox(20, readF32(&dst, 4), 0.000001);
+}
+
+test "flash attention vector path matches a scalar softmax over a 20-wide head" {
+    const hd = 20; // 16-lane chunk + 4 remainder, so both vector paths run
+    var q: [hd * 4]u8 = undefined;
+    var k: [2 * hd * 2]u8 = undefined;
+    var v: [2 * hd * 2]u8 = undefined;
+    var dst: [hd * 4]u8 = undefined;
+    var prng = std.Random.DefaultPrng.init(0xF1A5);
+    const rnd = prng.random();
+    for (0..hd) |d| writeF32(&q, d * 4, rnd.float(f32) - 0.5);
+    for (0..2) |kv| {
+        for (0..hd) |d| {
+            writeF16(&k, (kv * hd + d) * 2, @floatCast(rnd.float(f32) - 0.5));
+            writeF16(&v, (kv * hd + d) * 2, @floatCast(rnd.float(f32) * 2 - 1));
+        }
+    }
+    var p = baseParams();
+    p.head_dim_q = hd;
+    p.head_dim_v = hd;
+    p.n_kv = 2;
+    p.q_nb1 = hd * 4;
+    p.q_nb2 = hd * 4;
+    p.k_nb1 = hd * 2;
+    p.k_nb2 = 2 * hd * 2;
+    p.v_nb1 = hd * 2;
+    p.v_nb2 = 2 * hd * 2;
+    p.dst_nb1 = hd * 4;
+    p.dst_nb2 = hd * 4;
+
+    try runBytes(&q, &k, &v, null, &dst, p);
+
+    // Independent plain-softmax reference over the two keys.
+    var s0: f32 = 0;
+    var s1: f32 = 0;
+    for (0..hd) |d| {
+        const qd = readF32(&q, d * 4);
+        s0 += qd * readF16(&k, d * 2);
+        s1 += qd * readF16(&k, (hd + d) * 2);
+    }
+    const m = @max(s0, s1);
+    const e0 = @exp(s0 - m);
+    const e1 = @exp(s1 - m);
+    const z = e0 + e1;
+    for (0..hd) |d| {
+        const expected = (e0 * readF16(&v, d * 2) + e1 * readF16(&v, (hd + d) * 2)) / z;
+        try expectApprox(expected, readF32(&dst, d * 4), 0.001);
+    }
 }
 
 test "flash attention maps grouped query heads onto shared kv heads" {

@@ -1,0 +1,7 @@
+# Vivado build artifacts (large; track .bit/.bit.bin with git-lfs if desired).
+*.bit
+*.bit.bin
+*.xsa
+*.rpt
+bit.bif
+config.env

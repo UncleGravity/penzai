@@ -2,23 +2,21 @@ const std = @import("std");
 
 pub const rows_per_block: usize = 8;
 pub const q1_block: usize = 128;
-pub const q1_block_bytes: usize = 18;
+pub const q1_block_bytes: usize = 18; // ggml Q1_0 block size (2 B scale + 16 B bits)
 pub const q8_block: usize = 32;
 pub const q8_subblocks: usize = q1_block / q8_block;
-pub const beat_bytes: usize = 8;
+pub const beat_bytes: usize = 8; // activation AXIS beat (64-bit)
 
-pub const scale_beats: usize = (rows_per_block + 3) / 4;
-pub const wbits_beats: usize = (rows_per_block + 1) / 2;
-pub const scales_bytes: usize = scale_beats * beat_bytes;
-pub const wbits_bytes: usize = wbits_beats * beat_bytes;
-pub const packed_per_q1_block: usize = scales_bytes + q8_subblocks * wbits_bytes;
+// Resident weight layout = the wide (256-bit weight beat) layout the PL kernel
+// streams: per (rowblock, q1block) one scale beat (ROWS fp16 at byte lane*2) then
+// one beat per Q8 sub-block (ROWS u32 at byte lane*4). Same weight bits and fp16
+// scales as ggml Q1_0, re-arranged with all ROWS lanes contiguous per beat.
+pub const weight_beat_bytes: usize = rows_per_block * 4; // ROWS * 32 bits = 256
+pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 160
 pub const acts_per_q1_block: usize = q8_subblocks * (q8_block + beat_bytes);
 
 comptime {
-    if (packed_per_q1_block != rows_per_block * q1_block_bytes) {
-        @compileError("Q1A8 packed weight layout no longer matches Q1_0 size");
-    }
-    if (packed_per_q1_block != 144) @compileError("Q1A8 packed block size drifted");
+    if (packed_per_q1_block != 160) @compileError("Q1A8 packed block size drifted");
     if (acts_per_q1_block != 160) @compileError("Q1A8 acts block size drifted");
 }
 
@@ -71,31 +69,18 @@ pub fn packWeightsFromLogical(
         const row_start = rb * rows_per_block;
         const row_count = @min(rows_per_block, rows - row_start);
         for (0..q1_blocks) |q1| {
-            for (0..scale_beats) |beat| {
-                var word: u64 = 0;
-                for (0..4) |local| {
-                    const lane = beat * 4 + local;
-                    if (lane < row_count) {
-                        const scale_bits: u64 = @as(u16, @bitCast(weight_scales[(row_start + lane) * q1_blocks + q1]));
-                        word |= scale_bits << @intCast(local * 16);
-                    }
-                }
-                putU64(out, &cursor, word);
+            for (0..row_count) |lane| {
+                const scale_bits: u16 = @bitCast(weight_scales[(row_start + lane) * q1_blocks + q1]);
+                std.mem.writeInt(u16, out[cursor + lane * 2 ..][0..2], scale_bits, .little);
             }
-
+            cursor += weight_beat_bytes;
             for (0..q8_subblocks) |sub| {
-                for (0..wbits_beats) |beat| {
-                    var word: u64 = 0;
-                    for (0..2) |local| {
-                        const lane = beat * 2 + local;
-                        if (lane < row_count) {
-                            const bits = weight_bits[(row_start + lane) * q1_blocks + q1];
-                            const part: u64 = @as(u32, @truncate(bits >> @intCast(sub * q8_block)));
-                            word |= part << @intCast(local * 32);
-                        }
-                    }
-                    putU64(out, &cursor, word);
+                for (0..row_count) |lane| {
+                    const bits = weight_bits[(row_start + lane) * q1_blocks + q1];
+                    const part: u32 = @truncate(bits >> @intCast(sub * q8_block));
+                    std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], part, .little);
                 }
+                cursor += weight_beat_bytes;
             }
         }
     }
@@ -118,35 +103,20 @@ pub fn packWeightsFromGgmlQ1_0(
         const row_start = rb * rows_per_block;
         const row_count = @min(rows_per_block, rows - row_start);
         for (0..q1_blocks) |q1| {
-            for (0..scale_beats) |beat| {
-                var word: u64 = 0;
-                for (0..4) |local| {
-                    const lane = beat * 4 + local;
-                    if (lane < row_count) {
-                        const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
-                        const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
-                        word |= @as(u64, scale) << @intCast(local * 16);
-                    }
-                }
-                putU64(out, &cursor, word);
+            for (0..row_count) |lane| {
+                const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
+                const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
+                std.mem.writeInt(u16, out[cursor + lane * 2 ..][0..2], scale, .little);
             }
-
+            cursor += weight_beat_bytes;
             for (0..q8_subblocks) |sub| {
-                for (0..wbits_beats) |beat| {
-                    var word: u64 = 0;
-                    for (0..2) |local| {
-                        const lane = beat * 2 + local;
-                        if (lane < row_count) {
-                            const source_offset = (row_start + lane) * source_row_bytes +
-                                q1 * q1_block_bytes +
-                                @sizeOf(f16) +
-                                sub * (q8_block / 8);
-                            const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
-                            word |= @as(u64, bits) << @intCast(local * 32);
-                        }
-                    }
-                    putU64(out, &cursor, word);
+                for (0..row_count) |lane| {
+                    const source_offset = (row_start + lane) * source_row_bytes +
+                        q1 * q1_block_bytes + @sizeOf(f16) + sub * (q8_block / 8);
+                    const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
+                    std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], bits, .little);
                 }
+                cursor += weight_beat_bytes;
             }
         }
     }
@@ -158,10 +128,7 @@ pub fn packedWeightScale(weights: []const u8, rows: usize, k: usize, row: usize,
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
     const block_base = (rb * q1_blocks + q1) * packed_per_q1_block;
-    const beat = lane / 4;
-    const local = lane % 4;
-    const word = readU64(weights, block_base + beat * beat_bytes);
-    return @bitCast(@as(u16, @truncate(word >> @intCast(local * 16))));
+    return @bitCast(std.mem.readInt(u16, weights[block_base + lane * 2 ..][0..2], .little));
 }
 
 pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, sub: usize) LayoutError!u32 {
@@ -170,11 +137,8 @@ pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, 
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
     const block_base = (rb * q1_blocks + q1) * packed_per_q1_block;
-    const sub_base = block_base + scales_bytes + sub * wbits_bytes;
-    const beat = lane / 2;
-    const local = lane % 2;
-    const word = readU64(weights, sub_base + beat * beat_bytes);
-    return @truncate(word >> @intCast(local * 32));
+    const sub_base = block_base + weight_beat_bytes + sub * weight_beat_bytes;
+    return std.mem.readInt(u32, weights[sub_base + lane * 4 ..][0..4], .little);
 }
 
 pub fn quantizeQ8_0(column: []const f32, out_quants: []i8, out_scales: []f16) LayoutError!void {

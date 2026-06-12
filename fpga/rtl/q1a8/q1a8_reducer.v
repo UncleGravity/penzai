@@ -6,7 +6,7 @@
 //   - fp16 weight_scale  (constant across the 4 Q8 sub-blocks of one Q1 block)
 //   - fp16 act_scale     (varies per Q8 sub-block)
 //
-// and produces (two cycles later)
+// and produces (three cycles later)
 //
 //   contribution = (fp32) weight_scale * act_scale * Sigma_i (b_i ? +a_i : -a_i)
 //
@@ -18,7 +18,7 @@
 // fp32_mul.v). The two fp32 multiplies are separated by a register stage
 // so the rowblock version can close timing when several lanes are replicated.
 //
-// Latency:    2 cycles
+// Latency:    3 cycles
 // Throughput: 1 sub-block / cycle
 
 `default_nettype none
@@ -50,14 +50,19 @@ module q1a8_reducer (
         sext_act = $signed({{6{a[7]}}, a});
     endfunction
 
-    integer i;
-    reg signed [13:0] sub_sum;
+    integer group;
+    integer elem;
+    integer bit_index;
+    reg signed [13:0] partial_sum [0:7];
     always @(*) begin
-        sub_sum = 14'sd0;
-        for (i = 0; i < 32; i = i + 1) begin
-            sub_sum = sub_sum + (weight_bits[i] ?
-                 sext_act(acts_packed[i*8 +: 8]) :
-                -sext_act(acts_packed[i*8 +: 8]));
+        for (group = 0; group < 8; group = group + 1) begin
+            partial_sum[group] = 14'sd0;
+            for (elem = 0; elem < 4; elem = elem + 1) begin
+                bit_index = group * 4 + elem;
+                partial_sum[group] = partial_sum[group] + (weight_bits[bit_index] ?
+                     sext_act(acts_packed[bit_index*8 +: 8]) :
+                    -sext_act(acts_packed[bit_index*8 +: 8]));
+            end
         end
     end
 
@@ -68,7 +73,38 @@ module q1a8_reducer (
     fp16_to_fp32 u_ws  (.in(weight_scale), .out(weight_scale_f32));
     fp16_to_fp32 u_as  (.in(act_scale),    .out(act_scale_f32));
 
+    // -- Pipeline stage 0 --------------------------------------------------
+    // Register small local reductions so the 32-term integer sum does not
+    // become a long routed adder path into sub_sum_s1.
+    reg         valid_s0;
+    reg [31:0] weight_scale_f32_s0;
+    reg [31:0] act_scale_f32_s0;
+    reg signed [13:0] partial_sum_s0 [0:7];
+
+    integer ps;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s0            <= 1'b0;
+            weight_scale_f32_s0 <= 32'd0;
+            act_scale_f32_s0    <= 32'd0;
+            for (ps = 0; ps < 8; ps = ps + 1) partial_sum_s0[ps] <= 14'sd0;
+        end else begin
+            valid_s0            <= valid_in;
+            weight_scale_f32_s0 <= weight_scale_f32;
+            act_scale_f32_s0    <= act_scale_f32;
+            for (ps = 0; ps < 8; ps = ps + 1) partial_sum_s0[ps] <= partial_sum[ps];
+        end
+    end
+
     // -- Pipeline stage 1 --------------------------------------------------
+    wire signed [13:0] sum_l1_0 = partial_sum_s0[0] + partial_sum_s0[1];
+    wire signed [13:0] sum_l1_1 = partial_sum_s0[2] + partial_sum_s0[3];
+    wire signed [13:0] sum_l1_2 = partial_sum_s0[4] + partial_sum_s0[5];
+    wire signed [13:0] sum_l1_3 = partial_sum_s0[6] + partial_sum_s0[7];
+    wire signed [13:0] sum_l2_0 = sum_l1_0 + sum_l1_1;
+    wire signed [13:0] sum_l2_1 = sum_l1_2 + sum_l1_3;
+    wire signed [13:0] sub_sum = sum_l2_0 + sum_l2_1;
+
     reg         valid_s1;
     reg [31:0] weight_scale_f32_s1;
     reg [31:0] act_scale_f32_s1;
@@ -81,9 +117,9 @@ module q1a8_reducer (
             act_scale_f32_s1    <= 32'd0;
             sub_sum_s1          <= 14'sd0;
         end else begin
-            valid_s1            <= valid_in;
-            weight_scale_f32_s1 <= weight_scale_f32;
-            act_scale_f32_s1    <= act_scale_f32;
+            valid_s1            <= valid_s0;
+            weight_scale_f32_s1 <= weight_scale_f32_s0;
+            act_scale_f32_s1    <= act_scale_f32_s0;
             sub_sum_s1          <= sub_sum;
         end
     end
