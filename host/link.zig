@@ -361,12 +361,23 @@ pub const TcpLink = struct {
         var meta: [64]u8 = undefined;
         const id = self.nextId();
         const meta_len = wire.encodeDownload(&meta, id, range) catch return error.Protocol;
-        var response = try self.call(meta[0..meta_len], "");
+        const request_len = framing.encodedLen(meta_len, 0) catch return error.Protocol;
+        const request_frame = try self.allocator.alloc(u8, request_len);
+        defer self.allocator.free(request_frame);
+        _ = framing.encode(meta[0..meta_len], "", request_frame) catch return error.Protocol;
+
+        var response = self.endpoint.callInto(self.allocator, request_frame, out) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Protocol => return error.Protocol,
+            error.InvalidAddress, error.Transport => return error.Transport,
+        };
         defer response.deinit(self.allocator);
-        try response.expectOk(id);
-        if (response.payload.len != out.len) return error.Protocol;
-        @memcpy(out, response.payload);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+
+        const response_meta = wire.decodeResponseMeta(response.metadata) catch return error.Protocol;
+        if (response_meta.request_id != id) return error.Protocol;
+        if (response_meta.status != .ok) return error.RemoteFailed;
+        if (!response.payload_copied or response.payload_len != out.len) return error.Protocol;
+        return .{ .device_service_ns = response_meta.device_service_ns };
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {

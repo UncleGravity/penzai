@@ -55,6 +55,23 @@ pub const Endpoint = struct {
             else => error.Transport,
         };
     }
+
+    pub fn callInto(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        request_frame: []const u8,
+        payload_out: []u8,
+    ) Error!protocol_transport.FrameIntoResult {
+        var writer = self.stream.writer(self.io, &self.write_buf);
+        protocol_transport.writeFrame(&writer.interface, request_frame) catch return error.Transport;
+
+        var reader = self.stream.reader(self.io, &self.read_buf);
+        return protocol_transport.readFrameInto(allocator, &reader.interface, payload_out) catch |err| switch (err) {
+            error.OutOfMemory => error.OutOfMemory,
+            error.BadFrame => error.Protocol,
+            else => error.Transport,
+        };
+    }
 };
 
 /// Disable Nagle: our request/response ping-pong of small frames otherwise eats
