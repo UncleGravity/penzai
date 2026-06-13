@@ -450,7 +450,10 @@ pub fn giga(count: u64, total_ns: u64) f64 {
 /// (`pl_macs/pl_ns`, includes per-call quantize/DMA/sync overhead), kernel
 /// MAC/cycle (`pl_macs/cycles`, the array's intrinsic rate — clock-independent),
 /// and array utilization `(cycles - max stall)/cycles`. The gap between the
-/// PL MAC/s and MAC/cycle×fclk is the per-call software overhead.
+/// PL MAC/s and MAC/cycle×fclk is the per-call software overhead. The weight
+/// stream columns are derived from PL counters: W B/cyc is clock-independent;
+/// W GB/s uses PL end-to-end wall time because the current wire report does not
+/// carry the bitstream clock.
 pub fn writeMatmulDetail(
     writer: *std.Io.Writer,
     title: []const u8,
@@ -463,16 +466,20 @@ pub fn writeMatmulDetail(
     if (!any) return;
 
     try writer.print("{s}\n", .{title});
-    try writer.print("  {s:<10} {s:>7} {s:>10} {s:>12} {s:>9} {s:>7}\n", .{ "fmt", "calls", "GMAC", "MAC/s", "MAC/cyc", "util%" });
+    try writer.print("  {s:<10} {s:>7} {s:>10} {s:>12} {s:>9} {s:>7} {s:>8} {s:>8}\n", .{
+        "fmt", "calls", "GMAC", "MAC/s", "MAC/cyc", "util%", "W B/cyc", "W GB/s",
+    });
     for (matmul_stats) |stat| {
         if (stat.count == 0) continue;
         const gmac = @as(f64, @floatFromInt(stat.macs)) / 1_000_000_000.0;
         var macps_buf: [24]u8 = undefined;
-        try writer.print("  {s:<10} {d:>7} {d:>10.1} {s:>12} {s:>9} {s:>7}\n", .{
+        try writer.print("  {s:<10} {d:>7} {d:>10.1} {s:>12} {s:>9} {s:>7} {s:>8} {s:>8}\n", .{
             weightFormatName(stat.fmt),
             stat.count,
             gmac,
             std.fmt.bufPrint(&macps_buf, "{d:.2} G/s", .{giga(stat.macs, stat.total_ns)}) catch unreachable,
+            "-",
+            "-",
             "-",
             "-",
         });
@@ -481,14 +488,30 @@ pub fn writeMatmulDetail(
         const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles));
         const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
         const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
-        try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1}\n", .{
+        const weight_bytes = stat.w_beats * 32; // q1a8_kernel_mc weight beat is 256 bits.
+        const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
+        const weight_gb_s_wall = giga(weight_bytes, stat.pl_ns);
+        try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1} {d:>8.2} {d:>8.2}\n", .{
             "pl",
             stat.pl_count,
             "",
             std.fmt.bufPrint(&plps_buf, "{d:.2} G/s", .{giga(stat.pl_macs, stat.pl_ns)}) catch unreachable,
             mac_per_cyc,
             util,
+            weight_bytes_per_cycle,
+            weight_gb_s_wall,
         });
+        if (stat.cycles != 0 or stat.w_beats != 0 or stat.a_beats != 0 or stat.r_beats != 0) {
+            try writer.print("      cycles={d} stalls W/A/R={d}/{d}/{d} beats W/A/R={d}/{d}/{d}\n", .{
+                stat.cycles,
+                stat.w_stall_cycles,
+                stat.a_stall_cycles,
+                stat.r_stall_cycles,
+                stat.w_beats,
+                stat.a_beats,
+                stat.r_beats,
+            });
+        }
     }
 }
 

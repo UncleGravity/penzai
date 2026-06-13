@@ -155,8 +155,12 @@ pub fn Backend(comptime Heap: type) type {
                 const group = @min(mc_cols_max, cols - col0);
                 const act_total = group * act_stream_bytes;
                 const result_bytes = num_rb * group * result_bytes_per_rb;
+                const direct_result = group == 1 and rows % q1a8.rows_per_block == 0;
                 const acts_dma = subRange(self.acts_staging, act_total);
-                const result_dma = subRange(self.result_staging, result_bytes);
+                const result_dma = if (direct_result)
+                    offsetRange(mm.dst, col0 * rows * @sizeOf(f32), result_bytes)
+                else
+                    subRange(self.result_staging, result_bytes);
                 const acts_staging_buf = heap.bytes(acts_dma) catch return error.HeapFailure;
 
                 // 1. Quantize + pack each column of the group (acts are col-major,
@@ -193,9 +197,11 @@ pub fn Backend(comptime Heap: type) type {
                 // lane-major; place into the col-major destination, dropping pad rows.
                 heap.syncFromDevice(result_dma) catch return error.HeapFailure;
                 seg.sync_from_ns += lapNs(io, &last);
-                const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
-                gather.gatherResults(dst_buf, result_buf, rows, group, col0, num_rb);
-                seg.copy_ns += lapNs(io, &last);
+                if (!direct_result) {
+                    const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
+                    gather.gatherResults(dst_buf, result_buf, rows, group, col0, num_rb);
+                    seg.copy_ns += lapNs(io, &last);
+                }
                 col0 += group;
             }
 
@@ -266,6 +272,10 @@ pub fn Backend(comptime Heap: type) type {
 
 fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
     return .{ .handle = staging.handle, .offset = 0, .nbytes = nbytes };
+}
+
+fn offsetRange(base: wire.TensorRange, offset: usize, nbytes: usize) wire.TensorRange {
+    return .{ .handle = base.handle, .offset = base.offset + @as(u64, @intCast(offset)), .nbytes = @intCast(nbytes) };
 }
 
 /// Sum the per-group hardware counters into the matmul's total.

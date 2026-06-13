@@ -7,6 +7,7 @@ pub const FlashAttnError = error{
 };
 
 pub const max_head_dim = 256;
+pub const max_kv = 8192;
 
 // Head-dim inner loops are vectorized over fixed-width f32 lanes; the K/V tensors
 // are f16, loaded a block at a time and widened. Portable @Vector lowers to NEON
@@ -46,18 +47,6 @@ fn axpyF16(acc: []f32, scale: f32, v_bytes: []const u8, v_off: usize, n: usize) 
         acc[d..][0..vec_w].* = a;
     }
     while (d < n) : (d += 1) acc[d] += scale * readF16(v_bytes, v_off + d * 2);
-}
-
-/// acc[d] *= s, d in 0..n.
-fn scaleInPlace(acc: []f32, s: f32, n: usize) void {
-    const sv: F32Vec = @splat(s);
-    var d: usize = 0;
-    while (d + vec_w <= n) : (d += vec_w) {
-        var a: F32Vec = acc[d..][0..vec_w].*;
-        a *= sv;
-        acc[d..][0..vec_w].* = a;
-    }
-    while (d < n) : (d += 1) acc[d] *= s;
 }
 
 pub const Params = struct {
@@ -107,6 +96,7 @@ pub fn runBytes(
     const head_ratio = n_heads / n_head_kv;
 
     var q_row: [max_head_dim]f32 = undefined;
+    var scores: [max_kv]f32 = undefined;
     var acc: [max_head_dim]f32 = undefined;
 
     for (0..n_tokens) |token| {
@@ -119,34 +109,35 @@ pub fn runBytes(
             }
 
             var max_score = -std.math.inf(f32);
-            var sum: f32 = 0;
-            @memset(acc[0..head_dim_v], 0);
-
             for (0..n_kv) |kv| {
                 var mask_value: f32 = 0;
                 if (mask_row) |row| {
                     mask_value = readF16(row, kv * @sizeOf(f16));
-                    if (!std.math.isFinite(mask_value) and mask_value < 0) continue;
+                    if (!std.math.isFinite(mask_value) and mask_value < 0) {
+                        scores[kv] = -std.math.inf(f32);
+                        continue;
+                    }
                 }
 
                 const k_base = kv * k_nb1 + kv_head * k_nb2;
                 var score = dotF32F16(q_row[0..head_dim_q], k_data, k_base, head_dim_q);
                 score = score * params.scale + mask_value;
+                scores[kv] = score;
+                if (score > max_score) max_score = score;
+            }
 
-                const old_max = max_score;
-                var max_scale: f32 = 1;
-                var value_scale: f32 = 1;
-                if (score > max_score) {
-                    max_score = score;
-                    max_scale = @exp(old_max - max_score);
-                    scaleInPlace(acc[0..head_dim_v], max_scale, head_dim_v);
-                } else {
-                    value_scale = @exp(score - max_score);
+            @memset(acc[0..head_dim_v], 0);
+            var sum: f32 = 0;
+            if (std.math.isFinite(max_score)) {
+                for (0..n_kv) |kv| {
+                    const score = scores[kv];
+                    if (!std.math.isFinite(score) and score < 0) continue;
+                    const value_scale = @exp(score - max_score);
+
+                    const v_base = kv * v_nb1 + kv_head * v_nb2;
+                    axpyF16(acc[0..head_dim_v], value_scale, v_data, v_base, head_dim_v);
+                    sum += value_scale;
                 }
-
-                const v_base = kv * v_nb1 + kv_head * v_nb2;
-                axpyF16(acc[0..head_dim_v], value_scale, v_data, v_base, head_dim_v);
-                sum = sum * max_scale + value_scale;
             }
 
             const dst_base = head * dst_nb1 + token * dst_nb2;
@@ -163,6 +154,7 @@ fn validateInputs(q: []const u8, k: []const u8, v: []const u8, mask: ?[]const u8
         return error.InvalidShape;
     }
     if (params.head_dim_q > max_head_dim or params.head_dim_v > max_head_dim) return error.InvalidShape;
+    if (params.n_kv > max_kv) return error.InvalidShape;
     if (params.n_heads % params.n_head_kv != 0) return error.InvalidShape;
     if (!std.math.isFinite(params.scale)) return error.InvalidParam;
 
