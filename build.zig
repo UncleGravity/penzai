@@ -404,6 +404,7 @@ fn addTests(
     addDeviceTest(b, test_step, "device/ps/rows.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/ps/rope.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/ps/softmax.zig", target, optimize, build_options, shared);
+    addSharedTest(b, test_step, "device/pl/gather.zig", target, optimize, shared);
     addDeviceRuntimeTest(b, test_step, "device/main.zig", target, optimize, build_options, shared, runtime, server);
 
     addHostTest(b, test_step, "host/trace.zig", target, optimize, build_options, shared, runtime, server, link, llama_config, c_mod, false);

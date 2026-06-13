@@ -12,6 +12,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const mmio = @import("mmio.zig");
+const gather = @import("gather.zig");
 const profile = @import("../profile.zig");
 
 const wire = shared.wire;
@@ -31,7 +32,14 @@ const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * 32
 // Columns multiplied per kernel run. Must match q1a8_kernel_mc COLS_MAX in the
 // loaded bitstream. Prefill matmuls (cols>1) are tiled into groups of this many.
 const mc_cols_max: usize = 8;
-const result_bytes_per_rb: usize = (q1a8.rows_per_block / 2) * q1a8.beat_bytes; // 32
+const result_bytes_per_rb = gather.result_bytes_per_rb; // 32; single source in gather.zig
+
+// Fabric clock of the loaded bitstream (variant w256-f125). Must match the
+// deployed bitstream; used only to convert the cycle counter to time for the
+// `pl seg` diagnostic. TODO: expose as a CLK_MHZ regmap register so penzaid
+// self-describes the clock (as it already does VERSION) and the v7 ~300 MHz
+// bump can't silently re-introduce the drift this replaced.
+const pl_clk_mhz: f64 = 125.0;
 
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
 
@@ -186,17 +194,7 @@ pub fn Backend(comptime Heap: type) type {
                 heap.syncFromDevice(result_dma) catch return error.HeapFailure;
                 seg.sync_from_ns += lapNs(io, &last);
                 const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
-                for (0..group) |c| {
-                    const col = col0 + c;
-                    for (0..num_rb) |rb| {
-                        const chunk = (rb * group + c) * result_bytes_per_rb;
-                        const valid = @min(q1a8.rows_per_block, rows - rb * q1a8.rows_per_block);
-                        for (0..valid) |lane| {
-                            const grow = rb * q1a8.rows_per_block + lane;
-                            @memcpy(dst_buf[(col * rows + grow) * 4 ..][0..4], result_buf[chunk + lane * 4 ..][0..4]);
-                        }
-                    }
-                }
+                gather.gatherResults(dst_buf, result_buf, rows, group, col0, num_rb);
                 seg.copy_ns += lapNs(io, &last);
                 col0 += group;
             }
@@ -233,7 +231,7 @@ pub fn Backend(comptime Heap: type) type {
                 us(s.wait_ns, n),
                 us(s.sync_from_ns, n),
                 us(s.copy_ns, n),
-                @as(f64, @floatFromInt(s.cycles)) / n / 100.0, // cycles @ 100 MHz -> us
+                @as(f64, @floatFromInt(s.cycles)) / n / pl_clk_mhz, // cycles -> us
             });
             self.seg = .{};
         }
