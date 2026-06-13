@@ -117,6 +117,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     }, .payload = bytes };
                 },
                 .run_graph => |req| blk: {
+                    try self.applyPreloads(req.preload_bytes);
                     if (build_options.enable_profiling and req.tier != .off) {
                         const profiled = try self.runProfiled(io, req.tier, req.command_bytes);
                         break :blk .{ .meta = .{
@@ -139,6 +140,13 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     } };
                 },
             };
+        }
+
+        fn applyPreloads(self: *Self, preload_bytes: []const u8) RuntimeError!void {
+            var it: wire.PreloadIterator = .{ .bytes = preload_bytes };
+            while (it.next() catch return error.InvalidRequest) |entry| {
+                self.heap.write(entry.range, entry.bytes) catch |err| return mapHeapError(err);
+            }
         }
 
         const ProfiledRun = struct { payload: []u8, command_count: usize };

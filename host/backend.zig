@@ -14,6 +14,7 @@ const profiling = shared.profiling;
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;
 const alignment = 64;
+const max_pending_preload_bytes: usize = 1 * 1024 * 1024;
 
 pub const BackendError = error{
     HandshakeFailed,
@@ -367,6 +368,7 @@ pub const Device = struct {
     census: ?*census_mod.Census = null,
     profile: ?*Profile = null,
     trace: ?*trace_mod.Capture = null,
+    pending_preload: std.ArrayList(u8) = .empty,
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",
 
@@ -382,6 +384,7 @@ pub const Device = struct {
     }
 
     pub fn destroy(self: *Self) void {
+        self.pending_preload.deinit(self.allocator);
         self.allocator.destroy(self);
     }
 
@@ -622,6 +625,15 @@ fn bufSetTensor(
         .offset = binding.range.offset + @as(u64, @intCast(offset)),
         .nbytes = @intCast(size),
     };
+
+    if (shouldDeferUpload(buf, remote.dev)) {
+        if (tryDeferPreload(remote.dev, dst_range, src[0..size])) {
+            remote.dev.counters.upload_bytes += size;
+            recordUploadTensor(remote.dev, t, size);
+            return;
+        }
+    }
+
     timedUpload(remote.dev, dst_range, src[0..size]) catch return;
     remote.dev.counters.upload_bytes += size;
     recordUploadTensor(remote.dev, t, size);
@@ -635,6 +647,7 @@ fn bufGetTensor(
     size: usize,
 ) callconv(.c) void {
     const remote = remoteOf(buf);
+    flushPreloadsEager(remote.dev) catch return;
     const binding = findBindingIn(remote, tensor orelse return) orelse return;
     if (!rangeValid(binding, offset, size)) return;
     const dst: [*]u8 = @ptrCast(data orelse return);
@@ -655,6 +668,7 @@ fn bufMemsetTensor(
     size: usize,
 ) callconv(.c) void {
     const remote = remoteOf(buf);
+    flushPreloadsEager(remote.dev) catch return;
     const binding = findBindingIn(remote, tensor orelse return) orelse return;
     if (!rangeValid(binding, offset, size)) return;
     uploadFill(remote.dev, binding.range.handle, binding.range.offset + @as(u64, @intCast(offset)), size, value) catch return;
@@ -662,12 +676,15 @@ fn bufMemsetTensor(
 
 fn bufClear(buf: c.ggml_backend_buffer_t, value: u8) callconv(.c) void {
     const remote = remoteOf(buf);
+    flushPreloadsEager(remote.dev) catch return;
     if (remote.remote.handle == 0 or remote.remote.nbytes == 0) return;
     uploadFill(remote.dev, remote.remote.handle, 0, @intCast(remote.remote.nbytes), value) catch return;
 }
 
 fn bufReset(buf: c.ggml_backend_buffer_t) callconv(.c) void {
-    remoteOf(buf).bindings_len = 0;
+    const remote = remoteOf(buf);
+    flushPreloadsEager(remote.dev) catch return;
+    remote.bindings_len = 0;
 }
 
 fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) link_mod.LinkError!void {
@@ -706,7 +723,38 @@ fn timedDownload(dev: *Device, range: wire.TensorRange, out: []u8) link_mod.Link
 
 /// Best-effort free (teardown / error unwind); discards the error and timing.
 fn freeQuietly(dev: *Device, range: wire.TensorRange) void {
+    flushPreloadsEager(dev) catch {};
     _ = dev.link.free(range) catch return;
+}
+
+fn shouldDeferUpload(buf: c.ggml_backend_buffer_t, dev: *const Device) bool {
+    // Census mode records graph structure without executing, so there is no
+    // graph request to carry preloads. Keep that path eager and unsurprising.
+    if (dev.census != null) return false;
+    return c.ggml_backend_buffer_get_usage(buf) != c.GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+fn tryDeferPreload(dev: *Device, range: wire.TensorRange, bytes: []const u8) bool {
+    const entry_len = wire.preloadEntryLen(bytes.len) catch return false;
+    const new_len = std.math.add(usize, dev.pending_preload.items.len, entry_len) catch return false;
+    if (new_len > max_pending_preload_bytes) return false;
+
+    const start = dev.pending_preload.items.len;
+    dev.pending_preload.resize(dev.allocator, new_len) catch return false;
+    _ = wire.encodePreloadEntry(dev.pending_preload.items[start..], range, bytes) catch {
+        dev.pending_preload.shrinkRetainingCapacity(start);
+        return false;
+    };
+    return true;
+}
+
+fn flushPreloadsEager(dev: *Device) link_mod.LinkError!void {
+    if (dev.pending_preload.items.len == 0) return;
+    var it: wire.PreloadIterator = .{ .bytes = dev.pending_preload.items };
+    while (it.next() catch return error.Protocol) |entry| {
+        try timedUpload(dev, entry.range, entry.bytes);
+    }
+    dev.pending_preload.clearRetainingCapacity();
 }
 
 /// Tally an upload against the tensor's ggml name for the residency census.
@@ -818,18 +866,24 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
         return c.GGML_STATUS_FAILED;
     };
     defer dev.allocator.free(commands);
-    if (commands.len == 0) return c.GGML_STATUS_SUCCESS;
+    if (commands.len == 0) {
+        flushPreloadsEager(dev) catch return c.GGML_STATUS_FAILED;
+        return c.GGML_STATUS_SUCCESS;
+    }
+
+    const preload = dev.pending_preload.items;
     if (dev.profile) |profile| {
         // Trace requests per-command spans; otherwise aggregate-only.
         const tier: wire.ProfileTier = if (dev.trace != null) .trace else .aggregate;
         const host_base_ns = profile.now();
-        var profiled = dev.link.runGraphProfile(commands, tier) catch return c.GGML_STATUS_FAILED;
+        var profiled = dev.link.runGraphProfilePreload(preload, commands, tier) catch return c.GGML_STATUS_FAILED;
         defer profiled.deinit();
         profile.recordRunGraph(profiled);
         if (dev.trace) |cap| cap.append(profiled.report, host_base_ns) catch {};
     } else {
-        dev.link.runGraph(commands) catch return c.GGML_STATUS_FAILED;
+        dev.link.runGraphPreload(preload, commands) catch return c.GGML_STATUS_FAILED;
     }
+    dev.pending_preload.clearRetainingCapacity();
     dev.counters.lowered_commands += commands.len;
     return c.GGML_STATUS_SUCCESS;
 }

@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 8;
+pub const version: u16 = 9;
 pub const response_meta_len: usize = 56;
 
 pub const RequestTag = enum(u16) {
@@ -57,7 +57,7 @@ pub const DecodeError = error{
     TrailingBytes,
 };
 
-pub const EncodeError = error{ OutputTooSmall, TooManyCommands };
+pub const EncodeError = error{ OutputTooSmall, TooManyCommands, InvalidLength };
 
 pub const TensorRange = struct {
     handle: u64,
@@ -147,7 +147,64 @@ pub const RunGraphRequest = struct {
     request_id: u64,
     command_bytes: []const u8,
     tier: ProfileTier = .off,
+    /// Tensor writes to apply immediately before executing the command buffer.
+    /// Empty means no folded uploads. The payload format is parsed separately so
+    /// the command buffer remains the same closed op list used by the runtime.
+    preload_bytes: []const u8 = &.{},
 };
+
+/// One folded upload in a run_graph request: destination range plus exact bytes.
+pub const PreloadEntry = struct {
+    range: TensorRange,
+    bytes: []const u8,
+};
+
+pub const PreloadIterator = struct {
+    bytes: []const u8,
+    cursor: usize = 0,
+
+    pub fn next(self: *PreloadIterator) DecodeError!?PreloadEntry {
+        if (self.cursor == self.bytes.len) return null;
+        const range = try takeRange(self.bytes, &self.cursor);
+        const n = try checkedUsize(range.nbytes);
+        if (self.bytes.len - self.cursor < n) return error.Truncated;
+        const payload = self.bytes[self.cursor..][0..n];
+        self.cursor += n;
+        return .{ .range = range, .bytes = payload };
+    }
+};
+
+pub fn preloadEntryLen(nbytes: usize) EncodeError!usize {
+    return std.math.add(usize, rangeLen, nbytes) catch error.OutputTooSmall;
+}
+
+pub fn encodePreloadEntry(out: []u8, range: TensorRange, bytes: []const u8) EncodeError!usize {
+    if (range.nbytes != bytes.len) return error.InvalidLength;
+    const want = try preloadEntryLen(bytes.len);
+    if (out.len < want) return error.OutputTooSmall;
+    var cursor: usize = 0;
+    putRange(out, &cursor, range);
+    @memcpy(out[cursor..][0..bytes.len], bytes);
+    return want;
+}
+
+pub fn runGraphPayloadLen(preload_len: usize, command_len: usize) EncodeError!usize {
+    const with_commands = std.math.add(usize, preload_len, command_len) catch return error.OutputTooSmall;
+    return std.math.add(usize, 4, with_commands) catch error.OutputTooSmall;
+}
+
+/// run_graph payload = u32 preload_len, then preload entries, then command bytes.
+pub fn encodeRunGraphPayload(out: []u8, preload_bytes: []const u8, command_bytes: []const u8) EncodeError!usize {
+    if (preload_bytes.len > std.math.maxInt(u32)) return error.OutputTooSmall;
+    const want = try runGraphPayloadLen(preload_bytes.len, command_bytes.len);
+    if (out.len < want) return error.OutputTooSmall;
+    var cursor: usize = 0;
+    putU32(out, &cursor, @intCast(preload_bytes.len));
+    @memcpy(out[cursor..][0..preload_bytes.len], preload_bytes);
+    cursor += preload_bytes.len;
+    @memcpy(out[cursor..][0..command_bytes.len], command_bytes);
+    return want;
+}
 
 pub const Request = union(RequestTag) {
     hello: u64,
@@ -453,7 +510,21 @@ pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Requ
                 if (reserved != 0) return error.InvalidFlags;
                 tier = ProfileTier.fromFlags(flags) orelse return error.InvalidFlags;
             }
-            break :blk .{ .run_graph = .{ .request_id = request_id, .command_bytes = payload, .tier = tier } };
+            var preload_bytes: []const u8 = &.{};
+            var command_bytes: []const u8 = &.{};
+            if (payload.len != 0) {
+                var payload_cursor: usize = 0;
+                const preload_len = try checkedUsize(try takeU32(payload, &payload_cursor));
+                if (payload.len - payload_cursor < preload_len) return error.InvalidLength;
+                preload_bytes = payload[payload_cursor..][0..preload_len];
+                command_bytes = payload[payload_cursor + preload_len ..];
+            }
+            break :blk .{ .run_graph = .{
+                .request_id = request_id,
+                .command_bytes = command_bytes,
+                .tier = tier,
+                .preload_bytes = preload_bytes,
+            } };
         },
     };
 }
@@ -1041,6 +1112,54 @@ test "run_graph profile tier roundtrip and rejection" {
     var bad_reserved = meta;
     std.mem.writeInt(u32, bad_reserved[20..24], 1, .little);
     try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_reserved[0..len], ""));
+}
+
+test "run_graph preload payload roundtrips and bounds-checks" {
+    var meta: [32]u8 = undefined;
+    const meta_len = try encodeRunGraph(&meta, 7, .aggregate);
+
+    const r0: TensorRange = .{ .handle = 3, .offset = 16, .nbytes = 4 };
+    const r1: TensorRange = .{ .handle = 5, .offset = 0, .nbytes = 2 };
+    var preload: [128]u8 = undefined;
+    var preload_len: usize = 0;
+    preload_len += try encodePreloadEntry(preload[preload_len..], r0, &[_]u8{ 1, 2, 3, 4 });
+    preload_len += try encodePreloadEntry(preload[preload_len..], r1, &[_]u8{ 9, 9 });
+
+    const commands = [_]u8{ 0, 0, 0, 0 };
+    var payload: [256]u8 = undefined;
+    const payload_len = try encodeRunGraphPayload(&payload, preload[0..preload_len], &commands);
+
+    const req = (try decodeRequest(meta[0..meta_len], payload[0..payload_len])).run_graph;
+    try std.testing.expectEqual(@as(u64, 7), req.request_id);
+    try std.testing.expectEqual(ProfileTier.aggregate, req.tier);
+    try std.testing.expectEqualSlices(u8, &commands, req.command_bytes);
+
+    var it: PreloadIterator = .{ .bytes = req.preload_bytes };
+    const e0 = (try it.next()).?;
+    try std.testing.expectEqual(r0, e0.range);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 1, 2, 3, 4 }, e0.bytes);
+    const e1 = (try it.next()).?;
+    try std.testing.expectEqual(r1, e1.range);
+    try std.testing.expectEqualSlices(u8, &[_]u8{ 9, 9 }, e1.bytes);
+    try std.testing.expect((try it.next()) == null);
+
+    var bad = payload;
+    std.mem.writeInt(u32, bad[0..4], @intCast(payload_len), .little);
+    try std.testing.expectError(error.InvalidLength, decodeRequest(meta[0..meta_len], bad[0..payload_len]));
+
+    try std.testing.expectError(error.InvalidLength, encodePreloadEntry(preload[0..], .{
+        .handle = 1,
+        .offset = 0,
+        .nbytes = 8,
+    }, &[_]u8{ 1, 2 }));
+
+    var short: [rangeLen + 2]u8 = undefined;
+    var short_cursor: usize = 0;
+    putRange(&short, &short_cursor, .{ .handle = 1, .offset = 0, .nbytes = 8 });
+    short[short_cursor] = 1;
+    short[short_cursor + 1] = 2;
+    var short_it: PreloadIterator = .{ .bytes = &short };
+    try std.testing.expectError(error.Truncated, short_it.next());
 }
 
 test "response meta roundtrips including device service time" {

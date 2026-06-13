@@ -42,8 +42,8 @@ pub const Client = struct {
         upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!OpTiming,
         fill: *const fn (*anyopaque, wire.TensorRange, u8) LinkError!OpTiming,
         download: *const fn (*anyopaque, wire.TensorRange, []u8) LinkError!OpTiming,
-        run_graph: *const fn (*anyopaque, []const wire.Command) LinkError!void,
-        run_graph_profile: *const fn (*anyopaque, []const wire.Command, wire.ProfileTier) LinkError!ProfiledRunGraph,
+        run_graph: *const fn (*anyopaque, []const u8, []const wire.Command) LinkError!void,
+        run_graph_profile: *const fn (*anyopaque, []const u8, []const wire.Command, wire.ProfileTier) LinkError!ProfiledRunGraph,
     };
 
     pub fn init(link: anytype) Self {
@@ -81,12 +81,12 @@ pub const Client = struct {
                 return ptr(ctx).download(range, out);
             }
 
-            fn callRunGraph(ctx: *anyopaque, commands: []const wire.Command) LinkError!void {
-                return ptr(ctx).runGraph(commands);
+            fn callRunGraph(ctx: *anyopaque, preload_bytes: []const u8, commands: []const wire.Command) LinkError!void {
+                return ptr(ctx).runGraphPreload(preload_bytes, commands);
             }
 
-            fn callRunGraphProfile(ctx: *anyopaque, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
-                return ptr(ctx).runGraphProfile(commands, tier);
+            fn callRunGraphProfile(ctx: *anyopaque, preload_bytes: []const u8, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+                return ptr(ctx).runGraphProfilePreload(preload_bytes, commands, tier);
             }
 
             const vtable = VTable{
@@ -132,11 +132,19 @@ pub const Client = struct {
     }
 
     pub fn runGraph(self: Self, commands: []const wire.Command) LinkError!void {
-        return self.vtable.run_graph(self.ctx, commands);
+        return self.runGraphPreload(&.{}, commands);
+    }
+
+    pub fn runGraphPreload(self: Self, preload_bytes: []const u8, commands: []const wire.Command) LinkError!void {
+        return self.vtable.run_graph(self.ctx, preload_bytes, commands);
     }
 
     pub fn runGraphProfile(self: Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
-        return self.vtable.run_graph_profile(self.ctx, commands, tier);
+        return self.runGraphProfilePreload(&.{}, commands, tier);
+    }
+
+    pub fn runGraphProfilePreload(self: Self, preload_bytes: []const u8, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return self.vtable.run_graph_profile(self.ctx, preload_bytes, commands, tier);
     }
 };
 
@@ -238,11 +246,19 @@ pub const FakeLink = struct {
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
-        return runGraphImpl(self, commands);
+        return self.runGraphPreload(&.{}, commands);
+    }
+
+    pub fn runGraphPreload(self: *Self, preload_bytes: []const u8, commands: []const wire.Command) LinkError!void {
+        return runGraphImpl(self, preload_bytes, commands);
     }
 
     pub fn runGraphProfile(self: *Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
-        return runGraphProfileImpl(self, self.io, commands, tier);
+        return self.runGraphProfilePreload(&.{}, commands, tier);
+    }
+
+    pub fn runGraphProfilePreload(self: *Self, preload_bytes: []const u8, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return runGraphProfileImpl(self, self.io, preload_bytes, commands, tier);
     }
 
     fn call(self: *Self, metadata: []const u8, payload: []const u8) LinkError!Response {
@@ -354,11 +370,19 @@ pub const TcpLink = struct {
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
-        return runGraphImpl(self, commands);
+        return self.runGraphPreload(&.{}, commands);
+    }
+
+    pub fn runGraphPreload(self: *Self, preload_bytes: []const u8, commands: []const wire.Command) LinkError!void {
+        return runGraphImpl(self, preload_bytes, commands);
     }
 
     pub fn runGraphProfile(self: *Self, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
-        return runGraphProfileImpl(self, self.endpoint.io, commands, tier);
+        return self.runGraphProfilePreload(&.{}, commands, tier);
+    }
+
+    pub fn runGraphProfilePreload(self: *Self, preload_bytes: []const u8, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+        return runGraphProfileImpl(self, self.endpoint.io, preload_bytes, commands, tier);
     }
 
     fn call(self: *Self, metadata: []const u8, payload: []const u8) LinkError!Response {
@@ -395,28 +419,38 @@ fn encodeCommands(allocator: std.mem.Allocator, commands: []const wire.Command) 
     return command_bytes;
 }
 
-fn runGraphImpl(self: anytype, commands: []const wire.Command) LinkError!void {
-    const command_bytes = try encodeCommands(self.allocator, commands);
-    defer self.allocator.free(command_bytes);
+fn buildRunGraphPayload(allocator: std.mem.Allocator, preload_bytes: []const u8, commands: []const wire.Command) LinkError![]u8 {
+    const command_bytes = try encodeCommands(allocator, commands);
+    defer allocator.free(command_bytes);
+    const payload_len = wire.runGraphPayloadLen(preload_bytes.len, command_bytes.len) catch return error.Protocol;
+    const payload = try allocator.alloc(u8, payload_len);
+    errdefer allocator.free(payload);
+    _ = wire.encodeRunGraphPayload(payload, preload_bytes, command_bytes) catch return error.Protocol;
+    return payload;
+}
+
+fn runGraphImpl(self: anytype, preload_bytes: []const u8, commands: []const wire.Command) LinkError!void {
+    const payload = try buildRunGraphPayload(self.allocator, preload_bytes, commands);
+    defer self.allocator.free(payload);
 
     var meta: [32]u8 = undefined;
     const id = self.nextId();
     const meta_len = wire.encodeRunGraph(&meta, id, .off) catch return error.Protocol;
-    var response = try self.call(meta[0..meta_len], command_bytes);
+    var response = try self.call(meta[0..meta_len], payload);
     defer response.deinit(self.allocator);
     try response.expectOk(id);
 }
 
-fn runGraphProfileImpl(self: anytype, io: ?std.Io, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
-    const command_bytes = try encodeCommands(self.allocator, commands);
-    defer self.allocator.free(command_bytes);
+fn runGraphProfileImpl(self: anytype, io: ?std.Io, preload_bytes: []const u8, commands: []const wire.Command, tier: wire.ProfileTier) LinkError!ProfiledRunGraph {
+    const payload = try buildRunGraphPayload(self.allocator, preload_bytes, commands);
+    defer self.allocator.free(payload);
 
     var meta: [32]u8 = undefined;
     const id = self.nextId();
     const meta_len = wire.encodeRunGraph(&meta, id, tier) catch return error.Protocol;
-    const request_len = framing.encodedLen(meta_len, command_bytes.len) catch return error.Protocol;
+    const request_len = framing.encodedLen(meta_len, payload.len) catch return error.Protocol;
     const start_ns = profiling.nowNs(io);
-    var response = try self.call(meta[0..meta_len], command_bytes);
+    var response = try self.call(meta[0..meta_len], payload);
     const end_ns = profiling.nowNs(io);
     defer response.deinit(self.allocator);
     try response.expectOk(id);

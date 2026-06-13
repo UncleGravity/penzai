@@ -22,6 +22,23 @@ test "fake link alloc upload copy download" {
     try std.testing.expectEqualSlices(u8, "abcdefghijklmnop", &out);
 }
 
+test "fake link run_graph preload applies before commands" {
+    var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
+
+    const src = (try link.alloc(16, 64)).range;
+    const dst = (try link.alloc(16, 64)).range;
+
+    var preload: [64]u8 = undefined;
+    const preload_len = try wire.encodePreloadEntry(&preload, src, "preload-works-ok");
+    try link.runGraphPreload(preload[0..preload_len], &.{.{ .copy = .{ .src = src, .dst = dst } }});
+
+    var out: [16]u8 = undefined;
+    _ = try link.download(dst, &out);
+    try std.testing.expectEqualSlices(u8, "preload-works-ok", &out);
+}
+
 test "fake link fill download" {
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
     defer runtime.deinit();
