@@ -29,6 +29,11 @@ module q1a8_rowblock_mc #(
 
     input  wire                       valid_in,
     input  wire                       last_in,
+    // single_col: cols==1 (decode). The kernel issues sub-blocks back to back
+    // (no issue_gap); this rowblock ping-pongs them across acc[*][0]/acc[*][1] so
+    // each accumulator is revisited at >=2-cycle spacing (the forward's reach),
+    // then sums the two partials at emit. acc[*][1] is otherwise idle at cols==1.
+    input  wire                       single_col,
     input  wire [CW-1:0]              col_idx,
     input  wire [ROWS*32-1:0]         weight_bits_flat,
     input  wire [ROWS*16-1:0]         weight_scales_flat,
@@ -62,6 +67,14 @@ module q1a8_rowblock_mc #(
     // 64-deep array with a wide dynamic index (which fans out across every bit
     // and fails timing).
     reg [31:0] acc [0:ROWS-1][0:COLS_MAX-1];
+
+    // single_col ping-pong: toggles each issue so consecutive sub-blocks land in
+    // alternating accumulators. The effective accumulator column is the parity at
+    // cols==1, else the real matmul column. Everything downstream (the col_pipe
+    // delay, the forward, the writeback) keys off eff_col, so the d>=2 spacing is
+    // satisfied without an issue_gap.
+    reg          issue_parity;
+    wire [CW-1:0] eff_col = single_col ? {{(CW-1){1'b0}}, issue_parity} : col_idx;
 
     // col_idx delayed to align with reducer_valid / contribution.
     reg [CW-1:0] col_pipe [0:LAT-1];
@@ -102,7 +115,17 @@ module q1a8_rowblock_mc #(
                 .out(add_results_flat[row*32 +: 32])
             );
 
-            assign results_flat[row*32 +: 32] = acc[row][read_col];
+            // At cols==1 the result is the sum of the two ping-pong partials;
+            // otherwise it is the single accumulator for read_col. The add sits in
+            // the emit readout path, not the accumulate recurrence, so it is off
+            // the critical timing loop.
+            wire [31:0] emit_sum;
+            fp32_add u_emit_sum (
+                .a(acc[row][0]),
+                .b(acc[row][1]),
+                .out(emit_sum)
+            );
+            assign results_flat[row*32 +: 32] = single_col ? emit_sum : acc[row][read_col];
 
             for (col_g = 0; col_g < COLS_MAX; col_g = col_g + 1) begin : gen_acc_cols
                 always @(posedge clk) begin
@@ -130,13 +153,19 @@ module q1a8_rowblock_mc #(
             add_result_last_q   <= 1'b0;
             col_seen_q         <= {COLS_MAX{1'b0}};
             last_pipe <= {(LAT+1){1'b0}};
+            issue_parity <= 1'b0;
             done      <= 1'b0;
         end else begin
             done <= 1'b0;
 
-            // Shift the column index alongside the reducer's valid pipeline.
-            col_pipe[0] <= col_idx;
+            // Shift the (effective) column index alongside the reducer's valid
+            // pipeline. eff_col folds in the single_col ping-pong parity.
+            col_pipe[0] <= eff_col;
             for (p = 1; p < LAT; p = p + 1) col_pipe[p] <= col_pipe[p-1];
+
+            // Flip the ping-pong parity on every issue so consecutive sub-blocks
+            // alternate accumulators (only meaningful when single_col).
+            if (valid_in) issue_parity <= ~issue_parity;
 
             last_pipe <= {last_pipe[LAT-1:0], (valid_in && last_in)};
 
@@ -152,6 +181,7 @@ module q1a8_rowblock_mc #(
                 add_result_last_q   <= 1'b0;
                 col_seen_q         <= {COLS_MAX{1'b0}};
                 last_pipe          <= {(LAT+1){1'b0}};
+                issue_parity       <= 1'b0;
             end else begin
                 if (add_result_last_q) done <= 1'b1;
 

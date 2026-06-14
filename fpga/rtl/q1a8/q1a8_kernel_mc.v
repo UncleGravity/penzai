@@ -63,7 +63,6 @@ module q1a8_kernel_mc #(
     reg [13:0] q1_idx;
     reg [1:0]  sub;
     reg [15:0] col;          // column being issued (matmul)
-    reg        issue_gap;    // one-cycle dependency gap for single-column mode
     reg [1:0]  drain_cnt;
     reg [1:0]  emit_beat;
     reg [15:0] emit_col;
@@ -97,7 +96,7 @@ module q1a8_kernel_mc #(
 
     wire last_q1   = (q1_idx == num_q1_blocks - 14'd1);
     wire last_col  = (col == num_cols - 16'd1);
-    wire issue_now = (state == ST_WISSUE) && s_axis_tvalid && !issue_gap;
+    wire issue_now = (state == ST_WISSUE) && s_axis_tvalid;
     wire rowblock_last = issue_now && last_q1 && (sub == 2'd3) && last_col;
     wire single_col = (num_cols == 16'd1);
 
@@ -105,7 +104,7 @@ module q1a8_kernel_mc #(
     assign dbg_state = state;
     // Consume the scale beat in WSCALE; consume each wbit beat on the last column.
     assign s_axis_tready =
-        busy_q && ((state == ST_WSCALE) || ((state == ST_WISSUE) && last_col && !issue_gap));
+        busy_q && ((state == ST_WSCALE) || ((state == ST_WISSUE) && last_col));
     assign s_axis_acts_tready =
         busy_q && ((state == ST_LOAD_ACTS) || (state == ST_LOAD_ASCALE));
 
@@ -118,6 +117,7 @@ module q1a8_kernel_mc #(
         .start(rowblock_start),
         .valid_in(issue_now),
         .last_in(rowblock_last),
+        .single_col(single_col),
         .col_idx(col[CW-1:0]),
         .weight_bits_flat(s_axis_tdata),
         .weight_scales_flat(weight_scales_q),
@@ -152,7 +152,6 @@ module q1a8_kernel_mc #(
             q1_idx             <= 14'd0;
             sub                <= 2'd0;
             col                <= 16'd0;
-            issue_gap          <= 1'b0;
             drain_cnt          <= 2'd0;
             emit_beat          <= 2'd0;
             emit_col           <= 16'd0;
@@ -174,7 +173,6 @@ module q1a8_kernel_mc #(
                 acts_load_q1   <= 14'd0;
                 acts_load_sub  <= 2'd0;
                 acts_load_col  <= 16'd0;
-                issue_gap      <= 1'b0;
                 state          <= ST_LOAD_ACTS;
             end else if (busy_q) begin
                 case (state)
@@ -211,7 +209,6 @@ module q1a8_kernel_mc #(
                                         q1_idx             <= 14'd0;
                                         sub                <= 2'd0;
                                         col                <= 16'd0;
-                                        issue_gap          <= 1'b0;
                                         rowblock_start     <= 1'b1;
                                         state              <= ST_WSCALE;
                                     end else begin
@@ -234,7 +231,6 @@ module q1a8_kernel_mc #(
                             weight_scales_q <= s_axis_tdata[ROWS*16-1:0];
                             sub             <= 2'd0;
                             col             <= 16'd0;
-                            issue_gap       <= 1'b0;
                             state           <= ST_WISSUE;
                         end
                     end
@@ -242,28 +238,22 @@ module q1a8_kernel_mc #(
                     // Hold each wbit beat across the column sweep; advance only on
                     // the last column (s_axis_tready pulses there).
                     ST_WISSUE: begin
-                        if (issue_gap) begin
-                            issue_gap <= 1'b0;
-                        end else if (s_axis_tvalid) begin
+                        if (s_axis_tvalid) begin
                             if (last_col) begin
                                 col <= 16'd0;
                                 if (sub == 2'd3) begin
                                     sub <= 2'd0;
                                     if (last_q1) begin
-                                        issue_gap <= 1'b0;
                                         state <= ST_WAIT_DONE;
                                     end else begin
                                         q1_idx <= q1_idx + 14'd1;
-                                        issue_gap <= 1'b0;
                                         state  <= ST_WSCALE;
                                     end
                                 end else begin
                                     sub <= sub + 2'd1;
-                                    issue_gap <= single_col;
                                 end
                             end else begin
                                 col <= col + 16'd1;
-                                issue_gap <= 1'b0;
                             end
                         end
                     end
@@ -297,7 +287,6 @@ module q1a8_kernel_mc #(
                                         q1_idx             <= 14'd0;
                                         sub                <= 2'd0;
                                         col                <= 16'd0;
-                                        issue_gap          <= 1'b0;
                                         rowblock_start     <= 1'b1;
                                         state              <= ST_WSCALE;
                                     end
