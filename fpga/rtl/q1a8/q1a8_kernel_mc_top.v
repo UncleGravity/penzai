@@ -247,6 +247,7 @@ module q1a8_kernel_mc_top (
                     Q1A8_OFF_NUM_COLS[5:0]:      rdata_q <= {16'd0, num_cols_q};
                     Q1A8_OFF_CYCLES[5:0]:        rdata_q <= cycle_count_q;
                     Q1A8_OFF_ROWS[5:0]:          rdata_q <= Q1A8_RST_ROWS;
+                    Q1A8_OFF_CLK_HZ[5:0]:        rdata_q <= Q1A8_RST_CLK_HZ;
                     Q1A8_OFF_W_STALL[5:0]:       rdata_q <= w_stall_q;
                     Q1A8_OFF_A_STALL[5:0]:       rdata_q <= a_stall_q;
                     Q1A8_OFF_R_STALL[5:0]:       rdata_q <= r_stall_q;

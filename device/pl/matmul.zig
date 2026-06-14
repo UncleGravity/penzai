@@ -34,13 +34,6 @@ const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * 32
 const mc_cols_max: usize = 8;
 const result_bytes_per_rb = gather.result_bytes_per_rb; // 32; single source in gather.zig
 
-// Fabric clock of the loaded bitstream (variant w256-f125). Must match the
-// deployed bitstream; used only to convert the cycle counter to time for the
-// `pl seg` diagnostic. TODO: expose as a CLK_MHZ regmap register so penzaid
-// self-describes the clock (as it already does VERSION) and the v7 ~300 MHz
-// bump can't silently re-introduce the drift this replaced.
-const pl_clk_mhz: f64 = 125.0;
-
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
 
 /// Temporary per-segment timing accumulator for localizing per-call overhead.
@@ -237,7 +230,7 @@ pub fn Backend(comptime Heap: type) type {
                 us(s.wait_ns, n),
                 us(s.sync_from_ns, n),
                 us(s.copy_ns, n),
-                @as(f64, @floatFromInt(s.cycles)) / n / pl_clk_mhz, // cycles -> us
+                @as(f64, @floatFromInt(s.cycles)) / n / self.kernel.clkMhz(), // cycles -> us
             });
             self.seg = .{};
         }

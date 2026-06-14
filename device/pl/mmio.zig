@@ -168,9 +168,14 @@ pub const min_version: u32 = 6;
 pub const version_with_counters: u32 = 5;
 pub const expected_id: u32 = 0xB05A2000;
 
+/// Fallback fabric clock if the bitstream predates the CLK_HZ register (reads 0).
+/// The deployed w256-f125 v6 bitstream ran at 125 MHz, so that is the safe guess.
+pub const default_clk_mhz: f64 = 125.0;
+
 pub const Kernel = struct {
     win: RegWindow,
     version: u32,
+    clk_hz: u32,
 
     pub fn open(base: i64) Error!Kernel {
         var win = try RegWindow.mapWindow(base);
@@ -179,7 +184,8 @@ pub const Kernel = struct {
         if (id != expected_id) return error.BadId;
         const version = win.rd(regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
-        return .{ .win = win, .version = version };
+        const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
+        return .{ .win = win, .version = version, .clk_hz = clk_hz };
     }
 
     pub fn deinit(self: *Kernel) void {
@@ -188,6 +194,13 @@ pub const Kernel = struct {
 
     pub fn hasCounters(self: Kernel) bool {
         return self.version >= version_with_counters;
+    }
+
+    /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
+    /// Old bitstreams read 0 here, so fall back to the f125 default.
+    pub fn clkMhz(self: Kernel) f64 {
+        if (self.clk_hz == 0) return default_clk_mhz;
+        return @as(f64, @floatFromInt(self.clk_hz)) / 1_000_000.0;
     }
 
     /// Set dims then strobe start. done_latched clears on the strobe.

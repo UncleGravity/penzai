@@ -31,9 +31,34 @@ const Dut = struct {
     }
 };
 
-const Run = struct { res: []u8, busy_cycles: usize };
+/// Per-run handshake counters, mirroring the silicon bank in
+/// q1a8_kernel_mc_top.v:160-172 exactly: counted only while `busy`, beats =
+/// valid&&ready, stalls = ready&&!valid. Lets the cosim print the same MAC/cyc,
+/// util%, and W_STALL the board's `--prof` matmul detail shows — no translation.
+const Counters = struct {
+    busy: usize = 0,
+    w_beats: usize = 0,
+    a_beats: usize = 0,
+    r_beats: usize = 0,
+    w_stall: usize = 0,
+    a_stall: usize = 0,
+    r_stall: usize = 0,
+};
 
-fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, w_bytes: []const u8, a_bytes: []const u8) !Run {
+/// Models a bandwidth/latency-limited weight feed (the AXI DMA + HP port) so the
+/// cosim can reproduce the silicon W_STALL the perfect-feed default never shows.
+/// Token bucket: `w_rate` beats accrue per cycle, capped at `w_burst`; a weight
+/// beat is presented only when a whole token is available, spent when consumed.
+/// The default (inf rate, inf burst) is "never the limit" — the original
+/// always-valid behavior — so the unthrottled cases are unchanged.
+const Feed = struct {
+    w_rate: f64 = std.math.inf(f64),
+    w_burst: f64 = std.math.inf(f64),
+};
+
+const Run = struct { res: []u8, ctr: Counters };
+
+fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, w_bytes: []const u8, a_bytes: []const u8, feed: Feed) !Run {
     const num_rb = rows / ROWS;
     var dut = Dut.init();
     defer dut.deinit();
@@ -59,14 +84,19 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
     var wi: usize = 0;
     var ai: usize = 0;
     var ri: usize = 0;
-    var busy_cycles: usize = 0;
+    var ctr: Counters = .{};
+    var w_tokens: f64 = 0;
     var cycle: usize = 0;
     while (cycle < CYCLE_LIMIT) : (cycle += 1) {
         c.dut_set_start(dut.h, if (cycle == 0) 1 else 0);
 
-        const w_valid = wi < w_beats;
+        // Weight feed throttle: the token bucket caps how fast beats arrive, so a
+        // beat already prepared may be withheld (tvalid=0) to model DMA starvation.
+        w_tokens = @min(w_tokens + feed.w_rate, feed.w_burst);
+        const w_have = wi < w_beats;
+        const w_valid = w_have and w_tokens >= 1.0;
         var word = [_]u32{0} ** 8;
-        if (w_valid) {
+        if (w_have) {
             const base = wi * pack.WIDE_BEAT_BYTES;
             for (0..8) |k| word[k] = std.mem.readInt(u32, w_bytes[base + k * 4 ..][0..4], .little);
         }
@@ -77,26 +107,42 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
         c.dut_set_m_ready(dut.h, 1);
         c.dut_eval(dut.h);
 
-        const w_fire = w_valid and c.dut_w_ready(dut.h) != 0;
-        const a_fire = a_valid and c.dut_a_ready(dut.h) != 0;
-        if (c.dut_m_valid(dut.h) != 0) {
+        const w_ready = c.dut_w_ready(dut.h) != 0;
+        const a_ready = c.dut_a_ready(dut.h) != 0;
+        const m_valid = c.dut_m_valid(dut.h) != 0;
+        const w_fire = w_valid and w_ready;
+        const a_fire = a_valid and a_ready;
+        if (m_valid) {
             if (ri + 8 > res.len) return error.TooManyResultBeats;
             std.mem.writeInt(u64, res[ri..][0..8], c.dut_m_data(dut.h), .little);
             ri += 8;
         }
-        if (c.dut_busy(dut.h) != 0) busy_cycles += 1;
+        // Counter bank, sampled post-eval/pre-edge — the values the RTL's posedge
+        // logic in q1a8_kernel_mc_top.v:160-172 would latch. m_ready is tied high
+        // here, so r_stall stays 0 (the S2MM sink is always ready), as on silicon.
+        if (c.dut_busy(dut.h) != 0) {
+            ctr.busy += 1;
+            if (w_fire) ctr.w_beats += 1;
+            if (a_fire) ctr.a_beats += 1;
+            if (m_valid) ctr.r_beats += 1;
+            if (w_ready and !w_valid) ctr.w_stall += 1;
+            if (a_ready and !a_valid) ctr.a_stall += 1;
+        }
 
         dut.step();
-        if (w_fire) wi += 1;
+        if (w_fire) {
+            wi += 1;
+            w_tokens -= 1.0;
+        }
         if (a_fire) ai += 1;
         if (c.dut_done(dut.h) != 0) break;
     }
     if (cycle >= CYCLE_LIMIT) return error.KernelTimeout;
     if (ri != res.len) return error.MissingResultBeats;
-    return .{ .res = res, .busy_cycles = busy_cycles };
+    return .{ .res = res, .ctr = ctr };
 }
 
-fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, seed: u64) !void {
+fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, seed: u64, feed: Feed, note: []const u8) !void {
     const num_rb = rows / ROWS;
     const bits = try a.alloc(u128, rows * blocks);
     defer a.free(bits);
@@ -138,7 +184,7 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, se
         }, expected[col * rows ..][0..rows]);
     }
 
-    const run = try runKernel(a, rows, blocks, num_cols, w_bytes, a_bytes);
+    const run = try runKernel(a, rows, blocks, num_cols, w_bytes, a_bytes, feed);
     defer a.free(run.res);
 
     var max_rel: f32 = 0;
@@ -158,10 +204,16 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, se
         }
     }
 
+    const ctr = run.ctr;
     const macs = rows * blocks * q1a8.Q1_BLOCK * num_cols;
-    const bpc = @as(f64, @floatFromInt(macs)) / @as(f64, @floatFromInt(run.busy_cycles));
-    std.debug.print("case rows={d} blocks={d} cols={d} ok={d} max_rel={d:.4} busy_cycles={d} MAC/cycle={d:.1}\n", .{
-        rows, blocks, num_cols, @intFromBool(max_rel <= 0.02), max_rel, run.busy_cycles, bpc,
+    const fbusy: f64 = @floatFromInt(ctr.busy);
+    const bpc = @as(f64, @floatFromInt(macs)) / fbusy;
+    const max_stall = @max(ctr.w_stall, @max(ctr.a_stall, ctr.r_stall));
+    const util = 100.0 * (fbusy - @as(f64, @floatFromInt(max_stall))) / fbusy;
+    const wstall_pct = 100.0 * @as(f64, @floatFromInt(ctr.w_stall)) / fbusy;
+    std.debug.print("case rows={d} blocks={d} cols={d} feed={d:.2} ok={d} max_rel={d:.4} busy={d} MAC/cyc={d:.1} util={d:.1}% w_stall={d}({d:.1}%) w_beats={d} a_stall={d}  {s}\n", .{
+        rows, blocks, num_cols, feed.w_rate, @intFromBool(max_rel <= 0.02), max_rel,
+        ctr.busy, bpc, util, ctr.w_stall, wstall_pct, ctr.w_beats, ctr.a_stall, note,
     });
     if (max_rel > 0.02) return error.ResultMismatch;
 }
@@ -171,14 +223,32 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
-    const Case = struct { rows: usize, blocks: usize, cols: usize };
-    const cases = [_]Case{
-        .{ .rows = 8, .blocks = 1, .cols = 1 }, // C=1 must match the wide kernel
-        .{ .rows = 8, .blocks = 2, .cols = 4 },
-        .{ .rows = 24, .blocks = 2, .cols = 3 }, // multi-rowblock, odd cols
-        .{ .rows = 64, .blocks = 16, .cols = 1 }, // Bonsai-rep decode
-        .{ .rows = 64, .blocks = 16, .cols = 8 }, // Bonsai-rep prefill tile
+    const Case = struct {
+        rows: usize,
+        blocks: usize,
+        cols: usize,
+        feed: Feed = .{},
+        note: []const u8 = "",
     };
-    for (cases, 0..) |cs, i| try runCase(a, cs.rows, cs.blocks, cs.cols, 0x2000 + i);
+    const cases = [_]Case{
+        .{ .rows = 8, .blocks = 1, .cols = 1, .note = "C=1 must match wide" },
+        .{ .rows = 8, .blocks = 2, .cols = 4 },
+        .{ .rows = 24, .blocks = 2, .cols = 3, .note = "multi-rb, odd cols" },
+        .{ .rows = 64, .blocks = 16, .cols = 1, .note = "decode, full feed" },
+        .{ .rows = 64, .blocks = 16, .cols = 8, .note = "prefill, full feed" },
+        // Bonsai attn-size matmul (rows=2048, k=2048) so the cosim MAC/cyc is
+        // directly comparable to the silicon decode aggregate (~95), not a
+        // downscaled rep. Full feed = the true cols=1 compute ceiling at size.
+        .{ .rows = 2048, .blocks = 16, .cols = 1, .note = "decode attn-size, full feed" },
+        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode attn-size @ 0.5 beat/cyc" },
+        // Throttled weight feed (bandwidth-limited DMA). Bit-exactness must still
+        // hold — the kernel honors weight backpressure — so these double as
+        // backpressure-correctness tests. They expose the decode/prefill feed
+        // asymmetry: decode (no reuse) starves hard, prefill (8x reuse) shrugs.
+        .{ .rows = 64, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 1.0, .w_burst = 1.0 }, .note = "decode @ 1.0 beat/cyc" },
+        .{ .rows = 64, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode @ 0.5 beat/cyc" },
+        .{ .rows = 64, .blocks = 16, .cols = 8, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "prefill @ 0.5 beat/cyc" },
+    };
+    for (cases, 0..) |cs, i| try runCase(a, cs.rows, cs.blocks, cs.cols, 0x2000 + i, cs.feed, cs.note);
     std.debug.print("all mc cosim cases passed\n", .{});
 }
