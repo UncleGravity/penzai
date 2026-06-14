@@ -240,7 +240,13 @@ pub fn main() !void {
         // directly comparable to the silicon decode aggregate (~95), not a
         // downscaled rep. Full feed = the true cols=1 compute ceiling at size.
         .{ .rows = 2048, .blocks = 16, .cols = 1, .note = "decode attn-size, full feed" },
-        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode attn-size @ 0.5 beat/cyc" },
+        // Supply sweep = the HP-port lever. 0.5 = today's single 128-bit port @
+        // 125 MHz (matches silicon); 1.0 = a 2nd weight port (256 bit/cyc), which
+        // saturates the kernel's single 256-bit input. The gap between the 1.0
+        // result and the full-feed result is the issue_gap compute ceiling, not
+        // bandwidth — i.e. past 2 ports, decode needs the compute fix, not feed.
+        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode attn @ 0.5 (1 HP port = today)" },
+        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 1.0, .w_burst = 1.0 }, .note = "decode attn @ 1.0 (2 HP ports)" },
         // Throttled weight feed (bandwidth-limited DMA). Bit-exactness must still
         // hold — the kernel honors weight backpressure — so these double as
         // backpressure-correctness tests. They expose the decode/prefill feed
