@@ -17,7 +17,10 @@
 module q1a8_kernel_mc #(
     parameter integer ROWS          = 8,
     parameter integer COLS_MAX      = 8,
-    parameter integer MAX_SUB_INDEX = 64
+    parameter integer MAX_SUB_INDEX = 64,
+    // Decode accumulator-pool depth (see q1a8_rowblock_mc): >= the accumulate
+    // recurrence latency, <= COLS_MAX. 2 matches today's single-cycle fp32 add.
+    parameter integer ACCUM_DEPTH   = 2
 ) (
     input  wire                  clk,
     input  wire                  rst_n,
@@ -57,6 +60,13 @@ module q1a8_kernel_mc #(
     localparam [3:0] ST_EMIT       = 4'd7;
     localparam [3:0] ST_FINISH     = 4'd8;
 
+    // Result emit: the stream is 64-bit (2 fp32 lane-major per beat), so a
+    // rowblock's ROWS results take ROWS/2 beats. ROWS-parameterized so a wider
+    // array (ROWS=16 -> 512-bit weights, 8 emit beats) needs no emit rewrite.
+    localparam integer EMIT_BEATS = ROWS / 2;
+    localparam integer EBW        = (EMIT_BEATS <= 1) ? 1 : $clog2(EMIT_BEATS);
+    localparam integer EMIT_LAST  = EMIT_BEATS - 1;
+
     reg [3:0]  state;
     reg        busy_q;
     reg [15:0] rowblock_remaining;
@@ -64,7 +74,7 @@ module q1a8_kernel_mc #(
     reg [1:0]  sub;
     reg [15:0] col;          // column being issued (matmul)
     reg [1:0]  drain_cnt;
-    reg [1:0]  emit_beat;
+    reg [EBW-1:0] emit_beat;
     reg [15:0] emit_col;
 
     reg [ROWS*16-1:0] weight_scales_q;
@@ -111,7 +121,7 @@ module q1a8_kernel_mc #(
     wire acts_beat_accept = s_axis_acts_tvalid && s_axis_acts_tready;
     wire start_pulse      = start_kernel && !busy_q;
 
-    q1a8_rowblock_mc #(.ROWS(ROWS), .COLS_MAX(COLS_MAX)) u_rowblock (
+    q1a8_rowblock_mc #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .ACCUM_DEPTH(ACCUM_DEPTH)) u_rowblock (
         .clk(clk),
         .rst_n(rst_n),
         .start(rowblock_start),
@@ -128,19 +138,13 @@ module q1a8_kernel_mc #(
         .results_flat(rowblock_results)
     );
 
-    reg [63:0] emit_word;
-    always @(*) begin
-        case (emit_beat)
-            2'd0:    emit_word = {rowblock_results[ 63: 32], rowblock_results[ 31:  0]};
-            2'd1:    emit_word = {rowblock_results[127: 96], rowblock_results[ 95: 64]};
-            2'd2:    emit_word = {rowblock_results[191:160], rowblock_results[159:128]};
-            default: emit_word = {rowblock_results[255:224], rowblock_results[223:192]};
-        endcase
-    end
+    // Beat `emit_beat` carries result lanes [2*emit_beat, 2*emit_beat+1] (64 bits,
+    // {emit_beat,6'b0} == emit_beat*64). Generalizes the fixed 4-beat mux to any ROWS.
+    wire [63:0] emit_word = rowblock_results[{emit_beat, 6'b0} +: 64];
 
     assign m_axis_tdata  = emit_word;
     assign m_axis_tvalid = (state == ST_EMIT);
-    assign m_axis_tlast  = (state == ST_EMIT) && (emit_beat == 2'd3) &&
+    assign m_axis_tlast  = (state == ST_EMIT) && (emit_beat == EMIT_LAST[EBW-1:0]) &&
                            (emit_col == num_cols - 16'd1) && (rowblock_remaining == 16'd1);
     assign m_axis_tkeep  = 8'hFF;
 
@@ -153,7 +157,7 @@ module q1a8_kernel_mc #(
             sub                <= 2'd0;
             col                <= 16'd0;
             drain_cnt          <= 2'd0;
-            emit_beat          <= 2'd0;
+            emit_beat          <= {EBW{1'b0}};
             emit_col           <= 16'd0;
             weight_scales_q    <= {ROWS*16{1'b0}};
             rowblock_start     <= 1'b0;
@@ -267,7 +271,7 @@ module q1a8_kernel_mc #(
 
                     ST_DRAIN: begin
                         if (drain_cnt == 2'd0) begin
-                            emit_beat <= 2'd0;
+                            emit_beat <= {EBW{1'b0}};
                             emit_col  <= 16'd0;
                             state     <= ST_EMIT;
                         end else begin
@@ -277,8 +281,8 @@ module q1a8_kernel_mc #(
 
                     ST_EMIT: begin
                         if (m_axis_tready) begin
-                            if (emit_beat == 2'd3) begin
-                                emit_beat <= 2'd0;
+                            if (emit_beat == EMIT_LAST[EBW-1:0]) begin
+                                emit_beat <= {EBW{1'b0}};
                                 if (emit_col + 16'd1 == num_cols) begin
                                     if (rowblock_remaining == 16'd1) begin
                                         state <= ST_FINISH;
@@ -294,7 +298,7 @@ module q1a8_kernel_mc #(
                                     emit_col <= emit_col + 16'd1;
                                 end
                             end else begin
-                                emit_beat <= emit_beat + 2'd1;
+                                emit_beat <= emit_beat + 1'b1;
                             end
                         end
                     end

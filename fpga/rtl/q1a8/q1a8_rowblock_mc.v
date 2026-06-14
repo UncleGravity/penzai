@@ -18,9 +18,14 @@
 `default_nettype none
 
 module q1a8_rowblock_mc #(
-    parameter integer ROWS     = 8,
-    parameter integer COLS_MAX = 8,
-    parameter integer CW       = (COLS_MAX <= 1) ? 1 : $clog2(COLS_MAX)
+    parameter integer ROWS        = 8,
+    parameter integer COLS_MAX    = 8,
+    // Decode (single_col) accumulator pool depth: consecutive sub-blocks are
+    // round-robined across ACCUM_DEPTH accumulators so each is revisited every
+    // ACCUM_DEPTH issues. Must be >= the accumulate recurrence latency (the
+    // forward covers 2 today; deepen the fp32 add -> raise this). <= COLS_MAX.
+    parameter integer ACCUM_DEPTH = 2,
+    parameter integer CW          = (COLS_MAX <= 1) ? 1 : $clog2(COLS_MAX)
 ) (
     input  wire                       clk,
     input  wire                       rst_n,
@@ -30,9 +35,10 @@ module q1a8_rowblock_mc #(
     input  wire                       valid_in,
     input  wire                       last_in,
     // single_col: cols==1 (decode). The kernel issues sub-blocks back to back
-    // (no issue_gap); this rowblock ping-pongs them across acc[*][0]/acc[*][1] so
-    // each accumulator is revisited at >=2-cycle spacing (the forward's reach),
-    // then sums the two partials at emit. acc[*][1] is otherwise idle at cols==1.
+    // (no issue_gap); this rowblock round-robins them across ACCUM_DEPTH
+    // accumulators so each is revisited every ACCUM_DEPTH issues (>= the forward's
+    // reach), then sums the partials at emit. The pool reuses the COLS_MAX
+    // accumulators, idle at cols==1.
     input  wire                       single_col,
     input  wire [CW-1:0]              col_idx,
     input  wire [ROWS*32-1:0]         weight_bits_flat,
@@ -68,13 +74,14 @@ module q1a8_rowblock_mc #(
     // and fails timing).
     reg [31:0] acc [0:ROWS-1][0:COLS_MAX-1];
 
-    // single_col ping-pong: toggles each issue so consecutive sub-blocks land in
-    // alternating accumulators. The effective accumulator column is the parity at
-    // cols==1, else the real matmul column. Everything downstream (the col_pipe
-    // delay, the forward, the writeback) keys off eff_col, so the d>=2 spacing is
-    // satisfied without an issue_gap.
-    reg          issue_parity;
-    wire [CW-1:0] eff_col = single_col ? {{(CW-1){1'b0}}, issue_parity} : col_idx;
+    // single_col round-robin: advances each issue so consecutive sub-blocks land
+    // in successive accumulators (wrapping at ACCUM_DEPTH). The effective
+    // accumulator column is this pointer at cols==1, else the real matmul column.
+    // Everything downstream (the col_pipe delay, the forward, the writeback) keys
+    // off eff_col, so the >= ACCUM_DEPTH spacing is satisfied without an issue_gap.
+    reg [CW-1:0] issue_ptr;
+    localparam integer ACCUM_LAST = ACCUM_DEPTH - 1; // last pool slot (sliced to CW at use)
+    wire [CW-1:0] eff_col = single_col ? issue_ptr : col_idx;
 
     // col_idx delayed to align with reducer_valid / contribution.
     reg [CW-1:0] col_pipe [0:LAT-1];
@@ -115,17 +122,38 @@ module q1a8_rowblock_mc #(
                 .out(add_results_flat[row*32 +: 32])
             );
 
-            // At cols==1 the result is the sum of the two ping-pong partials;
-            // otherwise it is the single accumulator for read_col. The add sits in
-            // the emit readout path, not the accumulate recurrence, so it is off
-            // the critical timing loop.
-            wire [31:0] emit_sum;
-            fp32_add u_emit_sum (
-                .a(acc[row][0]),
-                .b(acc[row][1]),
-                .out(emit_sum)
-            );
-            assign results_flat[row*32 +: 32] = single_col ? emit_sum : acc[row][read_col];
+            // At cols==1 (single_col) the result is the sum of the ACCUM_DEPTH
+            // pool partials, masked by col_seen_q to the ones actually written
+            // (so a matmul shorter than ACCUM_DEPTH issues still sums correctly);
+            // otherwise it is the single accumulator for read_col. This reduction
+            // is in the emit readout path, off the accumulate recurrence.
+            // NOTE: combinational chain — fine for small ACCUM_DEPTH; turn into a
+            // sequential drain-phase reduction if ACCUM_DEPTH grows for timing.
+            wire [31:0] emit_part  [0:ACCUM_DEPTH-1];
+            wire [31:0] emit_chain [0:ACCUM_DEPTH-1];
+            assign emit_part[0]  = col_seen_q[0] ? acc[row][0] : 32'd0;
+            assign emit_chain[0] = emit_part[0];
+            for (col_g = 1; col_g < ACCUM_DEPTH; col_g = col_g + 1) begin : gen_emit_sum
+                assign emit_part[col_g] = col_seen_q[col_g] ? acc[row][col_g] : 32'd0;
+                fp32_add u_emit_add (
+                    .a(emit_chain[col_g-1]),
+                    .b(emit_part[col_g]),
+                    .out(emit_chain[col_g])
+                );
+            end
+            // Register the reduction: the fp32 add chain must NOT sit in the
+            // emit -> result-DMA combinational path (it failed 125 MHz timing as a
+            // live add, WNS -0.363 into dwc_r). decode_sum_r tracks the running
+            // pool sum every cycle; it is settled well before ST_EMIT (matmul done
+            // + drained), so emit reads a register. cols>1 reads the accumulator
+            // directly, exactly as the pre-pool kernel did.
+            reg [31:0] decode_sum_r;
+            always @(posedge clk) begin
+                if (!rst_n) decode_sum_r <= 32'd0;
+                else        decode_sum_r <= emit_chain[ACCUM_DEPTH-1];
+            end
+            assign results_flat[row*32 +: 32] =
+                single_col ? decode_sum_r : acc[row][read_col];
 
             for (col_g = 0; col_g < COLS_MAX; col_g = col_g + 1) begin : gen_acc_cols
                 always @(posedge clk) begin
@@ -153,7 +181,7 @@ module q1a8_rowblock_mc #(
             add_result_last_q   <= 1'b0;
             col_seen_q         <= {COLS_MAX{1'b0}};
             last_pipe <= {(LAT+1){1'b0}};
-            issue_parity <= 1'b0;
+            issue_ptr <= {CW{1'b0}};
             done      <= 1'b0;
         end else begin
             done <= 1'b0;
@@ -163,9 +191,11 @@ module q1a8_rowblock_mc #(
             col_pipe[0] <= eff_col;
             for (p = 1; p < LAT; p = p + 1) col_pipe[p] <= col_pipe[p-1];
 
-            // Flip the ping-pong parity on every issue so consecutive sub-blocks
-            // alternate accumulators (only meaningful when single_col).
-            if (valid_in) issue_parity <= ~issue_parity;
+            // Advance the round-robin pointer on every issue so consecutive
+            // sub-blocks land in successive accumulators, wrapping at ACCUM_DEPTH
+            // (only meaningful when single_col).
+            if (valid_in)
+                issue_ptr <= (issue_ptr == ACCUM_LAST[CW-1:0]) ? {CW{1'b0}} : issue_ptr + 1'b1;
 
             last_pipe <= {last_pipe[LAT-1:0], (valid_in && last_in)};
 
@@ -181,7 +211,7 @@ module q1a8_rowblock_mc #(
                 add_result_last_q   <= 1'b0;
                 col_seen_q         <= {COLS_MAX{1'b0}};
                 last_pipe          <= {(LAT+1){1'b0}};
-                issue_parity       <= 1'b0;
+                issue_ptr          <= {CW{1'b0}};
             end else begin
                 if (add_result_last_q) done <= 1'b1;
 

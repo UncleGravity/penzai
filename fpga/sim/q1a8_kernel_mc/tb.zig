@@ -71,8 +71,8 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
     c.dut_set_start(dut.h, 0);
     c.dut_set_a(dut.h, 0, 0);
     c.dut_set_m_ready(dut.h, 1);
-    var zero = [_]u32{0} ** 8;
-    c.dut_set_w(dut.h, &zero, 0);
+    var zero = [_]u32{0} ** ROWS;
+    c.dut_set_w(dut.h, &zero, @intCast(ROWS), 0);
     c.dut_set_clk(dut.h, 0);
     c.dut_eval(dut.h);
     for (0..4) |_| dut.step();
@@ -95,12 +95,12 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
         w_tokens = @min(w_tokens + feed.w_rate, feed.w_burst);
         const w_have = wi < w_beats;
         const w_valid = w_have and w_tokens >= 1.0;
-        var word = [_]u32{0} ** 8;
+        var word = [_]u32{0} ** ROWS;
         if (w_have) {
             const base = wi * pack.WIDE_BEAT_BYTES;
-            for (0..8) |k| word[k] = std.mem.readInt(u32, w_bytes[base + k * 4 ..][0..4], .little);
+            for (0..ROWS) |k| word[k] = std.mem.readInt(u32, w_bytes[base + k * 4 ..][0..4], .little);
         }
-        c.dut_set_w(dut.h, &word, @intFromBool(w_valid));
+        c.dut_set_w(dut.h, &word, @intCast(ROWS), @intFromBool(w_valid));
 
         const a_valid = ai < a_beats.len;
         c.dut_set_a(dut.h, if (a_valid) a_beats[ai] else 0, @intFromBool(a_valid));
@@ -223,38 +223,34 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
+    // rows = num_rb * ROWS, so the cases scale with the array width (at ROWS=8
+    // these are the familiar 8/24/64/2048-row shapes; at ROWS=16 they double).
     const Case = struct {
-        rows: usize,
+        num_rb: usize,
         blocks: usize,
         cols: usize,
         feed: Feed = .{},
         note: []const u8 = "",
     };
     const cases = [_]Case{
-        .{ .rows = 8, .blocks = 1, .cols = 1, .note = "C=1 must match wide" },
-        .{ .rows = 8, .blocks = 2, .cols = 4 },
-        .{ .rows = 24, .blocks = 2, .cols = 3, .note = "multi-rb, odd cols" },
-        .{ .rows = 64, .blocks = 16, .cols = 1, .note = "decode, full feed" },
-        .{ .rows = 64, .blocks = 16, .cols = 8, .note = "prefill, full feed" },
-        // Bonsai attn-size matmul (rows=2048, k=2048) so the cosim MAC/cyc is
-        // directly comparable to the silicon decode aggregate (~95), not a
-        // downscaled rep. Full feed = the true cols=1 compute ceiling at size.
-        .{ .rows = 2048, .blocks = 16, .cols = 1, .note = "decode attn-size, full feed" },
-        // Supply sweep = the HP-port lever. 0.5 = today's single 128-bit port @
-        // 125 MHz (matches silicon); 1.0 = a 2nd weight port (256 bit/cyc), which
-        // saturates the kernel's single 256-bit input. The gap between the 1.0
-        // result and the full-feed result is the issue_gap compute ceiling, not
-        // bandwidth — i.e. past 2 ports, decode needs the compute fix, not feed.
-        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode attn @ 0.5 (1 HP port = today)" },
-        .{ .rows = 2048, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 1.0, .w_burst = 1.0 }, .note = "decode attn @ 1.0 (2 HP ports)" },
-        // Throttled weight feed (bandwidth-limited DMA). Bit-exactness must still
-        // hold — the kernel honors weight backpressure — so these double as
-        // backpressure-correctness tests. They expose the decode/prefill feed
-        // asymmetry: decode (no reuse) starves hard, prefill (8x reuse) shrugs.
-        .{ .rows = 64, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 1.0, .w_burst = 1.0 }, .note = "decode @ 1.0 beat/cyc" },
-        .{ .rows = 64, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode @ 0.5 beat/cyc" },
-        .{ .rows = 64, .blocks = 16, .cols = 8, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "prefill @ 0.5 beat/cyc" },
+        .{ .num_rb = 1, .blocks = 1, .cols = 1, .note = "C=1 must match wide" },
+        .{ .num_rb = 1, .blocks = 2, .cols = 4 },
+        .{ .num_rb = 3, .blocks = 2, .cols = 3, .note = "multi-rb, odd cols" },
+        .{ .num_rb = 8, .blocks = 16, .cols = 1, .note = "decode, full feed" },
+        .{ .num_rb = 8, .blocks = 16, .cols = 8, .note = "prefill, full feed" },
+        // Bonsai attn-size matmul so the cosim MAC/cyc is comparable to the
+        // silicon decode aggregate. Full feed = the cols=1 compute ceiling.
+        .{ .num_rb = 256, .blocks = 16, .cols = 1, .note = "decode attn-size, full feed" },
+        // Supply sweep = the HP-port lever (beats here are ROWS*32-bit, so the
+        // bandwidth a rate maps to scales with ROWS). Full-feed vs throttled shows
+        // the compute ceiling vs the feed wall.
+        .{ .num_rb = 256, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode attn @ 0.5 beat/cyc" },
+        .{ .num_rb = 256, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 1.0, .w_burst = 1.0 }, .note = "decode attn @ 1.0 beat/cyc" },
+        // Throttled feed doubles as a backpressure-correctness test, and shows the
+        // decode/prefill feed asymmetry: decode (no reuse) starves, prefill shrugs.
+        .{ .num_rb = 8, .blocks = 16, .cols = 1, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "decode @ 0.5 beat/cyc" },
+        .{ .num_rb = 8, .blocks = 16, .cols = 8, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "prefill @ 0.5 beat/cyc" },
     };
-    for (cases, 0..) |cs, i| try runCase(a, cs.rows, cs.blocks, cs.cols, 0x2000 + i, cs.feed, cs.note);
+    for (cases, 0..) |cs, i| try runCase(a, cs.num_rb * ROWS, cs.blocks, cs.cols, 0x2000 + i, cs.feed, cs.note);
     std.debug.print("all mc cosim cases passed\n", .{});
 }

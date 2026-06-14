@@ -18,7 +18,7 @@ void dut_set_start(Dut *, int v);
 void dut_set_num_q1(Dut *, int v);
 void dut_set_num_rb(Dut *, int v);
 void dut_set_num_cols(Dut *, int v);
-void dut_set_w(Dut *, const uint32_t *w, int valid); /* 256-bit weight beat */
+void dut_set_w(Dut *, const uint32_t *w, int nwords, int valid); /* ROWS*32-bit weight beat (nwords = ROWS) */
 void dut_set_a(Dut *, uint64_t data, int valid);     /* 64-bit acts beat */
 void dut_set_m_ready(Dut *, int v);
 

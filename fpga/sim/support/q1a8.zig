@@ -32,7 +32,8 @@ pub const ACT_BYTES_PER_BLOCK: usize =
 pub const RESULT_BYTES_PER_ROWBLOCK: usize = (ROWS / 2) * BEAT_BYTES; // = 32
 
 comptime {
-    if (WEIGHT_BYTES_PER_BLOCK != 144) @compileError("weight block size drifted");
-    if (ACT_BYTES_PER_BLOCK != 160) @compileError("act block size drifted");
-    if (RESULT_BYTES_PER_ROWBLOCK != 32) @compileError("result block size drifted");
+    // ROWS-derived so the layout scales with the array width (ROWS=8 -> 144/160/32).
+    if (WEIGHT_BYTES_PER_BLOCK != ROWS * 18) @compileError("weight block size drifted");
+    if (ACT_BYTES_PER_BLOCK != 160) @compileError("act block size drifted"); // acts are per-column, ROWS-independent
+    if (RESULT_BYTES_PER_ROWBLOCK != ROWS * 4) @compileError("result block size drifted");
 }

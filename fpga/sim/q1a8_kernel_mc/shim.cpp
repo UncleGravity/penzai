@@ -27,8 +27,8 @@ void dut_set_start(Dut *d, int v) { d->t->start_kernel = v; }
 void dut_set_num_q1(Dut *d, int v) { d->t->num_q1_blocks = v; }
 void dut_set_num_rb(Dut *d, int v) { d->t->num_rowblocks = v; }
 void dut_set_num_cols(Dut *d, int v) { d->t->num_cols = v; }
-void dut_set_w(Dut *d, const uint32_t *w, int valid) {
-    for (int i = 0; i < 8; i++) d->t->s_axis_tdata[i] = w[i];
+void dut_set_w(Dut *d, const uint32_t *w, int nwords, int valid) {
+    for (int i = 0; i < nwords; i++) d->t->s_axis_tdata[i] = w[i];
     d->t->s_axis_tvalid = valid;
 }
 void dut_set_a(Dut *d, uint64_t data, int valid) {
