@@ -15,11 +15,19 @@
 
 set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w256-f125"}]
 
-# variant = w64-f<MHz>; the fabric clock is parsed from the name. The unpipelined
-# fp32 reducer closes around ~137 MHz, so 100 MHz is the safe correctness target.
-if {![regexp {^w256-f([0-9]+)$} $variant -> fclk_mhz]} {
-    error "unknown variant '$variant'; expected w256-f<MHz>, e.g. w256-f125"
+# variant = w256-f<MHz>[-wc<MHz>]. fclk = the kernel clock (the unpipelined fp32
+# reducer closes ~137 MHz). Optional -wc<MHz> = a faster weight-feed clock: HP0 +
+# dma_w (data) + the 128->256 upsizer run at wclk, and AXIS clock-converters cross
+# the weight stream down to the kernel and the result stream back up, so a single
+# 128-bit port delivers ~1 beat/cyc into the slower kernel (vs 0.5 at one clock).
+# No -wc = the original single-clock path (known-good; the deployed v6 bitstream).
+set wclk_mhz 0
+if {[regexp {^w256-f([0-9]+)-wc([0-9]+)$} $variant -> fclk_mhz wclk_mhz]} {
+} elseif {[regexp {^w256-f([0-9]+)$} $variant -> fclk_mhz]} {
+} else {
+    error "unknown variant '$variant'; expected w256-f<MHz>\[-wc<MHz>\], e.g. w256-f125 or w256-f125-wc250"
 }
+set dual_clock [expr {$wclk_mhz > 0}]
 
 set bit_prefix penzai-q1a8-mc
 set bit_name   "$bit_prefix-$variant"
@@ -97,14 +105,25 @@ connect_bd_net [get_bd_pins ps/emio_ttc0_wave_o] [get_bd_pins fan_ttc0_ch2/Din]
 connect_bd_net [get_bd_pins fan_ttc0_ch2/Dout]   [get_bd_ports fan_en_b]
 
 # ---- Fabric clock -----------------------------------------------------------
+# clk_out1 = kernel/control clock (fclk). clk_out2 = weight-feed clock (wclk),
+# only when dual_clock. Both derive from the same VCO so the CDC is well-behaved.
 create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* clk_wiz
-set_property -dict [list \
+set clk_wiz_cfg [list \
     CONFIG.PRIM_IN_FREQ $ps_fclk_mhz \
     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $fclk_mhz \
     CONFIG.USE_LOCKED {true} \
     CONFIG.USE_RESET {false} \
-] [get_bd_cells clk_wiz]
+]
+if {$dual_clock} {
+    lappend clk_wiz_cfg CONFIG.CLKOUT2_USED {true} \
+        CONFIG.CLKOUT2_REQUESTED_OUT_FREQ $wclk_mhz
+}
+set_property -dict $clk_wiz_cfg [get_bd_cells clk_wiz]
 connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins clk_wiz/clk_in1]
+
+# Pins for the weight-feed clock/reset domain: clk_out2/rst_fast when dual_clock,
+# else the single domain. Defined here; rst_fast is created in the reset section.
+set wclk_pin [expr {$dual_clock ? "clk_wiz/clk_out2" : "clk_wiz/clk_out1"}]
 
 # ---- DMAs, width converters, and kernel -------------------------------------
 # The AXI DMA forces a 128-bit memory-map/stream width for this addr/burst
@@ -135,6 +154,13 @@ proc make_dma {name include_s2mm} {
 }
 make_dma dma_w 1
 make_dma dma_a 0
+# Async clocks on the weight DMA: its data movers (m_axi_mm2s/s2mm + AXIS) run at
+# wclk; the AXI-Lite register interface stays at fclk with the PS control path.
+# UNCERTAIN (no sim): the exact async-DMA property + reset domain — validate_bd_design
+# (pre-synth) flags any miswiring fast, and PENZAI_PL_VERIFY catches CDC bugs on board.
+if {$dual_clock} {
+    set_property CONFIG.c_prmry_is_aclk_async {1} [get_bd_cells dma_w]
+}
 
 # AXIS data-width converter (single clock). s/m widths in bytes.
 proc make_dwc {name s_bytes m_bytes} {
@@ -150,14 +176,39 @@ make_dwc dwc_w 16 32 ;# weights 128 -> 256
 make_dwc dwc_a 16 8 ;# acts     128 -> 64
 make_dwc dwc_r 8 16 ;# results   64 -> 128
 
+# AXIS clock-domain converter (used only when dual_clock). bytes = TDATA width.
+proc make_clk_conv {name bytes} {
+    create_bd_cell -type ip -vlnv xilinx.com:ip:axis_clock_converter:* $name
+    set_property -dict [list \
+        CONFIG.TDATA_NUM_BYTES $bytes \
+        CONFIG.HAS_TLAST {1} \
+        CONFIG.HAS_TKEEP {1} \
+    ] [get_bd_cells $name]
+}
+
 create_bd_cell -type module -reference q1a8_kernel_mc_top kernel
 
-connect_bd_intf_net [get_bd_intf_pins dma_w/M_AXIS_MM2S] [get_bd_intf_pins dwc_w/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_w/M_AXIS]      [get_bd_intf_pins kernel/S_AXIS]
+# Acts are unchanged (single clock, fclk).
 connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXIS_MM2S] [get_bd_intf_pins dwc_a/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins dwc_a/M_AXIS]      [get_bd_intf_pins kernel/S_AXIS_ACTS]
-connect_bd_intf_net [get_bd_intf_pins kernel/M_AXIS]     [get_bd_intf_pins dwc_r/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_r/M_AXIS]      [get_bd_intf_pins dma_w/S_AXIS_S2MM]
+
+if {$dual_clock} {
+    # Weights: dma_w(wclk) -> dwc_w 128->256(wclk) -> clk_conv_w -> kernel.S_AXIS(fclk).
+    make_clk_conv clk_conv_w 32
+    connect_bd_intf_net [get_bd_intf_pins dma_w/M_AXIS_MM2S] [get_bd_intf_pins dwc_w/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins dwc_w/M_AXIS]      [get_bd_intf_pins clk_conv_w/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins clk_conv_w/M_AXIS] [get_bd_intf_pins kernel/S_AXIS]
+    # Results: kernel.M_AXIS(fclk) -> dwc_r 64->128(fclk) -> clk_conv_r -> dma_w.S2MM(wclk).
+    make_clk_conv clk_conv_r 16
+    connect_bd_intf_net [get_bd_intf_pins kernel/M_AXIS]     [get_bd_intf_pins dwc_r/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins dwc_r/M_AXIS]      [get_bd_intf_pins clk_conv_r/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins clk_conv_r/M_AXIS] [get_bd_intf_pins dma_w/S_AXIS_S2MM]
+} else {
+    connect_bd_intf_net [get_bd_intf_pins dma_w/M_AXIS_MM2S] [get_bd_intf_pins dwc_w/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins dwc_w/M_AXIS]      [get_bd_intf_pins kernel/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins kernel/M_AXIS]     [get_bd_intf_pins dwc_r/S_AXIS]
+    connect_bd_intf_net [get_bd_intf_pins dwc_r/M_AXIS]      [get_bd_intf_pins dma_w/S_AXIS_S2MM]
+}
 
 # ---- Reset ------------------------------------------------------------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* rst
@@ -166,20 +217,56 @@ connect_bd_net [get_bd_pins clk_wiz/clk_out1] [get_bd_pins rst/slowest_sync_clk]
 connect_bd_net [get_bd_pins ps/pl_resetn0]    [get_bd_pins rst/ext_reset_in]
 connect_bd_net [get_bd_pins clk_wiz/locked]   [get_bd_pins rst/dcm_locked]
 
+# Second reset synchronized to the weight-feed clock; its peripheral_aresetn drives
+# the wclk-domain IPs. wrst_pin selects it (or the single reset when not dual).
+if {$dual_clock} {
+    create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* rst_fast
+    set_property -dict [list CONFIG.C_EXT_RESET_HIGH {0}] [get_bd_cells rst_fast]
+    connect_bd_net [get_bd_pins clk_wiz/clk_out2] [get_bd_pins rst_fast/slowest_sync_clk]
+    connect_bd_net [get_bd_pins ps/pl_resetn0]    [get_bd_pins rst_fast/ext_reset_in]
+    connect_bd_net [get_bd_pins clk_wiz/locked]   [get_bd_pins rst_fast/dcm_locked]
+}
+set wrst_pin [expr {$dual_clock ? "rst_fast/peripheral_aresetn" : "rst/peripheral_aresetn"}]
+
 # ---- Clock fan-out ----------------------------------------------------------
+# fclk (clk_out1): kernel + control, acts, the result upsizer, the weight DMA's
+# AXI-Lite. (When not dual, the wclk loop below also resolves to clk_out1.)
 foreach clkpin {
-    ps/maxihpm0_fpd_aclk ps/saxihp0_fpd_aclk ps/saxihp1_fpd_aclk
-    dma_w/s_axi_lite_aclk dma_w/m_axi_mm2s_aclk dma_w/m_axi_s2mm_aclk
+    ps/maxihpm0_fpd_aclk ps/saxihp1_fpd_aclk
+    dma_w/s_axi_lite_aclk
     dma_a/s_axi_lite_aclk dma_a/m_axi_mm2s_aclk
-    dwc_w/aclk dwc_a/aclk dwc_r/aclk
+    dwc_a/aclk dwc_r/aclk
     kernel/s_axi_aclk
 } { connect_bd_net [get_bd_pins clk_wiz/clk_out1] [get_bd_pins $clkpin] }
 
+# wclk: HP0 + the weight DMA data movers + the weight upsizer.
+foreach clkpin {
+    ps/saxihp0_fpd_aclk
+    dma_w/m_axi_mm2s_aclk dma_w/m_axi_s2mm_aclk
+    dwc_w/aclk
+} { connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins $clkpin] }
+
+# Reset fan-out, split the same way. dma_w/axi_resetn stays on fclk (the AXI-Lite
+# domain); the async data movers handle their reset internally.
 foreach rstpin {
     dma_w/axi_resetn dma_a/axi_resetn
-    dwc_w/aresetn dwc_a/aresetn dwc_r/aresetn
+    dwc_a/aresetn dwc_r/aresetn
     kernel/s_axi_aresetn
 } { connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $rstpin] }
+connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins dwc_w/aresetn]
+
+if {$dual_clock} {
+    # Each converter straddles the two domains: weight = wclk(slave)->fclk(master),
+    # result = fclk(slave)->wclk(master).
+    connect_bd_net [get_bd_pins clk_wiz/clk_out2]            [get_bd_pins clk_conv_w/s_axis_aclk]
+    connect_bd_net [get_bd_pins rst_fast/peripheral_aresetn] [get_bd_pins clk_conv_w/s_axis_aresetn]
+    connect_bd_net [get_bd_pins clk_wiz/clk_out1]            [get_bd_pins clk_conv_w/m_axis_aclk]
+    connect_bd_net [get_bd_pins rst/peripheral_aresetn]      [get_bd_pins clk_conv_w/m_axis_aresetn]
+    connect_bd_net [get_bd_pins clk_wiz/clk_out1]            [get_bd_pins clk_conv_r/s_axis_aclk]
+    connect_bd_net [get_bd_pins rst/peripheral_aresetn]      [get_bd_pins clk_conv_r/s_axis_aresetn]
+    connect_bd_net [get_bd_pins clk_wiz/clk_out2]            [get_bd_pins clk_conv_r/m_axis_aclk]
+    connect_bd_net [get_bd_pins rst_fast/peripheral_aresetn] [get_bd_pins clk_conv_r/m_axis_aresetn]
+}
 
 # ---- Control path: PS -> dma_w, dma_a, kernel AXI-Lite ----------------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_ctrl
@@ -192,11 +279,11 @@ connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 1]] [get_bd_intf_pins dma_
 connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 2]] [get_bd_intf_pins kernel/S_AXI]
 
 # ---- Memory paths -----------------------------------------------------------
-# dma_w MM2S + S2MM share HP0; dma_a MM2S uses HP1.
+# dma_w MM2S + S2MM share HP0 (on wclk); dma_a MM2S uses HP1 (fclk).
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_mem_w
 set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_w]
-connect_bd_net [get_bd_pins clk_wiz/clk_out1]       [get_bd_pins sc_mem_w/aclk]
-connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_mem_w/aresetn]
+connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins sc_mem_w/aclk]
+connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w/aresetn]
 connect_bd_intf_net [get_bd_intf_pins dma_w/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins dma_w/M_AXI_S2MM] [get_bd_intf_pins sc_mem_w/S01_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_mem_w/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP0_FPD]
