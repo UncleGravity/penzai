@@ -1,9 +1,9 @@
 //! Pure result-gather for the PL matmul.
 //!
 //! The kernel's S2MM stream is ordered `[rowblock][col][row]`, lane-major, with
-//! a fixed 8 fp32 (32 B) per (rowblock, col) regardless of how many rows that
-//! rowblock actually carries -- the pad lanes sit *after* the valid rows. This
-//! scatters that stream into the col-major destination tensor.
+//! a fixed `rows_per_block` fp32 values per (rowblock, col) regardless of how
+//! many rows that rowblock actually carries -- the pad lanes sit *after* the
+//! valid rows. This scatters that stream into the col-major destination tensor.
 //!
 //! Isolated from the /dev/mem driver so it is unit-testable: the coarse-copy
 //! production path (`gatherResults`) is checked bit-for-bit against the obvious
@@ -13,7 +13,7 @@ const std = @import("std");
 const shared = @import("shared");
 const q1a8 = shared.q1a8;
 
-pub const result_bytes_per_rb: usize = (q1a8.rows_per_block / 2) * q1a8.beat_bytes; // 32
+pub const result_bytes_per_rb: usize = (q1a8.rows_per_block / 2) * q1a8.beat_bytes;
 
 /// Scatter one kernel run's results (`group` columns starting at `col0`) into
 /// `dst` (col-major `rows*cols` f32). Coarse memcpy: one contiguous copy for the
@@ -61,12 +61,12 @@ fn gatherResultsRef(dst: []u8, result: []const u8, rows: usize, group: usize, co
 test "gatherResults matches the per-lane oracle and places correctly" {
     const A = std.testing.allocator;
     const mc_cols_max: usize = 8; // matches the bitstream COLS_MAX / matmul.zig
-    // rows cover multiples and non-multiples of rows_per_block (8); cols cover
+    // rows cover multiples and non-multiples of rows_per_block; cols cover
     // decode (1), single-group, and multi-group tiling incl. a trailing group=1.
     const shapes = [_][2]usize{
         .{ 2048, 1 }, .{ 6144, 1 }, .{ 1024, 1 }, .{ 2048, 13 }, .{ 6144, 13 },
         .{ 10, 1 },   .{ 10, 5 },   .{ 17, 9 },   .{ 8, 8 },     .{ 1, 1 },
-        .{ 7, 3 },    .{ 9, 9 },    .{ 64, 16 },   .{ 3, 17 },
+        .{ 7, 3 },    .{ 9, 9 },    .{ 64, 16 },  .{ 3, 17 },
     };
     for (shapes) |s| {
         const rows = s[0];

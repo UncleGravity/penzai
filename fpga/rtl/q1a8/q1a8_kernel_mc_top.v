@@ -1,13 +1,12 @@
-// q1a8_kernel_mc_top - AXI-Lite top for the multi-column Q1A8 kernel (v6).
+// q1a8_kernel_mc_top - AXI-Lite top for the multi-column Q1A8 kernel (v7).
 //
 // Wraps q1a8_kernel_mc. The host sets NUM_Q1_BLOCKS, NUM_ROWBLOCKS and NUM_COLS,
-// then strobes CTRL.start. Weights stream in at 256 bits/beat (one Q8 sub-block
-// for all ROWS lanes); each beat is MAC'd against all NUM_COLS activation columns
-// before the next, so prefill (cols>1) reads each weight once. Results stream out
-// 64-bit, [rowblock][col][row].
+// then strobes CTRL.start. Weights stream in as two synchronized 256-bit ports;
+// the wrapper zips them into one 512-bit beat for ROWS=16. Each beat is MAC'd
+// against all NUM_COLS activation columns before the next, so prefill (cols>1)
+// reads each weight once. Results stream out 64-bit, [rowblock][col][row].
 //
-// Same register map + counter bank as v5; adds NUM_COLS. VERSION reads 6 so the
-// host driver selects the multi-column / wide-weight path.
+// VERSION reads 7 so the host driver selects the ROWS=16 two-port layout.
 
 `default_nettype none
 
@@ -18,7 +17,7 @@ module q1a8_kernel_mc_top (
     // makes validate_bd_design fail with a FREQ_HZ mismatch against the
     // propagated DMA/FCLK clock. Leaving it out lets Vivado propagate the
     // actual FCLK_CLK0 frequency through all four associated interfaces.
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS_W0:S_AXIS_W1:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn" *)
     input  wire         s_axi_aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -63,16 +62,27 @@ module q1a8_kernel_mc_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:aximm:1.0 S_AXI RREADY" *)
     input  wire         s_axi_rready,
 
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TDATA" *)
-    input  wire [255:0] s_axis_tdata,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TKEEP" *)
-    input  wire [31:0]  s_axis_tkeep,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TVALID" *)
-    input  wire         s_axis_tvalid,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TREADY" *)
-    output wire         s_axis_tready,
-    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS TLAST" *)
-    input  wire         s_axis_tlast,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TDATA" *)
+    input  wire [255:0] s_axis_w0_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TKEEP" *)
+    input  wire [31:0]  s_axis_w0_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TVALID" *)
+    input  wire         s_axis_w0_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TREADY" *)
+    output wire         s_axis_w0_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TLAST" *)
+    input  wire         s_axis_w0_tlast,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TDATA" *)
+    input  wire [255:0] s_axis_w1_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TKEEP" *)
+    input  wire [31:0]  s_axis_w1_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TVALID" *)
+    input  wire         s_axis_w1_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TREADY" *)
+    output wire         s_axis_w1_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TLAST" *)
+    input  wire         s_axis_w1_tlast,
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TDATA" *)
     input  wire [63:0]  s_axis_acts_tdata,
@@ -96,7 +106,7 @@ module q1a8_kernel_mc_top (
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TLAST" *)
     output wire         m_axis_tlast
 );
-    localparam integer ROWS = 8;
+    localparam integer ROWS = 16;
 
     // Register offsets and RO reset values, generated from fpga/regmap/q1a8.regmap
     // by `zig build regmap`. ID/VERSION/ROWS resets and every offset live here so
@@ -115,6 +125,12 @@ module q1a8_kernel_mc_top (
 
     wire kernel_busy;
     wire kernel_done;
+    wire weight_tready;
+    wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid;
+    wire [ROWS*32-1:0] weight_tdata = {s_axis_w1_tdata, s_axis_w0_tdata};
+
+    assign s_axis_w0_tready = weight_tready && s_axis_w1_tvalid;
+    assign s_axis_w1_tready = weight_tready && s_axis_w0_tvalid;
 
     q1a8_kernel_mc #(.ROWS(ROWS), .COLS_MAX(8), .MAX_SUB_INDEX(256)) u_kernel (
         .clk(clk),
@@ -125,9 +141,9 @@ module q1a8_kernel_mc_top (
         .num_cols(num_cols_q),
         .kernel_done(kernel_done),
         .busy(kernel_busy),
-        .s_axis_tdata(s_axis_tdata),
-        .s_axis_tvalid(s_axis_tvalid),
-        .s_axis_tready(s_axis_tready),
+        .s_axis_tdata(weight_tdata),
+        .s_axis_tvalid(weight_tvalid),
+        .s_axis_tready(weight_tready),
         .s_axis_acts_tdata(s_axis_acts_tdata),
         .s_axis_acts_tvalid(s_axis_acts_tvalid),
         .s_axis_acts_tready(s_axis_acts_tready),
@@ -162,10 +178,10 @@ module q1a8_kernel_mc_top (
             w_stall_q <= 32'd0; a_stall_q <= 32'd0; r_stall_q <= 32'd0;
             w_beats_q <= 32'd0; a_beats_q <= 32'd0; r_beats_q <= 32'd0;
         end else if (kernel_busy) begin
-            if (s_axis_tvalid && s_axis_tready)           w_beats_q <= w_beats_q + 32'd1;
+            if (weight_tvalid && weight_tready)           w_beats_q <= w_beats_q + 32'd1;
             if (s_axis_acts_tvalid && s_axis_acts_tready) a_beats_q <= a_beats_q + 32'd1;
             if (m_axis_tvalid && m_axis_tready)           r_beats_q <= r_beats_q + 32'd1;
-            if (s_axis_tready && !s_axis_tvalid)           w_stall_q <= w_stall_q + 32'd1;
+            if (weight_tready && !weight_tvalid)           w_stall_q <= w_stall_q + 32'd1;
             if (s_axis_acts_tready && !s_axis_acts_tvalid) a_stall_q <= a_stall_q + 32'd1;
             if (m_axis_tvalid && !m_axis_tready)           r_stall_q <= r_stall_q + 32'd1;
         end
@@ -238,9 +254,7 @@ module q1a8_kernel_mc_top (
                 rvalid_q <= 1'b1;
                 case (s_axi_araddr[5:0])
                     Q1A8_OFF_ID[5:0]:            rdata_q <= Q1A8_RST_ID;
-                    // v6: multi-column kernel. Overrides the regmap's VERSION
-                    // reset so the host driver selects the wide-weight/mc path.
-                    Q1A8_OFF_VERSION[5:0]:       rdata_q <= 32'd6;
+                    Q1A8_OFF_VERSION[5:0]:       rdata_q <= Q1A8_RST_VERSION;
                     Q1A8_OFF_STATUS[5:0]:        rdata_q <= {30'd0, done_latched, kernel_busy};
                     Q1A8_OFF_NUM_Q1_BLOCKS[5:0]: rdata_q <= {16'd0, num_q1_blocks_q};
                     Q1A8_OFF_NUM_ROWBLOCKS[5:0]: rdata_q <= {16'd0, num_rowblocks_q};
@@ -275,8 +289,10 @@ module q1a8_kernel_mc_top (
         1'b0,
         s_axi_awprot,
         s_axi_arprot,
-        s_axis_tkeep,
-        s_axis_tlast,
+        s_axis_w0_tkeep,
+        s_axis_w0_tlast,
+        s_axis_w1_tkeep,
+        s_axis_w1_tlast,
         s_axis_acts_tkeep,
         s_axis_acts_tlast
     };

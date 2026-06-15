@@ -4,6 +4,7 @@ const link_mod = @import("link");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
+const q1a8 = shared.q1a8;
 
 /// Selects how the llama `--prof` summary is rendered. `pretty` is the default
 /// human-facing layout; `json` emits every counter as a machine-readable object.
@@ -488,7 +489,7 @@ pub fn writeMatmulDetail(
         const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles));
         const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
         const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
-        const weight_bytes = stat.w_beats * 32; // q1a8_kernel_mc weight beat is 256 bits.
+        const weight_bytes = stat.w_beats * q1a8.weight_beat_bytes;
         const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
         const weight_gb_s_wall = giga(weight_bytes, stat.pl_ns);
         try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1} {d:>8.2} {d:>8.2}\n", .{

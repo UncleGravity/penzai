@@ -15,12 +15,12 @@
 `default_nettype none
 
 module q1a8_kernel_mc #(
-    parameter integer ROWS          = 8,
+    parameter integer ROWS          = 16,
     parameter integer COLS_MAX      = 8,
     parameter integer MAX_SUB_INDEX = 64,
     // Decode accumulator-pool depth (see q1a8_rowblock_mc): >= the accumulate
-    // recurrence latency, <= COLS_MAX. 2 matches today's single-cycle fp32 add.
-    parameter integer ACCUM_DEPTH   = 2
+    // recurrence latency, <= COLS_MAX.
+    parameter integer ACCUM_DEPTH   = 4
 ) (
     input  wire                  clk,
     input  wire                  rst_n,
@@ -78,6 +78,7 @@ module q1a8_kernel_mc #(
     reg [15:0] emit_col;
 
     reg [ROWS*16-1:0] weight_scales_q;
+    wire [ROWS*16-1:0] weight_scales_from_slots;
 
     // Acts BRAM: COLS_MAX columns, each MAX_SUB_INDEX subblock entries.
     localparam integer ACT_DEPTH = MAX_SUB_INDEX * COLS_MAX;
@@ -104,7 +105,8 @@ module q1a8_kernel_mc #(
     wire rowblock_done;
     wire [ROWS*32-1:0] rowblock_results;
 
-    wire last_q1   = (q1_idx == num_q1_blocks - 14'd1);
+    wire [15:0] q1_idx_wide = {2'b00, q1_idx};
+    wire last_q1   = (q1_idx_wide == num_q1_blocks - 16'd1);
     wire last_col  = (col == num_cols - 16'd1);
     wire issue_now = (state == ST_WISSUE) && s_axis_tvalid;
     wire rowblock_last = issue_now && last_q1 && (sub == 2'd3) && last_col;
@@ -120,6 +122,14 @@ module q1a8_kernel_mc #(
 
     wire acts_beat_accept = s_axis_acts_tvalid && s_axis_acts_tready;
     wire start_pulse      = start_kernel && !busy_q;
+
+    genvar scale_lane;
+    generate
+        for (scale_lane = 0; scale_lane < ROWS; scale_lane = scale_lane + 1) begin : gen_scale_slots
+            assign weight_scales_from_slots[scale_lane*16 +: 16] =
+                s_axis_tdata[scale_lane*32 +: 16];
+        end
+    endgenerate
 
     q1a8_rowblock_mc #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .ACCUM_DEPTH(ACCUM_DEPTH)) u_rowblock (
         .clk(clk),
@@ -232,7 +242,7 @@ module q1a8_kernel_mc #(
 
                     ST_WSCALE: begin
                         if (s_axis_tvalid) begin
-                            weight_scales_q <= s_axis_tdata[ROWS*16-1:0];
+                            weight_scales_q <= weight_scales_from_slots;
                             sub             <= 2'd0;
                             col             <= 16'd0;
                             state           <= ST_WISSUE;

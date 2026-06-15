@@ -85,8 +85,9 @@ pub fn weightBytesWide(num_rowblocks: usize, q1_blocks: usize) usize {
     return num_rowblocks * q1_blocks * (1 + q1a8.Q8_SUBBLOCKS) * WIDE_BEAT_BYTES;
 }
 
-/// Pack weights for q1a8_kernel_wide: per q1block per rowblock, one scale beat
-/// (ROWS fp16 in the low bits) then 4 wbit beats (ROWS×32 bits, one subblock).
+/// Pack weights for q1a8_kernel_mc: per q1block per rowblock, one scale beat
+/// then 4 wbit beats. Every row lane owns a 32-bit slot; scale beats store the
+/// fp16 scale in the low half of that slot, matching the v7 two-port combiner.
 pub fn packWeightsWide(
     rows: usize,
     q1_blocks: usize,
@@ -104,7 +105,7 @@ pub fn packWeightsWide(
             @memset(out[off..][0..WIDE_BEAT_BYTES], 0); // scale beat (low bits used)
             for (0..q1a8.ROWS) |lane| {
                 const s = weight_scales[(rb * q1a8.ROWS + lane) * q1_blocks + blk];
-                std.mem.writeInt(u16, out[off + lane * 2 ..][0..2], @bitCast(s), .little);
+                std.mem.writeInt(u16, out[off + lane * 4 ..][0..2], @bitCast(s), .little);
             }
             off += WIDE_BEAT_BYTES;
             var sub: usize = 0;

@@ -4,10 +4,10 @@
 # Packages the .bit.bin + device-tree overlay into /lib/firmware/xilinx/<APP>
 # and runs `xmutil loadapp`. This is the bitstream's deploy step; penzaid is
 # deployed separately (nix run .#deploy-penzaid). After this, penzaid's PL init
-# should report VERSION 5 with counters.
+# should report VERSION 7 with counters.
 #
-#   ./deploy.sh            # uses VARIANT from config.env (default w256-f125)
-#   ./deploy.sh w256-f125
+#   ./deploy.sh                         # uses VARIANT from config.env
+#   ./deploy.sh w512-p2-f125-wc250
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -18,7 +18,7 @@ set -a; source config.env; set +a
 : "${BOARD:?config.env must set BOARD (e.g. ubuntu@kria)}"
 : "${BOARD_TMP:?config.env must set BOARD_TMP (e.g. /tmp/penzai-q1a8)}"
 APP="${APP:-penzai-q1a8-mc}"
-VARIANT="${1:-${VARIANT:-w256-f125}}"
+VARIANT="${1:-${VARIANT:-w512-p2-f125-wc250}}"
 BIT_PREFIX="penzai-q1a8-mc"
 case "$BOARD_TMP" in /tmp/*) ;; *) echo "ERROR: BOARD_TMP must be under /tmp" >&2; exit 1 ;; esac
 
@@ -49,4 +49,4 @@ sudo xmutil unloadapp 2>/dev/null || true
 sudo xmutil loadapp "$APP"
 sudo xmutil listapps
 REMOTE
-echo "Done. Restart penzaid (as root) and check its PL init line reports version 5."
+echo "Done. Restart penzaid (as root) and check its PL init line reports version 7."

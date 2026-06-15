@@ -1,10 +1,10 @@
 @echo off
 REM build.bat - run on the Windows VM (Vivado). Invoked by build.sh over ssh, or
-REM directly:  build.bat w256-f125
+REM directly:  build.bat w512-p2-f125-wc250
 REM Produces out\penzai-q1a8-mc-<variant>.bit(.bin)
 
 set "VARIANT=%~1"
-if "%VARIANT%"=="" set "VARIANT=w256-f125"
+if "%VARIANT%"=="" set "VARIANT=w512-p2-f125-wc250"
 
 set "VIVADO_SETTINGS=C:\AMDDesignTools\2025.2.1\Vivado\settings64.bat"
 set "BIT_PREFIX=penzai-q1a8-mc"

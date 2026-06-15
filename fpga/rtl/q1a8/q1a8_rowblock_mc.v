@@ -22,9 +22,9 @@ module q1a8_rowblock_mc #(
     parameter integer COLS_MAX    = 8,
     // Decode (single_col) accumulator pool depth: consecutive sub-blocks are
     // round-robined across ACCUM_DEPTH accumulators so each is revisited every
-    // ACCUM_DEPTH issues. Must be >= the accumulate recurrence latency (the
-    // forward covers 2 today; deepen the fp32 add -> raise this). <= COLS_MAX.
-    parameter integer ACCUM_DEPTH = 2,
+    // ACCUM_DEPTH issues. Must be >= the accumulate recurrence latency. <=
+    // COLS_MAX.
+    parameter integer ACCUM_DEPTH = 4,
     parameter integer CW          = (COLS_MAX <= 1) ? 1 : $clog2(COLS_MAX)
 ) (
     input  wire                       clk,
@@ -53,20 +53,22 @@ module q1a8_rowblock_mc #(
     // q1a8_reducer plus one cycle for this rowblock to sample its registered
     // output contribution.
     localparam integer LAT = 4;
+    localparam integer ADD_LAT = 2;
+    localparam integer DONE_DELAY = (ACCUM_DEPTH - 1) * ADD_LAT + 3;
 
     wire [ROWS-1:0]    reducer_valid;
     wire [ROWS*32-1:0] contributions_flat;
-    wire [ROWS*32-1:0] add_results_flat;
+    wire [ROWS*32-1:0] acc_add_results_flat;
+    wire [ROWS-1:0]    acc_add_valid;
     reg  [ROWS*32-1:0] add_acc_q;
     reg  [ROWS*32-1:0] add_contribution_q;
     reg  [ROWS-1:0]    add_valid_q;
     reg  [COLS_MAX-1:0] add_col_oh_q;
     reg                add_last_q;
-    reg  [ROWS*32-1:0] add_result_q;
-    reg  [ROWS-1:0]    add_result_valid_q;
-    reg  [COLS_MAX-1:0] add_result_col_oh_q;
-    reg                add_result_last_q;
+    reg  [COLS_MAX-1:0] add_result_col_oh_pipe [0:ADD_LAT-1];
+    reg  [ADD_LAT-1:0] add_result_last_pipe;
     reg  [COLS_MAX-1:0] col_seen_q;
+    reg  [DONE_DELAY-1:0] done_pipe;
 
     // 2-D accumulator: acc[row][col]. A 2-D array with the native 3-bit column
     // index synthesizes to a clean per-row COLS_MAX:1 mux, instead of a flat
@@ -116,10 +118,14 @@ module q1a8_rowblock_mc #(
                 .contribution(contributions_flat[row*32 +: 32])
             );
 
-            fp32_add u_acc_add (
+            fp32_add_pipe u_acc_add (
+                .clk(clk),
+                .rst_n(rst_n),
+                .valid_in(add_valid_q[row]),
                 .a(add_acc),
                 .b(add_contribution),
-                .out(add_results_flat[row*32 +: 32])
+                .valid_out(acc_add_valid[row]),
+                .out(acc_add_results_flat[row*32 +: 32])
             );
 
             // At cols==1 (single_col) the result is the sum of the ACCUM_DEPTH
@@ -127,43 +133,41 @@ module q1a8_rowblock_mc #(
             // (so a matmul shorter than ACCUM_DEPTH issues still sums correctly);
             // otherwise it is the single accumulator for read_col. This reduction
             // is in the emit readout path, off the accumulate recurrence.
-            // NOTE: combinational chain — fine for small ACCUM_DEPTH; turn into a
-            // sequential drain-phase reduction if ACCUM_DEPTH grows for timing.
             wire [31:0] emit_part  [0:ACCUM_DEPTH-1];
             wire [31:0] emit_chain [0:ACCUM_DEPTH-1];
+            wire [ACCUM_DEPTH-1:0] emit_valid_unused;
             assign emit_part[0]  = col_seen_q[0] ? acc[row][0] : 32'd0;
             assign emit_chain[0] = emit_part[0];
+            assign emit_valid_unused[0] = 1'b1;
             for (col_g = 1; col_g < ACCUM_DEPTH; col_g = col_g + 1) begin : gen_emit_sum
                 assign emit_part[col_g] = col_seen_q[col_g] ? acc[row][col_g] : 32'd0;
-                fp32_add u_emit_add (
+                fp32_add_pipe u_emit_add (
+                    .clk(clk),
+                    .rst_n(rst_n),
+                    .valid_in(1'b1),
                     .a(emit_chain[col_g-1]),
                     .b(emit_part[col_g]),
+                    .valid_out(emit_valid_unused[col_g]),
                     .out(emit_chain[col_g])
                 );
             end
-            // Register the reduction: the fp32 add chain must NOT sit in the
-            // emit -> result-DMA combinational path (it failed 125 MHz timing as a
-            // live add, WNS -0.363 into dwc_r). decode_sum_r tracks the running
-            // pool sum every cycle; it is settled well before ST_EMIT (matmul done
-            // + drained), so emit reads a register. cols>1 reads the accumulator
-            // directly, exactly as the pre-pool kernel did.
-            reg [31:0] decode_sum_r;
-            always @(posedge clk) begin
-                if (!rst_n) decode_sum_r <= 32'd0;
-                else        decode_sum_r <= emit_chain[ACCUM_DEPTH-1];
-            end
+            // The fp32 reduction is pipelined, not combinational. `done` is
+            // delayed long enough after the final accumulator write for this
+            // always-on reduction pipeline to settle before ST_EMIT reads it.
             assign results_flat[row*32 +: 32] =
-                single_col ? decode_sum_r : acc[row][read_col];
+                single_col ? emit_chain[ACCUM_DEPTH-1] : acc[row][read_col];
 
             for (col_g = 0; col_g < COLS_MAX; col_g = col_g + 1) begin : gen_acc_cols
                 always @(posedge clk) begin
-                    if (add_result_valid_q[row] && add_result_col_oh_q[col_g]) begin
-                        acc[row][col_g] <= add_result_q[row*32 +: 32];
+                    if (acc_add_valid[row] && add_result_col_oh_pipe[ADD_LAT-1][col_g]) begin
+                        acc[row][col_g] <= acc_add_results_flat[row*32 +: 32];
                     end
                 end
             end
         end
     endgenerate
+
+    wire last_writeback = acc_add_valid[0] && add_result_last_pipe[ADD_LAT-1];
 
     integer i;
     integer p;
@@ -175,14 +179,15 @@ module q1a8_rowblock_mc #(
             add_valid_q        <= {ROWS{1'b0}};
             add_col_oh_q       <= {COLS_MAX{1'b0}};
             add_last_q         <= 1'b0;
-            add_result_q        <= {ROWS*32{1'b0}};
-            add_result_valid_q  <= {ROWS{1'b0}};
-            add_result_col_oh_q <= {COLS_MAX{1'b0}};
-            add_result_last_q   <= 1'b0;
             col_seen_q         <= {COLS_MAX{1'b0}};
-            last_pipe <= {(LAT+1){1'b0}};
-            issue_ptr <= {CW{1'b0}};
-            done      <= 1'b0;
+            last_pipe          <= {(LAT+1){1'b0}};
+            issue_ptr          <= {CW{1'b0}};
+            done_pipe          <= {DONE_DELAY{1'b0}};
+            done               <= 1'b0;
+            for (p = 0; p < ADD_LAT; p = p + 1) begin
+                add_result_col_oh_pipe[p] <= {COLS_MAX{1'b0}};
+            end
+            add_result_last_pipe <= {ADD_LAT{1'b0}};
         end else begin
             done <= 1'b0;
 
@@ -205,24 +210,26 @@ module q1a8_rowblock_mc #(
                 add_valid_q        <= {ROWS{1'b0}};
                 add_col_oh_q       <= {COLS_MAX{1'b0}};
                 add_last_q         <= 1'b0;
-                add_result_q        <= {ROWS*32{1'b0}};
-                add_result_valid_q  <= {ROWS{1'b0}};
-                add_result_col_oh_q <= {COLS_MAX{1'b0}};
-                add_result_last_q   <= 1'b0;
                 col_seen_q         <= {COLS_MAX{1'b0}};
                 last_pipe          <= {(LAT+1){1'b0}};
                 issue_ptr          <= {CW{1'b0}};
+                done_pipe          <= {DONE_DELAY{1'b0}};
+                for (p = 0; p < ADD_LAT; p = p + 1) begin
+                    add_result_col_oh_pipe[p] <= {COLS_MAX{1'b0}};
+                end
+                add_result_last_pipe <= {ADD_LAT{1'b0}};
             end else begin
-                if (add_result_last_q) done <= 1'b1;
+                done_pipe <= {done_pipe[DONE_DELAY-2:0], last_writeback};
+                done <= single_col ? done_pipe[DONE_DELAY-1] : last_writeback;
 
-                // Register the fp32 add output before it fans into the
-                // accumulator bank. This cuts the routed add->acc path; the
+                // Delay the writeback metadata to match fp32_add_pipe. The
                 // capture below forwards this stage when a column is revisited
                 // before the write lands.
-                add_result_q        <= add_results_flat;
-                add_result_valid_q  <= add_valid_q;
-                add_result_col_oh_q <= add_col_oh_q;
-                add_result_last_q   <= add_last_q;
+                add_result_col_oh_pipe[0] <= add_col_oh_q;
+                for (p = 1; p < ADD_LAT; p = p + 1) begin
+                    add_result_col_oh_pipe[p] <= add_result_col_oh_pipe[p-1];
+                end
+                add_result_last_pipe <= {add_result_last_pipe[ADD_LAT-2:0], add_last_q};
 
                 // Capture the next add inputs. The kernel spaces repeated
                 // accesses to a column far enough apart that the only bypass
@@ -234,8 +241,8 @@ module q1a8_rowblock_mc #(
                 for (i = 0; i < ROWS; i = i + 1) begin
                     if (reducer_valid[i]) begin
                         add_acc_q[i*32 +: 32] <=
-                            (add_result_valid_q[i] && add_result_col_oh_q[wcol])
-                                ? add_result_q[i*32 +: 32]
+                            (acc_add_valid[i] && add_result_col_oh_pipe[ADD_LAT-1][wcol])
+                                ? acc_add_results_flat[i*32 +: 32]
                                 : (wcol_seen ? acc[i][wcol] : 32'd0);
                         add_contribution_q[i*32 +: 32] <= contributions_flat[i*32 +: 32];
                     end

@@ -1,22 +1,32 @@
 const std = @import("std");
 
-pub const rows_per_block: usize = 8;
+pub const rows_per_block: usize = 16;
+pub const weight_ports: usize = 2;
+pub const rows_per_port: usize = rows_per_block / weight_ports;
 pub const q1_block: usize = 128;
 pub const q1_block_bytes: usize = 18; // ggml Q1_0 block size (2 B scale + 16 B bits)
 pub const q8_block: usize = 32;
 pub const q8_subblocks: usize = q1_block / q8_block;
 pub const beat_bytes: usize = 8; // activation AXIS beat (64-bit)
 
-// Resident weight layout = the wide (256-bit weight beat) layout the PL kernel
-// streams: per (rowblock, q1block) one scale beat (ROWS fp16 at byte lane*2) then
-// one beat per Q8 sub-block (ROWS u32 at byte lane*4). Same weight bits and fp16
-// scales as ggml Q1_0, re-arranged with all ROWS lanes contiguous per beat.
-pub const weight_beat_bytes: usize = rows_per_block * 4; // ROWS * 32 bits = 256
-pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 160
+// Resident weight layout for the v7 two-port PL kernel. Each rowblock has 16
+// rows split into two contiguous 8-row port streams. Within one port stream, per
+// (rowblock, q1block), there is one scale beat then one beat per Q8 sub-block.
+// Every row lane owns one 32-bit slot in each beat; scale beats store the fp16
+// scale in the low half of that slot. This makes the RTL combiner a pure zip:
+// {port1_256b, port0_256b} -> one 512-bit kernel beat.
+pub const weight_beat_bytes: usize = rows_per_block * 4; // ROWS * 32 bits = 512
+pub const weight_port_beat_bytes: usize = rows_per_port * 4; // 8 lanes * 32 bits = 256
+pub const packed_per_port_q1_block: usize = (1 + q8_subblocks) * weight_port_beat_bytes;
+pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 320
 pub const acts_per_q1_block: usize = q8_subblocks * (q8_block + beat_bytes);
 
 comptime {
-    if (packed_per_q1_block != 160) @compileError("Q1A8 packed block size drifted");
+    if (rows_per_block % weight_ports != 0) @compileError("Q1A8 rows must split evenly across ports");
+    if (rows_per_port != 8) @compileError("Q1A8 v7 expects 8 rows per weight port");
+    if (weight_port_beat_bytes != 32) @compileError("Q1A8 port beat size drifted");
+    if (packed_per_port_q1_block != 160) @compileError("Q1A8 port block size drifted");
+    if (packed_per_q1_block != 320) @compileError("Q1A8 packed block size drifted");
     if (acts_per_q1_block != 160) @compileError("Q1A8 acts block size drifted");
 }
 
@@ -38,6 +48,11 @@ pub fn blocksPerRow(k: usize) LayoutError!usize {
 pub fn packedWeightBytes(rows: usize, k: usize) LayoutError!usize {
     if (rows == 0) return error.InvalidRows;
     return rowblocksFor(rows) * try blocksPerRow(k) * packed_per_q1_block;
+}
+
+pub fn packedWeightPortBytes(rows: usize, k: usize) LayoutError!usize {
+    if (rows == 0) return error.InvalidRows;
+    return rowblocksFor(rows) * try blocksPerRow(k) * packed_per_port_q1_block;
 }
 
 pub fn actsF32Bytes(cols: usize, k: usize) LayoutError!usize {
@@ -65,22 +80,24 @@ pub fn packWeightsFromLogical(
 
     @memset(out, 0);
     var cursor: usize = 0;
-    for (0..rowblocksFor(rows)) |rb| {
-        const row_start = rb * rows_per_block;
-        const row_count = @min(rows_per_block, rows - row_start);
-        for (0..q1_blocks) |q1| {
-            for (0..row_count) |lane| {
-                const scale_bits: u16 = @bitCast(weight_scales[(row_start + lane) * q1_blocks + q1]);
-                std.mem.writeInt(u16, out[cursor + lane * 2 ..][0..2], scale_bits, .little);
-            }
-            cursor += weight_beat_bytes;
-            for (0..q8_subblocks) |sub| {
+    for (0..weight_ports) |port| {
+        for (0..rowblocksFor(rows)) |rb| {
+            const row_start = rb * rows_per_block + port * rows_per_port;
+            const row_count = if (row_start < rows) @min(rows_per_port, rows - row_start) else 0;
+            for (0..q1_blocks) |q1| {
                 for (0..row_count) |lane| {
-                    const bits = weight_bits[(row_start + lane) * q1_blocks + q1];
-                    const part: u32 = @truncate(bits >> @intCast(sub * q8_block));
-                    std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], part, .little);
+                    const scale_bits: u16 = @bitCast(weight_scales[(row_start + lane) * q1_blocks + q1]);
+                    std.mem.writeInt(u16, out[cursor + lane * 4 ..][0..2], scale_bits, .little);
                 }
-                cursor += weight_beat_bytes;
+                cursor += weight_port_beat_bytes;
+                for (0..q8_subblocks) |sub| {
+                    for (0..row_count) |lane| {
+                        const bits = weight_bits[(row_start + lane) * q1_blocks + q1];
+                        const part: u32 = @truncate(bits >> @intCast(sub * q8_block));
+                        std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], part, .little);
+                    }
+                    cursor += weight_port_beat_bytes;
+                }
             }
         }
     }
@@ -99,24 +116,26 @@ pub fn packWeightsFromGgmlQ1_0(
     @memset(out, 0);
     var cursor: usize = 0;
     const source_row_bytes = q1_blocks * q1_block_bytes;
-    for (0..rowblocksFor(rows)) |rb| {
-        const row_start = rb * rows_per_block;
-        const row_count = @min(rows_per_block, rows - row_start);
-        for (0..q1_blocks) |q1| {
-            for (0..row_count) |lane| {
-                const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
-                const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
-                std.mem.writeInt(u16, out[cursor + lane * 2 ..][0..2], scale, .little);
-            }
-            cursor += weight_beat_bytes;
-            for (0..q8_subblocks) |sub| {
+    for (0..weight_ports) |port| {
+        for (0..rowblocksFor(rows)) |rb| {
+            const row_start = rb * rows_per_block + port * rows_per_port;
+            const row_count = if (row_start < rows) @min(rows_per_port, rows - row_start) else 0;
+            for (0..q1_blocks) |q1| {
                 for (0..row_count) |lane| {
-                    const source_offset = (row_start + lane) * source_row_bytes +
-                        q1 * q1_block_bytes + @sizeOf(f16) + sub * (q8_block / 8);
-                    const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
-                    std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], bits, .little);
+                    const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
+                    const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
+                    std.mem.writeInt(u16, out[cursor + lane * 4 ..][0..2], scale, .little);
                 }
-                cursor += weight_beat_bytes;
+                cursor += weight_port_beat_bytes;
+                for (0..q8_subblocks) |sub| {
+                    for (0..row_count) |lane| {
+                        const source_offset = (row_start + lane) * source_row_bytes +
+                            q1 * q1_block_bytes + @sizeOf(f16) + sub * (q8_block / 8);
+                        const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
+                        std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], bits, .little);
+                    }
+                    cursor += weight_port_beat_bytes;
+                }
             }
         }
     }
@@ -127,8 +146,11 @@ pub fn packedWeightScale(weights: []const u8, rows: usize, k: usize, row: usize,
     if (weights.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
-    const block_base = (rb * q1_blocks + q1) * packed_per_q1_block;
-    return @bitCast(std.mem.readInt(u16, weights[block_base + lane * 2 ..][0..2], .little));
+    const port = lane / rows_per_port;
+    const port_lane = lane % rows_per_port;
+    const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
+    const block_base = port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+    return @bitCast(std.mem.readInt(u16, weights[block_base + port_lane * 4 ..][0..2], .little));
 }
 
 pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, sub: usize) LayoutError!u32 {
@@ -136,9 +158,12 @@ pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, 
     if (weights.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
-    const block_base = (rb * q1_blocks + q1) * packed_per_q1_block;
-    const sub_base = block_base + weight_beat_bytes + sub * weight_beat_bytes;
-    return std.mem.readInt(u32, weights[sub_base + lane * 4 ..][0..4], .little);
+    const port = lane / rows_per_port;
+    const port_lane = lane % rows_per_port;
+    const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
+    const block_base = port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+    const sub_base = block_base + weight_port_beat_bytes + sub * weight_port_beat_bytes;
+    return std.mem.readInt(u32, weights[sub_base + port_lane * 4 ..][0..4], .little);
 }
 
 pub fn quantizeQ8_0(column: []const f32, out_quants: []i8, out_scales: []f16) LayoutError!void {

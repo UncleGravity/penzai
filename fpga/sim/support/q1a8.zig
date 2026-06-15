@@ -9,7 +9,7 @@
 //!   - Each Q1 block is 4 Q8 sub-blocks of Q8_BLOCK activations; each sub-block
 //!     carries one fp16 activation scale.
 
-pub const ROWS: usize = 8; // lanes per rowblock
+pub const ROWS: usize = 16; // lanes per rowblock
 pub const Q1_BLOCK: usize = 128; // weights per Q1 block (per row)
 pub const Q8_BLOCK: usize = 32; // activations per Q8 sub-block
 pub const Q8_SUBBLOCKS: usize = Q1_BLOCK / Q8_BLOCK; // = 4

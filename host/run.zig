@@ -439,7 +439,7 @@ fn readF32(bytes: []const u8, offset: usize) f32 {
 
 test "fake q1a8 matmul smoke succeeds" {
     const result = try runFakeMatmul(std.testing.allocator, .{});
-    try std.testing.expectEqual(@as(u32, 8), result.rows);
+    try std.testing.expectEqual(@as(u32, @intCast(q1a8.rows_per_block)), result.rows);
     try std.testing.expectEqual(@as(u32, 1), result.cols);
     try std.testing.expectEqual(@as(f32, 127 * q1a8.q1_block), result.expected);
     try std.testing.expectEqual(@as(f32, 0), result.max_abs_diff);
@@ -451,7 +451,7 @@ test "fake q1a8 matmul rejects invalid k" {
 
 test "fake q1a8 matmul bench succeeds" {
     const result = try benchFakeMatmulQ1A8(std.testing.io, std.testing.allocator, .{ .warmup = 1, .iters = 2 });
-    try std.testing.expectEqual(@as(u32, 8), result.rows);
+    try std.testing.expectEqual(@as(u32, @intCast(q1a8.rows_per_block)), result.rows);
     try std.testing.expectEqual(@as(u32, 2), result.iters);
     try std.testing.expectEqual(@as(f32, 0), result.max_abs_diff);
     try std.testing.expect(result.host_total_ns > 0);

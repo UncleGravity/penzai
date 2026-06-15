@@ -7,13 +7,13 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x00000005   v5 = dual-stream + counter bank
+0x04      VERSION         ro      0x00000007   v7 = ROWS=16 two-port mc kernel
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
 0x14      NUM_ROWBLOCKS   rw      0x00000000   ceil(M / ROWS)
 0x18      CYCLES          ro      0x00000000   busy-cycle count of last run
-0x1C      ROWS            ro      0x00000008   lanes per rowblock (constant)
+0x1C      ROWS            ro      0x00000010   lanes per rowblock (constant)
 #
 # Counter bank (latched per run). Stall counters count cycles the kernel is busy
 # but a stream cannot make progress; utilization = (CYCLES - max stall) / CYCLES.

@@ -17,6 +17,7 @@ pub const Error = error{
     KernelTimeout,
     BadId,
     BadVersion,
+    BadRows,
 };
 
 /// Bytes mapped per AXI-Lite block. All our blocks fit in one 64 KiB page span.
@@ -108,7 +109,7 @@ pub const Dma = struct {
         try self.waitResetClear(S2MM_DMACR);
     }
 
-    /// Reset only MM2S — for a DMA built without S2MM (the acts lane).
+    /// Reset only MM2S — for a DMA built without S2MM.
     pub fn resetMm2s(self: *Dma) Error!void {
         self.win.wr(MM2S_DMACR, RESET);
         try self.waitResetClear(MM2S_DMACR);
@@ -161,15 +162,16 @@ const CTRL_START: u32 = 1 << 0;
 const STATUS_BUSY: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Minimum kernel VERSION the driver accepts. v6 is the multi-column kernel that
-/// reads the wide weight layout; v4/v5 read the old narrow layout and are
-/// incompatible with the resident wide weights, so the PL path requires v6.
-pub const min_version: u32 = 6;
+/// Minimum kernel VERSION the driver accepts. v7 is the ROWS=16 two-port kernel
+/// and reads the v7 resident layout; older kernels are incompatible with the
+/// current host packer and must fall back to PS instead of corrupting results.
+pub const min_version: u32 = 7;
 pub const version_with_counters: u32 = 5;
 pub const expected_id: u32 = 0xB05A2000;
+pub const expected_rows: u32 = 16;
 
 /// Fallback fabric clock if the bitstream predates the CLK_HZ register (reads 0).
-/// The deployed w256-f125 v6 bitstream ran at 125 MHz, so that is the safe guess.
+/// The v7 vertical-slice bitstream starts at 125 MHz, so that is the safe guess.
 pub const default_clk_mhz: f64 = 125.0;
 
 pub const Kernel = struct {
@@ -184,6 +186,7 @@ pub const Kernel = struct {
         if (id != expected_id) return error.BadId;
         const version = win.rd(regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
+        if (win.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
         const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
         return .{ .win = win, .version = version, .clk_hz = clk_hz };
     }

@@ -85,7 +85,7 @@ const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
 const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
 // The multi-column kernel uses its own rowblock; the rest of the core is shared.
 const reducer_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_reducer.v", "fpga/rtl/q1a8/fp32_add.v",
+    "fpga/rtl/q1a8/q1a8_reducer.v", "fpga/rtl/q1a8/fp32_add_pipe.v",
     "fpga/rtl/q1a8/fp32_mul.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
     "fpga/rtl/q1a8/int_to_fp32.v",
 };
@@ -94,6 +94,7 @@ const mc_rtl = [_][]const u8{
 } ++ reducer_rtl;
 
 const core_rtl_args = "fpga/rtl/q1a8/q1a8_rowblock.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
+const mc_rtl_args = "fpga/rtl/q1a8/q1a8_kernel_mc_top.v fpga/rtl/q1a8/q1a8_kernel_mc.v fpga/rtl/q1a8/q1a8_rowblock_mc.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add_pipe.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> generated Verilog header (single source of register offsets).
@@ -111,12 +112,12 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     update_vh.addCopyFileToSource(generated_vh, "fpga/rtl/q1a8/q1a8_regs.vh");
     b.step("regmap", "Generate fpga/rtl/q1a8/q1a8_regs.vh from fpga/regmap/q1a8.regmap").dependOn(&update_vh.step);
 
-    // Verilator lint of all q1a8 RTL, including kernel_top + the counter bank +
-    // the generated header. This is the structural gate for the gateware that the
-    // cosim (which drives the core) does not exercise.
+    // Verilator lint of the deployable q1a8 RTL, including kernel_top + the
+    // counter bank + the generated header. This is the structural gate for the
+    // gateware that the cosim (which drives the core) does not exercise.
     const lint = b.addSystemCommand(&.{
-        "sh", "-c",
-        "verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/q1a8 fpga/rtl/q1a8/q1a8_kernel_top.v fpga/rtl/q1a8/q1a8_kernel.v " ++ core_rtl_args,
+        "sh",                                                                                                                                                                     "-c",
+        "verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/q1a8 --top-module q1a8_kernel_mc_top " ++ mc_rtl_args,
     });
     b.step("lint-rtl", "Verilator lint the q1a8 RTL").dependOn(&lint.step);
 
