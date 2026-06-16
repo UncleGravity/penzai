@@ -96,11 +96,16 @@ pub fn runBytes(
     const head_ratio = n_heads / n_head_kv;
 
     var q_row: [max_head_dim]f32 = undefined;
-    var scores: [max_kv]f32 = undefined;
     var acc: [max_head_dim]f32 = undefined;
 
     for (0..n_tokens) |token| {
         const mask_row = if (mask_data) |mask| mask[token * mask_nb1 ..] else null;
+        // The mask is per token (shared across heads); scan it once to bound the
+        // kv loop to the real, non-masked extent. ggml pads n_kv (to 256), and a
+        // causal mask makes the valid region a [0, kv_hi) prefix, so this skips
+        // the padding. Interior holes (non-prefix masks) stay correct: the loop
+        // still skips any masked entry below kv_hi.
+        const kv_hi = maskedExtent(mask_row, n_kv);
         for (0..n_heads) |head| {
             const kv_head = head / head_ratio;
             const q_base = token * q_nb1 + head * q_nb2;
@@ -108,45 +113,74 @@ pub fn runBytes(
                 q_row[d] = readF32(q_data, q_base + d * @sizeOf(f32));
             }
 
-            var max_score = -std.math.inf(f32);
-            for (0..n_kv) |kv| {
+            // Streaming (online) softmax: one pass over K/V, no scores buffer.
+            // Running max `m`, denominator `l`, and an output `acc` rescaled by
+            // exp(m_old - m_new) whenever the max grows. out = acc / l.
+            var m = -std.math.inf(f32);
+            var l: f32 = 0;
+            @memset(acc[0..head_dim_v], 0);
+            for (0..kv_hi) |kv| {
                 var mask_value: f32 = 0;
                 if (mask_row) |row| {
                     mask_value = readF16(row, kv * @sizeOf(f16));
-                    if (!std.math.isFinite(mask_value) and mask_value < 0) {
-                        scores[kv] = -std.math.inf(f32);
-                        continue;
-                    }
+                    if (isMasked(mask_value)) continue;
                 }
 
                 const k_base = kv * k_nb1 + kv_head * k_nb2;
-                var score = dotF32F16(q_row[0..head_dim_q], k_data, k_base, head_dim_q);
-                score = score * params.scale + mask_value;
-                scores[kv] = score;
-                if (score > max_score) max_score = score;
-            }
+                const score = dotF32F16(q_row[0..head_dim_q], k_data, k_base, head_dim_q) * params.scale + mask_value;
 
-            @memset(acc[0..head_dim_v], 0);
-            var sum: f32 = 0;
-            if (std.math.isFinite(max_score)) {
-                for (0..n_kv) |kv| {
-                    const score = scores[kv];
-                    if (!std.math.isFinite(score) and score < 0) continue;
-                    const value_scale = @exp(score - max_score);
-
-                    const v_base = kv * v_nb1 + kv_head * v_nb2;
-                    axpyF16(acc[0..head_dim_v], value_scale, v_data, v_base, head_dim_v);
-                    sum += value_scale;
+                const m_new = @max(m, score);
+                if (m_new != m) {
+                    // Rescale prior contributions to the new max. On the first
+                    // valid kv, m = -inf so corr = exp(-inf) = 0, which correctly
+                    // leaves the (still-zero) acc/l untouched.
+                    const corr = @exp(m - m_new);
+                    l *= corr;
+                    scaleVec(acc[0..head_dim_v], corr);
+                    m = m_new;
                 }
+                const p = @exp(score - m);
+                l += p;
+                const v_base = kv * v_nb1 + kv_head * v_nb2;
+                axpyF16(acc[0..head_dim_v], p, v_data, v_base, head_dim_v);
             }
 
             const dst_base = head * dst_nb1 + token * dst_nb2;
-            const inv_sum: f32 = if (sum == 0) 0 else 1.0 / sum;
+            const inv_l: f32 = if (l == 0) 0 else 1.0 / l;
             for (0..head_dim_v) |d| {
-                writeF32(dst_data, dst_base + d * @sizeOf(f32), acc[d] * inv_sum);
+                writeF32(dst_data, dst_base + d * @sizeOf(f32), acc[d] * inv_l);
             }
         }
     }
+}
+
+/// A mask entry is "masked out" when it is -inf (ggml writes -inf for disallowed
+/// positions). Finite values (including 0 and any additive bias) are valid.
+inline fn isMasked(mask_value: f32) bool {
+    return !std.math.isFinite(mask_value) and mask_value < 0;
+}
+
+/// Highest non-masked index + 1, i.e. the kv loop bound. No mask → all of n_kv.
+/// One scan per token, amortized across all heads.
+fn maskedExtent(mask_row: ?[]const u8, n_kv: usize) usize {
+    const row = mask_row orelse return n_kv;
+    var hi: usize = 0;
+    for (0..n_kv) |kv| {
+        if (!isMasked(readF16(row, kv * @sizeOf(f16)))) hi = kv + 1;
+    }
+    return hi;
+}
+
+/// acc[d] *= s, d in 0..acc.len. Vectorized over fixed-width f32 lanes.
+fn scaleVec(acc: []f32, s: f32) void {
+    const sv: F32Vec = @splat(s);
+    var d: usize = 0;
+    while (d + vec_w <= acc.len) : (d += vec_w) {
+        var a: F32Vec = acc[d..][0..vec_w].*;
+        a *= sv;
+        acc[d..][0..vec_w].* = a;
+    }
+    while (d < acc.len) : (d += 1) acc[d] *= s;
 }
 
 fn validateInputs(q: []const u8, k: []const u8, v: []const u8, mask: ?[]const u8, dst: []const u8, params: Params) FlashAttnError!void {
@@ -368,4 +402,44 @@ test "flash attention maps grouped query heads onto shared kv heads" {
     try expectApprox(w0_head0 * 20 + w1_head0 * 40, readF32(&dst, 4), 0.00001);
     try expectApprox(w0_head1 * 10 + w1_head1 * 30, readF32(&dst, 8), 0.00001);
     try expectApprox(w0_head1 * 20 + w1_head1 * 40, readF32(&dst, 12), 0.00001);
+}
+
+test "flash attention ignores masked padding beyond the valid kv extent" {
+    // kv 0,1 valid; kv 2,3 are masked (-inf) padding with poisoned K/V that would
+    // dominate the softmax if the kv_hi bound or the mask skip let them through.
+    var q: [8]u8 = undefined; // 2 f32
+    var k: [16]u8 = undefined; // 4 kv * 2 f16
+    var v: [16]u8 = undefined;
+    var mask: [8]u8 = undefined; // 4 f16
+    var dst: [8]u8 = undefined;
+
+    writeF32(&q, 0, 1);
+    writeF32(&q, 4, 0);
+    // Valid entries mirror the base 2-kv case.
+    writeF16(&k, 0, 1);
+    writeF16(&k, 2, 0); // k0 = [1,0]
+    writeF16(&k, 4, 0);
+    writeF16(&k, 6, 1); // k1 = [0,1]
+    writeF16(&v, 0, 10);
+    writeF16(&v, 2, 20); // v0
+    writeF16(&v, 4, 30);
+    writeF16(&v, 6, 40); // v1
+    // Poison the padding: a huge score and a huge value if wrongly included.
+    inline for (.{ 8, 10, 12, 14 }) |off| writeF16(&k, off, 50);
+    inline for (.{ 8, 10, 12, 14 }) |off| writeF16(&v, off, 2000);
+    writeF16(&mask, 0, 0);
+    writeF16(&mask, 2, 0);
+    writeF16(&mask, 4, -std.math.inf(f16));
+    writeF16(&mask, 6, -std.math.inf(f16));
+
+    var p = baseParams();
+    p.n_kv = 4;
+    p.mask_nb1 = 4 * @sizeOf(f16);
+
+    try runBytes(&q, &k, &v, &mask, &dst, p);
+
+    const w0 = @exp(@as(f32, 1)) / (@exp(@as(f32, 1)) + 1.0);
+    const w1 = 1.0 - w0;
+    try expectApprox(w0 * 10 + w1 * 30, readF32(&dst, 0), 0.001);
+    try expectApprox(w0 * 20 + w1 * 40, readF32(&dst, 4), 0.001);
 }
