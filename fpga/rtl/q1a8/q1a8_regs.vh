@@ -17,8 +17,9 @@ localparam [11:0] Q1A8_OFF_A_BEATS = 12'h030;
 localparam [11:0] Q1A8_OFF_R_BEATS = 12'h034;
 localparam [11:0] Q1A8_OFF_NUM_COLS = 12'h038;
 localparam [11:0] Q1A8_OFF_CLK_HZ = 12'h03C;
+localparam [11:0] Q1A8_OFF_WEIGHT_PORTS = 12'h040;
 localparam [31:0] Q1A8_RST_ID = 32'hB05A2000;
-localparam [31:0] Q1A8_RST_VERSION = 32'h00000007;
+localparam [31:0] Q1A8_RST_VERSION = 32'h00000008;
 localparam [31:0] Q1A8_RST_STATUS = 32'h00000000;
 localparam [31:0] Q1A8_RST_CYCLES = 32'h00000000;
 localparam [31:0] Q1A8_RST_ROWS = 32'h00000010;
@@ -29,4 +30,5 @@ localparam [31:0] Q1A8_RST_W_BEATS = 32'h00000000;
 localparam [31:0] Q1A8_RST_A_BEATS = 32'h00000000;
 localparam [31:0] Q1A8_RST_R_BEATS = 32'h00000000;
 localparam [31:0] Q1A8_RST_CLK_HZ = 32'h00000000;
+localparam [31:0] Q1A8_RST_WEIGHT_PORTS = 32'h00000004;
 `endif

@@ -18,6 +18,7 @@ pub const Error = error{
     BadId,
     BadVersion,
     BadRows,
+    BadWeightPorts,
     BadClock,
 };
 
@@ -163,13 +164,14 @@ const CTRL_START: u32 = 1 << 0;
 const STATUS_BUSY: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Minimum kernel VERSION the driver accepts. v7 is the ROWS=16 two-port kernel
-/// and reads the v7 resident layout; older kernels are incompatible with the
+/// Minimum kernel VERSION the driver accepts. v8 is the ROWS=16 four-port kernel
+/// and reads the v8 resident layout; older kernels are incompatible with the
 /// current host packer and must fall back to PS instead of corrupting results.
-pub const min_version: u32 = 7;
+pub const min_version: u32 = 8;
 pub const version_with_counters: u32 = 5;
 pub const expected_id: u32 = 0xB05A2000;
 pub const expected_rows: u32 = 16;
+pub const expected_weight_ports: u32 = 4;
 
 pub const Kernel = struct {
     win: RegWindow,
@@ -184,6 +186,7 @@ pub const Kernel = struct {
         const version = win.rd(regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
         if (win.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
+        if (win.rd(regmap.offsetOf("WEIGHT_PORTS")) != expected_weight_ports) return error.BadWeightPorts;
         const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
         if (clk_hz == 0) return error.BadClock;
         return .{ .win = win, .version = version, .clk_hz = clk_hz };

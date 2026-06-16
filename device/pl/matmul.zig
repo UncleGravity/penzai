@@ -6,8 +6,8 @@
 //! int8), packed into a staging region, and DMA'd in. Results DMA into a staging
 //! region and copy into the destination range.
 //!
-//! The v7 kernel uses two contiguous weight-port streams: port 0 stores rows
-//! 0..7 of each 16-row block, port 1 stores rows 8..15. The RTL zips those
+//! The v8 kernel uses four contiguous weight-port streams: port N stores rows
+//! `N*4..N*4+3` of each 16-row block. The RTL zips those
 //! streams into one 512-bit beat.
 
 const std = @import("std");
@@ -20,10 +20,15 @@ const wire = shared.wire;
 const q1a8 = shared.q1a8;
 
 // AXI-Lite base addresses, matching fpga/bitstreams/q1a8-w256-mc/tcl/build.tcl.
-const dma_w0_base: i64 = 0xA000_0000; // weight port 0 MM2S + results S2MM
-const dma_w1_base: i64 = 0xA001_0000; // weight port 1 MM2S
-const dma_a_base: i64 = 0xA002_0000; // acts MM2S
-const kernel_base: i64 = 0xA003_0000; // kernel AXI-Lite
+// dma_w[0] also owns result S2MM; all weight ports use MM2S.
+const dma_w_bases = [_]i64{
+    0xA000_0000,
+    0xA001_0000,
+    0xA002_0000,
+    0xA003_0000,
+};
+const dma_a_base: i64 = 0xA004_0000; // acts MM2S
+const kernel_base: i64 = 0xA005_0000; // kernel AXI-Lite
 
 // Staging capacities, reserved once from the heap at init. Generous vs any real
 // shape; a matmul that would exceed them falls back to PS.
@@ -33,7 +38,7 @@ const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * result
 // Columns multiplied per kernel run. Must match q1a8_kernel_mc COLS_MAX in the
 // loaded bitstream. Prefill matmuls (cols>1) are tiled into groups of this many.
 const mc_cols_max: usize = 8;
-const result_bytes_per_rb = gather.result_bytes_per_rb; // 32; single source in gather.zig
+const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gather.zig
 
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
 
@@ -65,8 +70,7 @@ pub fn Backend(comptime Heap: type) type {
 
         allocator: std.mem.Allocator,
         kernel: mmio.Kernel,
-        dma_w0: mmio.Dma,
-        dma_w1: mmio.Dma,
+        dma_w: [q1a8.weight_ports]mmio.Dma,
         dma_a: mmio.Dma,
         acts_staging: wire.TensorRange,
         result_staging: wire.TensorRange,
@@ -79,10 +83,13 @@ pub fn Backend(comptime Heap: type) type {
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             var kernel = try mmio.Kernel.open(kernel_base);
             errdefer kernel.deinit();
-            var dma_w0 = try mmio.Dma.open(dma_w0_base);
-            errdefer dma_w0.deinit();
-            var dma_w1 = try mmio.Dma.open(dma_w1_base);
-            errdefer dma_w1.deinit();
+            var dma_w: [q1a8.weight_ports]mmio.Dma = undefined;
+            var opened: usize = 0;
+            errdefer for (dma_w[0..opened]) |*dma| dma.deinit();
+            for (&dma_w, dma_w_bases[0..]) |*dma, base| {
+                dma.* = try mmio.Dma.open(base);
+                opened += 1;
+            }
             var dma_a = try mmio.Dma.open(dma_a_base);
             errdefer dma_a.deinit();
 
@@ -92,8 +99,7 @@ pub fn Backend(comptime Heap: type) type {
             return .{
                 .allocator = allocator,
                 .kernel = kernel,
-                .dma_w0 = dma_w0,
-                .dma_w1 = dma_w1,
+                .dma_w = dma_w,
                 .dma_a = dma_a,
                 .acts_staging = acts_staging,
                 .result_staging = result_staging,
@@ -105,8 +111,7 @@ pub fn Backend(comptime Heap: type) type {
             self.allocator.free(self.quants);
             self.allocator.free(self.act_scales);
             self.dma_a.deinit();
-            self.dma_w1.deinit();
-            self.dma_w0.deinit();
+            for (&self.dma_w) |*dma| dma.deinit();
             self.kernel.deinit();
             self.* = undefined;
         }
@@ -143,7 +148,10 @@ pub fn Backend(comptime Heap: type) type {
             try self.ensureScratch(k);
             const q8_blocks = q1_blocks * q1a8.q8_subblocks;
             const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
-            const weights1_phys = weights_phys + weight_port_bytes;
+            var weight_phys: [q1a8.weight_ports]u64 = undefined;
+            for (&weight_phys, 0..) |*phys, port| {
+                phys.* = weights_phys + @as(u64, @intCast(port * weight_port_bytes));
+            }
             const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure; // col-major k*cols f32
             const dst_buf = heap.bytes(mm.dst) catch return error.HeapFailure; // col-major rows*cols f32
 
@@ -181,20 +189,20 @@ pub fn Backend(comptime Heap: type) type {
 
                 // 2. Program DMAs (arm result first), run the kernel, wait. Weights
                 // stream from their resident range once for the whole group.
-                try self.dma_w0.reset();
-                try self.dma_w1.resetMm2s();
+                try self.dma_w[0].reset();
+                for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
                 try self.dma_a.resetMm2s();
-                try self.dma_w0.startWriteToDdr(result_phys, result_bytes);
-                try self.dma_w0.startReadFromDdr(weights_phys, weight_port_bytes);
-                try self.dma_w1.startReadFromDdr(weights1_phys, weight_port_bytes);
+                try self.dma_w[0].startWriteToDdr(result_phys, result_bytes);
+                for (&self.dma_w, 0..) |*dma, port| {
+                    try dma.startReadFromDdr(weight_phys[port], weight_port_bytes);
+                }
                 try self.dma_a.startReadFromDdr(acts_phys, act_total);
                 self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group));
                 seg.setup_ns += lapNs(io, &last);
                 try self.kernel.waitDone();
-                try self.dma_w0.waitReadDone();
-                try self.dma_w1.waitReadDone();
+                for (&self.dma_w) |*dma| try dma.waitReadDone();
                 try self.dma_a.waitReadDone();
-                try self.dma_w0.waitWriteDone();
+                try self.dma_w[0].waitWriteDone();
                 seg.wait_ns += lapNs(io, &last);
 
                 accumulateCounters(&counters, self.readCounters());

@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # build.sh - drive the Vivado bitstream build on the Windows VM.
 #
-# Syncs the v7 RTL + generated regmap header + the TCL/BAT to the VM,
+# Syncs the v8 RTL + generated regmap header + the TCL/BAT to the VM,
 # runs Vivado (build.bat) over ssh, and fetches the .bit/.bit.bin back to ./out.
 # Run from this directory after `cp config.env.example config.env` and editing it.
 #
 #   ./build.sh                         # uses VARIANT from config.env
-#   ./build.sh w512-p2-f125-wc250      # explicit variant
+#   ./build.sh w512-p4-f125-wc250      # explicit variant
 #
 # The kernel_top `include`s q1a8_regs.vh; regenerate it first if the regmap
 # changed:  (cd ../../.. && zig build regmap)
@@ -19,11 +19,11 @@ set -a; source config.env; set +a
 
 : "${VM:?config.env must set VM (Windows Vivado host)}"
 : "${VM_DIR:?config.env must set VM_DIR (build dir on the VM)}"
-VARIANT="${1:-${VARIANT:-w512-p2-f125-wc250}}"
+VARIANT="${1:-${VARIANT:-w512-p4-f125-wc250}}"
 BIT_PREFIX="penzai-q1a8-mc"
 RTL_DIR="../../rtl/q1a8"
 
-# v7 multi-column RTL set. q1a8_regs.vh must exist — generate with
+# v8 multi-column RTL set. q1a8_regs.vh must exist — generate with
 # `zig build regmap`.
 RTL_FILES=(
   "$RTL_DIR/q1a8_kernel_mc_top.v"

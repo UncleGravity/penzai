@@ -1,23 +1,22 @@
-# build.tcl - KR260 Q1A8 matmul bitstream (v7 vertical slice).
+# build.tcl - KR260 Q1A8 matmul bitstream (v8 four-port vertical slice).
 #
-# Design: one q1a8_kernel_top fed by four AXI DMA channels.
+# Design: one q1a8_kernel_top fed by six AXI DMA/control blocks.
 #   PS pl_clk0 @ ~100 MHz -> clk_wiz -> fabric clock (fclk_mhz from variant)
-#   PS M_AXI_HPM0_FPD -> AXI-Lite -> dma_w0 + dma_w1 + dma_a + kernel
-#   dma_w0 MM2S: DDR/HP0 -> 128->256 upsizer -> kernel.S_AXIS_W0
-#   dma_w1 MM2S: DDR/HP1 -> 128->256 upsizer -> kernel.S_AXIS_W1
+#   PS M_AXI_HPM0_FPD -> AXI-Lite -> dma_w0..dma_w3 + dma_a + kernel
+#   dma_wN MM2S: DDR/HPN -> kernel.S_AXIS_WN
 #   kernel.M_AXIS -> dma_w0 S2MM -> DDR/HP0 (results)
-#   dma_a MM2S: DDR/HP2 -> kernel.S_AXIS_ACTS (activations)
+#   dma_a MM2S: DDR/HP0 -> kernel.S_AXIS_ACTS (activations; small vs weights)
 #
 # Weight lanes run at wclk and cross down to the kernel fclk through AXIS clock
-# converters. With f125/wc250, two 128-bit HP lanes feed one 512-bit kernel beat
-# per fclk cycle.
+# converters. With f250/wc300, four 128-bit HP lanes feed one 512-bit kernel
+# beat per fclk cycle.
 
-set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p2-f125-wc250"}]
+set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f125-wc250"}]
 
-# variant = w512-p2-f<MHz>-wc<MHz>. fclk is the kernel clock; wclk is the
-# faster weight-feed clock for HP0/HP1 + their DMAs + 128->256 upsizers.
-if {![regexp {^w512-p2-f([0-9]+)-wc([0-9]+)$} $variant -> fclk_mhz wclk_mhz]} {
-    error "unknown variant '$variant'; expected w512-p2-f<MHz>-wc<MHz>, e.g. w512-p2-f125-wc250"
+# variant = w512-p4-f<MHz>-wc<MHz>. fclk is the kernel clock; wclk is the
+# faster weight-feed clock for HP0..HP3 + their DMAs.
+if {![regexp {^w512-p4-f([0-9]+)-wc([0-9]+)$} $variant -> fclk_mhz wclk_mhz]} {
+    error "unknown variant '$variant'; expected w512-p4-f<MHz>-wc<MHz>, e.g. w512-p4-f125-wc250"
 }
 
 set bit_prefix penzai-q1a8-mc
@@ -97,9 +96,11 @@ set_property -dict [list \
     CONFIG.PSU__USE__S_AXI_GP2 {1} \
     CONFIG.PSU__USE__S_AXI_GP3 {1} \
     CONFIG.PSU__USE__S_AXI_GP4 {1} \
+    CONFIG.PSU__USE__S_AXI_GP5 {1} \
     CONFIG.PSU__SAXIGP2__DATA_WIDTH {128} \
     CONFIG.PSU__SAXIGP3__DATA_WIDTH {128} \
     CONFIG.PSU__SAXIGP4__DATA_WIDTH {128} \
+    CONFIG.PSU__SAXIGP5__DATA_WIDTH {128} \
     CONFIG.PSU__FPGA_PL0_ENABLE {1} \
     CONFIG.PSU__CRL_APB__PL0_REF_CTRL__FREQMHZ {100} \
     CONFIG.PSU__TTC0__PERIPHERAL__ENABLE {1} \
@@ -161,13 +162,16 @@ proc make_dma {name include_s2mm} {
 }
 make_dma dma_w0 1
 make_dma dma_w1 0
+make_dma dma_w2 0
+make_dma dma_w3 0
 make_dma dma_a 0
-# Async clocks on the weight DMAs: data movers (m_axi_* + AXIS) run at wclk; the
+# Async clocks on the stream DMAs: data movers (m_axi_* + AXIS) run at wclk; the
 # AXI-Lite register interfaces stay at fclk with the PS control path.
 # UNCERTAIN (no sim): the exact async-DMA property + reset domain — validate_bd_design
 # (pre-synth) flags any miswiring fast, and PENZAI_PL_VERIFY catches CDC bugs on board.
-set_property CONFIG.c_prmry_is_aclk_async {1} [get_bd_cells dma_w0]
-set_property CONFIG.c_prmry_is_aclk_async {1} [get_bd_cells dma_w1]
+foreach dma {dma_w0 dma_w1 dma_w2 dma_w3 dma_a} {
+    set_property CONFIG.c_prmry_is_aclk_async {1} [get_bd_cells $dma]
+}
 
 # AXIS data-width converter (single clock). s/m widths in bytes.
 proc make_dwc {name s_bytes m_bytes} {
@@ -179,8 +183,6 @@ proc make_dwc {name s_bytes m_bytes} {
         CONFIG.HAS_TKEEP {1} \
     ] [get_bd_cells $name]
 }
-make_dwc dwc_w0 16 32 ;# weight port 0: 128 -> 256
-make_dwc dwc_w1 16 32 ;# weight port 1: 128 -> 256
 make_dwc dwc_a 16 8 ;# acts     128 -> 64
 make_dwc dwc_r 8 16 ;# results   64 -> 128
 
@@ -196,19 +198,25 @@ proc make_clk_conv {name bytes} {
 
 create_bd_cell -type module -reference q1a8_kernel_mc_top kernel
 
-# Acts are unchanged (single clock, fclk).
+# Acts: dma_a(wclk) -> 128->64(wclk) -> clock converter -> kernel(fclk).
+make_clk_conv clk_conv_a 8
 connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXIS_MM2S] [get_bd_intf_pins dwc_a/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_a/M_AXIS]      [get_bd_intf_pins kernel/S_AXIS_ACTS]
+connect_bd_intf_net [get_bd_intf_pins dwc_a/M_AXIS]      [get_bd_intf_pins clk_conv_a/S_AXIS]
+connect_bd_intf_net [get_bd_intf_pins clk_conv_a/M_AXIS] [get_bd_intf_pins kernel/S_AXIS_ACTS]
 
-# Weight ports: dma_wN(wclk) -> 128->256(wclk) -> clock converter -> kernel(fclk).
-make_clk_conv clk_conv_w0 32
-make_clk_conv clk_conv_w1 32
-connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXIS_MM2S] [get_bd_intf_pins dwc_w0/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_w0/M_AXIS]      [get_bd_intf_pins clk_conv_w0/S_AXIS]
+# Weight ports: dma_wN(wclk) -> clock converter -> kernel(fclk).
+make_clk_conv clk_conv_w0 16
+make_clk_conv clk_conv_w1 16
+make_clk_conv clk_conv_w2 16
+make_clk_conv clk_conv_w3 16
+connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w0/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins clk_conv_w0/M_AXIS] [get_bd_intf_pins kernel/S_AXIS_W0]
-connect_bd_intf_net [get_bd_intf_pins dma_w1/M_AXIS_MM2S] [get_bd_intf_pins dwc_w1/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_w1/M_AXIS]      [get_bd_intf_pins clk_conv_w1/S_AXIS]
+connect_bd_intf_net [get_bd_intf_pins dma_w1/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w1/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins clk_conv_w1/M_AXIS] [get_bd_intf_pins kernel/S_AXIS_W1]
+connect_bd_intf_net [get_bd_intf_pins dma_w2/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w2/S_AXIS]
+connect_bd_intf_net [get_bd_intf_pins clk_conv_w2/M_AXIS] [get_bd_intf_pins kernel/S_AXIS_W2]
+connect_bd_intf_net [get_bd_intf_pins dma_w3/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w3/S_AXIS]
+connect_bd_intf_net [get_bd_intf_pins clk_conv_w3/M_AXIS] [get_bd_intf_pins kernel/S_AXIS_W3]
 
 # Results: kernel.M_AXIS(fclk) -> dwc_r 64->128(fclk) -> clock converter -> dma_w0.S2MM(wclk).
 make_clk_conv clk_conv_r 16
@@ -232,37 +240,37 @@ connect_bd_net [get_bd_pins clk_wiz/locked]   [get_bd_pins rst_fast/dcm_locked]
 set wrst_pin "rst_fast/peripheral_aresetn"
 
 # ---- Clock fan-out ----------------------------------------------------------
-# fclk (clk_out1): kernel + control, acts, the result upsizer, and the weight
-# DMA AXI-Lite ports.
+# fclk (clk_out1): kernel + AXI-Lite control and the result upsizer.
 foreach clkpin {
-    ps/maxihpm0_fpd_aclk ps/saxihp2_fpd_aclk
+    ps/maxihpm0_fpd_aclk
     dma_w0/s_axi_lite_aclk dma_w1/s_axi_lite_aclk
-    dma_a/s_axi_lite_aclk dma_a/m_axi_mm2s_aclk
-    dwc_a/aclk dwc_r/aclk
+    dma_w2/s_axi_lite_aclk dma_w3/s_axi_lite_aclk
+    dma_a/s_axi_lite_aclk
+    dwc_r/aclk
     kernel/s_axi_aclk
 } { connect_bd_net [get_bd_pins clk_wiz/clk_out1] [get_bd_pins $clkpin] }
 
-# wclk: HP0/HP1 + weight DMA data movers + weight upsizers.
+# wclk: HP0..HP3 + stream DMA data movers.
 foreach clkpin {
-    ps/saxihp0_fpd_aclk ps/saxihp1_fpd_aclk
+    ps/saxihp0_fpd_aclk ps/saxihp1_fpd_aclk ps/saxihp2_fpd_aclk ps/saxihp3_fpd_aclk
     dma_w0/m_axi_mm2s_aclk dma_w0/m_axi_s2mm_aclk
-    dma_w1/m_axi_mm2s_aclk
-    dwc_w0/aclk dwc_w1/aclk
+    dma_w1/m_axi_mm2s_aclk dma_w2/m_axi_mm2s_aclk dma_w3/m_axi_mm2s_aclk
+    dma_a/m_axi_mm2s_aclk
+    dwc_a/aclk
 } { connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins $clkpin] }
 
 # Reset fan-out, split the same way. dma_w*/axi_resetn stay on fclk (the AXI-Lite
 # domains); the async data movers handle their reset internally.
 foreach rstpin {
-    dma_w0/axi_resetn dma_w1/axi_resetn dma_a/axi_resetn
-    dwc_a/aresetn dwc_r/aresetn
+    dma_w0/axi_resetn dma_w1/axi_resetn dma_w2/axi_resetn dma_w3/axi_resetn dma_a/axi_resetn
+    dwc_r/aresetn
     kernel/s_axi_aresetn
 } { connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $rstpin] }
-connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins dwc_w0/aresetn]
-connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins dwc_w1/aresetn]
+connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins dwc_a/aresetn]
 
-# Each converter straddles the two domains: weights = wclk(slave)->fclk(master),
+# Each converter straddles the two domains: inputs = wclk(slave)->fclk(master),
 # result = fclk(slave)->wclk(master).
-foreach conv {clk_conv_w0 clk_conv_w1} {
+foreach conv {clk_conv_w0 clk_conv_w1 clk_conv_w2 clk_conv_w3 clk_conv_a} {
     connect_bd_net [get_bd_pins clk_wiz/clk_out2]            [get_bd_pins $conv/s_axis_aclk]
     connect_bd_net [get_bd_pins rst_fast/peripheral_aresetn] [get_bd_pins $conv/s_axis_aresetn]
     connect_bd_net [get_bd_pins clk_wiz/clk_out1]            [get_bd_pins $conv/m_axis_aclk]
@@ -273,25 +281,30 @@ connect_bd_net [get_bd_pins rst/peripheral_aresetn]      [get_bd_pins clk_conv_r
 connect_bd_net [get_bd_pins clk_wiz/clk_out2]            [get_bd_pins clk_conv_r/m_axis_aclk]
 connect_bd_net [get_bd_pins rst_fast/peripheral_aresetn] [get_bd_pins clk_conv_r/m_axis_aresetn]
 
-# ---- Control path: PS -> dma_w0, dma_w1, dma_a, kernel AXI-Lite -------------
+# ---- Control path: PS -> dma_w0..dma_w3, dma_a, kernel AXI-Lite -------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_ctrl
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {4}] [get_bd_cells sc_ctrl]
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {6}] [get_bd_cells sc_ctrl]
 connect_bd_net [get_bd_pins clk_wiz/clk_out1]       [get_bd_pins sc_ctrl/aclk]
 connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_ctrl/aresetn]
 connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins sc_ctrl/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 0]] [get_bd_intf_pins dma_w0/S_AXI_LITE]
 connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 1]] [get_bd_intf_pins dma_w1/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 2]] [get_bd_intf_pins dma_a/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 3]] [get_bd_intf_pins kernel/S_AXI]
+connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 2]] [get_bd_intf_pins dma_w2/S_AXI_LITE]
+connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 3]] [get_bd_intf_pins dma_w3/S_AXI_LITE]
+connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 4]] [get_bd_intf_pins dma_a/S_AXI_LITE]
+connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 5]] [get_bd_intf_pins kernel/S_AXI]
 
 # ---- Memory paths -----------------------------------------------------------
-# dma_w0 MM2S + S2MM share HP0 (on wclk).
+# dma_w0 MM2S + S2MM + dma_a MM2S share HP0 (on wclk). The activation stream is
+# small and is loaded before the weight sweep; the other three HP ports stay
+# weight-only.
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_mem_w0
-set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_w0]
+set_property -dict [list CONFIG.NUM_SI {3} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_w0]
 connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins sc_mem_w0/aclk]
 connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w0/aresetn]
 connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w0/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXI_S2MM] [get_bd_intf_pins sc_mem_w0/S01_AXI]
+connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXI_MM2S]  [get_bd_intf_pins sc_mem_w0/S02_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_mem_w0/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP0_FPD]
 
 # dma_w1 MM2S uses HP1 (on wclk).
@@ -302,20 +315,30 @@ connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w1/aresetn]
 connect_bd_intf_net [get_bd_intf_pins dma_w1/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w1/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_mem_w1/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP1_FPD]
 
-# dma_a MM2S uses HP2 (on fclk).
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_mem_a
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_a]
-connect_bd_net [get_bd_pins clk_wiz/clk_out1]       [get_bd_pins sc_mem_a/aclk]
-connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_mem_a/aresetn]
-connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXI_MM2S] [get_bd_intf_pins sc_mem_a/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_mem_a/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP2_FPD]
+# dma_w2 MM2S uses HP2 (on wclk).
+create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_mem_w2
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_w2]
+connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins sc_mem_w2/aclk]
+connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w2/aresetn]
+connect_bd_intf_net [get_bd_intf_pins dma_w2/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w2/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins sc_mem_w2/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP2_FPD]
+
+# dma_w3 MM2S uses HP3 (on wclk).
+create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_mem_w3
+set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells sc_mem_w3]
+connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins sc_mem_w3/aclk]
+connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w3/aresetn]
+connect_bd_intf_net [get_bd_intf_pins dma_w3/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w3/S00_AXI]
+connect_bd_intf_net [get_bd_intf_pins sc_mem_w3/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP3_FPD]
 
 # ---- Address map (must match device/pl/matmul.zig) --------------------------
 foreach entry {
     {dma_w0 S_AXI_LITE 0xA0000000}
     {dma_w1 S_AXI_LITE 0xA0010000}
-    {dma_a  S_AXI_LITE 0xA0020000}
-    {kernel S_AXI      0xA0030000}
+    {dma_w2 S_AXI_LITE 0xA0020000}
+    {dma_w3 S_AXI_LITE 0xA0030000}
+    {dma_a  S_AXI_LITE 0xA0040000}
+    {kernel S_AXI      0xA0050000}
 } {
     lassign $entry cell intf offset
     assign_bd_address -offset $offset -range 64K \

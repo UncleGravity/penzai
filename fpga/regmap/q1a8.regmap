@@ -1,5 +1,5 @@
 # Q1A8 kernel AXI-Lite register map — single source of truth.
-# Consumed by the Zig MMIO driver (device/pl, P2) and the RTL via the generated
+# Consumed by the Zig MMIO driver (device/pl, P4) and the RTL via the generated
 # Verilog header (fpga/regmap/q1a8.zig emits q1a8_regs.vh). Do not hand-edit the
 # generated header or duplicate these constants; change them here.
 #
@@ -7,7 +7,7 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x00000007   v7 = ROWS=16 two-port mc kernel
+0x04      VERSION         ro      0x00000008   v8 = ROWS=16 four-port mc kernel
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
@@ -33,3 +33,4 @@
 # populated by the Vivado build from the propagated clk_wiz output frequency.
 # A zero value means the bitstream did not self-describe its clock.
 0x3C      CLK_HZ          ro      0x00000000   fabric clock (Hz); set by bitstream build
+0x40      WEIGHT_PORTS    ro      0x00000004   synchronized AXIS weight ports

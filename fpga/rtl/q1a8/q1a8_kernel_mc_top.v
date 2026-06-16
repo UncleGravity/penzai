@@ -1,12 +1,12 @@
-// q1a8_kernel_mc_top - AXI-Lite top for the multi-column Q1A8 kernel (v7).
+// q1a8_kernel_mc_top - AXI-Lite top for the multi-column Q1A8 kernel (v8).
 //
 // Wraps q1a8_kernel_mc. The host sets NUM_Q1_BLOCKS, NUM_ROWBLOCKS and NUM_COLS,
-// then strobes CTRL.start. Weights stream in as two synchronized 256-bit ports;
+// then strobes CTRL.start. Weights stream in as four synchronized 128-bit ports;
 // the wrapper zips them into one 512-bit beat for ROWS=16. Each beat is MAC'd
 // against all NUM_COLS activation columns before the next, so prefill (cols>1)
 // reads each weight once. Results stream out 64-bit, [rowblock][col][row].
 //
-// VERSION reads 7 so the host driver selects the ROWS=16 two-port layout.
+// VERSION reads 8 so the host driver selects the ROWS=16 four-port layout.
 
 `default_nettype none
 
@@ -22,7 +22,7 @@ module q1a8_kernel_mc_top #(
     // makes validate_bd_design fail with a FREQ_HZ mismatch against the
     // propagated DMA/FCLK clock. Leaving it out lets Vivado propagate the
     // actual FCLK_CLK0 frequency through all four associated interfaces.
-    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS_W0:S_AXIS_W1:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn" *)
+    (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS_W0:S_AXIS_W1:S_AXIS_W2:S_AXIS_W3:S_AXIS_ACTS:M_AXIS, ASSOCIATED_RESET s_axi_aresetn" *)
     input  wire         s_axi_aclk,
     (* X_INTERFACE_INFO = "xilinx.com:signal:reset:1.0 s_axi_aresetn RST" *)
     (* X_INTERFACE_PARAMETER = "POLARITY ACTIVE_LOW" *)
@@ -68,9 +68,9 @@ module q1a8_kernel_mc_top #(
     input  wire         s_axi_rready,
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TDATA" *)
-    input  wire [255:0] s_axis_w0_tdata,
+    input  wire [127:0] s_axis_w0_tdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TKEEP" *)
-    input  wire [31:0]  s_axis_w0_tkeep,
+    input  wire [15:0]  s_axis_w0_tkeep,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TVALID" *)
     input  wire         s_axis_w0_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W0 TREADY" *)
@@ -79,15 +79,37 @@ module q1a8_kernel_mc_top #(
     input  wire         s_axis_w0_tlast,
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TDATA" *)
-    input  wire [255:0] s_axis_w1_tdata,
+    input  wire [127:0] s_axis_w1_tdata,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TKEEP" *)
-    input  wire [31:0]  s_axis_w1_tkeep,
+    input  wire [15:0]  s_axis_w1_tkeep,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TVALID" *)
     input  wire         s_axis_w1_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TREADY" *)
     output wire         s_axis_w1_tready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W1 TLAST" *)
     input  wire         s_axis_w1_tlast,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W2 TDATA" *)
+    input  wire [127:0] s_axis_w2_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W2 TKEEP" *)
+    input  wire [15:0]  s_axis_w2_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W2 TVALID" *)
+    input  wire         s_axis_w2_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W2 TREADY" *)
+    output wire         s_axis_w2_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W2 TLAST" *)
+    input  wire         s_axis_w2_tlast,
+
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W3 TDATA" *)
+    input  wire [127:0] s_axis_w3_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W3 TKEEP" *)
+    input  wire [15:0]  s_axis_w3_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W3 TVALID" *)
+    input  wire         s_axis_w3_tvalid,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W3 TREADY" *)
+    output wire         s_axis_w3_tready,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_W3 TLAST" *)
+    input  wire         s_axis_w3_tlast,
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_ACTS TDATA" *)
     input  wire [63:0]  s_axis_acts_tdata,
@@ -131,11 +153,19 @@ module q1a8_kernel_mc_top #(
     wire kernel_busy;
     wire kernel_done;
     wire weight_tready;
-    wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid;
-    wire [ROWS*32-1:0] weight_tdata = {s_axis_w1_tdata, s_axis_w0_tdata};
+    wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid &&
+                         s_axis_w2_tvalid && s_axis_w3_tvalid;
+    wire [ROWS*32-1:0] weight_tdata = {
+        s_axis_w3_tdata,
+        s_axis_w2_tdata,
+        s_axis_w1_tdata,
+        s_axis_w0_tdata
+    };
 
-    assign s_axis_w0_tready = weight_tready && s_axis_w1_tvalid;
-    assign s_axis_w1_tready = weight_tready && s_axis_w0_tvalid;
+    assign s_axis_w0_tready = weight_tready && s_axis_w1_tvalid && s_axis_w2_tvalid && s_axis_w3_tvalid;
+    assign s_axis_w1_tready = weight_tready && s_axis_w0_tvalid && s_axis_w2_tvalid && s_axis_w3_tvalid;
+    assign s_axis_w2_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w3_tvalid;
+    assign s_axis_w3_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w2_tvalid;
 
     q1a8_kernel_mc #(.ROWS(ROWS), .COLS_MAX(8), .MAX_SUB_INDEX(256)) u_kernel (
         .clk(clk),
@@ -220,20 +250,20 @@ module q1a8_kernel_mc_top #(
             else if (bvalid_q && s_axi_bready) bvalid_q <= 1'b0;
 
             if (write_commit) begin
-                case (awaddr_q[5:0])
-                    Q1A8_OFF_CTRL[5:0]: begin
+                case (awaddr_q[7:0])
+                    Q1A8_OFF_CTRL[7:0]: begin
                         if (s_axi_wstrb[0] && s_axi_wdata[0])
                             start_strobe <= 1'b1;
                     end
-                    Q1A8_OFF_NUM_Q1_BLOCKS[5:0]: begin
+                    Q1A8_OFF_NUM_Q1_BLOCKS[7:0]: begin
                         if (s_axi_wstrb[0]) num_q1_blocks_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_q1_blocks_q[15:8] <= s_axi_wdata[15:8];
                     end
-                    Q1A8_OFF_NUM_ROWBLOCKS[5:0]: begin
+                    Q1A8_OFF_NUM_ROWBLOCKS[7:0]: begin
                         if (s_axi_wstrb[0]) num_rowblocks_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_rowblocks_q[15:8] <= s_axi_wdata[15:8];
                     end
-                    Q1A8_OFF_NUM_COLS[5:0]: begin
+                    Q1A8_OFF_NUM_COLS[7:0]: begin
                         if (s_axi_wstrb[0]) num_cols_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_cols_q[15:8] <= s_axi_wdata[15:8];
                     end
@@ -257,22 +287,23 @@ module q1a8_kernel_mc_top #(
             arready_q <= read_accept;
             if (read_accept) begin
                 rvalid_q <= 1'b1;
-                case (s_axi_araddr[5:0])
-                    Q1A8_OFF_ID[5:0]:            rdata_q <= Q1A8_RST_ID;
-                    Q1A8_OFF_VERSION[5:0]:       rdata_q <= Q1A8_RST_VERSION;
-                    Q1A8_OFF_STATUS[5:0]:        rdata_q <= {30'd0, done_latched, kernel_busy};
-                    Q1A8_OFF_NUM_Q1_BLOCKS[5:0]: rdata_q <= {16'd0, num_q1_blocks_q};
-                    Q1A8_OFF_NUM_ROWBLOCKS[5:0]: rdata_q <= {16'd0, num_rowblocks_q};
-                    Q1A8_OFF_NUM_COLS[5:0]:      rdata_q <= {16'd0, num_cols_q};
-                    Q1A8_OFF_CYCLES[5:0]:        rdata_q <= cycle_count_q;
-                    Q1A8_OFF_ROWS[5:0]:          rdata_q <= Q1A8_RST_ROWS;
-                    Q1A8_OFF_CLK_HZ[5:0]:        rdata_q <= CLK_HZ;
-                    Q1A8_OFF_W_STALL[5:0]:       rdata_q <= w_stall_q;
-                    Q1A8_OFF_A_STALL[5:0]:       rdata_q <= a_stall_q;
-                    Q1A8_OFF_R_STALL[5:0]:       rdata_q <= r_stall_q;
-                    Q1A8_OFF_W_BEATS[5:0]:       rdata_q <= w_beats_q;
-                    Q1A8_OFF_A_BEATS[5:0]:       rdata_q <= a_beats_q;
-                    Q1A8_OFF_R_BEATS[5:0]:       rdata_q <= r_beats_q;
+                case (s_axi_araddr[7:0])
+                    Q1A8_OFF_ID[7:0]:            rdata_q <= Q1A8_RST_ID;
+                    Q1A8_OFF_VERSION[7:0]:       rdata_q <= Q1A8_RST_VERSION;
+                    Q1A8_OFF_STATUS[7:0]:        rdata_q <= {30'd0, done_latched, kernel_busy};
+                    Q1A8_OFF_NUM_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, num_q1_blocks_q};
+                    Q1A8_OFF_NUM_ROWBLOCKS[7:0]: rdata_q <= {16'd0, num_rowblocks_q};
+                    Q1A8_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
+                    Q1A8_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
+                    Q1A8_OFF_ROWS[7:0]:          rdata_q <= Q1A8_RST_ROWS;
+                    Q1A8_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;
+                    Q1A8_OFF_W_STALL[7:0]:       rdata_q <= w_stall_q;
+                    Q1A8_OFF_A_STALL[7:0]:       rdata_q <= a_stall_q;
+                    Q1A8_OFF_R_STALL[7:0]:       rdata_q <= r_stall_q;
+                    Q1A8_OFF_W_BEATS[7:0]:       rdata_q <= w_beats_q;
+                    Q1A8_OFF_A_BEATS[7:0]:       rdata_q <= a_beats_q;
+                    Q1A8_OFF_R_BEATS[7:0]:       rdata_q <= r_beats_q;
+                    Q1A8_OFF_WEIGHT_PORTS[7:0]:  rdata_q <= Q1A8_RST_WEIGHT_PORTS;
                     default: rdata_q <= 32'd0;
                 endcase
             end else if (rvalid_q && s_axi_rready) begin
@@ -298,6 +329,10 @@ module q1a8_kernel_mc_top #(
         s_axis_w0_tlast,
         s_axis_w1_tkeep,
         s_axis_w1_tlast,
+        s_axis_w2_tkeep,
+        s_axis_w2_tlast,
+        s_axis_w3_tkeep,
+        s_axis_w3_tlast,
         s_axis_acts_tkeep,
         s_axis_acts_tlast
     };

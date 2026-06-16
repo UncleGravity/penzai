@@ -1,7 +1,7 @@
 const std = @import("std");
 
 pub const rows_per_block: usize = 16;
-pub const weight_ports: usize = 2;
+pub const weight_ports: usize = 4;
 pub const rows_per_port: usize = rows_per_block / weight_ports;
 pub const q1_block: usize = 128;
 pub const q1_block_bytes: usize = 18; // ggml Q1_0 block size (2 B scale + 16 B bits)
@@ -9,23 +9,23 @@ pub const q8_block: usize = 32;
 pub const q8_subblocks: usize = q1_block / q8_block;
 pub const beat_bytes: usize = 8; // activation AXIS beat (64-bit)
 
-// Resident weight layout for the v7 two-port PL kernel. Each rowblock has 16
-// rows split into two contiguous 8-row port streams. Within one port stream, per
+// Resident weight layout for the v8 four-port PL kernel. Each rowblock has 16
+// rows split into four contiguous 4-row port streams. Within one port stream, per
 // (rowblock, q1block), there is one scale beat then one beat per Q8 sub-block.
 // Every row lane owns one 32-bit slot in each beat; scale beats store the fp16
 // scale in the low half of that slot. This makes the RTL combiner a pure zip:
-// {port1_256b, port0_256b} -> one 512-bit kernel beat.
+// {port3_128b, port2_128b, port1_128b, port0_128b} -> one 512-bit kernel beat.
 pub const weight_beat_bytes: usize = rows_per_block * 4; // ROWS * 32 bits = 512
-pub const weight_port_beat_bytes: usize = rows_per_port * 4; // 8 lanes * 32 bits = 256
+pub const weight_port_beat_bytes: usize = rows_per_port * 4; // 4 lanes * 32 bits = 128
 pub const packed_per_port_q1_block: usize = (1 + q8_subblocks) * weight_port_beat_bytes;
 pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 320
 pub const acts_per_q1_block: usize = q8_subblocks * (q8_block + beat_bytes);
 
 comptime {
     if (rows_per_block % weight_ports != 0) @compileError("Q1A8 rows must split evenly across ports");
-    if (rows_per_port != 8) @compileError("Q1A8 v7 expects 8 rows per weight port");
-    if (weight_port_beat_bytes != 32) @compileError("Q1A8 port beat size drifted");
-    if (packed_per_port_q1_block != 160) @compileError("Q1A8 port block size drifted");
+    if (rows_per_port != 4) @compileError("Q1A8 v8 expects 4 rows per weight port");
+    if (weight_port_beat_bytes != 16) @compileError("Q1A8 port beat size drifted");
+    if (packed_per_port_q1_block != 80) @compileError("Q1A8 port block size drifted");
     if (packed_per_q1_block != 320) @compileError("Q1A8 packed block size drifted");
     if (acts_per_q1_block != 160) @compileError("Q1A8 acts block size drifted");
 }

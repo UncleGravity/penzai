@@ -7,7 +7,9 @@
 		__overlay__ {
 			firmware-name = "@FIRMWARE_NAME@";
 			resets = <&zynqmp_reset 0x74
-			          &zynqmp_reset 0x75>;
+			          &zynqmp_reset 0x75
+			          &zynqmp_reset 0x76
+			          &zynqmp_reset 0x77>;
 
 			zyxclmm_drm {
 				compatible = "xlnx,zocl";
