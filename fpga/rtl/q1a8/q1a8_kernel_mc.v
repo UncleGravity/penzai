@@ -20,7 +20,7 @@ module q1a8_kernel_mc #(
     parameter integer MAX_SUB_INDEX = 64,
     // Decode accumulator-pool depth (see q1a8_rowblock_mc): >= the accumulate
     // recurrence latency, <= COLS_MAX.
-    parameter integer ACCUM_DEPTH   = 4
+    parameter integer ACCUM_DEPTH   = 8
 ) (
     input  wire                  clk,
     input  wire                  rst_n,
@@ -59,6 +59,10 @@ module q1a8_kernel_mc #(
     localparam [3:0] ST_DRAIN      = 4'd6;
     localparam [3:0] ST_EMIT       = 4'd7;
     localparam [3:0] ST_FINISH     = 4'd8;
+    localparam [3:0] ST_ISSUE_GAP  = 4'd9;
+    localparam integer ADD_LAT = 6;
+    localparam [15:0] ADD_LAT_U16 = 16'd6;
+    localparam [2:0] ADD_LAT_U3 = 3'd6;
 
     // Result emit: the stream is 64-bit (2 fp32 lane-major per beat), so a
     // rowblock's ROWS results take ROWS/2 beats. ROWS-parameterized so a wider
@@ -73,6 +77,8 @@ module q1a8_kernel_mc #(
     reg [13:0] q1_idx;
     reg [1:0]  sub;
     reg [15:0] col;          // column being issued (matmul)
+    reg [2:0]  issue_gap_cnt;
+    reg [3:0]  issue_gap_next;
     reg [1:0]  drain_cnt;
     reg [EBW-1:0] emit_beat;
     reg [15:0] emit_col;
@@ -91,6 +97,13 @@ module q1a8_kernel_mc #(
     wire [31:0]       issue_addr = issue_sub * COLS_MAX + {16'd0, col};
     wire [255:0] acts_packed_w = acts_mem[issue_addr];
     wire [15:0]  act_scale_w   = act_scale_mem[issue_addr];
+
+    reg                 issue_valid_q;
+    reg                 issue_last_q;
+    reg [CW-1:0]        issue_col_q;
+    reg [ROWS*32-1:0]   issue_weight_bits_q;
+    reg [255:0]         issue_acts_packed_q;
+    reg [15:0]          issue_act_scale_q;
 
     // Acts load scratch.
     reg [255:0] acts_load_accum;
@@ -111,6 +124,8 @@ module q1a8_kernel_mc #(
     wire issue_now = (state == ST_WISSUE) && s_axis_tvalid;
     wire rowblock_last = issue_now && last_q1 && (sub == 2'd3) && last_col;
     wire single_col = (num_cols == 16'd1);
+    wire needs_issue_gap = !single_col && (num_cols < ADD_LAT_U16);
+    wire [2:0] issue_gap_cycles = ADD_LAT_U3 - num_cols[2:0];
 
     assign busy = busy_q;
     assign dbg_state = state;
@@ -135,14 +150,14 @@ module q1a8_kernel_mc #(
         .clk(clk),
         .rst_n(rst_n),
         .start(rowblock_start),
-        .valid_in(issue_now),
-        .last_in(rowblock_last),
+        .valid_in(issue_valid_q),
+        .last_in(issue_last_q),
         .single_col(single_col),
-        .col_idx(col[CW-1:0]),
-        .weight_bits_flat(s_axis_tdata),
+        .col_idx(issue_col_q),
+        .weight_bits_flat(issue_weight_bits_q),
         .weight_scales_flat(weight_scales_q),
-        .acts_packed(acts_packed_w),
-        .act_scale(act_scale_w),
+        .acts_packed(issue_acts_packed_q),
+        .act_scale(issue_act_scale_q),
         .read_col(emit_col[CW-1:0]),
         .done(rowblock_done),
         .results_flat(rowblock_results)
@@ -166,11 +181,19 @@ module q1a8_kernel_mc #(
             q1_idx             <= 14'd0;
             sub                <= 2'd0;
             col                <= 16'd0;
+            issue_gap_cnt      <= 3'd0;
+            issue_gap_next     <= ST_IDLE;
             drain_cnt          <= 2'd0;
             emit_beat          <= {EBW{1'b0}};
             emit_col           <= 16'd0;
             weight_scales_q    <= {ROWS*16{1'b0}};
             rowblock_start     <= 1'b0;
+            issue_valid_q      <= 1'b0;
+            issue_last_q       <= 1'b0;
+            issue_col_q        <= {CW{1'b0}};
+            issue_weight_bits_q <= {ROWS*32{1'b0}};
+            issue_acts_packed_q <= 256'd0;
+            issue_act_scale_q  <= 16'd0;
             kernel_done        <= 1'b0;
             acts_load_accum    <= 256'd0;
             acts_load_beat     <= 3'd0;
@@ -179,6 +202,7 @@ module q1a8_kernel_mc #(
             acts_load_col      <= 16'd0;
         end else begin
             rowblock_start <= 1'b0;
+            issue_valid_q  <= 1'b0;
             kernel_done    <= 1'b0;
 
             if (start_pulse) begin
@@ -253,6 +277,12 @@ module q1a8_kernel_mc #(
                     // the last column (s_axis_tready pulses there).
                     ST_WISSUE: begin
                         if (s_axis_tvalid) begin
+                            issue_valid_q       <= 1'b1;
+                            issue_last_q        <= rowblock_last;
+                            issue_col_q         <= col[CW-1:0];
+                            issue_weight_bits_q <= s_axis_tdata;
+                            issue_acts_packed_q <= acts_packed_w;
+                            issue_act_scale_q   <= act_scale_w;
                             if (last_col) begin
                                 col <= 16'd0;
                                 if (sub == 2'd3) begin
@@ -261,14 +291,33 @@ module q1a8_kernel_mc #(
                                         state <= ST_WAIT_DONE;
                                     end else begin
                                         q1_idx <= q1_idx + 14'd1;
-                                        state  <= ST_WSCALE;
+                                        if (needs_issue_gap) begin
+                                            issue_gap_cnt  <= issue_gap_cycles - 3'd1;
+                                            issue_gap_next <= ST_WSCALE;
+                                            state          <= ST_ISSUE_GAP;
+                                        end else begin
+                                            state <= ST_WSCALE;
+                                        end
                                     end
                                 end else begin
                                     sub <= sub + 2'd1;
+                                    if (needs_issue_gap) begin
+                                        issue_gap_cnt  <= issue_gap_cycles - 3'd1;
+                                        issue_gap_next <= ST_WISSUE;
+                                        state          <= ST_ISSUE_GAP;
+                                    end
                                 end
                             end else begin
                                 col <= col + 16'd1;
                             end
+                        end
+                    end
+
+                    ST_ISSUE_GAP: begin
+                        if (issue_gap_cnt == 3'd0) begin
+                            state <= issue_gap_next;
+                        end else begin
+                            issue_gap_cnt <= issue_gap_cnt - 3'd1;
                         end
                     end
 

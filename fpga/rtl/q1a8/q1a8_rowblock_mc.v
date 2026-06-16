@@ -24,7 +24,7 @@ module q1a8_rowblock_mc #(
     // round-robined across ACCUM_DEPTH accumulators so each is revisited every
     // ACCUM_DEPTH issues. Must be >= the accumulate recurrence latency. <=
     // COLS_MAX.
-    parameter integer ACCUM_DEPTH = 4,
+    parameter integer ACCUM_DEPTH = 8,
     parameter integer CW          = (COLS_MAX <= 1) ? 1 : $clog2(COLS_MAX)
 ) (
     input  wire                       clk,
@@ -52,8 +52,8 @@ module q1a8_rowblock_mc #(
 );
     // q1a8_reducer plus one cycle for this rowblock to sample its registered
     // output contribution.
-    localparam integer LAT = 4;
-    localparam integer ADD_LAT = 2;
+    localparam integer LAT = 8;
+    localparam integer ADD_LAT = 5;
     localparam integer DONE_DELAY = (ACCUM_DEPTH - 1) * ADD_LAT + 3;
 
     wire [ROWS-1:0]    reducer_valid;
@@ -106,7 +106,7 @@ module q1a8_rowblock_mc #(
             wire [31:0] add_acc = add_acc_q[row*32 +: 32];
             wire [31:0] add_contribution = add_contribution_q[row*32 +: 32];
 
-            q1a8_reducer u_reducer (
+            q1a8_reducer_pipe u_reducer (
                 .clk(clk),
                 .rst_n(rst_n),
                 .valid_in(valid_in),

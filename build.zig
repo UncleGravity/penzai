@@ -85,8 +85,8 @@ const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
 const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
 // The multi-column kernel uses its own rowblock; the rest of the core is shared.
 const reducer_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_reducer.v", "fpga/rtl/q1a8/fp32_add_pipe.v",
-    "fpga/rtl/q1a8/fp32_mul.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
+    "fpga/rtl/q1a8/q1a8_reducer_pipe.v", "fpga/rtl/q1a8/fp32_add_pipe.v",
+    "fpga/rtl/q1a8/fp32_mul_pipe.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
     "fpga/rtl/q1a8/int_to_fp32.v",
 };
 const mc_rtl = [_][]const u8{
@@ -94,7 +94,7 @@ const mc_rtl = [_][]const u8{
 } ++ reducer_rtl;
 
 const core_rtl_args = "fpga/rtl/q1a8/q1a8_rowblock.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
-const mc_rtl_args = "fpga/rtl/q1a8/q1a8_kernel_mc_top.v fpga/rtl/q1a8/q1a8_kernel_mc.v fpga/rtl/q1a8/q1a8_rowblock_mc.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add_pipe.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
+const mc_rtl_args = "fpga/rtl/q1a8/q1a8_kernel_mc_top.v fpga/rtl/q1a8/q1a8_kernel_mc.v fpga/rtl/q1a8/q1a8_rowblock_mc.v fpga/rtl/q1a8/q1a8_reducer_pipe.v fpga/rtl/q1a8/fp32_add_pipe.v fpga/rtl/q1a8/fp32_mul_pipe.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> generated Verilog header (single source of register offsets).
@@ -121,13 +121,16 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
     b.step("lint-rtl", "Verilator lint the q1a8 RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl", "Verilator cosim: narrow q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl);
-    addCosim(b, target, optimize, "test-rtl-wide", "Verilator cosim: wide q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl);
-    addCosim(b, target, optimize, "test-rtl-mc", "Verilator cosim: multi-column q1a8_kernel_mc vs matmul_ref", "q1a8_kernel_mc", "fpga/sim/q1a8_kernel_mc", &mc_rtl);
+    addCosim(b, target, optimize, "test-rtl", "Verilator cosim: narrow q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl, 8);
+    addCosim(b, target, optimize, "test-rtl-wide", "Verilator cosim: wide q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl, 8);
+    addCosim(b, target, optimize, "test-rtl-mc", "Verilator cosim: multi-column q1a8_kernel_mc vs matmul_ref", "q1a8_kernel_mc", "fpga/sim/q1a8_kernel_mc", &mc_rtl, 16);
 }
 
-fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rows: usize) void {
     const q1a8 = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/q1a8.zig"), .target = target, .optimize = optimize });
+    const q1a8_options = b.addOptions();
+    q1a8_options.addOption(usize, "rows", rows);
+    q1a8.addImport("q1a8_options", q1a8_options.createModule());
     const pack = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/pack.zig"), .target = target, .optimize = optimize });
     const ref = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/matmul_ref.zig"), .target = target, .optimize = optimize });
     pack.addImport("q1a8", q1a8);
@@ -147,6 +150,7 @@ fn addCosim(
     top: []const u8,
     dir: []const u8,
     rtl: []const []const u8,
+    rows: usize,
 ) void {
     const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
@@ -170,7 +174,7 @@ fn addCosim(
         .optimize = optimize,
         .link_libc = true,
     });
-    attachCosimSupport(b, tb_mod, target, optimize);
+    attachCosimSupport(b, tb_mod, target, optimize, rows);
     tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });

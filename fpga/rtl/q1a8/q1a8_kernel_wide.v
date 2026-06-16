@@ -7,7 +7,7 @@
 // Throughput ceiling ~= ROWS*32 MAC/cycle (=256), vs ~40 for the narrow kernel.
 //
 // Weight stream layout (256-bit beats), per q1block per rowblock:
-//   1 scale beat : ROWS fp16 weight scales in [ROWS*16-1:0]
+//   1 scale beat : ROWS fp16 weight scales in low 16 bits of each 32-bit lane
 //   4 wbit beats : ROWS*32 weight bits (one Q8 subblock for all rows)
 // Acts stream (64-bit) and result stream (64-bit) are unchanged from the narrow
 // kernel. NOTE: the cosim feeds beats with no stall, so this measures the
@@ -70,6 +70,7 @@ module q1a8_kernel_wide #(
     reg [1:0]  emit_beat;
 
     reg [ROWS*16-1:0] weight_scales_q;
+    wire [ROWS*16-1:0] weight_scales_from_slots;
 
     // -- Acts BRAM (one column, broadcast across rowblocks) --
     reg [255:0] acts_mem      [0:MAX_SUB_INDEX-1];
@@ -107,6 +108,14 @@ module q1a8_kernel_wide #(
 
     wire acts_beat_accept = s_axis_acts_tvalid && s_axis_acts_tready;
     wire start_pulse      = start_kernel && !busy_q;
+
+    genvar scale_lane;
+    generate
+        for (scale_lane = 0; scale_lane < ROWS; scale_lane = scale_lane + 1) begin : gen_scale_slots
+            assign weight_scales_from_slots[scale_lane*16 +: 16] =
+                s_axis_tdata[scale_lane*32 +: 16];
+        end
+    endgenerate
 
     q1a8_rowblock #(.ROWS(ROWS)) u_rowblock (
         .clk(clk),
@@ -212,7 +221,7 @@ module q1a8_kernel_wide #(
                     // One weight beat carries ROWS fp16 scales for this q1block.
                     ST_WSCALE: begin
                         if (s_axis_tvalid) begin
-                            weight_scales_q <= s_axis_tdata[ROWS*16-1:0];
+                            weight_scales_q <= weight_scales_from_slots;
                             sub             <= 2'd0;
                             state           <= ST_WISSUE;
                         end
