@@ -28,8 +28,8 @@
 # Multi-column kernel (v6+): columns multiplied per run (1 for decode, >1 prefill).
 0x38      NUM_COLS        rw      0x00000000   activation columns per matmul
 #
-# Fabric clock of the bitstream, in Hz. The host reads this to convert the cycle
-# counter to time instead of hardcoding it (a 300 MHz v7 bump just changes the
-# reset here + a rebuild). 0x07735940 = 125 MHz; an older bitstream without this
-# register reads 0, and the host falls back to 125 MHz.
-0x3C      CLK_HZ          ro      0x07735940   fabric clock (Hz); 125 MHz = 0x07735940
+# Fabric clock of the bitstream, in Hz. The host reads this to convert cycle
+# counters to time. The mc top exposes this register from a Verilog parameter
+# populated by the Vivado build from the propagated clk_wiz output frequency.
+# A zero value means the bitstream did not self-describe its clock.
+0x3C      CLK_HZ          ro      0x00000000   fabric clock (Hz); set by bitstream build

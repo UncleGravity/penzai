@@ -26,6 +26,10 @@ pub const RunGraphTotals = struct {
     span_dropped: u64 = 0,
     op_totals: [profiling.max_op_tag + 1]profiling.Aggregate = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
     matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
+    flash: profiling.FlashStat = .{},
+    /// Constant across a run (the PL bitstream's fabric clock); 0 on a PS-only or
+    /// fake run. Last-wins, ignoring zeros so a stray PS run_graph can't clear it.
+    device_fclk_hz: u32 = 0,
 
     pub fn record(self: *RunGraphTotals, profiled: link_mod.ProfiledRunGraph) void {
         self.run_graph_count += 1;
@@ -65,6 +69,20 @@ pub const RunGraphTotals = struct {
             total.a_beats += stat.a_beats;
             total.r_beats += stat.r_beats;
         }
+        for (profiled.report.flash_stats) |stat| {
+            self.flash.count += stat.count;
+            self.flash.sum_n_kv += stat.sum_n_kv;
+            self.flash.max_n_kv = @max(self.flash.max_n_kv, stat.max_n_kv);
+            self.flash.total_ns += stat.total_ns;
+            self.flash.bytes += stat.bytes;
+            if (stat.n_heads != 0) {
+                self.flash.n_heads = stat.n_heads;
+                self.flash.n_head_kv = stat.n_head_kv;
+                self.flash.head_dim_q = stat.head_dim_q;
+                self.flash.head_dim_v = stat.head_dim_v;
+            }
+        }
+        if (profiled.report.summary.device_fclk_hz != 0) self.device_fclk_hz = profiled.report.summary.device_fclk_hz;
     }
 
     pub fn opTotalNs(self: *const RunGraphTotals) u64 {
@@ -453,12 +471,14 @@ pub fn giga(count: u64, total_ns: u64) f64 {
 /// and array utilization `(cycles - max stall)/cycles`. The gap between the
 /// PL MAC/s and MAC/cycle×fclk is the per-call software overhead. The weight
 /// stream columns are derived from PL counters: W B/cyc is clock-independent;
-/// W GB/s uses PL end-to-end wall time because the current wire report does not
-/// carry the bitstream clock.
+/// W GB/s is `W_BEATS·beat_bytes·fclk/cycles` (kernel-busy bandwidth, the figure
+/// to compare against the DDR ceiling) when the bitstream reports its clock
+/// (`device_fclk_hz`), else it falls back to a PL end-to-end wall-time estimate.
 pub fn writeMatmulDetail(
     writer: *std.Io.Writer,
     title: []const u8,
     matmul_stats: []const profiling.MatmulStat,
+    fclk_hz: u32,
 ) std.Io.Writer.Error!void {
     var any = false;
     for (matmul_stats) |stat| {
@@ -491,7 +511,7 @@ pub fn writeMatmulDetail(
         const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
         const weight_bytes = stat.w_beats * q1a8.weight_beat_bytes;
         const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
-        const weight_gb_s_wall = giga(weight_bytes, stat.pl_ns);
+        const weight_gb_s_wall = weightGbps(stat, fclk_hz);
         try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1} {d:>8.2} {d:>8.2}\n", .{
             "pl",
             stat.pl_count,
@@ -513,7 +533,139 @@ pub fn writeMatmulDetail(
                 stat.r_beats,
             });
         }
+        if (clockImplausible(stat, fclk_hz)) {
+            var busy_buf: [16]u8 = undefined;
+            var wall_buf: [16]u8 = undefined;
+            const busy_ns: u64 = @intFromFloat(@as(f64, @floatFromInt(stat.cycles)) /
+                @as(f64, @floatFromInt(fclk_hz)) * 1_000_000_000.0);
+            try writer.print("      note: CLK_HZ={d} implausible (kernel busy {s} > wall {s}) — W GB/s is wall-time; rebuild bitstream\n", .{
+                fclk_hz,
+                formatDuration(&busy_buf, busy_ns),
+                formatDuration(&wall_buf, stat.pl_ns),
+            });
+        }
     }
+}
+
+/// Kernel-busy weight bandwidth from PL counters: `W_BEATS·beat_bytes·fclk/cycles`
+/// when the bitstream clock is known, else a PL wall-time estimate. Shared by the
+/// matmul detail and the scoreboard so they never disagree.
+pub fn weightGbps(stat: profiling.MatmulStat, fclk_hz: u32) f64 {
+    const weight_bytes = stat.w_beats * q1a8.weight_beat_bytes;
+    const wall = giga(weight_bytes, stat.pl_ns);
+    if (fclk_hz == 0 or stat.cycles == 0) return wall;
+    const exact = @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles)) *
+        @as(f64, @floatFromInt(fclk_hz)) / 1_000_000_000.0;
+    // Kernel-busy bandwidth must be >= wall-time bandwidth (busy time <= wall).
+    // If the reported clock makes it lower, CLK_HZ is implausibly low (e.g. a
+    // bitstream built before the clock self-description was wired) — fall back to
+    // the wall-time estimate rather than report an impossible number.
+    return if (exact >= wall) exact else wall;
+}
+
+/// True when the reported clock is physically impossible against the counters:
+/// kernel-busy time (cycles/fclk) exceeds the matmul wall time. Signals a stale
+/// or mis-set CLK_HZ (e.g. a bitstream predating the clock self-description).
+pub fn clockImplausible(stat: profiling.MatmulStat, fclk_hz: u32) bool {
+    if (fclk_hz == 0 or stat.cycles == 0 or stat.pl_ns == 0) return false;
+    const busy_ns = @as(f64, @floatFromInt(stat.cycles)) / @as(f64, @floatFromInt(fclk_hz)) * 1_000_000_000.0;
+    return busy_ns > @as(f64, @floatFromInt(stat.pl_ns));
+}
+
+/// Sub-millisecond latency with an auto unit (us >= 1us, else ns). For the
+/// flash per-inner-iteration column, which lives in the ns–us range.
+pub fn formatLatencyFine(buf: []u8, ns: f64) []const u8 {
+    if (ns >= 1000.0) return std.fmt.bufPrint(buf, "{d:.2} us", .{ns / 1000.0}) catch unreachable;
+    return std.fmt.bufPrint(buf, "{d:.0} ns", .{ns}) catch unreachable;
+}
+
+/// Flash-attention shape detail for a phase (one row — there is one flash op
+/// kind). The diagnostic is `ns/inner` = total_ns / (n_heads · Σn_kv), the cost
+/// of one (head, kv) inner iteration. Microseconds there at small avg n_kv means
+/// the op is overhead/padding-bound (two passes, walking masked entries), not
+/// bound on the K/V stream — which decides PS rewrite vs PL move. Read it as a
+/// decode metric: decode is always n_tokens=1, so the per-token denominator is
+/// exact; prefill packs n_tokens query rows per call, so its `ns/inner`
+/// aggregates over them (n_tokens is not in the denominator) and runs lower.
+pub fn writeFlashDetail(
+    writer: *std.Io.Writer,
+    title: []const u8,
+    flash: profiling.FlashStat,
+) std.Io.Writer.Error!void {
+    if (flash.count == 0) return;
+    try writer.print("{s}\n", .{title});
+    try writer.print("  {s:<8} {s:>7} {s:>11} {s:>7} {s:>9} {s:>10} {s:>10} {s:>10}\n", .{
+        "qkv", "calls", "n_kv a/max", "heads", "hdim q/v", "ns/call", "ns/inner", "eff MiB/s",
+    });
+    const avg_n_kv = @as(f64, @floatFromInt(flash.sum_n_kv)) / @as(f64, @floatFromInt(flash.count));
+    const ns_per_call = flash.total_ns / flash.count;
+    const inner = @as(f64, @floatFromInt(flash.n_heads)) * @as(f64, @floatFromInt(flash.sum_n_kv));
+    const ns_per_inner = if (inner == 0) 0 else @as(f64, @floatFromInt(flash.total_ns)) / inner;
+    var nkv_buf: [20]u8 = undefined;
+    var heads_buf: [12]u8 = undefined;
+    var hdim_buf: [12]u8 = undefined;
+    var call_buf: [16]u8 = undefined;
+    var inner_buf: [16]u8 = undefined;
+    try writer.print("  {s:<8} {d:>7} {s:>11} {s:>7} {s:>9} {s:>10} {s:>10} {d:>10.1}\n", .{
+        "f32/f16",
+        flash.count,
+        std.fmt.bufPrint(&nkv_buf, "{d:.0}/{d}", .{ avg_n_kv, flash.max_n_kv }) catch "?",
+        std.fmt.bufPrint(&heads_buf, "{d}/{d}", .{ flash.n_heads, flash.n_head_kv }) catch "?",
+        std.fmt.bufPrint(&hdim_buf, "{d}/{d}", .{ flash.head_dim_q, flash.head_dim_v }) catch "?",
+        formatDuration(&call_buf, ns_per_call),
+        formatLatencyFine(&inner_buf, ns_per_inner),
+        mibPerSecond(flash.bytes, flash.total_ns),
+    });
+}
+
+/// One compact, greppable line per run for cross-variant comparison across
+/// clock/port/kernel sweeps. All values are decode-phase and derived from data
+/// already in the report — pure rendering, no new measurement. The variant label
+/// auto-derives from the resident layout (host constants) and the device clock,
+/// so it can't drift from the build the way a hand-typed string can.
+pub fn writeScoreboard(
+    writer: *std.Io.Writer,
+    decode: *const PhaseAccum,
+    tokens: u64,
+) std.Io.Writer.Error!void {
+    if (tokens == 0 or decode.wall_ns == 0) return;
+    const rg = &decode.rg;
+    const t: f64 = @floatFromInt(tokens);
+    const mhz: u64 = (@as(u64, rg.device_fclk_hz) + 500_000) / 1_000_000;
+    var vbuf: [32]u8 = undefined;
+    const variant = std.fmt.bufPrint(&vbuf, "w{d}-p{d}-f{d}", .{
+        q1a8.rows_per_block * 32, q1a8.weight_ports, mhz,
+    }) catch "unknown";
+
+    var mm: profiling.MatmulStat = .{};
+    for (rg.matmul_stats) |s| {
+        if (s.count != 0) {
+            mm = s;
+            break;
+        }
+    }
+    const mac_cyc = if (mm.cycles == 0) 0 else @as(f64, @floatFromInt(mm.pl_macs)) / @as(f64, @floatFromInt(mm.cycles));
+    const flash_ns = rg.op_totals[@intFromEnum(wire.OpTag.flash_attn_f32)].total_ns;
+    const swiglu_ns = rg.op_totals[@intFromEnum(wire.OpTag.swiglu)].total_ns;
+
+    try writer.print(
+        "scoreboard variant={s} tok_s={d:.2} decode_ms={d:.1} device_ms={d:.1} transport_ms={d:.1}" ++
+            " matmul_gmac_s={d:.2} matmul_mac_cyc={d:.1} matmul_w_gbps={d:.2} matmul_w_stall_pct={d:.1}" ++
+            " flash_ms_tok={d:.1} swiglu_ms_tok={d:.1}\n",
+        .{
+            variant,
+            perSecond(tokens, decode.wall_ns),
+            nsToMs(decode.wall_ns) / t,
+            nsToMs(decode.deviceNs()) / t,
+            nsToMs(decode.transportNs()) / t,
+            giga(mm.macs, mm.total_ns),
+            mac_cyc,
+            weightGbps(mm, rg.device_fclk_hz),
+            percent(mm.w_stall_cycles, mm.cycles),
+            nsToMs(flash_ns) / t,
+            nsToMs(swiglu_ns) / t,
+        },
+    );
 }
 
 /// Per-op breakdown, sorted by device time descending, with human units. The

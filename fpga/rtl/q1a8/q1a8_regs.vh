@@ -28,5 +28,5 @@ localparam [31:0] Q1A8_RST_R_STALL = 32'h00000000;
 localparam [31:0] Q1A8_RST_W_BEATS = 32'h00000000;
 localparam [31:0] Q1A8_RST_A_BEATS = 32'h00000000;
 localparam [31:0] Q1A8_RST_R_BEATS = 32'h00000000;
-localparam [31:0] Q1A8_RST_CLK_HZ = 32'h07735940;
+localparam [31:0] Q1A8_RST_CLK_HZ = 32'h00000000;
 `endif

@@ -179,7 +179,21 @@ pub const Profile = struct {
                 writer,
                 std.fmt.bufPrint(&mm_title, "matmul \u{b7} {s}", .{label}) catch "matmul",
                 &phase.rg.matmul_stats,
+                phase.rg.device_fclk_hz,
             );
+            var fa_title: [48]u8 = undefined;
+            try prof_report.writeFlashDetail(
+                writer,
+                std.fmt.bufPrint(&fa_title, "flash \u{b7} {s}", .{label}) catch "flash",
+                phase.rg.flash,
+            );
+        }
+
+        // One greppable comparison line for the decode phase (the roofline target).
+        const decode = &self.phases[@intFromEnum(prof_report.Phase.decode)];
+        if (decode.rg.run_graph_count != 0) {
+            try writer.writeByte('\n');
+            try prof_report.writeScoreboard(writer, decode, self.generated_tokens);
         }
     }
 
@@ -225,12 +239,25 @@ pub const Profile = struct {
             device_ms: f64,
             eff_mib_s: f64,
         };
+        const FlashRow = struct {
+            calls: u32,
+            n_heads: u16,
+            n_head_kv: u16,
+            head_dim_q: u16,
+            head_dim_v: u16,
+            avg_n_kv: f64,
+            max_n_kv: u32,
+            ns_per_call: f64,
+            ns_per_inner: f64,
+            eff_mib_s: f64,
+        };
         const PhaseRow = struct {
             phase: []const u8,
             wall_ms: f64,
             device_ms: f64,
             transport_ms: f64,
             residual_ms: f64,
+            device_fclk_hz: u32,
             graphs: u64,
             commands: u64,
             request_bytes: u64,
@@ -239,6 +266,7 @@ pub const Profile = struct {
             transfers: []const TransferRow,
             ops: []const OpRow,
             matmul: []const MatmulRow,
+            flash: ?FlashRow,
         };
 
         // Backing storage for the per-phase slices; lives until stringify returns.
@@ -307,12 +335,30 @@ pub const Profile = struct {
                 mn += 1;
             }
 
+            const fa = phase.rg.flash;
+            const flash_row: ?FlashRow = if (fa.count == 0) null else blk: {
+                const inner = @as(f64, @floatFromInt(fa.n_heads)) * @as(f64, @floatFromInt(fa.sum_n_kv));
+                break :blk .{
+                    .calls = fa.count,
+                    .n_heads = fa.n_heads,
+                    .n_head_kv = fa.n_head_kv,
+                    .head_dim_q = fa.head_dim_q,
+                    .head_dim_v = fa.head_dim_v,
+                    .avg_n_kv = @as(f64, @floatFromInt(fa.sum_n_kv)) / @as(f64, @floatFromInt(fa.count)),
+                    .max_n_kv = fa.max_n_kv,
+                    .ns_per_call = @as(f64, @floatFromInt(fa.total_ns)) / @as(f64, @floatFromInt(fa.count)),
+                    .ns_per_inner = if (inner == 0) 0 else @as(f64, @floatFromInt(fa.total_ns)) / inner,
+                    .eff_mib_s = prof_report.mibPerSecond(fa.bytes, fa.total_ns),
+                };
+            };
+
             phase_rows[i] = .{
                 .phase = (@as(prof_report.Phase, @enumFromInt(i))).label(),
                 .wall_ms = prof_report.nsToMs(phase.wall_ns),
                 .device_ms = prof_report.nsToMs(phase.deviceNs()),
                 .transport_ms = prof_report.nsToMs(phase.transportNs()),
                 .residual_ms = prof_report.nsToMs(phase.residualNs()),
+                .device_fclk_hz = phase.rg.device_fclk_hz,
                 .graphs = phase.rg.run_graph_count,
                 .commands = phase.rg.command_count,
                 .request_bytes = phase.rg.request_bytes,
@@ -321,6 +367,7 @@ pub const Profile = struct {
                 .transfers = tr_store[i][0..tn],
                 .ops = ops_store[i][0..on],
                 .matmul = mm_store[i][0..mn],
+                .flash = flash_row,
             };
         }
 

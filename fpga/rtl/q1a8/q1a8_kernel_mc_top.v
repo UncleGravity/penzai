@@ -10,7 +10,12 @@
 
 `default_nettype none
 
-module q1a8_kernel_mc_top (
+module q1a8_kernel_mc_top #(
+    // Set by the Vivado BD build from the propagated clk_wiz output frequency.
+    // Keep this as a build parameter, not a regmap reset, so one checked-in
+    // regmap can serve f125/f200/f250/f300 bitstream variants.
+    parameter [31:0] CLK_HZ = 32'd0
+) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
     // No fixed FREQ_HZ: the Zynq PLL can't hit every requested FCLK exactly
     // (e.g. a 150 MHz request yields 142.857 MHz), and a pinned value here
@@ -261,7 +266,7 @@ module q1a8_kernel_mc_top (
                     Q1A8_OFF_NUM_COLS[5:0]:      rdata_q <= {16'd0, num_cols_q};
                     Q1A8_OFF_CYCLES[5:0]:        rdata_q <= cycle_count_q;
                     Q1A8_OFF_ROWS[5:0]:          rdata_q <= Q1A8_RST_ROWS;
-                    Q1A8_OFF_CLK_HZ[5:0]:        rdata_q <= Q1A8_RST_CLK_HZ;
+                    Q1A8_OFF_CLK_HZ[5:0]:        rdata_q <= CLK_HZ;
                     Q1A8_OFF_W_STALL[5:0]:       rdata_q <= w_stall_q;
                     Q1A8_OFF_A_STALL[5:0]:       rdata_q <= a_stall_q;
                     Q1A8_OFF_R_STALL[5:0]:       rdata_q <= r_stall_q;

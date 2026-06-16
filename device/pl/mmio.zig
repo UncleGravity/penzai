@@ -18,6 +18,7 @@ pub const Error = error{
     BadId,
     BadVersion,
     BadRows,
+    BadClock,
 };
 
 /// Bytes mapped per AXI-Lite block. All our blocks fit in one 64 KiB page span.
@@ -170,10 +171,6 @@ pub const version_with_counters: u32 = 5;
 pub const expected_id: u32 = 0xB05A2000;
 pub const expected_rows: u32 = 16;
 
-/// Fallback fabric clock if the bitstream predates the CLK_HZ register (reads 0).
-/// The v7 vertical-slice bitstream starts at 125 MHz, so that is the safe guess.
-pub const default_clk_mhz: f64 = 125.0;
-
 pub const Kernel = struct {
     win: RegWindow,
     version: u32,
@@ -188,6 +185,7 @@ pub const Kernel = struct {
         if (version < min_version) return error.BadVersion;
         if (win.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
         const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
+        if (clk_hz == 0) return error.BadClock;
         return .{ .win = win, .version = version, .clk_hz = clk_hz };
     }
 
@@ -200,9 +198,7 @@ pub const Kernel = struct {
     }
 
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
-    /// Old bitstreams read 0 here, so fall back to the f125 default.
     pub fn clkMhz(self: Kernel) f64 {
-        if (self.clk_hz == 0) return default_clk_mhz;
         return @as(f64, @floatFromInt(self.clk_hz)) / 1_000_000.0;
     }
 

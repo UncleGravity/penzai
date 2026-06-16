@@ -48,6 +48,24 @@ proc first_addr_seg {patterns} {
 
 proc mi_pin {index} { return [format "M%02d_AXI" $index] }
 
+proc clock_hz {pin fallback_mhz} {
+    set hz ""
+    catch {set hz [get_property CONFIG.FREQ_HZ [get_bd_pins $pin]]}
+    if {$hz ne "" && $hz != 0} {
+        return [expr {int(round(double($hz)))}]
+    }
+
+    # Some Vivado versions expose the actual clk_wiz output only on the IP
+    # config, not on the output pin until after validation. This is MHz.
+    set actual_mhz ""
+    catch {set actual_mhz [get_property CONFIG.CLKOUT1_ACTUAL_OUT_FREQ [get_bd_cells clk_wiz]]}
+    if {$actual_mhz ne "" && $actual_mhz != 0} {
+        return [expr {int(round(double($actual_mhz) * 1000000.0))}]
+    }
+
+    return [expr {int(round(double($fallback_mhz) * 1000000.0))}]
+}
+
 create_project $proj [file normalize ./$proj] -part $part -force
 if {[catch {set_property board_part $board [current_project]} err]} {
     puts "WARNING: could not set board_part '$board': $err"
@@ -306,6 +324,10 @@ foreach entry {
 # Route the DMA mem masters to PS DDR through their HP ports.
 assign_bd_address
 
+validate_bd_design
+set kernel_clk_hz [clock_hz "clk_wiz/clk_out1" $fclk_mhz]
+puts "==> kernel CLK_HZ=$kernel_clk_hz"
+set_property CONFIG.CLK_HZ $kernel_clk_hz [get_bd_cells kernel]
 validate_bd_design
 save_bd_design
 

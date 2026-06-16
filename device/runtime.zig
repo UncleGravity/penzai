@@ -176,11 +176,16 @@ pub fn RuntimeFor(comptime Heap: type) type {
             }
             const execute_done_ns = profiling.nowNs(io);
 
+            const fclk_hz: u32 = if (comptime pl_supported)
+                (if (self.pl) |b| b.kernel.clk_hz else 0)
+            else
+                0;
             const payload = collector.encode(self.allocator, .{
                 .device_total_ns = profiling.elapsed(request_start_ns, execute_done_ns),
                 .decode_ns = profiling.elapsed(request_start_ns, decode_done_ns),
                 .execute_ns = profiling.elapsed(execute_start_ns, execute_done_ns),
                 .command_count = @intCast(commands.len),
+                .device_fclk_hz = fclk_hz,
             }) catch return error.OutOfMemory;
             return .{ .payload = payload, .command_count = commands.len };
         }

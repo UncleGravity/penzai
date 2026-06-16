@@ -29,6 +29,9 @@ pub const Collector = struct {
     /// macs/total_ns are filled here; the PL counter fields stay zero until the
     /// PL backend reports them (P2).
     matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat,
+    /// Flash-attention shape rollup. One flash op kind, so a single accumulator
+    /// (emitted as a 0-or-1 element slice on the wire).
+    flash_stat: profiling.FlashStat,
     spans: []profiling.Span,
     span_count: u32 = 0,
     span_dropped: u32 = 0,
@@ -42,6 +45,7 @@ pub const Collector = struct {
         return .{
             .aggregates = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
             .matmul_stats = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
+            .flash_stat = .{},
             .spans = try allocator.alloc(profiling.Span, cap),
         };
     }
@@ -96,6 +100,20 @@ pub const Collector = struct {
                     }
                 }
             },
+            .flash_attn_f32 => |fa| {
+                // Shape fields are constant per model (last-wins capture); only
+                // n_kv varies, so its sum/max describe the per-call distribution.
+                var s = &self.flash_stat;
+                s.count +|= 1;
+                s.n_heads = sat16(fa.n_heads);
+                s.n_head_kv = sat16(fa.n_head_kv);
+                s.head_dim_q = sat16(fa.head_dim_q);
+                s.head_dim_v = sat16(fa.head_dim_v);
+                s.sum_n_kv +|= fa.n_kv;
+                s.max_n_kv = @max(s.max_n_kv, fa.n_kv);
+                s.total_ns +|= profiling.elapsed(start_ns, end_ns);
+                s.bytes +|= bytes;
+            },
             else => {},
         }
         if (self.span_count < self.spans.len) {
@@ -132,6 +150,8 @@ pub const Collector = struct {
             used_stats[sn] = stat;
             sn += 1;
         }
+        var flash_buf = [_]profiling.FlashStat{self.flash_stat};
+        const flash_used = if (self.flash_stat.count == 0) flash_buf[0..0] else flash_buf[0..1];
         var filled = summary;
         filled.span_count = self.span_count;
         filled.span_dropped = self.span_dropped;
@@ -140,6 +160,7 @@ pub const Collector = struct {
             .aggregates = used[0..n],
             .spans = self.spans[0..self.span_count],
             .matmul_stats = used_stats[0..sn],
+            .flash_stats = flash_used,
         });
     }
 };
@@ -218,6 +239,12 @@ fn q1GetRowsSourceBytes(row_width: u32) u64 {
 
 fn mul(a: u64, b: u64) u64 {
     return a *| b;
+}
+
+/// Saturating u32→u16 for profile shape fields (post-execute values are sane;
+/// this just guards the device ReleaseFast path against a silent wrap).
+fn sat16(v: u32) u16 {
+    return std.math.cast(u16, v) orelse std.math.maxInt(u16);
 }
 
 test "profile byte estimates for row ops count touched rows, not backing spans" {
