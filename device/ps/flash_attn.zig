@@ -15,6 +15,26 @@ pub const max_kv = 8192;
 // path, so results match within the op's documented fp tolerance, not bit-exact.
 const vec_w = 16;
 const F32Vec = @Vector(vec_w, f32);
+const max_group = 4;
+
+const RuntimeParams = struct {
+    head_dim_q: usize,
+    head_dim_v: usize,
+    n_heads: usize,
+    n_head_kv: usize,
+    n_kv: usize,
+    n_tokens: usize,
+    q_nb1: usize,
+    q_nb2: usize,
+    k_nb1: usize,
+    k_nb2: usize,
+    v_nb1: usize,
+    v_nb2: usize,
+    mask_nb1: usize,
+    dst_nb1: usize,
+    dst_nb2: usize,
+    head_ratio: usize,
+};
 
 /// Load `vec_w` contiguous f16 values from `bytes[off..]` and widen to f32.
 inline fn loadF16Block(bytes: []const u8, off: usize) F32Vec {
@@ -37,6 +57,30 @@ fn dotF32F16(q: []const f32, k_bytes: []const u8, k_off: usize, n: usize) f32 {
     return sum;
 }
 
+/// Load one contiguous f16 row and widen it into `dst`.
+fn loadF16Row(dst: []f32, bytes: []const u8, off: usize) void {
+    var d: usize = 0;
+    while (d + vec_w <= dst.len) : (d += vec_w) {
+        dst[d..][0..vec_w].* = loadF16Block(bytes, off + d * 2);
+    }
+    while (d < dst.len) : (d += 1) dst[d] = readF16(bytes, off + d * 2);
+}
+
+/// dot(a[0..n], b[0..n]), using the same vector reduction shape as dotF32F16.
+fn dotF32F32(a: []const f32, b: []const f32) f32 {
+    std.debug.assert(a.len == b.len);
+    var acc: F32Vec = @splat(0);
+    var d: usize = 0;
+    while (d + vec_w <= a.len) : (d += vec_w) {
+        const av: F32Vec = a[d..][0..vec_w].*;
+        const bv: F32Vec = b[d..][0..vec_w].*;
+        acc += av * bv;
+    }
+    var sum = @reduce(.Add, acc);
+    while (d < a.len) : (d += 1) sum += a[d] * b[d];
+    return sum;
+}
+
 /// acc[d] += scale * f16(v_bytes[v_off..]), d in 0..n.
 fn axpyF16(acc: []f32, scale: f32, v_bytes: []const u8, v_off: usize, n: usize) void {
     const sv: F32Vec = @splat(scale);
@@ -47,6 +91,20 @@ fn axpyF16(acc: []f32, scale: f32, v_bytes: []const u8, v_off: usize, n: usize) 
         acc[d..][0..vec_w].* = a;
     }
     while (d < n) : (d += 1) acc[d] += scale * readF16(v_bytes, v_off + d * 2);
+}
+
+/// acc[d] += scale * x[d], d in 0..acc.len.
+fn axpyF32(acc: []f32, scale: f32, x: []const f32) void {
+    std.debug.assert(acc.len == x.len);
+    const sv: F32Vec = @splat(scale);
+    var d: usize = 0;
+    while (d + vec_w <= acc.len) : (d += vec_w) {
+        var a: F32Vec = acc[d..][0..vec_w].*;
+        const xv: F32Vec = x[d..][0..vec_w].*;
+        a += sv * xv;
+        acc[d..][0..vec_w].* = a;
+    }
+    while (d < acc.len) : (d += 1) acc[d] += scale * x[d];
 }
 
 pub const Params = struct {
@@ -78,38 +136,61 @@ pub fn runBytes(
 ) FlashAttnError!void {
     try validateInputs(q_data, k_data, v_data, mask_data, dst_data, params);
 
-    const head_dim_q: usize = @intCast(params.head_dim_q);
-    const head_dim_v: usize = @intCast(params.head_dim_v);
+    const runtime = runtimeParams(params);
+    if (runtime.head_ratio > 1 and runtime.head_ratio <= max_group) {
+        runGrouped(q_data, k_data, v_data, mask_data, dst_data, runtime, params.scale);
+    } else {
+        runPerHead(q_data, k_data, v_data, mask_data, dst_data, runtime, params.scale);
+    }
+}
+
+fn runtimeParams(params: Params) RuntimeParams {
     const n_heads: usize = @intCast(params.n_heads);
     const n_head_kv: usize = @intCast(params.n_head_kv);
-    const n_kv: usize = @intCast(params.n_kv);
-    const n_tokens: usize = @intCast(params.n_tokens);
-    const q_nb1: usize = @intCast(params.q_nb1);
-    const q_nb2: usize = @intCast(params.q_nb2);
-    const k_nb1: usize = @intCast(params.k_nb1);
-    const k_nb2: usize = @intCast(params.k_nb2);
-    const v_nb1: usize = @intCast(params.v_nb1);
-    const v_nb2: usize = @intCast(params.v_nb2);
-    const mask_nb1: usize = @intCast(params.mask_nb1);
-    const dst_nb1: usize = @intCast(params.dst_nb1);
-    const dst_nb2: usize = @intCast(params.dst_nb2);
-    const head_ratio = n_heads / n_head_kv;
+    return .{
+        .head_dim_q = @intCast(params.head_dim_q),
+        .head_dim_v = @intCast(params.head_dim_v),
+        .n_heads = n_heads,
+        .n_head_kv = n_head_kv,
+        .n_kv = @intCast(params.n_kv),
+        .n_tokens = @intCast(params.n_tokens),
+        .q_nb1 = @intCast(params.q_nb1),
+        .q_nb2 = @intCast(params.q_nb2),
+        .k_nb1 = @intCast(params.k_nb1),
+        .k_nb2 = @intCast(params.k_nb2),
+        .v_nb1 = @intCast(params.v_nb1),
+        .v_nb2 = @intCast(params.v_nb2),
+        .mask_nb1 = @intCast(params.mask_nb1),
+        .dst_nb1 = @intCast(params.dst_nb1),
+        .dst_nb2 = @intCast(params.dst_nb2),
+        .head_ratio = n_heads / n_head_kv,
+    };
+}
 
+fn runPerHead(
+    q_data: []const u8,
+    k_data: []const u8,
+    v_data: []const u8,
+    mask_data: ?[]const u8,
+    dst_data: []u8,
+    params: RuntimeParams,
+    scale: f32,
+) void {
     var q_row: [max_head_dim]f32 = undefined;
     var acc: [max_head_dim]f32 = undefined;
 
-    for (0..n_tokens) |token| {
-        const mask_row = if (mask_data) |mask| mask[token * mask_nb1 ..] else null;
+    for (0..params.n_tokens) |token| {
+        const mask_row = if (mask_data) |mask| mask[token * params.mask_nb1 ..] else null;
         // The mask is per token (shared across heads); scan it once to bound the
         // kv loop to the real, non-masked extent. ggml pads n_kv (to 256), and a
         // causal mask makes the valid region a [0, kv_hi) prefix, so this skips
         // the padding. Interior holes (non-prefix masks) stay correct: the loop
         // still skips any masked entry below kv_hi.
-        const kv_hi = maskedExtent(mask_row, n_kv);
-        for (0..n_heads) |head| {
-            const kv_head = head / head_ratio;
-            const q_base = token * q_nb1 + head * q_nb2;
-            for (0..head_dim_q) |d| {
+        const kv_hi = maskedExtent(mask_row, params.n_kv);
+        for (0..params.n_heads) |head| {
+            const kv_head = head / params.head_ratio;
+            const q_base = token * params.q_nb1 + head * params.q_nb2;
+            for (0..params.head_dim_q) |d| {
                 q_row[d] = readF32(q_data, q_base + d * @sizeOf(f32));
             }
 
@@ -118,7 +199,7 @@ pub fn runBytes(
             // exp(m_old - m_new) whenever the max grows. out = acc / l.
             var m = -std.math.inf(f32);
             var l: f32 = 0;
-            @memset(acc[0..head_dim_v], 0);
+            @memset(acc[0..params.head_dim_v], 0);
             for (0..kv_hi) |kv| {
                 var mask_value: f32 = 0;
                 if (mask_row) |row| {
@@ -126,8 +207,8 @@ pub fn runBytes(
                     if (isMasked(mask_value)) continue;
                 }
 
-                const k_base = kv * k_nb1 + kv_head * k_nb2;
-                const score = dotF32F16(q_row[0..head_dim_q], k_data, k_base, head_dim_q) * params.scale + mask_value;
+                const k_base = kv * params.k_nb1 + kv_head * params.k_nb2;
+                const score = dotF32F16(q_row[0..params.head_dim_q], k_data, k_base, params.head_dim_q) * scale + mask_value;
 
                 const m_new = @max(m, score);
                 if (m_new != m) {
@@ -136,19 +217,97 @@ pub fn runBytes(
                     // leaves the (still-zero) acc/l untouched.
                     const corr = @exp(m - m_new);
                     l *= corr;
-                    scaleVec(acc[0..head_dim_v], corr);
+                    scaleVec(acc[0..params.head_dim_v], corr);
                     m = m_new;
                 }
                 const p = @exp(score - m);
                 l += p;
-                const v_base = kv * v_nb1 + kv_head * v_nb2;
-                axpyF16(acc[0..head_dim_v], p, v_data, v_base, head_dim_v);
+                const v_base = kv * params.v_nb1 + kv_head * params.v_nb2;
+                axpyF16(acc[0..params.head_dim_v], p, v_data, v_base, params.head_dim_v);
             }
 
-            const dst_base = head * dst_nb1 + token * dst_nb2;
+            const dst_base = head * params.dst_nb1 + token * params.dst_nb2;
             const inv_l: f32 = if (l == 0) 0 else 1.0 / l;
-            for (0..head_dim_v) |d| {
+            for (0..params.head_dim_v) |d| {
                 writeF32(dst_data, dst_base + d * @sizeOf(f32), acc[d] * inv_l);
+            }
+        }
+    }
+}
+
+fn runGrouped(
+    q_data: []const u8,
+    k_data: []const u8,
+    v_data: []const u8,
+    mask_data: ?[]const u8,
+    dst_data: []u8,
+    params: RuntimeParams,
+    scale: f32,
+) void {
+    std.debug.assert(params.head_ratio > 1);
+    std.debug.assert(params.head_ratio <= max_group);
+
+    var q_rows: [max_group][max_head_dim]f32 = undefined;
+    var k_row: [max_head_dim]f32 = undefined;
+    var v_row: [max_head_dim]f32 = undefined;
+    var acc: [max_group][max_head_dim]f32 = undefined;
+    var m: [max_group]f32 = undefined;
+    var l: [max_group]f32 = undefined;
+    var p: [max_group]f32 = undefined;
+
+    for (0..params.n_tokens) |token| {
+        const mask_row = if (mask_data) |mask| mask[token * params.mask_nb1 ..] else null;
+        const kv_hi = maskedExtent(mask_row, params.n_kv);
+
+        for (0..params.n_head_kv) |kv_head| {
+            const head_base = kv_head * params.head_ratio;
+            for (0..params.head_ratio) |group| {
+                const head = head_base + group;
+                const q_base = token * params.q_nb1 + head * params.q_nb2;
+                for (0..params.head_dim_q) |d| {
+                    q_rows[group][d] = readF32(q_data, q_base + d * @sizeOf(f32));
+                }
+                m[group] = -std.math.inf(f32);
+                l[group] = 0;
+                @memset(acc[group][0..params.head_dim_v], 0);
+            }
+
+            for (0..kv_hi) |kv| {
+                var mask_value: f32 = 0;
+                if (mask_row) |row| {
+                    mask_value = readF16(row, kv * @sizeOf(f16));
+                    if (isMasked(mask_value)) continue;
+                }
+
+                const k_base = kv * params.k_nb1 + kv_head * params.k_nb2;
+                loadF16Row(k_row[0..params.head_dim_q], k_data, k_base);
+                for (0..params.head_ratio) |group| {
+                    const score = dotF32F32(q_rows[group][0..params.head_dim_q], k_row[0..params.head_dim_q]) * scale + mask_value;
+                    const m_new = @max(m[group], score);
+                    if (m_new != m[group]) {
+                        const corr = @exp(m[group] - m_new);
+                        l[group] *= corr;
+                        scaleVec(acc[group][0..params.head_dim_v], corr);
+                        m[group] = m_new;
+                    }
+                    p[group] = @exp(score - m[group]);
+                    l[group] += p[group];
+                }
+
+                const v_base = kv * params.v_nb1 + kv_head * params.v_nb2;
+                loadF16Row(v_row[0..params.head_dim_v], v_data, v_base);
+                for (0..params.head_ratio) |group| {
+                    axpyF32(acc[group][0..params.head_dim_v], p[group], v_row[0..params.head_dim_v]);
+                }
+            }
+
+            for (0..params.head_ratio) |group| {
+                const head = head_base + group;
+                const dst_base = head * params.dst_nb1 + token * params.dst_nb2;
+                const inv_l: f32 = if (l[group] == 0) 0 else 1.0 / l[group];
+                for (0..params.head_dim_v) |d| {
+                    writeF32(dst_data, dst_base + d * @sizeOf(f32), acc[group][d] * inv_l);
+                }
             }
         }
     }
@@ -402,6 +561,86 @@ test "flash attention maps grouped query heads onto shared kv heads" {
     try expectApprox(w0_head0 * 20 + w1_head0 * 40, readF32(&dst, 4), 0.00001);
     try expectApprox(w0_head1 * 10 + w1_head1 * 30, readF32(&dst, 8), 0.00001);
     try expectApprox(w0_head1 * 20 + w1_head1 * 40, readF32(&dst, 12), 0.00001);
+}
+
+test "grouped flash attention matches per-head schedule exactly" {
+    const hd = 20; // vector chunk + remainder
+    const n_tokens = 2;
+    const n_heads = 4;
+    const n_head_kv = 2;
+    const n_kv = 5;
+    const q_nb1 = hd * @sizeOf(f32);
+    const q_nb2 = n_tokens * q_nb1;
+    const k_nb1 = hd * @sizeOf(f16);
+    const k_nb2 = n_kv * k_nb1;
+    const v_nb1 = hd * @sizeOf(f16);
+    const v_nb2 = n_kv * v_nb1;
+    const mask_nb1 = n_kv * @sizeOf(f16);
+    const dst_nb1 = hd * @sizeOf(f32);
+    const dst_nb2 = n_heads * dst_nb1;
+
+    var q: [n_heads * n_tokens * hd * @sizeOf(f32)]u8 = undefined;
+    var k: [n_head_kv * n_kv * hd * @sizeOf(f16)]u8 = undefined;
+    var v: [n_head_kv * n_kv * hd * @sizeOf(f16)]u8 = undefined;
+    var mask: [n_tokens * n_kv * @sizeOf(f16)]u8 = undefined;
+    var per_head: [n_tokens * n_heads * hd * @sizeOf(f32)]u8 = undefined;
+    var grouped: [n_tokens * n_heads * hd * @sizeOf(f32)]u8 = undefined;
+    var public_path: [n_tokens * n_heads * hd * @sizeOf(f32)]u8 = undefined;
+
+    var prng = std.Random.DefaultPrng.init(0x6A51);
+    const rnd = prng.random();
+    for (0..n_tokens) |token| {
+        for (0..n_heads) |head| {
+            const q_base = token * q_nb1 + head * q_nb2;
+            for (0..hd) |d| {
+                writeF32(&q, q_base + d * @sizeOf(f32), rnd.float(f32) * 2 - 1);
+            }
+        }
+    }
+    for (0..n_head_kv) |kv_head| {
+        for (0..n_kv) |kv| {
+            const k_base = kv * k_nb1 + kv_head * k_nb2;
+            const v_base = kv * v_nb1 + kv_head * v_nb2;
+            for (0..hd) |d| {
+                writeF16(&k, k_base + d * @sizeOf(f16), @floatCast(rnd.float(f32) * 2 - 1));
+                writeF16(&v, v_base + d * @sizeOf(f16), @floatCast(rnd.float(f32) * 2 - 1));
+            }
+        }
+    }
+    for (0..n_tokens) |token| {
+        for (0..n_kv) |kv| {
+            const masked = (token == 1 and (kv == 1 or kv >= 3));
+            const value: f16 = if (masked) -std.math.inf(f16) else @floatCast((rnd.float(f32) - 0.5) * 0.25);
+            writeF16(&mask, token * mask_nb1 + kv * @sizeOf(f16), value);
+        }
+    }
+
+    const p: Params = .{
+        .head_dim_q = hd,
+        .head_dim_v = hd,
+        .n_heads = n_heads,
+        .n_head_kv = n_head_kv,
+        .n_kv = n_kv,
+        .n_tokens = n_tokens,
+        .scale = 0.125,
+        .q_nb1 = q_nb1,
+        .q_nb2 = q_nb2,
+        .k_nb1 = k_nb1,
+        .k_nb2 = k_nb2,
+        .v_nb1 = v_nb1,
+        .v_nb2 = v_nb2,
+        .mask_nb1 = mask_nb1,
+        .dst_nb1 = dst_nb1,
+        .dst_nb2 = dst_nb2,
+    };
+    const runtime = runtimeParams(p);
+
+    runPerHead(&q, &k, &v, &mask, &per_head, runtime, p.scale);
+    runGrouped(&q, &k, &v, &mask, &grouped, runtime, p.scale);
+    try runBytes(&q, &k, &v, &mask, &public_path, p);
+
+    try std.testing.expectEqualSlices(u8, per_head[0..], grouped[0..]);
+    try std.testing.expectEqualSlices(u8, per_head[0..], public_path[0..]);
 }
 
 test "flash attention ignores masked padding beyond the valid kv extent" {
