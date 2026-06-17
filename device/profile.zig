@@ -182,6 +182,8 @@ pub fn commandTag(command: wire.Command) wire.OpTag {
         .set_rows => .set_rows,
         .get_rows => .get_rows,
         .flash_attn_f32 => .flash_attn_f32,
+        .argmax => .argmax,
+        .pad => .pad,
     };
 }
 
@@ -205,6 +207,8 @@ pub fn commandBytes(command: wire.Command) u64 {
         .set_rows => |op| setRowsBytes(op),
         .get_rows => |op| getRowsBytes(op),
         .flash_attn_f32 => |op| op.q.nbytes +| op.k.nbytes +| op.v.nbytes +| (if (op.has_mask) op.mask.nbytes else 0) +| op.dst.nbytes,
+        .argmax => |op| op.src.nbytes +| op.dst.nbytes,
+        .pad => |op| op.src.nbytes +| op.dst.nbytes,
     };
 }
 

@@ -89,6 +89,7 @@ pub const LlamaOptions = struct {
     prof_format: prof_report.ProfFormat = .pretty,
     device_label: []const u8 = "fake",
     trace_path: ?[]const u8 = null,
+    backend_sampling: bool = false,
 };
 
 pub fn runFakeLlama(
@@ -114,6 +115,7 @@ pub fn runFakeLlama(
         .prof_format = options.prof_format,
         .device_label = options.device_label,
         .trace_path = options.trace_path,
+        .backend_sampling = options.backend_sampling,
     });
 }
 
@@ -140,6 +142,7 @@ pub fn runTcpLlama(
         .prof_format = options.prof_format,
         .device_label = options.device_label,
         .trace_path = options.trace_path,
+        .backend_sampling = options.backend_sampling,
     });
 }
 

@@ -39,6 +39,11 @@ pub const Options = struct {
     prof_format: prof_report.ProfFormat = .pretty,
     device_label: []const u8 = "fake",
     trace_path: ?[]const u8 = null,
+    /// Build the greedy sampler on the llama.cpp backend (bound to seq 0) so the
+    /// argmax runs in the device compute graph and only the sampled token id is
+    /// transferred back, instead of the full f32 logits vector. Requires device
+    /// support for GGML_OP_ARGMAX and GGML_OP_PAD (the static-graph dummy row).
+    backend_sampling: bool = false,
 };
 
 const PreparedPrompt = struct {
@@ -132,14 +137,31 @@ pub fn runPrompt(
     // token_embd table every token. Off → get_rows uses the resident table.
     ctx_params.op_offload = false;
 
+    // Greedy sampler, built as a chain up front. With backend sampling it is bound
+    // to seq 0 through ctx_params *before* context init, so llama.cpp folds the
+    // sampling graph (argmax over the logits) into the compute graph at reserve
+    // time and runs it on the device — only the sampled token id returns instead of
+    // the full logits vector. Without the flag it is an ordinary host-side greedy
+    // driven by llama_sampler_sample. The chain is freed after the context, which
+    // references it under backend sampling (single defer → no double free on the
+    // context-init error path).
+    var sparams = c.llama_sampler_chain_default_params();
+    sparams.no_perf = true;
+    const sampler = c.llama_sampler_chain_init(sparams) orelse return error.SamplerInitFailed;
+    defer c.llama_sampler_free(sampler);
+    c.llama_sampler_chain_add(sampler, c.llama_sampler_init_greedy() orelse return error.SamplerInitFailed);
+
+    var sampler_config: c.llama_sampler_seq_config = .{ .seq_id = 0, .sampler = sampler };
+    if (options.backend_sampling) {
+        ctx_params.samplers = &sampler_config;
+        ctx_params.n_samplers = 1;
+    }
+
     if (profile) |p| p.setPhase(.context_init);
     const context_start = if (profile) |p| p.now() else 0;
     const ctx = c.llama_init_from_model(model, ctx_params) orelse return error.ContextInitFailed;
     if (profile) |p| p.addWall(.context_init, p.elapsedSince(context_start));
     defer c.llama_free(ctx);
-
-    const sampler = c.llama_sampler_init_greedy() orelse return error.SamplerInitFailed;
-    defer c.llama_sampler_free(sampler);
 
     const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template, options.enable_thinking);
     defer prepared.deinit();

@@ -10,6 +10,8 @@ const ps_matmul_q1a8 = @import("ps/matmul_q1a8.zig");
 const ps_rmsnorm = @import("ps/rmsnorm.zig");
 const ps_rows = @import("ps/rows.zig");
 const ps_rope = @import("ps/rope.zig");
+const ps_select = @import("ps/select.zig");
+const ps_pad = @import("ps/pad.zig");
 const ps_softmax = @import("ps/softmax.zig");
 const pl_matmul = @import("pl/matmul.zig");
 
@@ -355,6 +357,16 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         .dst_nb2 = attn.dst_nb2,
                     }) catch |err| return mapKernelError(err);
                 },
+                .argmax => |argmax| {
+                    const src = self.heap.read(argmax.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(argmax.dst) catch |err| return mapHeapError(err);
+                    ps_select.argmaxF32Bytes(src, dst, argmax.rows, argmax.cols) catch |err| return mapKernelError(err);
+                },
+                .pad => |pad| {
+                    const src = self.heap.read(pad.src) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(pad.dst) catch |err| return mapHeapError(err);
+                    ps_pad.padZeroTailBytes(src, dst) catch |err| return mapKernelError(err);
+                },
             }
         }
     };
@@ -441,6 +453,8 @@ test "runtime dispatches ps f32 command variants" {
     const indices = try rawTensor(&runtime, @sizeOf(i32), @alignOf(i32));
     const out_rows = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
     const out_get_rows = try tensor(&runtime, 2);
+    const out_pad = try tensor(&runtime, 4);
+    const out_argmax = try rawTensor(&runtime, @sizeOf(i32), @alignOf(i32));
 
     try writeTensor(&runtime, a, &.{ 3, 4 });
     try writeTensor(&runtime, b, &.{ 1, 2 });
@@ -539,6 +553,8 @@ test "runtime dispatches ps f32 command variants" {
             .dst_nb1 = 2 * @sizeOf(f32),
             .dst_nb2 = 2 * @sizeOf(f32),
         } },
+        .{ .pad = .{ .src = b, .dst = out_pad } },
+        .{ .argmax = .{ .src = get_rows_src, .dst = out_argmax, .rows = 1, .cols = 4 } },
     };
     var command_bytes: [2048]u8 = undefined;
     const command_len = try wire.encodeCommandBuffer(&commands, &command_bytes);
@@ -564,6 +580,14 @@ test "runtime dispatches ps f32 command variants" {
     const w0 = @exp(@as(f32, 1)) / (@exp(@as(f32, 1)) + 1.0);
     const w1 = 1.0 - w0;
     try expectTensorApprox(&runtime, out_flash, &.{ w0 * 10 + w1 * 30, w0 * 20 + w1 * 40 }, 0.00001);
+    try expectTensor(&runtime, out_pad, &.{ 1, 2, 0, 0 });
+    try expectI32(&runtime, out_argmax, 3);
+}
+
+fn expectI32(runtime: *Runtime, range: wire.TensorRange, expected: i32) !void {
+    const bytes = try runtime.heap.read(range);
+    try std.testing.expectEqual(@as(usize, @sizeOf(i32)), bytes.len);
+    try std.testing.expectEqual(expected, std.mem.readInt(i32, bytes[0..4], .little));
 }
 
 fn tensor(runtime: *Runtime, len: usize) !wire.TensorRange {

@@ -51,6 +51,14 @@
             version = "pinned";
             src = llama-cpp-src;
 
+            # Backend-sampling fix: stock greedy leaves data.logits non-null, so
+            # build_sampling records full-vocab "sampled_logits" and llama.cpp copies
+            # them back every decode — no transport win. This makes build_sampling
+            # skip recording logits once a token was sampled on-device. Only the
+            # compiled library is patched; the Zig cImport headers (-Dllama-src) are
+            # unaffected (the change is in a .cpp, not a header).
+            patches = [ ./patches/greedy-backend-drop-logits.patch ];
+
             nativeBuildInputs = [
               pkgs.cmake
               pkgs.ninja

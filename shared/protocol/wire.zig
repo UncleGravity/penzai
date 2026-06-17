@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 9;
+pub const version: u16 = 10;
 pub const response_meta_len: usize = 56;
 
 pub const RequestTag = enum(u16) {
@@ -29,6 +29,8 @@ pub const OpTag = enum(u16) {
     get_rows = 13,
     flash_attn_f32 = 14,
     cpy_f32_to_f16 = 15,
+    argmax = 16,
+    pad = 17,
 };
 
 pub const Status = enum(u16) {
@@ -375,6 +377,16 @@ pub const GetRows = struct {
     dst_nb3: u64,
 };
 
+/// f32 argmax along each contiguous row (ggml `GGML_OP_ARGMAX`): reduce `cols`
+/// elements per row over `rows` rows, writing one i32 index per row. `pad` reuses
+/// `UnaryF32` (src/dst ranges only).
+pub const Argmax = struct {
+    src: TensorRange,
+    dst: TensorRange,
+    rows: u32,
+    cols: u32,
+};
+
 pub const Command = union(OpTag) {
     copy: Copy,
     matmul_q1a8: MatmulQ1A8,
@@ -391,6 +403,8 @@ pub const Command = union(OpTag) {
     get_rows: GetRows,
     flash_attn_f32: FlashAttnF32,
     cpy_f32_to_f16: CpyF32ToF16,
+    argmax: Argmax,
+    pad: UnaryF32,
 };
 
 pub const ResponseMeta = struct {
@@ -583,6 +597,8 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .set_rows => 4 + rangeLen * 3 + 32 + 64,
             .get_rows => 4 + rangeLen * 3 + 32 + 64,
             .flash_attn_f32 => 4 + rangeLen * 5 + 32 + 72,
+            .argmax => 4 + rangeLen * 2 + 8,
+            .pad => 4 + rangeLen * 2,
         };
     }
     return len;
@@ -775,6 +791,20 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU64(out, &cursor, attn.mask_nb1);
             putU64(out, &cursor, attn.dst_nb1);
             putU64(out, &cursor, attn.dst_nb2);
+        },
+        .argmax => |op| {
+            putU16(out, &cursor, @intFromEnum(OpTag.argmax));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, op.src);
+            putRange(out, &cursor, op.dst);
+            putU32(out, &cursor, op.rows);
+            putU32(out, &cursor, op.cols);
+        },
+        .pad => |unary| {
+            putU16(out, &cursor, @intFromEnum(OpTag.pad));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, unary.src);
+            putRange(out, &cursor, unary.dst);
         },
     };
     return cursor;
@@ -989,6 +1019,14 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                     .dst_nb2 = try takeU64(bytes, &cursor),
                 } };
             },
+            .argmax => blk: {
+                const src = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const rows = try takeU32(bytes, &cursor);
+                const cols = try takeU32(bytes, &cursor);
+                break :blk .{ .argmax = .{ .src = src, .dst = dst, .rows = rows, .cols = cols } };
+            },
+            .pad => .{ .pad = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
         };
     }
     if (cursor != bytes.len) return error.TrailingBytes;
@@ -1307,6 +1345,8 @@ test "command buffer roundtrip" {
             .dst_nb1 = 16,
             .dst_nb2 = 128,
         } },
+        .{ .argmax = .{ .src = a, .dst = b, .rows = 1, .cols = 4 } },
+        .{ .pad = .{ .src = a, .dst = c } },
     };
     var buf: [2048]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
@@ -1339,4 +1379,9 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[14].flash_attn_f32.n_head_kv, got[14].flash_attn_f32.n_head_kv);
     try std.testing.expectEqual(commands[14].flash_attn_f32.scale, got[14].flash_attn_f32.scale);
     try std.testing.expectEqual(commands[14].flash_attn_f32.dst_nb2, got[14].flash_attn_f32.dst_nb2);
+    try std.testing.expectEqual(commands[15].argmax.cols, got[15].argmax.cols);
+    try std.testing.expectEqual(commands[15].argmax.rows, got[15].argmax.rows);
+    try std.testing.expectEqual(commands[15].argmax.dst.handle, got[15].argmax.dst.handle);
+    try std.testing.expectEqual(commands[16].pad.src.handle, got[16].pad.src.handle);
+    try std.testing.expectEqual(commands[16].pad.dst.offset, got[16].pad.dst.offset);
 }

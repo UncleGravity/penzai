@@ -157,6 +157,8 @@ fn runLlamaCommand(
             options.chat_template = false;
         } else if (std.mem.eql(u8, arg, "--think")) {
             options.enable_thinking = true;
+        } else if (std.mem.eql(u8, arg, "--backend-sampling")) {
+            options.backend_sampling = true;
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
         } else if (std.mem.startsWith(u8, arg, "--prof=")) {

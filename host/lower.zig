@@ -48,7 +48,9 @@ pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
         supportsFlashAttnF32(tensor) or
         supportsSwigluF32(tensor) or
         supportsSetRows(tensor) or
-        supportsGetRows(tensor);
+        supportsGetRows(tensor) or
+        supportsArgmax(tensor) or
+        supportsPad(tensor);
 }
 
 pub fn lowerGraph(
@@ -104,6 +106,14 @@ pub fn lowerGraph(
         }
         if (supportsGetRows(node)) {
             try commands.append(allocator, try lowerGetRows(node, lookup));
+            continue;
+        }
+        if (supportsArgmax(node)) {
+            try commands.append(allocator, try lowerArgmax(node, lookup));
+            continue;
+        }
+        if (supportsPad(node)) {
+            try commands.append(allocator, try lowerPad(node, lookup));
             continue;
         }
 
@@ -272,6 +282,32 @@ fn supportsGetRows(op: *const c.ggml_tensor) bool {
     if (src0.*.type == c.GGML_TYPE_Q1_0 and (dim(src0, 2) != 1 or dim(src0, 3) != 1)) return false;
     if (dim(src0, 2) != dim(src1, 1) or dim(src0, 3) != dim(src1, 2)) return false;
     if (dim(op, 0) != dim(src0, 0) or dim(op, 1) != dim(src1, 0) or dim(op, 2) != dim(src1, 1) or dim(op, 3) != dim(src1, 2)) return false;
+    return true;
+}
+
+fn supportsArgmax(op: *const c.ggml_tensor) bool {
+    // ggml_argmax: matrix f32 src -> 1-D i32 result of length src.ne[1].
+    if (op.*.op != c.GGML_OP_ARGMAX or op.*.type != c.GGML_TYPE_I32) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    if (src.*.type != c.GGML_TYPE_F32 or !c.ggml_is_contiguous(src)) return false;
+    if (src.*.nb[0] != @sizeOf(f32) or op.*.nb[0] != @sizeOf(i32)) return false;
+    if (dim(src, 0) <= 0 or dim(src, 1) <= 0 or dim(src, 2) != 1 or dim(src, 3) != 1) return false;
+    if (dim(op, 0) != dim(src, 1) or dim(op, 1) != 1 or dim(op, 2) != 1 or dim(op, 3) != 1) return false;
+    return true;
+}
+
+fn supportsPad(op: *const c.ggml_tensor) bool {
+    // ggml_pad: zero-pad. Only the front-aligned, right-side pad that
+    // padZeroTailBytes implements — every left pad zero, not circular, dim0
+    // unchanged, dims 2/3 singleton — so dst is src bytes followed by zeros.
+    if (op.*.op != c.GGML_OP_PAD or !isContiguousF32(op)) return false;
+    const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
+    if (!isContiguousF32(src)) return false;
+    if (opParamI32(op, 0) != 0 or opParamI32(op, 2) != 0 or opParamI32(op, 4) != 0 or opParamI32(op, 6) != 0) return false;
+    if (opParamI32(op, 8) != 0) return false; // circular flag
+    if (dim(op, 0) != dim(src, 0)) return false;
+    if (dim(src, 2) != 1 or dim(src, 3) != 1 or dim(op, 2) != 1 or dim(op, 3) != 1) return false;
+    if (dim(op, 1) < dim(src, 1)) return false;
     return true;
 }
 
@@ -641,6 +677,34 @@ fn lowerSetRows(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Comm
         .dst_nb1 = @intCast(node.*.nb[1]),
         .dst_nb2 = @intCast(node.*.nb[2]),
         .dst_nb3 = @intCast(node.*.nb[3]),
+    } };
+}
+
+fn lowerArgmax(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const cols = try u32Dim(dim(src, 0));
+    const rows = try u32Dim(dim(src, 1));
+    const src_bytes = try checkedMul(try checkedMul(@as(usize, cols), @as(usize, rows)), @sizeOf(f32));
+    const dst_bytes = try checkedMul(@as(usize, rows), @sizeOf(i32));
+
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+
+    return .{ .argmax = .{
+        .src = try backingRange(src_binding, src_bytes),
+        .dst = try backingRange(dst_binding, dst_bytes),
+        .rows = rows,
+        .cols = cols,
+    } };
+}
+
+fn lowerPad(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
+    const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
+    const src_binding = lookup.find(src) orelse return error.MissingBinding;
+    const dst_binding = lookup.find(node) orelse return error.MissingBinding;
+    return .{ .pad = .{
+        .src = try backingRange(src_binding, tensorNbytes(src)),
+        .dst = try backingRange(dst_binding, tensorNbytes(node)),
     } };
 }
 
