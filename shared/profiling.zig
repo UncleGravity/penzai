@@ -1,16 +1,14 @@
 const std = @import("std");
 
-pub const version: u16 = 3;
-pub const max_spans = 8192;
+pub const version: u16 = 4;
 pub const max_op_tag = 64;
 /// Distinct weight formats a matmul can carry (wire.WeightFormat values are
 /// 1-based; this bounds the per-format MatmulStat table indexed by that value).
 pub const max_weight_fmt = 8;
 
 const magic: u32 = 0x5046_5250; // "PRFP", little-endian on the wire.
-const header_len: usize = 64;
+const header_len: usize = 52;
 const aggregate_len: usize = 24;
-const span_len: usize = 28;
 const matmul_stat_len: usize = 104;
 const flash_stat_len: usize = 40;
 
@@ -27,8 +25,6 @@ pub const Summary = struct {
     decode_ns: u64 = 0,
     execute_ns: u64 = 0,
     command_count: u32 = 0,
-    span_count: u32 = 0,
-    span_dropped: u32 = 0,
     /// Fabric clock the PL kernel ran at (from its CLK_HZ register). Zero on a
     /// PS-only run, so the host falls back to wall-time bandwidth estimates and
     /// leaves the clock out of the variant label.
@@ -39,13 +35,6 @@ pub const Aggregate = struct {
     tag: u16 = 0,
     count: u32 = 0,
     total_ns: u64 = 0,
-    bytes: u64 = 0,
-};
-
-pub const Span = struct {
-    tag: u16 = 0,
-    start_ns: u64 = 0,
-    end_ns: u64 = 0,
     bytes: u64 = 0,
 };
 
@@ -95,7 +84,6 @@ pub const FlashStat = struct {
 pub const ReportView = struct {
     summary: Summary,
     aggregates: []const Aggregate = &.{},
-    spans: []const Span = &.{},
     matmul_stats: []const MatmulStat = &.{},
     flash_stats: []const FlashStat = &.{},
 };
@@ -103,13 +91,11 @@ pub const ReportView = struct {
 pub const Report = struct {
     summary: Summary,
     aggregates: []Aggregate = &.{},
-    spans: []Span = &.{},
     matmul_stats: []MatmulStat = &.{},
     flash_stats: []FlashStat = &.{},
 
     pub fn deinit(self: *Report, allocator: std.mem.Allocator) void {
         allocator.free(self.aggregates);
-        allocator.free(self.spans);
         allocator.free(self.matmul_stats);
         allocator.free(self.flash_stats);
         self.* = undefined;
@@ -127,7 +113,7 @@ pub fn elapsed(start_ns: u64, end_ns: u64) u64 {
 }
 
 pub fn encodedLen(report: ReportView) usize {
-    return header_len + report.aggregates.len * aggregate_len + report.spans.len * span_len +
+    return header_len + report.aggregates.len * aggregate_len +
         report.matmul_stats.len * matmul_stat_len + report.flash_stats.len * flash_stat_len;
 }
 
@@ -142,11 +128,8 @@ pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
     putU64(out, &cursor, report.summary.decode_ns);
     putU64(out, &cursor, report.summary.execute_ns);
     putU32(out, &cursor, report.summary.command_count);
-    putU32(out, &cursor, report.summary.span_count);
-    putU32(out, &cursor, report.summary.span_dropped);
     putU32(out, &cursor, report.summary.device_fclk_hz);
     putU32(out, &cursor, @intCast(report.aggregates.len));
-    putU32(out, &cursor, @intCast(report.spans.len));
     putU32(out, &cursor, @intCast(report.matmul_stats.len));
     putU32(out, &cursor, @intCast(report.flash_stats.len));
 
@@ -156,13 +139,6 @@ pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
         putU32(out, &cursor, aggregate.count);
         putU64(out, &cursor, aggregate.total_ns);
         putU64(out, &cursor, aggregate.bytes);
-    }
-    for (report.spans) |span| {
-        putU16(out, &cursor, span.tag);
-        putU16(out, &cursor, 0);
-        putU64(out, &cursor, span.start_ns);
-        putU64(out, &cursor, span.end_ns);
-        putU64(out, &cursor, span.bytes);
     }
     for (report.matmul_stats) |stat| {
         putU16(out, &cursor, stat.fmt);
@@ -214,29 +190,22 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
         .decode_ns = try takeU64(bytes, &cursor),
         .execute_ns = try takeU64(bytes, &cursor),
         .command_count = try takeU32(bytes, &cursor),
-        .span_count = try takeU32(bytes, &cursor),
-        .span_dropped = try takeU32(bytes, &cursor),
         .device_fclk_hz = try takeU32(bytes, &cursor),
     };
     const aggregate_count = try takeU32(bytes, &cursor);
-    const span_count = try takeU32(bytes, &cursor);
     const matmul_stat_count = try takeU32(bytes, &cursor);
     const flash_stat_count = try takeU32(bytes, &cursor);
 
     const aggregate_bytes = std.math.mul(usize, @intCast(aggregate_count), aggregate_len) catch return error.InvalidLength;
-    const spans_bytes = std.math.mul(usize, @intCast(span_count), span_len) catch return error.InvalidLength;
     const matmul_bytes = std.math.mul(usize, @intCast(matmul_stat_count), matmul_stat_len) catch return error.InvalidLength;
     const flash_bytes = std.math.mul(usize, @intCast(flash_stat_count), flash_stat_len) catch return error.InvalidLength;
     var total = std.math.add(usize, header_len, aggregate_bytes) catch return error.InvalidLength;
-    total = std.math.add(usize, total, spans_bytes) catch return error.InvalidLength;
     total = std.math.add(usize, total, matmul_bytes) catch return error.InvalidLength;
     total = std.math.add(usize, total, flash_bytes) catch return error.InvalidLength;
     if (bytes.len != total) return error.InvalidLength;
 
     const aggregates = allocator.alloc(Aggregate, @intCast(aggregate_count)) catch return error.OutOfMemory;
     errdefer allocator.free(aggregates);
-    const spans = allocator.alloc(Span, @intCast(span_count)) catch return error.OutOfMemory;
-    errdefer allocator.free(spans);
     const matmul_stats = allocator.alloc(MatmulStat, @intCast(matmul_stat_count)) catch return error.OutOfMemory;
     errdefer allocator.free(matmul_stats);
     const flash_stats = allocator.alloc(FlashStat, @intCast(flash_stat_count)) catch return error.OutOfMemory;
@@ -250,17 +219,6 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
                 break :blk try takeU32(bytes, &cursor);
             },
             .total_ns = try takeU64(bytes, &cursor),
-            .bytes = try takeU64(bytes, &cursor),
-        };
-    }
-    for (spans) |*span| {
-        span.* = .{
-            .tag = try takeU16(bytes, &cursor),
-            .start_ns = blk: {
-                _ = try takeU16(bytes, &cursor);
-                break :blk try takeU64(bytes, &cursor);
-            },
-            .end_ns = try takeU64(bytes, &cursor),
             .bytes = try takeU64(bytes, &cursor),
         };
     }
@@ -303,7 +261,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
         };
     }
 
-    return .{ .summary = summary, .aggregates = aggregates, .spans = spans, .matmul_stats = matmul_stats, .flash_stats = flash_stats };
+    return .{ .summary = summary, .aggregates = aggregates, .matmul_stats = matmul_stats, .flash_stats = flash_stats };
 }
 
 fn putU16(out: []u8, cursor: *usize, value: u16) void {
@@ -343,9 +301,6 @@ test "profile report roundtrips" {
     const aggregates = [_]Aggregate{
         .{ .tag = 2, .count = 3, .total_ns = 99, .bytes = 1234 },
     };
-    const spans = [_]Span{
-        .{ .tag = 2, .start_ns = 10, .end_ns = 20, .bytes = 64 },
-    };
     const matmul_stats = [_]MatmulStat{
         .{ .fmt = 1, .count = 5, .macs = 9000, .total_ns = 42, .pl_count = 3, .pl_macs = 6000, .pl_ns = 30, .cycles = 1000, .w_stall_cycles = 100, .a_stall_cycles = 20, .r_stall_cycles = 5, .w_beats = 700, .a_beats = 80, .r_beats = 16 },
     };
@@ -358,12 +313,9 @@ test "profile report roundtrips" {
             .decode_ns = 7,
             .execute_ns = 90,
             .command_count = 3,
-            .span_count = spans.len,
-            .span_dropped = 1,
             .device_fclk_hz = 250_000_000,
         },
         .aggregates = &aggregates,
-        .spans = &spans,
         .matmul_stats = &matmul_stats,
         .flash_stats = &flash_stats,
     };
@@ -372,10 +324,8 @@ test "profile report roundtrips" {
     var decoded = try decodeAlloc(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
     try std.testing.expectEqual(view.summary.device_total_ns, decoded.summary.device_total_ns);
-    try std.testing.expectEqual(view.summary.span_dropped, decoded.summary.span_dropped);
     try std.testing.expectEqual(view.summary.device_fclk_hz, decoded.summary.device_fclk_hz);
     try std.testing.expectEqual(aggregates[0].bytes, decoded.aggregates[0].bytes);
-    try std.testing.expectEqual(spans[0].end_ns, decoded.spans[0].end_ns);
     try std.testing.expectEqual(@as(usize, 1), decoded.matmul_stats.len);
     try std.testing.expectEqual(matmul_stats[0].macs, decoded.matmul_stats[0].macs);
     try std.testing.expectEqual(matmul_stats[0].pl_macs, decoded.matmul_stats[0].pl_macs);

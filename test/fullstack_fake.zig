@@ -180,7 +180,6 @@ test "fake link runGraphProfile reports per-op aggregates" {
     defer profiled.deinit(); // testing.allocator fails the test if the report leaks.
 
     try std.testing.expectEqual(@as(u32, 2), profiled.report.summary.command_count);
-    try std.testing.expectEqual(@as(u32, 0), profiled.report.summary.span_dropped);
     try std.testing.expect(profiled.rpc.request_bytes > 0);
     try std.testing.expect(profiled.rpc.response_bytes > 0);
 

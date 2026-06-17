@@ -19,48 +19,25 @@ pub const PlCounters = struct {
 };
 
 /// Device-side per-graph profile collection. The runtime drives a Collector
-/// around its execute loop; the Collector owns the aggregate/span bookkeeping
-/// and produces the wire payload. Aggregates are always accrued (fixed size);
-/// spans are recorded only for the `trace` tier, into a buffer sized to the
-/// command count (no large stack array, no spans on the cheap path).
+/// around its execute loop; the Collector owns the aggregate bookkeeping and
+/// produces the wire payload. All accumulators are fixed-size, so a Collector is
+/// a plain value with no allocation.
 pub const Collector = struct {
-    aggregates: [profiling.max_op_tag + 1]profiling.Aggregate,
+    aggregates: [profiling.max_op_tag + 1]profiling.Aggregate =
+        [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
     /// Per-(weight format) matmul rollup, indexed by the wire.WeightFormat value.
     /// macs/total_ns are filled here; the PL counter fields stay zero until the
     /// PL backend reports them (P2).
-    matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat,
+    matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat =
+        [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
     /// Flash-attention shape rollup. One flash op kind, so a single accumulator
     /// (emitted as a 0-or-1 element slice on the wire).
-    flash_stat: profiling.FlashStat,
-    spans: []profiling.Span,
-    span_count: u32 = 0,
-    span_dropped: u32 = 0,
+    flash_stat: profiling.FlashStat = .{},
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        tier: wire.ProfileTier,
-        command_count: usize,
-    ) std.mem.Allocator.Error!Collector {
-        const cap: usize = if (tier == .trace) @min(command_count, profiling.max_spans) else 0;
-        return .{
-            .aggregates = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
-            .matmul_stats = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
-            .flash_stat = .{},
-            .spans = try allocator.alloc(profiling.Span, cap),
-        };
-    }
-
-    pub fn deinit(self: *Collector, allocator: std.mem.Allocator) void {
-        allocator.free(self.spans);
-        self.* = undefined;
-    }
-
-    /// Record one executed command. Timestamps are device-clock nanoseconds;
-    /// span offsets are stored relative to the request start.
+    /// Record one executed command. Timestamps are device-clock nanoseconds.
     pub fn record(
         self: *Collector,
         command: wire.Command,
-        request_start_ns: u64,
         start_ns: u64,
         end_ns: u64,
         pl: ?PlCounters,
@@ -116,21 +93,10 @@ pub const Collector = struct {
             },
             else => {},
         }
-        if (self.span_count < self.spans.len) {
-            self.spans[self.span_count] = .{
-                .tag = raw_tag,
-                .start_ns = profiling.elapsed(request_start_ns, start_ns),
-                .end_ns = profiling.elapsed(request_start_ns, end_ns),
-                .bytes = bytes,
-            };
-            self.span_count += 1;
-        } else if (self.spans.len > 0) {
-            self.span_dropped += 1;
-        }
     }
 
     /// Encode the collected report. `summary` carries the caller's timing and
-    /// command_count; the span counts are filled in here.
+    /// command_count.
     pub fn encode(
         self: *const Collector,
         allocator: std.mem.Allocator,
@@ -152,13 +118,9 @@ pub const Collector = struct {
         }
         var flash_buf = [_]profiling.FlashStat{self.flash_stat};
         const flash_used = if (self.flash_stat.count == 0) flash_buf[0..0] else flash_buf[0..1];
-        var filled = summary;
-        filled.span_count = self.span_count;
-        filled.span_dropped = self.span_dropped;
         return profiling.encodeAlloc(allocator, .{
-            .summary = filled,
+            .summary = summary,
             .aggregates = used[0..n],
-            .spans = self.spans[0..self.span_count],
             .matmul_stats = used_stats[0..sn],
             .flash_stats = flash_used,
         });

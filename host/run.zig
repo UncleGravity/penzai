@@ -2,7 +2,6 @@ const std = @import("std");
 const build_options = @import("build_options");
 const shared = @import("shared");
 const prof_report = @import("prof_report.zig");
-const trace_mod = @import("trace.zig");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
 const llama_mod = if (build_options.enable_llama) @import("llama.zig") else struct {
@@ -22,7 +21,6 @@ pub const RunError = error{
     RemoteFailed,
     Transport,
     LlamaDisabled,
-    TraceWriteFailed,
 } || llama_mod.Error;
 
 pub const RunOptions = struct {
@@ -52,7 +50,6 @@ pub const BenchOptions = struct {
     warmup: u32 = 3,
     iters: u32 = 30,
     profile: bool = false,
-    trace_path: ?[]const u8 = null,
 };
 
 pub const BenchResult = struct {
@@ -87,7 +84,6 @@ pub const LlamaOptions = struct {
     enable_thinking: bool = false,
     profile: bool = false,
     device_label: []const u8 = "fake",
-    trace_path: ?[]const u8 = null,
     backend_sampling: bool = false,
 };
 
@@ -112,7 +108,6 @@ pub fn runFakeLlama(
         .enable_thinking = options.enable_thinking,
         .profile = options.profile,
         .device_label = options.device_label,
-        .trace_path = options.trace_path,
         .backend_sampling = options.backend_sampling,
     });
 }
@@ -138,7 +133,6 @@ pub fn runTcpLlama(
         .enable_thinking = options.enable_thinking,
         .profile = options.profile,
         .device_label = options.device_label,
-        .trace_path = options.trace_path,
         .backend_sampling = options.backend_sampling,
     });
 }
@@ -305,18 +299,12 @@ fn benchMatmulQ1A8WithLink(
         .max_abs_diff = 0,
     };
 
-    var capture: ?trace_mod.Capture = if (options.trace_path != null) trace_mod.Capture.init(allocator) else null;
-    defer if (capture) |*cap| cap.deinit();
-    // Trace requests spans (per-command); plain profiling stays aggregate-only.
-    const tier: wire.ProfileTier = if (options.trace_path != null) .trace else .aggregate;
-
     for (0..iters) |_| {
         const start_ns = profiling.nowNs(io);
         if (options.profile) {
-            var profiled = try link.runGraphProfile(&commands, tier);
+            var profiled = try link.runGraphProfile(&commands, .aggregate);
             const end_ns = profiling.nowNs(io);
             result.profile.record(profiled);
-            if (capture) |*cap| cap.append(profiled.report, start_ns) catch {};
             profiled.deinit();
             recordIteration(&result, profiling.elapsed(start_ns, end_ns));
         } else {
@@ -328,9 +316,6 @@ fn benchMatmulQ1A8WithLink(
 
     _ = try link.download(dst_range, fixture.out);
     result.max_abs_diff = fixture.maxAbsDiff();
-    if (options.trace_path) |path| {
-        if (capture) |*cap| cap.writeFile(io, path) catch return error.TraceWriteFailed;
-    }
     return result;
 }
 

@@ -19,7 +19,6 @@ pub const RunGraphTotals = struct {
     device_total_ns: u64 = 0,
     device_decode_ns: u64 = 0,
     device_execute_ns: u64 = 0,
-    span_dropped: u64 = 0,
     op_totals: [profiling.max_op_tag + 1]profiling.Aggregate = [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
     matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat = [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
     flash: profiling.FlashStat = .{},
@@ -36,7 +35,6 @@ pub const RunGraphTotals = struct {
         self.device_total_ns += profiled.report.summary.device_total_ns;
         self.device_decode_ns += profiled.report.summary.decode_ns;
         self.device_execute_ns += profiled.report.summary.execute_ns;
-        self.span_dropped += profiled.report.summary.span_dropped;
         for (profiled.report.aggregates) |aggregate| {
             const index: usize = aggregate.tag;
             if (index >= self.op_totals.len) continue;
@@ -388,7 +386,6 @@ pub fn writeLinkSection(writer: *std.Io.Writer, totals: *const RunGraphTotals) s
     });
     try writer.print("  request          {s}\n", .{formatBytes(&req_buf, totals.request_bytes)});
     try writer.print("  response         {s}\n", .{formatBytes(&resp_buf, totals.response_bytes)});
-    try writer.print("  dropped          {d}\n", .{totals.span_dropped});
 }
 
 /// Canonical op name from the wire enum — single source of truth.

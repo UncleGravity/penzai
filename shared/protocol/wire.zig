@@ -118,20 +118,17 @@ pub const FillRequest = struct {
     value: u8,
 };
 
-/// What a run_graph request asks the device to collect.
-/// `aggregate` accrues per-op totals (cheap, fixed size); `trace` additionally
-/// records per-command spans (O(commands), opt-in). Wire flags: bit0 = aggregate,
-/// bit1 = spans. Spans imply aggregate, so 0b10 alone is invalid.
+/// What a run_graph request asks the device to collect. `aggregate` accrues
+/// per-op totals (cheap, fixed size); `off` collects nothing. Wire flag bit0 =
+/// aggregate; all other bit patterns are reserved and rejected.
 pub const ProfileTier = enum(u8) {
     off,
     aggregate,
-    trace,
 
     fn flags(self: ProfileTier) u32 {
         return switch (self) {
             .off => 0,
             .aggregate => 0b01,
-            .trace => 0b11,
         };
     }
 
@@ -139,7 +136,6 @@ pub const ProfileTier = enum(u8) {
         return switch (value) {
             0 => .off,
             0b01 => .aggregate,
-            0b11 => .trace,
             else => null,
         };
     }
@@ -1132,14 +1128,14 @@ test "run_graph profile tier roundtrip and rejection" {
     try std.testing.expectEqual(ProfileTier.off, (try decodeRequest(meta[0..legacy_len], "")).run_graph.tier);
 
     // Each tier round-trips through its flag bits.
-    inline for (.{ ProfileTier.off, ProfileTier.aggregate, ProfileTier.trace }) |tier| {
+    inline for (.{ ProfileTier.off, ProfileTier.aggregate }) |tier| {
         const len = try encodeRunGraph(&meta, 2, tier);
         try std.testing.expectEqual(tier, (try decodeRequest(meta[0..len], "")).run_graph.tier);
     }
 
-    const len = try encodeRunGraph(&meta, 2, .trace);
+    const len = try encodeRunGraph(&meta, 2, .aggregate);
 
-    // Spans-without-aggregate (0b10) and unknown bits are rejected, not coerced.
+    // Unknown flag bits (e.g. 0b10, the old spans bit) are rejected, not coerced.
     var bad_flags = meta;
     std.mem.writeInt(u32, bad_flags[16..20], 0b10, .little);
     try std.testing.expectError(error.InvalidFlags, decodeRequest(bad_flags[0..len], ""));

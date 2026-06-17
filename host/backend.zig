@@ -2,7 +2,6 @@ const std = @import("std");
 const c = @import("c");
 const shared = @import("shared");
 const prof_report = @import("prof_report.zig");
-const trace_mod = @import("trace.zig");
 const link_mod = @import("link");
 const lower = @import("lower.zig");
 const census_mod = @import("census.zig");
@@ -213,7 +212,6 @@ pub const Device = struct {
     counters: Counters = .{},
     census: ?*census_mod.Census = null,
     profile: ?*Profile = null,
-    trace: ?*trace_mod.Capture = null,
     pending_preload: std.ArrayList(u8) = .empty,
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",
@@ -719,13 +717,9 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
 
     const preload = dev.pending_preload.items;
     if (dev.profile) |profile| {
-        // Trace requests per-command spans; otherwise aggregate-only.
-        const tier: wire.ProfileTier = if (dev.trace != null) .trace else .aggregate;
-        const host_base_ns = profile.now();
-        var profiled = dev.link.runGraphProfilePreload(preload, commands, tier) catch return c.GGML_STATUS_FAILED;
+        var profiled = dev.link.runGraphProfilePreload(preload, commands, .aggregate) catch return c.GGML_STATUS_FAILED;
         defer profiled.deinit();
         profile.recordRunGraph(profiled);
-        if (dev.trace) |cap| cap.append(profiled.report, host_base_ns) catch {};
     } else {
         dev.link.runGraphPreload(preload, commands) catch return c.GGML_STATUS_FAILED;
     }

@@ -4,7 +4,6 @@ const build_options = @import("build_options");
 const backend_mod = @import("backend.zig");
 const census_mod = @import("census.zig");
 const link_mod = @import("link");
-const trace_mod = @import("trace.zig");
 const prof_report = @import("prof_report.zig");
 
 pub const Error = error{
@@ -20,7 +19,6 @@ pub const Error = error{
     SamplerInitFailed,
     PieceDecodeFailed,
     BackendHandshakeFailed,
-    TraceWriteFailed,
 } || std.mem.Allocator.Error || std.Io.Writer.Error;
 
 pub const Options = struct {
@@ -37,7 +35,6 @@ pub const Options = struct {
     enable_thinking: bool = false,
     profile: bool = false,
     device_label: []const u8 = "fake",
-    trace_path: ?[]const u8 = null,
     /// Build the greedy sampler on the llama.cpp backend (bound to seq 0) so the
     /// argmax runs in the device compute graph and only the sampled token id is
     /// transferred back, instead of the full f32 logits vector. Requires device
@@ -89,16 +86,12 @@ pub fn runPrompt(
 ) Error!void {
     if (options.model_path.len == 0) return error.MissingModel;
 
-    // A trace capture implies aggregate profiling (it needs the same run_graph path).
-    const want_profile = (options.profile or options.trace_path != null) and !options.census;
+    const want_profile = options.profile and !options.census;
     var profile_store = backend_mod.Profile.init(io);
     const profile: ?*backend_mod.Profile = if (want_profile) &profile_store else null;
-    var capture: ?trace_mod.Capture = if (options.trace_path != null and !options.census) trace_mod.Capture.init(allocator) else null;
-    defer if (capture) |*cap| cap.deinit();
     const device = backend_mod.Device.create(allocator, link) catch return error.BackendHandshakeFailed;
     defer device.destroy();
     device.profile = profile;
-    if (capture) |*cap| device.trace = cap;
     var census: census_mod.Census = .{};
     if (options.census) device.census = &census;
 
@@ -197,10 +190,6 @@ pub fn runPrompt(
     } else {
         try writer.writeByte('\n');
         if (profile) |p| try p.report(writer, options.model_path, options.device_label);
-        if (capture) |*cap| if (options.trace_path) |path| {
-            cap.writeFile(io, path) catch return error.TraceWriteFailed;
-            try writer.print("trace written {s} (convert with: penzai prof {s})\n", .{ path, path });
-        };
     }
 }
 

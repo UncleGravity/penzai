@@ -121,7 +121,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .run_graph => |req| blk: {
                     try self.applyPreloads(req.preload_bytes);
                     if (build_options.enable_profiling and req.tier != .off) {
-                        const profiled = try self.runProfiled(io, req.tier, req.command_bytes);
+                        const profiled = try self.runProfiled(io, req.command_bytes);
                         break :blk .{ .meta = .{
                             .request_id = req.request_id,
                             .status = .ok,
@@ -156,7 +156,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
         /// Execute a graph while timing each command and accruing a profile.
         /// Decode + execution stay here (runtime's job); the byte/span/aggregate
         /// bookkeeping and payload encoding live in `profile.Collector`.
-        fn runProfiled(self: *Self, io: ?std.Io, tier: wire.ProfileTier, command_bytes: []const u8) RuntimeError!ProfiledRun {
+        fn runProfiled(self: *Self, io: ?std.Io, command_bytes: []const u8) RuntimeError!ProfiledRun {
             const request_start_ns = profiling.nowNs(io);
             const commands = wire.decodeCommandBuffer(self.allocator, command_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
@@ -165,8 +165,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
             defer self.allocator.free(commands);
             const decode_done_ns = profiling.nowNs(io);
 
-            var collector = profile.Collector.init(self.allocator, tier, commands.len) catch return error.OutOfMemory;
-            defer collector.deinit(self.allocator);
+            var collector: profile.Collector = .{};
 
             const execute_start_ns = profiling.nowNs(io);
             for (commands) |command| {
@@ -174,7 +173,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 self.pl_last = null;
                 try self.execute(command, io);
                 const end_ns = profiling.nowNs(io);
-                collector.record(command, request_start_ns, start_ns, end_ns, self.pl_last);
+                collector.record(command, start_ns, end_ns, self.pl_last);
             }
             const execute_done_ns = profiling.nowNs(io);
 

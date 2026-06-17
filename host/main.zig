@@ -2,7 +2,6 @@ const std = @import("std");
 const shared = @import("shared");
 const run_mod = @import("run.zig");
 const prof_report = @import("prof_report.zig");
-const trace_mod = @import("trace.zig");
 
 const protocol_transport = shared.protocol_transport;
 
@@ -12,7 +11,6 @@ const CliError = error{
     InvalidNumber,
     MissingValue,
     UnsupportedDevice,
-    TraceFailed,
 } || protocol_transport.ParseError || run_mod.RunError || std.process.Args.Iterator.InitError || std.Io.Writer.Error;
 
 const LlamaMode = enum { generate, census, logits };
@@ -70,48 +68,7 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         try runBenchCommand(init, &args, stdout);
         return;
     }
-    if (std.mem.eql(u8, command, "prof")) {
-        try runProfCommand(init, &args, stdout);
-        return;
-    }
     return error.InvalidCommand;
-}
-
-fn runProfCommand(
-    init: std.process.Init,
-    args: *std.process.Args.Iterator,
-    stdout: *std.Io.Writer,
-) CliError!void {
-    var in_path: ?[]const u8 = null;
-    var out_path: ?[]const u8 = null;
-    while (args.next()) |arg| {
-        if (std.mem.eql(u8, arg, "-o") or std.mem.eql(u8, arg, "--out")) {
-            out_path = try requireValue(args, "-o");
-        } else if (std.mem.startsWith(u8, arg, "--out=")) {
-            out_path = arg["--out=".len..];
-        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            try writeUsage(stdout);
-            return;
-        } else if (std.mem.startsWith(u8, arg, "-")) {
-            return error.InvalidOption;
-        } else if (in_path == null) {
-            in_path = arg;
-        } else {
-            return error.InvalidCommand;
-        }
-    }
-    const path = in_path orelse return error.MissingValue;
-
-    if (out_path) |out| {
-        var file = std.Io.Dir.cwd().createFile(init.io, out, .{}) catch return error.TraceFailed;
-        defer file.close(init.io);
-        var write_buf: [4096]u8 = undefined;
-        var file_writer = file.writerStreaming(init.io, &write_buf);
-        trace_mod.convertFile(init.io, init.gpa, path, &file_writer.interface) catch return error.TraceFailed;
-        file_writer.interface.flush() catch return error.TraceFailed;
-    } else {
-        trace_mod.convertFile(init.io, init.gpa, path, stdout) catch return error.TraceFailed;
-    }
 }
 
 fn runLlamaCommand(
@@ -161,10 +118,6 @@ fn runLlamaCommand(
             options.backend_sampling = true;
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
-        } else if (std.mem.eql(u8, arg, "--prof-trace")) {
-            options.trace_path = try requireValue(args, "--prof-trace");
-        } else if (std.mem.startsWith(u8, arg, "--prof-trace=")) {
-            options.trace_path = arg["--prof-trace=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -306,12 +259,6 @@ fn runBenchCommand(
             options.iters = try parseU32(arg["--iters=".len..]);
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
-        } else if (std.mem.eql(u8, arg, "--prof-trace")) {
-            options.trace_path = try requireValue(args, "--prof-trace");
-            options.profile = true;
-        } else if (std.mem.startsWith(u8, arg, "--prof-trace=")) {
-            options.trace_path = arg["--prof-trace=".len..];
-            options.profile = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -364,7 +311,6 @@ fn runBenchCommand(
         result.max_abs_diff,
     });
     if (result.profiled) try writeBenchProfile(stdout, result.profile);
-    if (options.trace_path) |path| try stdout.print("trace written {s} (convert with: penzai prof {s})\n", .{ path, path });
 }
 
 fn requireValue(args: *std.process.Args.Iterator, option: []const u8) CliError![]const u8 {
@@ -389,13 +335,12 @@ fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof] [--prof-trace FILE]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof]
         \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
         \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
-        \\  penzai bench op matmul-q1a8 --device fake|tcp:HOST:PORT [--rows N] [--cols N] [--k N] [--warmup N] [--iters N] [--prof] [--prof-trace FILE]
-        \\  penzai prof CAPTURE.bin [-o TRACE.json]
+        \\  penzai bench op matmul-q1a8 --device fake|tcp:HOST:PORT [--rows N] [--cols N] [--k N] [--warmup N] [--iters N] [--prof]
         \\
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
@@ -403,7 +348,6 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  logits   compare token choices and report logit drift against llama.cpp CPU
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  bench    run resident-buffer microbenchmarks
-        \\  prof     convert a --prof-trace capture into a Chrome trace JSON
         \\  help     show this help
         \\
     );
