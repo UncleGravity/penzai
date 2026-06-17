@@ -49,7 +49,18 @@ fn finish(
     if (build_options.enable_profiling) {
         meta.device_service_ns = profiling.elapsed(start_ns, profiling.nowNs(io));
     }
-    return encodeResponse(allocator, meta, payload);
+    const encode_start = if (build_options.enable_profiling) profiling.nowNs(io) else 0;
+    const out = try encodeResponse(allocator, meta, payload);
+    // device_service_ns brackets request servicing only; the response framing +
+    // payload copy (large for downloads and the profile payload) happen here. Stamp
+    // them by patching device_encode_ns — the meta's last u64, at a fixed offset in
+    // the framed buffer — so the host can keep its transport bucket as pure wire time.
+    if (build_options.enable_profiling) {
+        const encode_ns = profiling.elapsed(encode_start, profiling.nowNs(io));
+        const off = framing.header_len + wire.response_meta_len - 8;
+        if (out.len >= off + 8) std.mem.writeInt(u64, out[off..][0..8], encode_ns, .little);
+    }
+    return out;
 }
 
 fn encodeResponse(

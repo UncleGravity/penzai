@@ -192,7 +192,7 @@ pub const PhaseAccum = struct {
         return self.wall_ns -| self.linkHostNs();
     }
 
-    fn isEmpty(self: *const PhaseAccum) bool {
+    pub fn isEmpty(self: *const PhaseAccum) bool {
         return self.wall_ns == 0 and self.linkHostNs() == 0;
     }
 };

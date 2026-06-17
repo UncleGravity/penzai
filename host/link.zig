@@ -23,6 +23,13 @@ pub const OpTiming = struct {
     device_service_ns: u64 = 0,
 };
 
+/// Device-side time for the budget = request servicing (device_service_ns) + the
+/// response encode/copy (device_encode_ns), both stamped on the wire ResponseMeta.
+/// Folding them together here keeps the host's transport bucket pure wire time.
+fn opTimingFrom(meta: wire.ResponseMeta) OpTiming {
+    return .{ .device_service_ns = meta.device_service_ns +| meta.device_encode_ns };
+}
+
 /// `alloc` result: the granted range plus the op's service timing.
 pub const AllocResult = struct {
     range: wire.TensorRange,
@@ -199,7 +206,7 @@ pub const FakeLink = struct {
         try response.expectOk(id);
         return .{
             .range = .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes },
-            .timing = .{ .device_service_ns = response.meta.device_service_ns },
+            .timing = opTimingFrom(response.meta),
         };
     }
 
@@ -210,7 +217,7 @@ pub const FakeLink = struct {
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
@@ -220,7 +227,7 @@ pub const FakeLink = struct {
         var response = try self.call(meta[0..meta_len], bytes);
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!OpTiming {
@@ -230,7 +237,7 @@ pub const FakeLink = struct {
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
@@ -242,7 +249,7 @@ pub const FakeLink = struct {
         try response.expectOk(id);
         if (response.payload.len != out.len) return error.Protocol;
         @memcpy(out, response.payload);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
@@ -323,7 +330,7 @@ pub const TcpLink = struct {
         try response.expectOk(id);
         return .{
             .range = .{ .handle = response.meta.handle, .offset = 0, .nbytes = response.meta.nbytes },
-            .timing = .{ .device_service_ns = response.meta.device_service_ns },
+            .timing = opTimingFrom(response.meta),
         };
     }
 
@@ -334,7 +341,7 @@ pub const TcpLink = struct {
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
@@ -344,7 +351,7 @@ pub const TcpLink = struct {
         var response = try self.call(meta[0..meta_len], bytes);
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn fill(self: *Self, range: wire.TensorRange, value: u8) LinkError!OpTiming {
@@ -354,7 +361,7 @@ pub const TcpLink = struct {
         var response = try self.call(meta[0..meta_len], "");
         defer response.deinit(self.allocator);
         try response.expectOk(id);
-        return .{ .device_service_ns = response.meta.device_service_ns };
+        return opTimingFrom(response.meta);
     }
 
     pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
@@ -377,7 +384,7 @@ pub const TcpLink = struct {
         if (response_meta.request_id != id) return error.Protocol;
         if (response_meta.status != .ok) return error.RemoteFailed;
         if (!response.payload_copied or response.payload_len != out.len) return error.Protocol;
-        return .{ .device_service_ns = response_meta.device_service_ns };
+        return opTimingFrom(response_meta);
     }
 
     pub fn runGraph(self: *Self, commands: []const wire.Command) LinkError!void {
@@ -467,6 +474,9 @@ fn runGraphProfileImpl(self: anytype, io: ?std.Io, preload_bytes: []const u8, co
     try response.expectOk(id);
     var report = profiling.decodeAlloc(self.allocator, response.payload) catch return error.Protocol;
     errdefer report.deinit(self.allocator);
+    // Fold the device's response-encode time (framing + the profile payload copy)
+    // into device_total so the host's transport bucket stays pure wire time.
+    report.summary.device_total_ns +|= response.meta.device_encode_ns;
     return .{
         .allocator = self.allocator,
         .rpc = .{

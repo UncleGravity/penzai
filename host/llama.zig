@@ -1,11 +1,15 @@
 const std = @import("std");
 const c = @import("c");
 const build_options = @import("build_options");
+const shared = @import("shared");
 const backend_mod = @import("backend.zig");
 const census_mod = @import("census.zig");
 const link_mod = @import("link");
 const prof_collector = @import("prof/collector.zig");
+const prof_model = @import("prof/model.zig");
 const prof_render = @import("prof/render.zig");
+
+const profiling = shared.profiling;
 
 pub const Error = error{
     MissingModel,
@@ -171,10 +175,16 @@ pub fn runPrompt(
 
     if (profile) |p| p.setPhase(.decode);
     var generated: u32 = 0;
+    // Always-on decode throughput (free tok/s, no --prof needed): wall of each step,
+    // split TTFT vs steady. Cheap — a clock read per token. When profiling is on the
+    // Collector tracks the same split for the report.
+    var first_decode_ns: u64 = 0;
+    var steady_decode_ns: u64 = 0;
+    var steady_decode_count: u64 = 0;
     while (generated < options.max_tokens) : (generated += 1) {
         // Bracket the whole per-token step (sample + detokenize + decode) so the
         // decode phase wall closes; the non-decode part lands in host residual.
-        const step_start = if (profile) |p| p.now() else 0;
+        const step_start = profiling.nowNs(io);
         const token = c.llama_sampler_sample(sampler, ctx, -1);
         c.llama_sampler_accept(sampler, token);
         if (c.llama_vocab_is_eog(vocab, token)) break;
@@ -183,14 +193,28 @@ pub fn runPrompt(
         tokens[n_past] = token;
         n_past += 1;
         try decodeTokens(ctx, tokens[n_past - 1 .. n_past], n_past - 1, true);
-        if (profile) |p| p.recordDecodeToken(generated == 0, p.elapsedSince(step_start));
+        const step_ns = profiling.elapsed(step_start, profiling.nowNs(io));
+        if (generated == 0) {
+            first_decode_ns = step_ns;
+        } else {
+            steady_decode_ns += step_ns;
+            steady_decode_count += 1;
+        }
+        if (profile) |p| p.recordDecodeToken(generated == 0, step_ns);
     }
 
     if (options.census) {
         try census.report(writer);
-    } else {
+    } else if (profile) |p| {
         try writer.writeByte('\n');
-        if (profile) |p| try prof_render.writeProfile(writer, p, options.model_path, options.device_label);
+        try prof_render.writeProfile(writer, p, options.model_path, options.device_label);
+    } else if (generated > 0) {
+        // tok/s even without --prof (the report shows the same when profiling is on).
+        try writer.print("\ndecode: {d} tok, {d:.2} tok/s (TTFT {d:.1} ms)\n", .{
+            generated,
+            prof_model.perSecond(steady_decode_count, steady_decode_ns),
+            prof_model.nsToMs(first_decode_ns),
+        });
     }
 }
 

@@ -1,7 +1,7 @@
 const std = @import("std");
 
-pub const version: u16 = 10;
-pub const response_meta_len: usize = 56;
+pub const version: u16 = 11;
+pub const response_meta_len: usize = 64;
 
 pub const RequestTag = enum(u16) {
     hello = 1,
@@ -416,6 +416,12 @@ pub const ResponseMeta = struct {
     /// split any op's round trip into device-service vs transport. Zero when the
     /// device was built with profiling disabled. See device/server.zig.
     device_service_ns: u64 = 0,
+    /// Device time spent encoding + copying the response (framing + payload memcpy),
+    /// in device-clock ns. Separate from device_service_ns (which brackets request
+    /// servicing only), so without it the response-encode cost — large for downloads
+    /// and the profile payload — would hide in the host's transport bucket. The host
+    /// folds it into device time. Patched in post-encode; see device/server.zig.
+    device_encode_ns: u64 = 0,
 };
 
 pub fn encodeHello(out: []u8, request_id: u64) EncodeError!usize {
@@ -552,6 +558,7 @@ pub fn encodeResponseMeta(out: []u8, meta: ResponseMeta) EncodeError!usize {
     putU64(out, &cursor, meta.value0);
     putU64(out, &cursor, meta.value1);
     putU64(out, &cursor, meta.device_service_ns);
+    putU64(out, &cursor, meta.device_encode_ns);
     return cursor;
 }
 
@@ -572,6 +579,7 @@ pub fn decodeResponseMeta(bytes: []const u8) DecodeError!ResponseMeta {
         .value0 = try takeU64(bytes, &cursor),
         .value1 = try takeU64(bytes, &cursor),
         .device_service_ns = try takeU64(bytes, &cursor),
+        .device_encode_ns = try takeU64(bytes, &cursor),
     };
 }
 
@@ -1205,6 +1213,7 @@ test "response meta roundtrips including device service time" {
         .nbytes = 4096,
         .value0 = 3,
         .device_service_ns = 123_456,
+        .device_encode_ns = 789,
     };
     const n = try encodeResponseMeta(&buf, meta);
     try std.testing.expectEqual(response_meta_len, n);
