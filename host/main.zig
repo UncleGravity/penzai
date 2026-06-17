@@ -1,7 +1,8 @@
 const std = @import("std");
 const shared = @import("shared");
 const run_mod = @import("run.zig");
-const prof_report = @import("prof_report.zig");
+const prof_model = @import("prof/model.zig");
+const prof_render = @import("prof/render.zig");
 
 const protocol_transport = shared.protocol_transport;
 
@@ -300,11 +301,11 @@ fn runBenchCommand(
         result.dst_nbytes,
     });
     try stdout.print("host total_ms={d:.3} avg_ms={d:.3} min_ms={d:.3} max_ms={d:.3} ops_s={d:.3}\n", .{
-        prof_report.nsToMs(result.host_total_ns),
-        prof_report.avgMs(result.host_total_ns, result.iters),
-        prof_report.nsToMs(result.host_min_ns),
-        prof_report.nsToMs(result.host_max_ns),
-        prof_report.perSecond(result.iters, result.host_total_ns),
+        prof_model.nsToMs(result.host_total_ns),
+        prof_model.avgMs(result.host_total_ns, result.iters),
+        prof_model.nsToMs(result.host_min_ns),
+        prof_model.nsToMs(result.host_max_ns),
+        prof_model.perSecond(result.iters, result.host_total_ns),
     });
     try stdout.print("check=ok expected={d:.3} max_abs_diff={d:.6}\n", .{
         result.expected,
@@ -327,9 +328,9 @@ fn parseF32(value: []const u8) CliError!f32 {
 }
 
 fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.Io.Writer.Error!void {
-    try prof_report.writeLinkSection(writer, &profile);
+    try prof_render.writeLinkSection(writer, &profile);
     try writer.writeByte('\n');
-    try prof_report.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_total_ns);
+    try prof_render.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_total_ns);
 }
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {

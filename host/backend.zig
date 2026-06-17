@@ -1,7 +1,7 @@
 const std = @import("std");
 const c = @import("c");
 const shared = @import("shared");
-const prof_report = @import("prof_report.zig");
+const prof_collector = @import("prof/collector.zig");
 const link_mod = @import("link");
 const lower = @import("lower.zig");
 const census_mod = @import("census.zig");
@@ -33,173 +33,6 @@ pub const Counters = struct {
     unsupported_graphs: usize = 0,
 };
 
-pub const Profile = struct {
-    io: std.Io,
-    phases: [prof_report.phase_count]prof_report.PhaseAccum =
-        [_]prof_report.PhaseAccum{.{}} ** prof_report.phase_count,
-    current: prof_report.Phase = .model_load,
-    // Decode throughput split (a subset of the decode phase wall): time to the
-    // first generated token vs the steady-state tokens after it.
-    first_decode_ns: u64 = 0,
-    steady_decode_ns: u64 = 0,
-    steady_decode_count: u64 = 0,
-    generated_tokens: u64 = 0,
-    // Residency diagnostic: which tensors get uploaded, in which phase.
-    upload_census: prof_report.UploadCensus = .{},
-
-    pub fn init(io: std.Io) Profile {
-        return .{ .io = io };
-    }
-
-    pub fn now(self: *const Profile) u64 {
-        return profiling.nowNs(self.io);
-    }
-
-    pub fn elapsedSince(self: *const Profile, start_ns: u64) u64 {
-        return profiling.elapsed(start_ns, self.now());
-    }
-
-    /// Direct subsequent link ops/run_graphs to phase `p`. Set this around each
-    /// phase region so the ggml callbacks firing inside it attribute correctly.
-    pub fn setPhase(self: *Profile, p: prof_report.Phase) void {
-        self.current = p;
-    }
-
-    /// Add host wall time to a phase (the timer around a phase region).
-    pub fn addWall(self: *Profile, p: prof_report.Phase, ns: u64) void {
-        self.phases[@intFromEnum(p)].wall_ns += ns;
-    }
-
-    fn cur(self: *Profile) *prof_report.PhaseAccum {
-        return &self.phases[@intFromEnum(self.current)];
-    }
-
-    pub fn recordAlloc(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
-        self.cur().alloc.record(nbytes, host_ns, device_ns);
-    }
-
-    pub fn recordUpload(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
-        self.cur().upload.record(nbytes, host_ns, device_ns);
-    }
-
-    pub fn recordFill(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
-        self.cur().fill.record(nbytes, host_ns, device_ns);
-    }
-
-    pub fn recordDownload(self: *Profile, nbytes: u64, host_ns: u64, device_ns: u64) void {
-        self.cur().download.record(nbytes, host_ns, device_ns);
-    }
-
-    pub fn recordFree(self: *Profile, host_ns: u64, device_ns: u64) void {
-        self.cur().free.record(0, host_ns, device_ns);
-    }
-
-    pub fn recordRunGraph(self: *Profile, profiled: link_mod.ProfiledRunGraph) void {
-        self.cur().rg.record(profiled);
-    }
-
-    pub fn recordUploadTensor(self: *Profile, name: []const u8, nbytes: u64) void {
-        self.upload_census.record(@intFromEnum(self.current), name, nbytes);
-    }
-
-    /// One decode token: extends the decode phase wall and the TTFT/steady split.
-    pub fn recordDecodeToken(self: *Profile, is_first: bool, ns: u64) void {
-        self.phases[@intFromEnum(prof_report.Phase.decode)].wall_ns += ns;
-        if (is_first) {
-            self.first_decode_ns += ns;
-        } else {
-            self.steady_decode_ns += ns;
-            self.steady_decode_count += 1;
-        }
-        self.generated_tokens += 1;
-    }
-
-    /// Total wall = Σ phase walls. Nothing is excluded; every phase reconciles.
-    fn wallNs(self: *const Profile) u64 {
-        var total: u64 = 0;
-        for (self.phases) |phase| total += phase.wall_ns;
-        return total;
-    }
-
-    pub fn report(
-        self: *const Profile,
-        writer: *std.Io.Writer,
-        model_path: []const u8,
-        device_label: []const u8,
-    ) std.Io.Writer.Error!void {
-        try self.reportPretty(writer, model_path, device_label);
-    }
-
-    fn reportPretty(self: *const Profile, writer: *std.Io.Writer, model_path: []const u8, device_label: []const u8) std.Io.Writer.Error!void {
-        var buf: [32]u8 = undefined;
-        try writer.print("penzai profile\n\n", .{});
-        try writer.print("  model        {s}\n", .{modelName(model_path)});
-        try writer.print("  device       {s}\n", .{device_label});
-        try writer.print("  tokens       {d}\n", .{self.generated_tokens});
-        if (self.steady_decode_count > 0) {
-            var avg_buf: [32]u8 = undefined;
-            var ttft_buf: [32]u8 = undefined;
-            try writer.print("  decode       {s}/tok ({d:.2} tok/s), TTFT {s}\n", .{
-                prof_report.formatDuration(&avg_buf, self.steady_decode_ns / self.steady_decode_count),
-                prof_report.perSecond(self.steady_decode_count, self.steady_decode_ns),
-                prof_report.formatDuration(&ttft_buf, self.first_decode_ns),
-            });
-        }
-        try writer.print("  wall         {s}\n\n", .{prof_report.formatDuration(&buf, self.wallNs())});
-
-        // The headline: wall = device + transport + residual, per phase.
-        try prof_report.writePhaseBudget(writer, &self.phases);
-        try writer.writeByte('\n');
-        try prof_report.writeTransfers(writer, &self.phases);
-        try writer.writeByte('\n');
-        try prof_report.writeUploadCensus(writer, &self.upload_census);
-
-        // Device-side op + matmul detail, separately per phase that ran graphs —
-        // prefill (compute-bound) and decode (bandwidth-bound) have distinct
-        // rooflines, so a merged op table would be meaningless.
-        for (&self.phases, 0..) |*phase, i| {
-            if (phase.rg.run_graph_count == 0) continue;
-            const label = (@as(prof_report.Phase, @enumFromInt(i))).label();
-            var ops_title: [96]u8 = undefined;
-            var mm_title: [48]u8 = undefined;
-            try writer.writeByte('\n');
-            try prof_report.writeOpTable(
-                writer,
-                std.fmt.bufPrint(&ops_title, "ops \u{b7} {s}  {d} graphs, {d} cmds", .{ label, phase.rg.run_graph_count, phase.rg.command_count }) catch "ops",
-                &phase.rg.op_totals,
-                phase.rg.device_total_ns,
-            );
-            try prof_report.writeMatmulDetail(
-                writer,
-                std.fmt.bufPrint(&mm_title, "matmul \u{b7} {s}", .{label}) catch "matmul",
-                &phase.rg.matmul_stats,
-                phase.rg.device_fclk_hz,
-            );
-            var fa_title: [48]u8 = undefined;
-            try prof_report.writeFlashDetail(
-                writer,
-                std.fmt.bufPrint(&fa_title, "flash \u{b7} {s}", .{label}) catch "flash",
-                phase.rg.flash,
-            );
-        }
-
-        // One greppable comparison line for the decode phase (the roofline target).
-        const decode = &self.phases[@intFromEnum(prof_report.Phase.decode)];
-        if (decode.rg.run_graph_count != 0) {
-            try writer.writeByte('\n');
-            try prof_report.writeScoreboard(writer, decode, self.generated_tokens);
-        }
-    }
-};
-
-/// Basename of the model path with the `.gguf` suffix removed, for the header.
-fn modelName(path: []const u8) []const u8 {
-    var name = path;
-    if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name = name[i + 1 ..];
-    if (std.mem.endsWith(u8, name, ".gguf")) name = name[0 .. name.len - 5];
-    return name;
-}
-
 pub const Device = struct {
     const Self = @This();
 
@@ -211,7 +44,7 @@ pub const Device = struct {
     buft: c.ggml_backend_buffer_type = undefined,
     counters: Counters = .{},
     census: ?*census_mod.Census = null,
-    profile: ?*Profile = null,
+    profile: ?*prof_collector.Collector = null,
     pending_preload: std.ArrayList(u8) = .empty,
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",

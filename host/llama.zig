@@ -4,7 +4,8 @@ const build_options = @import("build_options");
 const backend_mod = @import("backend.zig");
 const census_mod = @import("census.zig");
 const link_mod = @import("link");
-const prof_report = @import("prof_report.zig");
+const prof_collector = @import("prof/collector.zig");
+const prof_render = @import("prof/render.zig");
 
 pub const Error = error{
     MissingModel,
@@ -87,8 +88,8 @@ pub fn runPrompt(
     if (options.model_path.len == 0) return error.MissingModel;
 
     const want_profile = options.profile and !options.census;
-    var profile_store = backend_mod.Profile.init(io);
-    const profile: ?*backend_mod.Profile = if (want_profile) &profile_store else null;
+    var profile_store = prof_collector.Collector.init(io);
+    const profile: ?*prof_collector.Collector = if (want_profile) &profile_store else null;
     const device = backend_mod.Device.create(allocator, link) catch return error.BackendHandshakeFailed;
     defer device.destroy();
     device.profile = profile;
@@ -189,7 +190,7 @@ pub fn runPrompt(
         try census.report(writer);
     } else {
         try writer.writeByte('\n');
-        if (profile) |p| try p.report(writer, options.model_path, options.device_label);
+        if (profile) |p| try prof_render.writeProfile(writer, p, options.model_path, options.device_label);
     }
 }
 

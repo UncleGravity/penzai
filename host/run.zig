@@ -1,7 +1,7 @@
 const std = @import("std");
 const build_options = @import("build_options");
 const shared = @import("shared");
-const prof_report = @import("prof_report.zig");
+const prof_model = @import("prof/model.zig");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
 const llama_mod = if (build_options.enable_llama) @import("llama.zig") else struct {
@@ -71,7 +71,7 @@ pub const BenchResult = struct {
 };
 
 /// Bench run_graph profiling is exactly the shared cross-call rollup.
-pub const BenchProfile = prof_report.RunGraphTotals;
+pub const BenchProfile = prof_model.RunGraphTotals;
 
 pub const LlamaOptions = struct {
     model_path: []const u8 = build_options.default_model_path,
