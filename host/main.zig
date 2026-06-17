@@ -161,9 +161,6 @@ fn runLlamaCommand(
             options.backend_sampling = true;
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
-        } else if (std.mem.startsWith(u8, arg, "--prof=")) {
-            options.profile = true;
-            options.prof_format = try parseProfFormat(arg["--prof=".len..]);
         } else if (std.mem.eql(u8, arg, "--prof-trace")) {
             options.trace_path = try requireValue(args, "--prof-trace");
         } else if (std.mem.startsWith(u8, arg, "--prof-trace=")) {
@@ -383,12 +380,6 @@ fn parseF32(value: []const u8) CliError!f32 {
     return std.fmt.parseFloat(f32, value) catch return error.InvalidNumber;
 }
 
-fn parseProfFormat(value: []const u8) CliError!prof_report.ProfFormat {
-    if (std.mem.eql(u8, value, "pretty")) return .pretty;
-    if (std.mem.eql(u8, value, "json")) return .json;
-    return error.InvalidOption;
-}
-
 fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.Io.Writer.Error!void {
     try prof_report.writeLinkSection(writer, &profile);
     try writer.writeByte('\n');
@@ -398,7 +389,7 @@ fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof[=pretty|json]] [--prof-trace FILE]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof] [--prof-trace FILE]
         \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
         \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]

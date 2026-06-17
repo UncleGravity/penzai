@@ -36,7 +36,6 @@ pub const Options = struct {
     chat_template: bool = true,
     enable_thinking: bool = false,
     profile: bool = false,
-    prof_format: prof_report.ProfFormat = .pretty,
     device_label: []const u8 = "fake",
     trace_path: ?[]const u8 = null,
     /// Build the greedy sampler on the llama.cpp backend (bound to seq 0) so the
@@ -197,7 +196,7 @@ pub fn runPrompt(
         try census.report(writer);
     } else {
         try writer.writeByte('\n');
-        if (profile) |p| try p.report(writer, device.counters, options.prof_format, options.model_path, options.device_label);
+        if (profile) |p| try p.report(writer, options.model_path, options.device_label);
         if (capture) |*cap| if (options.trace_path) |path| {
             cap.writeFile(io, path) catch return error.TraceWriteFailed;
             try writer.print("trace written {s} (convert with: penzai prof {s})\n", .{ path, path });

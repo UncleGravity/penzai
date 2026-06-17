@@ -6,10 +6,6 @@ const wire = shared.wire;
 const profiling = shared.profiling;
 const q1a8 = shared.q1a8;
 
-/// Selects how the llama `--prof` summary is rendered. `pretty` is the default
-/// human-facing layout; `json` emits every counter as a machine-readable object.
-pub const ProfFormat = enum { pretty, json };
-
 /// Host-side accumulation of run_graph profiles across many calls, shared by the
 /// llama decode path and the bench harness. Domain-specific summaries (model load,
 /// prefill, warmup/iters, …) live in the consumer; the run_graph + per-op rollup
