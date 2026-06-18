@@ -3,7 +3,7 @@ const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 const wire = shared.wire;
 const profiling = shared.profiling;
 
@@ -59,17 +59,17 @@ test "fake link q1a8 matmul reference" {
     defer runtime.deinit();
     var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
 
-    const rows = q1a8.rows_per_block;
+    const rows = layout.rows_per_block;
     const cols = 1;
-    const k = q1a8.q1_block;
-    const q1_blocks = comptime q1a8.blocksPerRow(k) catch unreachable;
+    const k = layout.q1_block;
+    const q1_blocks = comptime layout.blocksPerRow(k) catch unreachable;
     const logical_len = rows * q1_blocks;
-    const packed_len = comptime q1a8.packedWeightBytes(rows, k) catch unreachable;
+    const packed_len = comptime layout.packedWeightBytes(rows, k) catch unreachable;
 
     var bits: [logical_len]u128 = [_]u128{std.math.maxInt(u128)} ** logical_len;
     var scales: [logical_len]f16 = [_]f16{1} ** logical_len;
     var packed_buf: [packed_len]u8 = undefined;
-    try q1a8.packWeightsFromLogical(rows, k, &bits, &scales, &packed_buf);
+    try layout.packWeightsFromLogical(rows, k, &bits, &scales, &packed_buf);
 
     var acts: [k * @sizeOf(f32)]u8 = undefined;
     for (0..k) |i| writeF32(&acts, i * @sizeOf(f32), 127);
@@ -92,7 +92,7 @@ test "fake link q1a8 matmul reference" {
     var out: [rows * @sizeOf(f32)]u8 = undefined;
     _ = try link.download(dst_range, &out);
     for (0..rows) |row| {
-        try std.testing.expectEqual(@as(f32, 127 * q1a8.q1_block), readF32(&out, row * @sizeOf(f32)));
+        try std.testing.expectEqual(@as(f32, 127 * layout.q1_block), readF32(&out, row * @sizeOf(f32)));
     }
 }
 

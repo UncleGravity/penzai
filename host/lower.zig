@@ -2,7 +2,7 @@ const std = @import("std");
 const c = @import("c");
 const shared = @import("shared");
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 const wire = shared.wire;
 
 pub const LowerError = error{
@@ -148,7 +148,7 @@ fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
     if (dim(weights, 0) <= 0 or dim(weights, 1) <= 0 or dim(acts, 1) <= 0) return false;
     if (dim(weights, 0) != dim(acts, 0)) return false;
     if (dim(op, 0) != dim(weights, 1) or dim(op, 1) != dim(acts, 1)) return false;
-    if (@mod(@as(usize, @intCast(dim(weights, 0))), q1a8.q1_block) != 0) return false;
+    if (@mod(@as(usize, @intCast(dim(weights, 0))), layout.q1_block) != 0) return false;
     for (2..4) |axis| {
         if (dimAt(weights, axis) != 1 or dimAt(acts, axis) != 1 or dimAt(op, axis) != 1) return false;
     }
@@ -277,7 +277,7 @@ fn supportsGetRows(op: *const c.ggml_tensor) bool {
     if (dim(src0, 0) <= 0 or dim(src0, 1) <= 0 or dim(src0, 2) <= 0 or dim(src0, 3) <= 0) return false;
     if (dim(src1, 0) <= 0 or dim(src1, 1) <= 0 or dim(src1, 2) <= 0 or dim(src1, 3) != 1) return false;
     if (src0.*.type == c.GGML_TYPE_F32 and src0.*.nb[0] != @sizeOf(f32)) return false;
-    if (src0.*.type == c.GGML_TYPE_Q1_0 and (src0.*.nb[0] != q1a8.q1_block_bytes or @mod(@as(usize, @intCast(dim(src0, 0))), q1a8.q1_block) != 0)) return false;
+    if (src0.*.type == c.GGML_TYPE_Q1_0 and (src0.*.nb[0] != layout.q1_block_bytes or @mod(@as(usize, @intCast(dim(src0, 0))), layout.q1_block) != 0)) return false;
     if (src1.*.nb[0] != @sizeOf(i32) or op.*.nb[0] != @sizeOf(f32)) return false;
     if (src0.*.type == c.GGML_TYPE_Q1_0 and (dim(src0, 2) != 1 or dim(src0, 3) != 1)) return false;
     if (dim(src0, 2) != dim(src1, 1) or dim(src0, 3) != dim(src1, 2)) return false;
@@ -344,9 +344,9 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
     const acts_binding = lookup.find(acts) orelse return error.MissingBinding;
     const dst_binding = lookup.find(node) orelse return error.MissingBinding;
 
-    const weights_bytes = q1a8.packedWeightBytes(rows, k) catch return error.InvalidShape;
-    const acts_bytes = q1a8.actsF32Bytes(cols, k) catch return error.InvalidShape;
-    const dst_bytes = q1a8.outputF32Bytes(rows, cols) catch return error.InvalidShape;
+    const weights_bytes = layout.packedWeightBytes(rows, k) catch return error.InvalidShape;
+    const acts_bytes = layout.actsF32Bytes(cols, k) catch return error.InvalidShape;
+    const dst_bytes = layout.outputF32Bytes(rows, cols) catch return error.InvalidShape;
 
     return .{ .matmul_q1a8 = .{
         .weights = range(weights_binding, weights_bytes),
@@ -580,7 +580,7 @@ fn lowerGetRows(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Comm
             src0.*.nb[2],
             src0.*.nb[3],
         ),
-        .q1_0 => q1a8.packedWeightBytes(src_rows, row_width) catch return error.InvalidShape,
+        .q1_0 => layout.packedWeightBytes(src_rows, row_width) catch return error.InvalidShape,
     };
     const indices_span = try stridedSpan(
         try checkedMul(@as(usize, @intCast(ne10)), @sizeOf(i32)),

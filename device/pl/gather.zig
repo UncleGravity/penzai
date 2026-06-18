@@ -11,9 +11,9 @@
 
 const std = @import("std");
 const shared = @import("shared");
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
-pub const result_bytes_per_rb: usize = (q1a8.rows_per_block / 2) * q1a8.beat_bytes;
+pub const result_bytes_per_rb: usize = (layout.rows_per_block / 2) * layout.beat_bytes;
 
 /// Scatter one kernel run's results (`group` columns starting at `col0`) into
 /// `dst` (col-major `rows*cols` f32). Coarse memcpy: one contiguous copy for the
@@ -28,11 +28,11 @@ pub fn gatherResults(dst: []u8, result: []const u8, rows: usize, group: usize, c
         return;
     }
     for (0..num_rb) |rb| {
-        const row0 = rb * q1a8.rows_per_block;
+        const row0 = rb * layout.rows_per_block;
         // `valid: usize` is load-bearing: @min with the comptime `rows_per_block`
         // narrows the result type, and `valid * fp` would then overflow that
         // narrow type (silently wrapping to 0 in ReleaseFast -> empty copies).
-        const valid: usize = @min(q1a8.rows_per_block, rows - row0);
+        const valid: usize = @min(layout.rows_per_block, rows - row0);
         const nbytes = valid * fp;
         for (0..group) |c| {
             const col = col0 + c;
@@ -49,9 +49,9 @@ fn gatherResultsRef(dst: []u8, result: []const u8, rows: usize, group: usize, co
         const col = col0 + c;
         for (0..num_rb) |rb| {
             const chunk = (rb * group + c) * result_bytes_per_rb;
-            const valid = @min(q1a8.rows_per_block, rows - rb * q1a8.rows_per_block);
+            const valid = @min(layout.rows_per_block, rows - rb * layout.rows_per_block);
             for (0..valid) |lane| {
-                const grow = rb * q1a8.rows_per_block + lane;
+                const grow = rb * layout.rows_per_block + lane;
                 @memcpy(dst[(col * rows + grow) * 4 ..][0..4], result[chunk + lane * 4 ..][0..4]);
             }
         }
@@ -71,7 +71,7 @@ test "gatherResults matches the per-lane oracle and places correctly" {
     for (shapes) |s| {
         const rows = s[0];
         const cols = s[1];
-        const num_rb = q1a8.rowblocksFor(rows);
+        const num_rb = layout.rowblocksFor(rows);
         const dst_ref = try A.alloc(u8, rows * cols * 4);
         defer A.free(dst_ref);
         const dst_opt = try A.alloc(u8, rows * cols * 4);
@@ -85,10 +85,10 @@ test "gatherResults matches the per-lane oracle and places correctly" {
             @memset(result, 0xEE); // pad-lane sentinel; must never be copied out
             for (0..group) |c| {
                 for (0..num_rb) |rb| {
-                    const valid = @min(q1a8.rows_per_block, rows - rb * q1a8.rows_per_block);
+                    const valid = @min(layout.rows_per_block, rows - rb * layout.rows_per_block);
                     const chunk = (rb * group + c) * result_bytes_per_rb;
                     for (0..valid) |lane| {
-                        const grow = rb * q1a8.rows_per_block + lane;
+                        const grow = rb * layout.rows_per_block + lane;
                         const idx: u32 = @intCast((col0 + c) * rows + grow);
                         std.mem.writeInt(u32, result[chunk + lane * 4 ..][0..4], idx, .little);
                     }

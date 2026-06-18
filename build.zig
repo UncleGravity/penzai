@@ -117,20 +117,21 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
     b.step("lint-rtl", "Verilator lint the matmul RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl, 16);
-    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl, 16);
+    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl);
+    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl);
 }
 
-fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rows: usize) void {
-    const q1a8 = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/q1a8.zig"), .target = target, .optimize = optimize });
-    const q1a8_options = b.addOptions();
-    q1a8_options.addOption(usize, "rows", rows);
-    q1a8.addImport("q1a8_options", q1a8_options.createModule());
+fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    // The one production layout source; the sim layout shim derives its block
+    // constants from it so cosim and device never drift (rebuild 1D-2c).
+    const shared_layout = b.createModule(.{ .root_source_file = b.path("shared/layout.zig"), .target = target, .optimize = optimize });
+    const layout = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/layout.zig"), .target = target, .optimize = optimize });
+    layout.addImport("shared_layout", shared_layout);
     const pack = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/pack.zig"), .target = target, .optimize = optimize });
     const ref = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/matmul_ref.zig"), .target = target, .optimize = optimize });
-    pack.addImport("q1a8", q1a8);
-    ref.addImport("q1a8", q1a8);
-    mod.addImport("q1a8", q1a8);
+    pack.addImport("layout", layout);
+    ref.addImport("layout", layout);
+    mod.addImport("layout", layout);
     mod.addImport("pack", pack);
     mod.addImport("matmul_ref", ref);
 }
@@ -145,7 +146,6 @@ fn addCosim(
     top: []const u8,
     dir: []const u8,
     rtl: []const []const u8,
-    rows: usize,
 ) void {
     const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
@@ -170,7 +170,7 @@ fn addCosim(
         .optimize = optimize,
         .link_libc = true,
     });
-    attachCosimSupport(b, tb_mod, target, optimize, rows);
+    attachCosimSupport(b, tb_mod, target, optimize);
     tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
@@ -391,7 +391,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/protocol/transport.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/protocol/wire.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/profiling.zig", target, optimize, shared);
-    addSharedTest(b, test_step, "shared/q1a8.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "shared/layout.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/matmul.zig", target, optimize, shared);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);

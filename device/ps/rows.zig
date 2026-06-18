@@ -1,7 +1,7 @@
 const std = @import("std");
 const shared = @import("shared");
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 const wire = shared.wire;
 
 pub const RowsError = error{
@@ -72,16 +72,16 @@ pub fn getRowsF32Bytes(command: wire.GetRows, src: []const u8, indices: []const 
 }
 
 fn dequantizePackedQ1Row(src: []const u8, dst: []u8, rows: usize, k: usize, row: usize) RowsError!void {
-    const q1_blocks = q1a8.blocksPerRow(k) catch return error.InvalidShape;
-    if (src.len != (q1a8.packedWeightBytes(rows, k) catch return error.InvalidShape)) return error.OutOfBounds;
+    const q1_blocks = layout.blocksPerRow(k) catch return error.InvalidShape;
+    if (src.len != (layout.packedWeightBytes(rows, k) catch return error.InvalidShape)) return error.OutOfBounds;
     if (dst.len != try checkedMul(k, @sizeOf(f32))) return error.InvalidShape;
 
     for (0..q1_blocks) |q1| {
-        const scale: f32 = @floatCast(q1a8.packedWeightScale(src, rows, k, row, q1) catch return error.OutOfBounds);
-        for (0..q1a8.q8_subblocks) |sub| {
-            const bits = q1a8.packedWeightBits(src, rows, k, row, q1, sub) catch return error.OutOfBounds;
-            const base = q1 * q1a8.q1_block + sub * q1a8.q8_block;
-            for (0..q1a8.q8_block) |i| {
+        const scale: f32 = @floatCast(layout.packedWeightScale(src, rows, k, row, q1) catch return error.OutOfBounds);
+        for (0..layout.q8_subblocks) |sub| {
+            const bits = layout.packedWeightBits(src, rows, k, row, q1, sub) catch return error.OutOfBounds;
+            const base = q1 * layout.q1_block + sub * layout.q8_block;
+            for (0..layout.q8_block) |i| {
                 const value = if (((bits >> @intCast(i)) & 1) != 0) scale else -scale;
                 writeF32(dst, base + i, value);
             }
@@ -319,12 +319,12 @@ test "get_rows rejects negative and out of range indices" {
 
 test "get_rows dequantizes resident q1_0 packed rows" {
     const rows = 2;
-    const k = q1a8.q1_block;
-    const packed_len = comptime q1a8.packedWeightBytes(rows, k) catch unreachable;
+    const k = layout.q1_block;
+    const packed_len = comptime layout.packedWeightBytes(rows, k) catch unreachable;
     var bits = [_]u128{ 0, std.math.maxInt(u128) };
     var scales = [_]f16{ 1, 2 };
     var src: [packed_len]u8 = undefined;
-    try q1a8.packWeightsFromLogical(rows, k, &bits, &scales, &src);
+    try layout.packWeightsFromLogical(rows, k, &bits, &scales, &src);
 
     var indices: [@sizeOf(i32)]u8 = undefined;
     writeI32(&indices, 0, 1);
@@ -341,7 +341,7 @@ test "get_rows dequantizes resident q1_0 packed rows" {
         .ne10 = 1,
         .ne11 = 1,
         .ne12 = 1,
-        .src_nb1 = q1a8.packed_per_q1_block,
+        .src_nb1 = layout.packed_per_q1_block,
         .src_nb2 = src.len,
         .src_nb3 = src.len,
         .indices_nb1 = @sizeOf(i32),

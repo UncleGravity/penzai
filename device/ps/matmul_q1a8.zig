@@ -1,7 +1,7 @@
 const std = @import("std");
 const shared = @import("shared");
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
 pub const MatmulError = error{
     InvalidShape,
@@ -28,18 +28,18 @@ pub fn runQ1A8(
     const cols_usize: usize = @intCast(cols);
     const k_usize: usize = @intCast(k);
     if (rows_usize == 0 or cols_usize == 0) return error.InvalidShape;
-    const q1_blocks = q1a8.blocksPerRow(k_usize) catch return error.InvalidShape;
-    if (packed_weights.len != (q1a8.packedWeightBytes(rows_usize, k_usize) catch return error.InvalidShape)) {
+    const q1_blocks = layout.blocksPerRow(k_usize) catch return error.InvalidShape;
+    if (packed_weights.len != (layout.packedWeightBytes(rows_usize, k_usize) catch return error.InvalidShape)) {
         return error.InvalidLength;
     }
-    if (acts_f32.len != (q1a8.actsF32Bytes(cols_usize, k_usize) catch return error.InvalidShape)) {
+    if (acts_f32.len != (layout.actsF32Bytes(cols_usize, k_usize) catch return error.InvalidShape)) {
         return error.InvalidLength;
     }
-    if (dst_f32.len != (q1a8.outputF32Bytes(rows_usize, cols_usize) catch return error.InvalidShape)) {
+    if (dst_f32.len != (layout.outputF32Bytes(rows_usize, cols_usize) catch return error.InvalidShape)) {
         return error.InvalidLength;
     }
 
-    const q8_blocks = q1_blocks * q1a8.q8_subblocks;
+    const q8_blocks = q1_blocks * layout.q8_subblocks;
     const column = try allocator.alloc(f32, k_usize);
     defer allocator.free(column);
     const quants = try allocator.alloc(i8, k_usize);
@@ -49,20 +49,20 @@ pub fn runQ1A8(
 
     for (0..cols_usize) |col| {
         for (0..k_usize) |i| column[i] = readF32(acts_f32, (col * k_usize + i) * @sizeOf(f32));
-        q1a8.quantizeQ8_0F32Scales(column, quants, act_scales) catch return error.InvalidShape;
+        layout.quantizeQ8_0F32Scales(column, quants, act_scales) catch return error.InvalidShape;
 
         for (0..rows_usize) |row| {
             var acc: f32 = 0;
             for (0..q1_blocks) |q1| {
-                const wscale: f32 = @floatCast(q1a8.packedWeightScale(packed_weights, rows_usize, k_usize, row, q1) catch return error.InvalidShape);
+                const wscale: f32 = @floatCast(layout.packedWeightScale(packed_weights, rows_usize, k_usize, row, q1) catch return error.InvalidShape);
                 if (wscale == 0) continue;
-                for (0..q1a8.q8_subblocks) |sub| {
-                    const ascale = act_scales[q1 * q1a8.q8_subblocks + sub];
+                for (0..layout.q8_subblocks) |sub| {
+                    const ascale = act_scales[q1 * layout.q8_subblocks + sub];
                     if (ascale == 0) continue;
-                    const bits = q1a8.packedWeightBits(packed_weights, rows_usize, k_usize, row, q1, sub) catch return error.InvalidShape;
-                    const base = q1 * q1a8.q1_block + sub * q1a8.q8_block;
+                    const bits = layout.packedWeightBits(packed_weights, rows_usize, k_usize, row, q1, sub) catch return error.InvalidShape;
+                    const base = q1 * layout.q1_block + sub * layout.q8_block;
                     var sum: i32 = 0;
-                    for (0..q1a8.q8_block) |i| {
+                    for (0..layout.q8_block) |i| {
                         const a: i32 = quants[base + i];
                         sum += if (((bits >> @intCast(i)) & 1) != 0) a else -a;
                     }
@@ -83,15 +83,15 @@ fn writeF32(bytes: []u8, offset: usize, value: f32) void {
 }
 
 test "all positive weights and 127 activations" {
-    const rows = q1a8.rows_per_block;
-    const k = q1a8.q1_block;
-    const q1_blocks = comptime q1a8.blocksPerRow(k) catch unreachable;
+    const rows = layout.rows_per_block;
+    const k = layout.q1_block;
+    const q1_blocks = comptime layout.blocksPerRow(k) catch unreachable;
     const logical_len = rows * q1_blocks;
-    const packed_len = comptime q1a8.packedWeightBytes(rows, k) catch unreachable;
+    const packed_len = comptime layout.packedWeightBytes(rows, k) catch unreachable;
     var bits: [logical_len]u128 = [_]u128{std.math.maxInt(u128)} ** logical_len;
     var scales: [logical_len]f16 = [_]f16{1} ** logical_len;
     var weights: [packed_len]u8 = undefined;
-    try q1a8.packWeightsFromLogical(rows, k, &bits, &scales, &weights);
+    try layout.packWeightsFromLogical(rows, k, &bits, &scales, &weights);
 
     var acts: [k * 4]u8 = undefined;
     for (0..k) |i| writeF32(&acts, i * 4, 127);
@@ -99,25 +99,25 @@ test "all positive weights and 127 activations" {
     try runQ1A8(std.testing.allocator, &weights, &acts, &dst, @intCast(rows), 1, @intCast(k));
 
     for (0..rows) |row| {
-        try std.testing.expectEqual(@as(f32, 127 * q1a8.q1_block), readF32(&dst, row * 4));
+        try std.testing.expectEqual(@as(f32, 127 * layout.q1_block), readF32(&dst, row * 4));
     }
 }
 
 test "rowblock tail and multiple columns match logical reference" {
-    const rows = q1a8.rows_per_block + 3;
+    const rows = layout.rows_per_block + 3;
     const cols = 2;
-    const k = q1a8.q1_block * 2;
-    const q1_blocks = comptime q1a8.blocksPerRow(k) catch unreachable;
-    const q8_blocks = q1_blocks * q1a8.q8_subblocks;
+    const k = layout.q1_block * 2;
+    const q1_blocks = comptime layout.blocksPerRow(k) catch unreachable;
+    const q8_blocks = q1_blocks * layout.q8_subblocks;
     const logical_len = rows * q1_blocks;
-    const packed_len = comptime q1a8.packedWeightBytes(rows, k) catch unreachable;
+    const packed_len = comptime layout.packedWeightBytes(rows, k) catch unreachable;
 
     var bits: [logical_len]u128 = undefined;
     var scales: [logical_len]f16 = undefined;
     for (0..rows) |row| {
         for (0..q1_blocks) |q1| {
             var mask: u128 = 0;
-            for (0..q1a8.q1_block) |bit| {
+            for (0..layout.q1_block) |bit| {
                 if (((row * 17 + q1 * 31 + bit * 7) % 5) < 2) mask |= @as(u128, 1) << @intCast(bit);
             }
             bits[row * q1_blocks + q1] = mask;
@@ -126,7 +126,7 @@ test "rowblock tail and multiple columns match logical reference" {
     }
 
     var weights: [packed_len]u8 = undefined;
-    try q1a8.packWeightsFromLogical(rows, k, &bits, &scales, &weights);
+    try layout.packWeightsFromLogical(rows, k, &bits, &scales, &weights);
 
     var acts: [cols * k * @sizeOf(f32)]u8 = undefined;
     for (0..cols) |col| {
@@ -144,20 +144,20 @@ test "rowblock tail and multiple columns match logical reference" {
     var act_scales: [q8_blocks]f16 = undefined;
     for (0..cols) |col| {
         for (0..k) |i| column[i] = readF32(&acts, (col * k + i) * @sizeOf(f32));
-        try q1a8.quantizeQ8_0(&column, &quants, &act_scales);
+        try layout.quantizeQ8_0(&column, &quants, &act_scales);
 
         for (0..rows) |row| {
             var expected: f32 = 0;
             for (0..q1_blocks) |q1| {
                 const weight_scale: f32 = @floatCast(scales[row * q1_blocks + q1]);
                 if (weight_scale == 0) continue;
-                for (0..q1a8.q8_subblocks) |sub| {
-                    const act_scale: f32 = @floatCast(act_scales[q1 * q1a8.q8_subblocks + sub]);
+                for (0..layout.q8_subblocks) |sub| {
+                    const act_scale: f32 = @floatCast(act_scales[q1 * layout.q8_subblocks + sub]);
                     if (act_scale == 0) continue;
-                    const sub_bits: u32 = @truncate(bits[row * q1_blocks + q1] >> @intCast(sub * q1a8.q8_block));
-                    const base = q1 * q1a8.q1_block + sub * q1a8.q8_block;
+                    const sub_bits: u32 = @truncate(bits[row * q1_blocks + q1] >> @intCast(sub * layout.q8_block));
+                    const base = q1 * layout.q1_block + sub * layout.q8_block;
                     var sum: i32 = 0;
-                    for (0..q1a8.q8_block) |i| {
+                    for (0..layout.q8_block) |i| {
                         const act: i32 = quants[base + i];
                         sum += if (((sub_bits >> @intCast(i)) & 1) != 0) act else -act;
                     }

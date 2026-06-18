@@ -3,7 +3,7 @@
 //! the same 512-bit core order as packWeightsWide.
 
 const std = @import("std");
-const q1a8 = @import("q1a8");
+const layout = @import("layout");
 const pack = @import("pack");
 const ref = @import("matmul_ref");
 
@@ -11,10 +11,10 @@ const c = @cImport(@cInclude("shim.h"));
 
 const CYCLE_LIMIT: usize = 1_000_000;
 const PORTS: usize = 4;
-const ROWS = q1a8.ROWS;
+const ROWS = layout.ROWS;
 const ROWS_PER_PORT = ROWS / PORTS;
 const PORT_BEAT_BYTES = ROWS_PER_PORT * 4;
-const RESULT_BYTES_PER_RB = q1a8.RESULT_BYTES_PER_ROWBLOCK;
+const RESULT_BYTES_PER_RB = layout.RESULT_BYTES_PER_ROWBLOCK;
 
 const REG_CTRL: u8 = 0x08;
 const REG_NUM_Q1_BLOCKS: u8 = 0x10;
@@ -69,7 +69,7 @@ fn reset(dut: *Dut) void {
 }
 
 fn weightPortBytes(num_rb: usize, q1_blocks: usize) usize {
-    return num_rb * q1_blocks * (1 + q1a8.Q8_SUBBLOCKS) * PORT_BEAT_BYTES;
+    return num_rb * q1_blocks * (1 + layout.Q8_SUBBLOCKS) * PORT_BEAT_BYTES;
 }
 
 fn packWeightPorts(
@@ -91,7 +91,7 @@ fn packWeightPorts(
                     std.mem.writeInt(u16, ports[port][off + lane * 4 ..][0..2], scale, .little);
                 }
                 off += PORT_BEAT_BYTES;
-                for (0..q1a8.Q8_SUBBLOCKS) |sub| {
+                for (0..layout.Q8_SUBBLOCKS) |sub| {
                     for (0..ROWS_PER_PORT) |lane| {
                         const row = rb * ROWS + port * ROWS_PER_PORT + lane;
                         const bits = weight_bits[row * q1_blocks + blk];
@@ -208,11 +208,11 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, cols: usize, seed: 
     defer a.free(acts);
     const expected = try a.alloc(f32, cols * rows);
     defer a.free(expected);
-    const column = try a.alloc(f32, blocks * q1a8.Q1_BLOCK);
+    const column = try a.alloc(f32, blocks * layout.Q1_BLOCK);
     defer a.free(column);
     const aquants = try a.alloc(i8, column.len);
     defer a.free(aquants);
-    const ascales = try a.alloc(f16, blocks * q1a8.Q8_SUBBLOCKS);
+    const ascales = try a.alloc(f16, blocks * layout.Q8_SUBBLOCKS);
     defer a.free(ascales);
 
     for (0..cols) |col| {

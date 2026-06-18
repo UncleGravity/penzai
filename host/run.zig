@@ -9,7 +9,7 @@ const llama_mod = if (build_options.enable_llama) @import("llama.zig") else stru
     pub const Options = struct {};
 };
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 const protocol_transport = shared.protocol_transport;
 const profiling = shared.profiling;
 const wire = shared.wire;
@@ -24,9 +24,9 @@ pub const RunError = error{
 } || llama_mod.Error;
 
 pub const RunOptions = struct {
-    rows: u32 = @intCast(q1a8.rows_per_block),
+    rows: u32 = @intCast(layout.rows_per_block),
     cols: u32 = 1,
-    k: u32 = @intCast(q1a8.q1_block),
+    k: u32 = @intCast(layout.q1_block),
     heap_mib: u32 = 16,
 };
 
@@ -43,9 +43,9 @@ pub const RunResult = struct {
 };
 
 pub const BenchOptions = struct {
-    rows: u32 = @intCast(q1a8.rows_per_block),
+    rows: u32 = @intCast(layout.rows_per_block),
     cols: u32 = 1,
-    k: u32 = @intCast(q1a8.q1_block),
+    k: u32 = @intCast(layout.q1_block),
     heap_mib: u32 = 16,
     warmup: u32 = 3,
     iters: u32 = 30,
@@ -333,12 +333,12 @@ const MatmulFixture = struct {
         const cols = try validatePositive(cols_value);
         const k = try validatePositive(k_value);
 
-        const q1_blocks = q1a8.blocksPerRow(k) catch return error.InvalidShape;
+        const q1_blocks = layout.blocksPerRow(k) catch return error.InvalidShape;
         const logical_len = try checkedMul(rows, q1_blocks);
         const act_count = try checkedMul(cols, k);
-        const weights_nbytes = q1a8.packedWeightBytes(rows, k) catch return error.InvalidShape;
-        const acts_nbytes = q1a8.actsF32Bytes(cols, k) catch return error.InvalidShape;
-        const dst_nbytes = q1a8.outputF32Bytes(rows, cols) catch return error.InvalidShape;
+        const weights_nbytes = layout.packedWeightBytes(rows, k) catch return error.InvalidShape;
+        const acts_nbytes = layout.actsF32Bytes(cols, k) catch return error.InvalidShape;
+        const dst_nbytes = layout.outputF32Bytes(rows, cols) catch return error.InvalidShape;
 
         const weight_bits = try allocator.alloc(u128, logical_len);
         defer allocator.free(weight_bits);
@@ -349,7 +349,7 @@ const MatmulFixture = struct {
 
         const packed_weights = try allocator.alloc(u8, weights_nbytes);
         errdefer allocator.free(packed_weights);
-        q1a8.packWeightsFromLogical(rows, k, weight_bits, weight_scales, packed_weights) catch return error.InvalidShape;
+        layout.packWeightsFromLogical(rows, k, weight_bits, weight_scales, packed_weights) catch return error.InvalidShape;
 
         const acts = try allocator.alloc(u8, acts_nbytes);
         errdefer allocator.free(acts);
@@ -424,9 +424,9 @@ fn readF32(bytes: []const u8, offset: usize) f32 {
 
 test "fake q1a8 matmul smoke succeeds" {
     const result = try runFakeMatmul(std.testing.allocator, .{});
-    try std.testing.expectEqual(@as(u32, @intCast(q1a8.rows_per_block)), result.rows);
+    try std.testing.expectEqual(@as(u32, @intCast(layout.rows_per_block)), result.rows);
     try std.testing.expectEqual(@as(u32, 1), result.cols);
-    try std.testing.expectEqual(@as(f32, 127 * q1a8.q1_block), result.expected);
+    try std.testing.expectEqual(@as(f32, 127 * layout.q1_block), result.expected);
     try std.testing.expectEqual(@as(f32, 0), result.max_abs_diff);
 }
 
@@ -436,7 +436,7 @@ test "fake q1a8 matmul rejects invalid k" {
 
 test "fake q1a8 matmul bench succeeds" {
     const result = try benchFakeMatmulQ1A8(std.testing.io, std.testing.allocator, .{ .warmup = 1, .iters = 2 });
-    try std.testing.expectEqual(@as(u32, @intCast(q1a8.rows_per_block)), result.rows);
+    try std.testing.expectEqual(@as(u32, @intCast(layout.rows_per_block)), result.rows);
     try std.testing.expectEqual(@as(u32, 2), result.iters);
     try std.testing.expectEqual(@as(f32, 0), result.max_abs_diff);
     try std.testing.expect(result.host_total_ns > 0);

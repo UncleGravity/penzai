@@ -3,7 +3,7 @@ const shared = @import("shared");
 const link_mod = @import("link");
 
 const profiling = shared.profiling;
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
 /// Host-side accumulation of run_graph profiles across many calls, shared by the
 /// llama decode path and the bench harness. Domain-specific summaries (model load,
@@ -301,7 +301,7 @@ pub fn giga(count: u64, total_ns: u64) f64 {
 /// when the bitstream clock is known, else a PL wall-time estimate. Shared by the
 /// matmul detail and the scoreboard so they never disagree.
 pub fn weightGbps(stat: profiling.MatmulStat, fclk_hz: u32) f64 {
-    const weight_bytes = stat.w_beats * q1a8.weight_beat_bytes;
+    const weight_bytes = stat.w_beats * layout.weight_beat_bytes;
     const wall = giga(weight_bytes, stat.pl_ns);
     if (fclk_hz == 0 or stat.cycles == 0) return wall;
     const exact = @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles)) *

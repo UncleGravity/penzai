@@ -5,15 +5,15 @@
 //! matmul_rowblock is bit-exact-within-ε.
 
 const std = @import("std");
-const q1a8 = @import("q1a8");
+const layout = @import("layout");
 const pack = @import("pack");
 const ref = @import("matmul_ref");
 
 const c = @cImport(@cInclude("shim.h"));
 
 const CYCLE_LIMIT: usize = 4_000_000;
-const ROWS = q1a8.ROWS;
-const RESULT_BYTES_PER_RB = q1a8.RESULT_BYTES_PER_ROWBLOCK;
+const ROWS = layout.ROWS;
+const RESULT_BYTES_PER_RB = layout.RESULT_BYTES_PER_ROWBLOCK;
 
 const Dut = struct {
     h: *c.Dut,
@@ -163,11 +163,11 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, se
     defer a.free(a_bytes);
     const expected = try a.alloc(f32, num_cols * rows);
     defer a.free(expected);
-    const column = try a.alloc(f32, blocks * q1a8.Q1_BLOCK);
+    const column = try a.alloc(f32, blocks * layout.Q1_BLOCK);
     defer a.free(column);
     const aquants = try a.alloc(i8, column.len);
     defer a.free(aquants);
-    const ascales = try a.alloc(f16, blocks * q1a8.Q8_SUBBLOCKS);
+    const ascales = try a.alloc(f16, blocks * layout.Q8_SUBBLOCKS);
     defer a.free(ascales);
 
     for (0..num_cols) |col| {
@@ -205,7 +205,7 @@ fn runCase(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, se
     }
 
     const ctr = run.ctr;
-    const macs = rows * blocks * q1a8.Q1_BLOCK * num_cols;
+    const macs = rows * blocks * layout.Q1_BLOCK * num_cols;
     const fbusy: f64 = @floatFromInt(ctr.busy);
     const bpc = @as(f64, @floatFromInt(macs)) / fbusy;
     const max_stall = @max(ctr.w_stall, @max(ctr.a_stall, ctr.r_stall));

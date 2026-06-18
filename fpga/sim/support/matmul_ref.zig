@@ -7,7 +7,7 @@
 //! bit-exact gate survives even though the final fp32 is only ε-comparable.
 
 const std = @import("std");
-const q1a8 = @import("q1a8");
+const layout = @import("layout");
 
 /// One matmul problem, in logical (unpacked) form. Activations are a single
 /// column shared across every row.
@@ -27,7 +27,7 @@ pub const Problem = struct {
     act_scales: []const f16,
 
     pub fn subblockCount(self: Problem) usize {
-        return self.rows * self.q1_blocks * q1a8.Q8_SUBBLOCKS;
+        return self.rows * self.q1_blocks * layout.Q8_SUBBLOCKS;
     }
 };
 
@@ -37,9 +37,9 @@ pub fn subSum(p: Problem, row: usize, blk: usize, sub: usize) i32 {
     const bits = p.weight_bits[row * p.q1_blocks + blk];
     var sum: i32 = 0;
     var i: usize = 0;
-    while (i < q1a8.Q8_BLOCK) : (i += 1) {
-        const bit_index = sub * q1a8.Q8_BLOCK + i;
-        const act: i32 = p.act_quants[blk * q1a8.Q1_BLOCK + bit_index];
+    while (i < layout.Q8_BLOCK) : (i += 1) {
+        const bit_index = sub * layout.Q8_BLOCK + i;
+        const act: i32 = p.act_quants[blk * layout.Q1_BLOCK + bit_index];
         const set = (bits >> @intCast(bit_index)) & 1 == 1;
         sum += if (set) act else -act;
     }
@@ -56,7 +56,7 @@ pub fn accumulateInt(p: Problem, out: []i32) void {
         var blk: usize = 0;
         while (blk < p.q1_blocks) : (blk += 1) {
             var sub: usize = 0;
-            while (sub < q1a8.Q8_SUBBLOCKS) : (sub += 1) {
+            while (sub < layout.Q8_SUBBLOCKS) : (sub += 1) {
                 out[idx] = subSum(p, row, blk, sub);
                 idx += 1;
             }
@@ -75,8 +75,8 @@ pub fn scaledOutput(p: Problem, out: []f32) void {
         while (blk < p.q1_blocks) : (blk += 1) {
             const ws: f32 = @floatCast(p.weight_scales[row * p.q1_blocks + blk]);
             var sub: usize = 0;
-            while (sub < q1a8.Q8_SUBBLOCKS) : (sub += 1) {
-                const as_: f32 = @floatCast(p.act_scales[blk * q1a8.Q8_SUBBLOCKS + sub]);
+            while (sub < layout.Q8_SUBBLOCKS) : (sub += 1) {
+                const as_: f32 = @floatCast(p.act_scales[blk * layout.Q8_SUBBLOCKS + sub]);
                 if (ws == 0 or as_ == 0) continue;
                 const ss: f32 = @floatFromInt(subSum(p, row, blk, sub));
                 acc += ws * as_ * ss;
@@ -92,11 +92,11 @@ test "all-ones: sub_sum == Q8_BLOCK, output == blocks*Q8_SUBBLOCKS" {
     // bits all set (+1), acts all +1, scales all 1.0 -> each sub_sum = 32,
     // each row accumulates q1_blocks * 4 sub-blocks * 32 * 1 * 1.
     const blocks = 3;
-    const rows = q1a8.ROWS;
+    const rows = layout.ROWS;
     var bits = [_]u128{std.math.maxInt(u128)} ** (rows * blocks);
     var wscales = [_]f16{1.0} ** (rows * blocks);
-    var aquants = [_]i8{1} ** (blocks * q1a8.Q1_BLOCK);
-    var ascales = [_]f16{1.0} ** (blocks * q1a8.Q8_SUBBLOCKS);
+    var aquants = [_]i8{1} ** (blocks * layout.Q1_BLOCK);
+    var ascales = [_]f16{1.0} ** (blocks * layout.Q8_SUBBLOCKS);
     const p: Problem = .{
         .rows = rows,
         .q1_blocks = blocks,
@@ -106,24 +106,24 @@ test "all-ones: sub_sum == Q8_BLOCK, output == blocks*Q8_SUBBLOCKS" {
         .act_scales = &ascales,
     };
 
-    var sums: [rows * blocks * q1a8.Q8_SUBBLOCKS]i32 = undefined;
+    var sums: [rows * blocks * layout.Q8_SUBBLOCKS]i32 = undefined;
     accumulateInt(p, &sums);
     for (sums) |s| try testing.expectEqual(@as(i32, 32), s);
 
     var out: [rows]f32 = undefined;
     scaledOutput(p, &out);
-    const expect: f32 = @floatFromInt(blocks * q1a8.Q8_SUBBLOCKS * 32);
+    const expect: f32 = @floatFromInt(blocks * layout.Q8_SUBBLOCKS * 32);
     for (out) |v| try testing.expectApproxEqAbs(expect, v, 1e-3);
 }
 
 test "sign bits flip activation contribution" {
     // bits = 0 (-1), acts = 5 -> sub_sum = -160 over the 32-wide sub-block.
-    var bits = [_]u128{0} ** q1a8.ROWS;
-    var wscales = [_]f16{1.0} ** q1a8.ROWS;
-    var aquants = [_]i8{5} ** q1a8.Q1_BLOCK;
-    var ascales = [_]f16{1.0} ** q1a8.Q8_SUBBLOCKS;
+    var bits = [_]u128{0} ** layout.ROWS;
+    var wscales = [_]f16{1.0} ** layout.ROWS;
+    var aquants = [_]i8{5} ** layout.Q1_BLOCK;
+    var ascales = [_]f16{1.0} ** layout.Q8_SUBBLOCKS;
     const p: Problem = .{
-        .rows = q1a8.ROWS,
+        .rows = layout.ROWS,
         .q1_blocks = 1,
         .weight_bits = &bits,
         .weight_scales = &wscales,

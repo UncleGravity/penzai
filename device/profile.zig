@@ -3,7 +3,7 @@ const shared = @import("shared");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
 /// Hardware counters read from the PL kernel after a matmul run. Cycle/stall/beat
 /// counts; all zero for a CPU matmul. The PL backend produces these and the
@@ -198,8 +198,8 @@ fn getRowsBytes(op: wire.GetRows) u64 {
 
 fn q1GetRowsSourceBytes(row_width: u32) u64 {
     if (row_width == 0) return 0;
-    const blocks = (@as(u64, row_width) + q1a8.q1_block - 1) / q1a8.q1_block;
-    const bytes_per_block = q1a8.beat_bytes * (1 + q1a8.q8_subblocks);
+    const blocks = (@as(u64, row_width) + layout.q1_block - 1) / layout.q1_block;
+    const bytes_per_block = layout.beat_bytes * (1 + layout.q8_subblocks);
     return mul(blocks, bytes_per_block);
 }
 
@@ -257,6 +257,6 @@ test "profile byte estimates for row ops count touched rows, not backing spans" 
         .dst_nb2 = 2 * 256 * @sizeOf(f32),
         .dst_nb3 = 6 * 256 * @sizeOf(f32),
     } };
-    const q1_source_bytes = 2 * q1a8.beat_bytes * (1 + q1a8.q8_subblocks);
+    const q1_source_bytes = 2 * layout.beat_bytes * (1 + layout.q8_subblocks);
     try std.testing.expectEqual(@as(u64, 6 * (q1_source_bytes + 4 + 256 * 4)), commandBytes(get_rows));
 }

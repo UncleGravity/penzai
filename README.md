@@ -1,13 +1,12 @@
 # penzai
 
-LLM inference on FPGA (KR260)
+1-Bit / 1.58-Bit LLM inference accelerator on FPGA (KR260)
 
 ## TLDR
 ```sh
 # Terminal 1
 nix run .#deploy-penzaid # build and upload daemon
 nix run .#serve-penzaid # run remote daemon
-ssh ubuntu@kria "pkill -f '/tmp/penzai/penzaid serve'" # kill when done
 
 # Terminal 2
 nix run .#penzai -- run \
@@ -33,7 +32,5 @@ nix run .#penzai -- run \
   -m ./models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
   --device tcp:kria:29092 \
   --prompt "hello" \
-  --prof # pretty table
-  # OR view as json
-  # --prof=json 2>/dev/null | tail -1 | jq 
+  --prof # stats table
 ```

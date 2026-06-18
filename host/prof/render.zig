@@ -5,7 +5,7 @@ const collector_mod = @import("collector.zig");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
 // Aliases so the renderers below reference the model types/helpers unqualified.
 const RunGraphTotals = model.RunGraphTotals;
@@ -228,7 +228,7 @@ pub fn writeMatmulDetail(
         const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles));
         const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
         const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
-        const weight_bytes = stat.w_beats * q1a8.weight_beat_bytes;
+        const weight_bytes = stat.w_beats * layout.weight_beat_bytes;
         const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
         const weight_gb_s_wall = weightGbps(stat, fclk_hz);
         try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1} {d:>8.2} {d:>8.2}\n", .{
@@ -328,7 +328,7 @@ pub fn writeScoreboard(
     const mhz: u64 = (@as(u64, rg.device_fclk_hz) + 500_000) / 1_000_000;
     var vbuf: [32]u8 = undefined;
     const variant = std.fmt.bufPrint(&vbuf, "w{d}-p{d}-f{d}", .{
-        q1a8.rows_per_block * 32, q1a8.weight_ports, mhz,
+        layout.rows_per_block * 32, layout.weight_ports, mhz,
     }) catch "unknown";
 
     var mm: profiling.MatmulStat = .{};

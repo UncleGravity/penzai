@@ -6,7 +6,7 @@ const link_mod = @import("link");
 const lower = @import("lower.zig");
 const census_mod = @import("census.zig");
 
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 const wire = shared.wire;
 const profiling = shared.profiling;
 
@@ -183,7 +183,7 @@ fn effectiveAllocSize(tensor: *const c.ggml_tensor) usize {
     if (isRepackableQ1_0(tensor)) {
         const rows: usize = @intCast(dim(tensor, 1));
         const k: usize = @intCast(dim(tensor, 0));
-        return q1a8.packedWeightBytes(rows, k) catch tensorNbytes(tensor);
+        return layout.packedWeightBytes(rows, k) catch tensorNbytes(tensor);
     }
     return tensorNbytes(tensor);
 }
@@ -194,7 +194,7 @@ fn isRepackableQ1_0(tensor: *const c.ggml_tensor) bool {
         dim(tensor, 1) > 0 and
         dim(tensor, 2) == 1 and
         dim(tensor, 3) == 1 and
-        @mod(@as(usize, @intCast(dim(tensor, 0))), q1a8.q1_block) == 0;
+        @mod(@as(usize, @intCast(dim(tensor, 0))), layout.q1_block) == 0;
 }
 
 fn shouldRepackQ1_0(tensor: *const c.ggml_tensor, offset: usize, size: usize) bool {
@@ -287,10 +287,10 @@ fn bufSetTensor(
     if (shouldRepackQ1_0(t, offset, size)) {
         const rows: usize = @intCast(dim(t, 1));
         const k: usize = @intCast(dim(t, 0));
-        const packed_len = q1a8.packedWeightBytes(rows, k) catch return;
+        const packed_len = layout.packedWeightBytes(rows, k) catch return;
         const packed_weights = remote.dev.allocator.alloc(u8, packed_len) catch return;
         defer remote.dev.allocator.free(packed_weights);
-        q1a8.packWeightsFromGgmlQ1_0(rows, k, src[0..size], packed_weights) catch return;
+        layout.packWeightsFromGgmlQ1_0(rows, k, src[0..size], packed_weights) catch return;
         timedUpload(remote.dev, binding.range, packed_weights) catch return;
         remote.dev.counters.upload_bytes += packed_weights.len;
         recordUploadTensor(remote.dev, t, packed_weights.len);

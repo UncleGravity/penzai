@@ -1,7 +1,7 @@
 //! PL Q1A8 matmul backend: drives the fabric kernel for a wire matmul command.
 //!
 //! Weights are streamed straight from their resident XRT BO range. Activations
-//! are quantized with the *canonical* quantizer (`shared.q1a8.quantizeQ8_0`, the
+//! are quantized with the *canonical* quantizer (`shared.layout.quantizeQ8_0`, the
 //! same round-nearest-even the PS oracle uses, so PL and PS feed bit-identical
 //! int8), packed into a staging region, and DMA'd in. Results DMA into a staging
 //! region and copy into the destination range.
@@ -17,7 +17,7 @@ const gather = @import("gather.zig");
 const profile = @import("../profile.zig");
 
 const wire = shared.wire;
-const q1a8 = shared.q1a8;
+const layout = shared.layout;
 
 // AXI-Lite base addresses, matching fpga/bitstreams/q1a8-w256-mc/tcl/build.tcl.
 // dma_w[0] also owns result S2MM; all weight ports use MM2S.
@@ -70,7 +70,7 @@ pub fn Backend(comptime Heap: type) type {
 
         allocator: std.mem.Allocator,
         kernel: mmio.Kernel,
-        dma_w: [q1a8.weight_ports]mmio.Dma,
+        dma_w: [layout.weight_ports]mmio.Dma,
         dma_a: mmio.Dma,
         acts_staging: wire.TensorRange,
         result_staging: wire.TensorRange,
@@ -83,7 +83,7 @@ pub fn Backend(comptime Heap: type) type {
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             var kernel = try mmio.Kernel.open(kernel_base);
             errdefer kernel.deinit();
-            var dma_w: [q1a8.weight_ports]mmio.Dma = undefined;
+            var dma_w: [layout.weight_ports]mmio.Dma = undefined;
             var opened: usize = 0;
             errdefer for (dma_w[0..opened]) |*dma| dma.deinit();
             for (&dma_w, dma_w_bases[0..]) |*dma, base| {
@@ -128,13 +128,13 @@ pub fn Backend(comptime Heap: type) type {
             const rows: usize = mm.rows;
             const cols: usize = mm.cols;
             const k: usize = mm.k;
-            if (rows == 0 or cols == 0 or k == 0 or k % q1a8.q1_block != 0) return null;
+            if (rows == 0 or cols == 0 or k == 0 or k % layout.q1_block != 0) return null;
 
-            const q1_blocks = k / q1a8.q1_block;
-            const num_rb = q1a8.rowblocksFor(rows);
-            const weight_port_bytes = num_rb * q1_blocks * q1a8.packed_per_port_q1_block;
-            const weight_bytes = weight_port_bytes * q1a8.weight_ports;
-            const act_stream_bytes = q1_blocks * q1a8.acts_per_q1_block; // per column
+            const q1_blocks = k / layout.q1_block;
+            const num_rb = layout.rowblocksFor(rows);
+            const weight_port_bytes = num_rb * q1_blocks * layout.packed_per_port_q1_block;
+            const weight_bytes = weight_port_bytes * layout.weight_ports;
+            const act_stream_bytes = q1_blocks * layout.acts_per_q1_block; // per column
             const dst_bytes = rows * cols * @sizeOf(f32);
 
             // Shapes must match the resident packing and the staging windows must
@@ -146,9 +146,9 @@ pub fn Backend(comptime Heap: type) type {
             if (num_rb * mc_cols_max * result_bytes_per_rb > result_staging_cap) return null;
 
             try self.ensureScratch(k);
-            const q8_blocks = q1_blocks * q1a8.q8_subblocks;
+            const q8_blocks = q1_blocks * layout.q8_subblocks;
             const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
-            var weight_phys: [q1a8.weight_ports]u64 = undefined;
+            var weight_phys: [layout.weight_ports]u64 = undefined;
             for (&weight_phys, 0..) |*phys, port| {
                 phys.* = weights_phys + @as(u64, @intCast(port * weight_port_bytes));
             }
@@ -164,7 +164,7 @@ pub fn Backend(comptime Heap: type) type {
                 const group = @min(mc_cols_max, cols - col0);
                 const act_total = group * act_stream_bytes;
                 const result_bytes = num_rb * group * result_bytes_per_rb;
-                const direct_result = group == 1 and rows % q1a8.rows_per_block == 0;
+                const direct_result = group == 1 and rows % layout.rows_per_block == 0;
                 const acts_dma = subRange(self.acts_staging, act_total);
                 const result_dma = if (direct_result)
                     offsetRange(mm.dst, col0 * rows * @sizeOf(f32), result_bytes)
@@ -177,7 +177,7 @@ pub fn Backend(comptime Heap: type) type {
                 for (0..group) |c| {
                     const src = ((col0 + c) * k) * @sizeOf(f32);
                     @memcpy(std.mem.sliceAsBytes(self.column[0..k]), acts_bytes[src..][0 .. k * @sizeOf(f32)]);
-                    q1a8.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
+                    layout.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
                     packActs(q1_blocks, self.quants[0..k], self.act_scales[0..q8_blocks], acts_staging_buf[c * act_stream_bytes ..][0..act_stream_bytes]);
                 }
                 seg.quant_ns += lapNs(io, &last);
@@ -280,7 +280,7 @@ pub fn Backend(comptime Heap: type) type {
             self.allocator.free(self.act_scales);
             self.column = self.allocator.alloc(f32, k) catch return error.OutOfMemory;
             self.quants = self.allocator.alloc(i8, k) catch return error.OutOfMemory;
-            self.act_scales = self.allocator.alloc(f16, k / q1a8.q8_block) catch return error.OutOfMemory;
+            self.act_scales = self.allocator.alloc(f16, k / layout.q8_block) catch return error.OutOfMemory;
         }
     };
 }
@@ -310,13 +310,13 @@ fn accumulateCounters(dst: *profile.PlCounters, src: profile.PlCounters) void {
 fn packActs(q1_blocks: usize, quants: []const i8, scales: []const f16, out: []u8) void {
     var off: usize = 0;
     for (0..q1_blocks) |blk| {
-        for (0..q1a8.q8_subblocks) |sub| {
-            const q8 = blk * q1a8.q8_subblocks + sub;
-            const acts = quants[q8 * q1a8.q8_block ..][0..q1a8.q8_block];
-            for (0..q1a8.q8_block / q1a8.beat_bytes) |beat| {
+        for (0..layout.q8_subblocks) |sub| {
+            const q8 = blk * layout.q8_subblocks + sub;
+            const acts = quants[q8 * layout.q8_block ..][0..layout.q8_block];
+            for (0..layout.q8_block / layout.beat_bytes) |beat| {
                 var word: u64 = 0;
-                for (0..q1a8.beat_bytes) |byte| {
-                    const u: u64 = @as(u8, @bitCast(acts[beat * q1a8.beat_bytes + byte]));
+                for (0..layout.beat_bytes) |byte| {
+                    const u: u64 = @as(u8, @bitCast(acts[beat * layout.beat_bytes + byte]));
                     word |= u << @intCast(byte * 8);
                 }
                 std.mem.writeInt(u64, out[off..][0..8], word, .little);
@@ -330,11 +330,11 @@ fn packActs(q1_blocks: usize, quants: []const i8, scales: []const f16, out: []u8
 
 test "packActs fills the expected stream length" {
     const q1_blocks = 3;
-    var quants: [q1_blocks * q1a8.q1_block]i8 = undefined;
+    var quants: [q1_blocks * layout.q1_block]i8 = undefined;
     for (&quants, 0..) |*q, i| q.* = @intCast(@as(i32, @intCast(i % 251)) - 125);
-    var scales: [q1_blocks * q1a8.q8_subblocks]f16 = undefined;
+    var scales: [q1_blocks * layout.q8_subblocks]f16 = undefined;
     for (&scales, 0..) |*s, i| s.* = @floatCast(@as(f32, @floatFromInt(i + 1)) * 0.01);
-    var out: [q1_blocks * q1a8.acts_per_q1_block]u8 = undefined;
+    var out: [q1_blocks * layout.acts_per_q1_block]u8 = undefined;
     packActs(q1_blocks, &quants, &scales, &out);
     // Last scale beat carries the final sub-block's fp16 scale in its low 16 bits.
     const last = std.mem.readInt(u64, out[out.len - 8 ..][0..8], .little);
