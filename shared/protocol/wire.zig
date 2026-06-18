@@ -424,6 +424,14 @@ pub const ResponseMeta = struct {
     device_encode_ns: u64 = 0,
 };
 
+/// Byte offset of `device_encode_ns` inside an encoded ResponseMeta: it is the
+/// last u64 `encodeResponseMeta` writes. The device stamps the field in place
+/// after encoding (it can only measure encode time once encoding is done), at
+/// `framing.header_len + device_encode_ns_offset` in the framed buffer. Pinned by
+/// a golden test against the encoder, so adding or reordering a field fails the
+/// test instead of silently corrupting the wire.
+pub const device_encode_ns_offset: usize = response_meta_len - @sizeOf(u64);
+
 pub fn encodeHello(out: []u8, request_id: u64) EncodeError!usize {
     return encodeHeader(out, .hello, request_id);
 }
@@ -1219,6 +1227,36 @@ test "response meta roundtrips including device service time" {
     try std.testing.expectEqual(response_meta_len, n);
     const decoded = try decodeResponseMeta(buf[0..n]);
     try std.testing.expectEqual(meta, decoded);
+}
+
+test "device_encode_ns_offset locates the field in an encoded ResponseMeta" {
+    // Pins the constant the device patches at (server.zig) to the actual encoder
+    // layout: a field added/reordered before device_encode_ns breaks this, not the
+    // silent on-wire stamp.
+    var buf: [response_meta_len]u8 = undefined;
+    const sentinel: u64 = 0xDEAD_BEEF_F00D_1234;
+    const meta: ResponseMeta = .{
+        .request_id = 1,
+        .status = .ok,
+        .handle = 2,
+        .nbytes = 3,
+        .value0 = 4,
+        .value1 = 5,
+        .device_service_ns = 6,
+        .device_encode_ns = sentinel,
+    };
+    const n = try encodeResponseMeta(&buf, meta);
+    try std.testing.expectEqual(response_meta_len, n);
+    // The named offset must point exactly at the encoded device_encode_ns bytes.
+    try std.testing.expectEqual(sentinel, std.mem.readInt(u64, buf[device_encode_ns_offset..][0..8], .little));
+
+    // The device's in-place post-encode patch must then round-trip through decode.
+    const patched: u64 = 0x0102_0304_0506_0708;
+    std.mem.writeInt(u64, buf[device_encode_ns_offset..][0..8], patched, .little);
+    const decoded = try decodeResponseMeta(buf[0..n]);
+    try std.testing.expectEqual(patched, decoded.device_encode_ns);
+    // ...and only that field changed.
+    try std.testing.expectEqual(@as(u64, 6), decoded.device_service_ns);
 }
 
 test "alloc request roundtrip" {
