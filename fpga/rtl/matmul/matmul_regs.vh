@@ -31,4 +31,5 @@ localparam [31:0] MATMUL_RST_A_BEATS = 32'h00000000;
 localparam [31:0] MATMUL_RST_R_BEATS = 32'h00000000;
 localparam [31:0] MATMUL_RST_CLK_HZ = 32'h00000000;
 localparam [31:0] MATMUL_RST_WEIGHT_PORTS = 32'h00000004;
+localparam integer MATMUL_COLS_MAX = 8;
 `endif

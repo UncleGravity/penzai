@@ -167,11 +167,21 @@ const STATUS_DONE: u32 = 1 << 1;
 /// Minimum kernel VERSION the driver accepts. v8 is the ROWS=16 four-port kernel
 /// and reads the v8 resident layout; older kernels are incompatible with the
 /// current host packer and must fall back to PS instead of corrupting results.
+/// This is policy (the oldest compatible kernel), distinct from the current
+/// build's VERSION reset — so it is not sourced from the regmap.
 pub const min_version: u32 = 8;
 pub const version_with_counters: u32 = 5;
-pub const expected_id: u32 = 0xB05A2000;
-pub const expected_rows: u32 = 16;
-pub const expected_weight_ports: u32 = 4;
+/// Identity/shape the driver requires of the loaded kernel, sourced from the
+/// regmap reset column (the gateware's self-described values) so the runtime
+/// check and the bitstream can never disagree.
+pub const expected_id: u32 = regmap.resetOf("ID");
+pub const expected_rows: u32 = regmap.resetOf("ROWS");
+pub const expected_weight_ports: u32 = regmap.resetOf("WEIGHT_PORTS");
+
+comptime {
+    // The minimum we accept must not exceed what this build self-describes.
+    std.debug.assert(min_version <= regmap.resetOf("VERSION"));
+}
 
 pub const Kernel = struct {
     win: RegWindow,

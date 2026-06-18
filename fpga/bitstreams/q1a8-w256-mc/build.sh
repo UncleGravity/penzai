@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # build.sh - drive the Vivado bitstream build on the Windows VM.
 #
-# Syncs the v8 RTL + generated regmap header + the TCL/BAT to the VM,
-# runs Vivado (build.bat) over ssh, and fetches the .bit/.bit.bin back to ./out.
+# Syncs the v8 RTL + generated regmap header + address map + the TCL/BAT to the
+# VM, runs Vivado (build.bat) over ssh, and fetches the .bit/.bit.bin to ./out.
 # Run from this directory after `cp config.env.example config.env` and editing it.
 #
 #   ./build.sh                         # uses VARIANT from config.env
@@ -41,11 +41,15 @@ for f in "${RTL_FILES[@]}"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for matmul_regs.vh)" >&2; exit 1; }
 done
 
+# Generated Vivado address map (build.tcl sources it). Also from `zig build regmap`.
+ADDR_MAP="tcl/address_map.tcl"
+[[ -f "$ADDR_MAP" ]] || { echo "ERROR: missing $ADDR_MAP (run 'zig build regmap')" >&2; exit 1; }
+
 echo "== sync FPGA inputs -> $VM:$VM_DIR =="
 # Windows cmd `mkdir` (no -p); ignore "already exists".
 ssh "$VM" "if not exist $VM_DIR mkdir $VM_DIR" || true
 ssh "$VM" "if not exist $VM_DIR\\rtl mkdir $VM_DIR\\rtl" || true
-scp tcl/build.tcl build.bat "$VM:$VM_DIR/"
+scp tcl/build.tcl "$ADDR_MAP" build.bat "$VM:$VM_DIR/"
 scp "${RTL_FILES[@]}" "$VM:$VM_DIR/rtl/"
 
 echo "== Vivado build variant=$VARIANT on $VM =="

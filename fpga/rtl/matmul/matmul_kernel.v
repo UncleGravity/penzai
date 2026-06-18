@@ -16,6 +16,8 @@
 
 module matmul_kernel #(
     parameter integer ROWS          = 16,
+    // Default is a standalone/cosim fallback; the deployed value is driven by
+    // matmul_top from MATMUL_COLS_MAX (regmap caps.cols_max). Keep in sync with it.
     parameter integer COLS_MAX      = 8,
     parameter integer MAX_SUB_INDEX = 64,
     // Decode accumulator-pool depth (see matmul_rowblock): >= the accumulate

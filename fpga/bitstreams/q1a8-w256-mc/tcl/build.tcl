@@ -331,15 +331,12 @@ connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_mem_w3/aresetn]
 connect_bd_intf_net [get_bd_intf_pins dma_w3/M_AXI_MM2S] [get_bd_intf_pins sc_mem_w3/S00_AXI]
 connect_bd_intf_net [get_bd_intf_pins sc_mem_w3/M00_AXI] [get_bd_intf_pins ps/S_AXI_HP3_FPD]
 
-# ---- Address map (must match device/pl/matmul.zig) --------------------------
-foreach entry {
-    {dma_w0 S_AXI_LITE 0xA0000000}
-    {dma_w1 S_AXI_LITE 0xA0010000}
-    {dma_w2 S_AXI_LITE 0xA0020000}
-    {dma_w3 S_AXI_LITE 0xA0030000}
-    {dma_a  S_AXI_LITE 0xA0040000}
-    {kernel S_AXI      0xA0050000}
-} {
+# ---- Address map (generated; single source: fpga/regmap/matmul.zig) ---------
+# `zig build regmap` writes address_map.tcl (synced next to this file), defining
+# $matmul_address_map as {cell intf offset} per AXI-Lite block. device/pl maps the
+# same table, so the addresses Vivado assigns and the host maps cannot drift.
+source [file normalize ./address_map.tcl]
+foreach entry $matmul_address_map {
     lassign $entry cell intf offset
     assign_bd_address -offset $offset -range 64K \
         [first_addr_seg [list "$cell/$intf/Reg" "$cell/$intf/*"]]

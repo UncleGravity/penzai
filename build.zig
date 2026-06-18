@@ -93,7 +93,9 @@ const matmul_top_rtl = [_][]const u8{
 const matmul_rtl_args = "fpga/rtl/matmul/matmul_top.v fpga/rtl/matmul/matmul_kernel.v fpga/rtl/matmul/matmul_rowblock.v fpga/rtl/matmul/matmul_reducer.v fpga/rtl/fp/fp32_add_pipe.v fpga/rtl/fp/fp32_mul_pipe.v fpga/rtl/fp/fp16_to_fp32.v fpga/rtl/fp/int_to_fp32.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    // regmap -> generated Verilog header (single source of register offsets).
+    // regmap -> the generated bitstream-contract files (single source: the
+    // matmul regmap module). One emitter, two artifacts: the Verilog register
+    // header (offsets/resets + MATMUL_COLS_MAX) and the Vivado address-map TCL.
     const emit = b.addExecutable(.{
         .name = "regmap-emit",
         .root_module = b.createModule(.{
@@ -102,11 +104,17 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
             .optimize = .Debug,
         }),
     });
-    const run_emit = b.addRunArtifact(emit);
-    const generated_vh = run_emit.captureStdOut(.{});
-    const update_vh = b.addUpdateSourceFiles();
-    update_vh.addCopyFileToSource(generated_vh, "fpga/rtl/matmul/matmul_regs.vh");
-    b.step("regmap", "Generate fpga/rtl/matmul/matmul_regs.vh from fpga/regmap/matmul.regmap").dependOn(&update_vh.step);
+    const update = b.addUpdateSourceFiles();
+
+    const run_vh = b.addRunArtifact(emit);
+    run_vh.addArg("vh");
+    update.addCopyFileToSource(run_vh.captureStdOut(.{}), "fpga/rtl/matmul/matmul_regs.vh");
+
+    const run_tcl = b.addRunArtifact(emit);
+    run_tcl.addArg("tcl");
+    update.addCopyFileToSource(run_tcl.captureStdOut(.{}), "fpga/bitstreams/q1a8-w256-mc/tcl/address_map.tcl");
+
+    b.step("regmap", "Generate matmul_regs.vh + address_map.tcl from fpga/regmap/matmul.zig").dependOn(&update.step);
 
     // Verilator lint of the deployable matmul RTL, including matmul_top + the
     // counter bank + the generated header. This is the structural gate for the

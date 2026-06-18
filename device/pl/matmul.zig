@@ -12,6 +12,7 @@
 
 const std = @import("std");
 const shared = @import("shared");
+const regmap = @import("regmap");
 const mmio = @import("mmio.zig");
 const gather = @import("gather.zig");
 const profile = @import("../profile.zig");
@@ -19,25 +20,24 @@ const profile = @import("../profile.zig");
 const wire = shared.wire;
 const layout = shared.layout;
 
-// AXI-Lite base addresses, matching fpga/bitstreams/q1a8-w256-mc/tcl/build.tcl.
-// dma_w[0] also owns result S2MM; all weight ports use MM2S.
-const dma_w_bases = [_]i64{
-    0xA000_0000,
-    0xA001_0000,
-    0xA002_0000,
-    0xA003_0000,
-};
-const dma_a_base: i64 = 0xA004_0000; // acts MM2S
-const kernel_base: i64 = 0xA005_0000; // kernel AXI-Lite
+// The AXI-Lite base addresses, staging reservations, and COLS_MAX all come from
+// the generated bitstream manifest (fpga/regmap/matmul.zig) — the same source
+// build.tcl assigns addresses from and the RTL takes COLS_MAX from — so the host
+// can never drift from the loaded gateware. Local aliases keep the call sites
+// below unchanged. dma_w[0] also owns result S2MM; all weight ports use MM2S.
+const dma_w_bases = regmap.addr.dma_w;
+const dma_a_base: i64 = regmap.addr.dma_a; // acts MM2S
+const kernel_base: i64 = regmap.addr.kernel; // kernel AXI-Lite
 
 // Staging capacities, reserved once from the heap at init. Generous vs any real
 // shape; a matmul that would exceed them falls back to PS.
-const acts_staging_cap: usize = 256 * 1024; // COLS_MAX columns of acts
-const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * result_bytes_per_rb
+const acts_staging_cap: usize = regmap.caps.acts_staging_bytes; // COLS_MAX columns of acts
+const result_staging_cap: usize = regmap.caps.result_staging_bytes; // num_rb * COLS_MAX * result_bytes_per_rb
 
-// Columns multiplied per kernel run. Must match matmul_kernel COLS_MAX in the
-// loaded bitstream. Prefill matmuls (cols>1) are tiled into groups of this many.
-const mc_cols_max: usize = 8;
+// Columns multiplied per kernel run. Matches matmul_kernel COLS_MAX in the loaded
+// bitstream (both derive from caps.cols_max). Prefill (cols>1) is tiled into
+// groups of this many.
+const mc_cols_max: usize = regmap.caps.cols_max;
 const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gather.zig
 
 pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
@@ -81,6 +81,9 @@ pub fn Backend(comptime Heap: type) type {
         seg: Seg = .{},
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
+            // The resident weight packing splits each 16-row block across this
+            // many DMA ports; the address table must expose exactly that many.
+            comptime std.debug.assert(dma_w_bases.len == layout.weight_ports);
             var kernel = try mmio.Kernel.open(kernel_base);
             errdefer kernel.deinit();
             var dma_w: [layout.weight_ports]mmio.Dma = undefined;

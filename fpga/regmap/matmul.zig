@@ -4,6 +4,13 @@
 //! driver (device/pl, P2) reads register offsets straight from the table and the
 //! RTL gets the same constants via `emitVerilog` (the generated `matmul_regs.vh`).
 //! Nothing else may hand-duplicate these constants — change the `.regmap`.
+//!
+//! This module also owns the rest of the bitstream contract that is not an
+//! AXI-Lite register: the block base `addr`esses (assigned by the Vivado build,
+//! which sources the generated `address_map.tcl`, and mapped by device/pl) and
+//! the build `caps` (COLS_MAX — also emitted to the RTL as `MATMUL_COLS_MAX` —
+//! and the host staging reservations). Host and gateware both derive from here,
+//! so the address map and column count cannot drift across the three layers.
 
 const std = @import("std");
 
@@ -35,6 +42,42 @@ pub fn resetOf(comptime name: []const u8) u32 {
         if (comptime std.mem.eql(u8, reg.name, name)) return reg.reset;
     }
     @compileError("unknown matmul register: " ++ name);
+}
+
+// ---- The rest of the bitstream contract (not AXI-Lite registers) ------------
+
+/// AXI-Lite block base addresses in the PS M_AXI_HPM0_FPD window. The Vivado
+/// build assigns them (build.tcl sources the generated `address_map.tcl`); the
+/// device PL driver maps them (device/pl/{matmul,mmio}.zig). One table, both
+/// sides — change addresses here only.
+pub const addr = struct {
+    /// Weight-port DMA AXI-Lite bases (port N -> dma_wN). dma_w[0] also carries
+    /// the result S2MM channel. Length is WEIGHT_PORTS. Typed i64 to match the
+    /// /dev/mem mmap offset the device passes straight through.
+    pub const dma_w = [_]i64{ 0xA000_0000, 0xA001_0000, 0xA002_0000, 0xA003_0000 };
+    /// Activation MM2S DMA AXI-Lite base.
+    pub const dma_a: i64 = 0xA004_0000;
+    /// Matmul kernel AXI-Lite base.
+    pub const kernel: i64 = 0xA005_0000;
+};
+
+/// Build/layout caps of the deployed bitstream the host must match. `cols_max`
+/// is the kernel COLS_MAX (also emitted to the RTL as `MATMUL_COLS_MAX`, so the
+/// device and gateware agree on it); the staging sizes are host DMA-buffer
+/// reservations sized to one COLS_MAX group.
+pub const caps = struct {
+    /// Activation columns multiplied per kernel run (matmul_kernel COLS_MAX).
+    pub const cols_max: u32 = 8;
+    /// Activation staging reservation: COLS_MAX columns of packed acts.
+    pub const acts_staging_bytes: usize = 256 * 1024;
+    /// Result staging reservation: num_rb * COLS_MAX * result-bytes-per-rb.
+    pub const result_staging_bytes: usize = 8 * 1024 * 1024;
+};
+
+comptime {
+    // The weight-port count is self-described by the WEIGHT_PORTS register; the
+    // address table must expose exactly that many weight DMAs.
+    std.debug.assert(addr.dma_w.len == resetOf("WEIGHT_PORTS"));
 }
 
 fn isDataLine(line: []const u8) bool {
@@ -90,7 +133,31 @@ pub fn emitVerilog(buf: []u8) std.fmt.BufPrintError![]const u8 {
         if (reg.access != .ro) continue;
         cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [31:0] MATMUL_RST_{s} = 32'h{X:0>8};\n", .{ reg.name, reg.reset })).len;
     }
+    // Build caps the RTL needs (not registers). matmul_top drives the kernel's
+    // COLS_MAX from this so the deployed column count and the host's caps.cols_max
+    // share one source.
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam integer MATMUL_COLS_MAX = {d};\n", .{caps.cols_max})).len;
     cursor += (try std.fmt.bufPrint(buf[cursor..], "`endif\n", .{})).len;
+    return buf[0..cursor];
+}
+
+/// Emit the Vivado address-map TCL into `buf`, returning the written slice. The
+/// bitstream `build.tcl` `source`s the generated file and iterates
+/// `$matmul_address_map` (one `{cell intf offset}` per AXI-Lite block) so the
+/// addresses Vivado assigns and the addresses device/pl maps never drift.
+pub fn emitAddrTcl(buf: []u8) std.fmt.BufPrintError![]const u8 {
+    var cursor: usize = 0;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "# Generated from fpga/regmap/matmul.zig — do not edit.\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "# AXI-Lite address map for the matmul bitstream; {{cell intf offset}} per block.\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "set matmul_address_map {{\n", .{})).len;
+    // These AXI-Lite bases are 32-bit; cast to unsigned so the hex prints
+    // without a sign (signed {X} would emit a leading '+').
+    for (addr.dma_w, 0..) |base, i| {
+        cursor += (try std.fmt.bufPrint(buf[cursor..], "    {{dma_w{d} S_AXI_LITE 0x{X:0>8}}}\n", .{ i, @as(u32, @intCast(base)) })).len;
+    }
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "    {{dma_a S_AXI_LITE 0x{X:0>8}}}\n", .{@as(u32, @intCast(addr.dma_a))})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "    {{kernel S_AXI 0x{X:0>8}}}\n", .{@as(u32, @intCast(addr.kernel))})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "}}\n", .{})).len;
     return buf[0..cursor];
 }
 
@@ -112,4 +179,25 @@ test "emitVerilog contains offsets and ro reset values" {
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_ID = 32'hB05A2000;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_CTRL") == null);
+    // COLS_MAX flows to the RTL so matmul_top can drive the kernel from it.
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_COLS_MAX = 8;") != null);
+}
+
+test "address map and caps are internally consistent" {
+    try std.testing.expectEqual(@as(usize, 4), addr.dma_w.len);
+    try std.testing.expectEqual(@as(usize, addr.dma_w.len), @as(usize, resetOf("WEIGHT_PORTS")));
+    try std.testing.expectEqual(@as(i64, 0xA000_0000), addr.dma_w[0]);
+    try std.testing.expectEqual(@as(i64, 0xA004_0000), addr.dma_a);
+    try std.testing.expectEqual(@as(i64, 0xA005_0000), addr.kernel);
+    try std.testing.expectEqual(@as(u32, 8), caps.cols_max);
+}
+
+test "emitAddrTcl matches the deployed address map" {
+    var buf: [4096]u8 = undefined;
+    const out = try emitAddrTcl(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "set matmul_address_map {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{dma_w0 S_AXI_LITE 0xA0000000}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{dma_w3 S_AXI_LITE 0xA0030000}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{dma_a S_AXI_LITE 0xA0040000}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{kernel S_AXI 0xA0050000}") != null);
 }

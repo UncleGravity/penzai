@@ -167,7 +167,9 @@ module matmul_top #(
     assign s_axis_w2_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w3_tvalid;
     assign s_axis_w3_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w2_tvalid;
 
-    matmul_kernel #(.ROWS(ROWS), .COLS_MAX(8), .MAX_SUB_INDEX(256)) u_kernel (
+    // COLS_MAX comes from the generated header (caps.cols_max in the regmap
+    // manifest), the same source the host's mc_cols_max reads — never a literal.
+    matmul_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(256)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
         .start_kernel(start_strobe),
