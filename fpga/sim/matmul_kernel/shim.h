@@ -1,4 +1,4 @@
-/* C ABI over the Verilated q1a8_kernel_mc model. Mirrors the wide-kernel shim
+/* C ABI over the Verilated matmul_kernel model. Mirrors the wide-kernel shim
  * plus num_cols (the number of activation columns to multiply in one run). */
 #pragma once
 #include <stdint.h>

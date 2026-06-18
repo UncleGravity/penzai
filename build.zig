@@ -75,23 +75,22 @@ pub fn build(b: *std.Build) void {
     addRtlSteps(b, target, optimize);
 }
 
-// q1a8 RTL file sets (paths relative to the repo root, where `zig build` runs).
-// The multi-column kernel + its pipelined reducer + the fp helpers are the only
-// shipping datapath. The single-column narrow/wide kernels and the unpipelined
-// reducer/fp units were deleted (rebuild 1D-2); see plan-fpga-6 deletion inventory.
-const reducer_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_reducer_pipe.v", "fpga/rtl/q1a8/fp32_add_pipe.v",
-    "fpga/rtl/q1a8/fp32_mul_pipe.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
-    "fpga/rtl/q1a8/int_to_fp32.v",
+// RTL file sets (paths relative to the repo root, where `zig build` runs). The
+// matmul op lives in rtl/matmul/; the reusable fp32 cells in rtl/fp/ (a leaf
+// library shared with future ops). One module per file, file named after the module.
+const fp_rtl = [_][]const u8{
+    "fpga/rtl/fp/fp32_add_pipe.v", "fpga/rtl/fp/fp32_mul_pipe.v",
+    "fpga/rtl/fp/fp16_to_fp32.v",  "fpga/rtl/fp/int_to_fp32.v",
 };
-const mc_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_kernel_mc.v", "fpga/rtl/q1a8/q1a8_rowblock_mc.v",
-} ++ reducer_rtl;
-const mc_top_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_kernel_mc_top.v",
-} ++ mc_rtl;
+const matmul_rtl = [_][]const u8{
+    "fpga/rtl/matmul/matmul_kernel.v", "fpga/rtl/matmul/matmul_rowblock.v",
+    "fpga/rtl/matmul/matmul_reducer.v",
+} ++ fp_rtl;
+const matmul_top_rtl = [_][]const u8{
+    "fpga/rtl/matmul/matmul_top.v",
+} ++ matmul_rtl;
 
-const mc_rtl_args = "fpga/rtl/q1a8/q1a8_kernel_mc_top.v fpga/rtl/q1a8/q1a8_kernel_mc.v fpga/rtl/q1a8/q1a8_rowblock_mc.v fpga/rtl/q1a8/q1a8_reducer_pipe.v fpga/rtl/q1a8/fp32_add_pipe.v fpga/rtl/q1a8/fp32_mul_pipe.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
+const matmul_rtl_args = "fpga/rtl/matmul/matmul_top.v fpga/rtl/matmul/matmul_kernel.v fpga/rtl/matmul/matmul_rowblock.v fpga/rtl/matmul/matmul_reducer.v fpga/rtl/fp/fp32_add_pipe.v fpga/rtl/fp/fp32_mul_pipe.v fpga/rtl/fp/fp16_to_fp32.v fpga/rtl/fp/int_to_fp32.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> generated Verilog header (single source of register offsets).
@@ -106,20 +105,20 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const run_emit = b.addRunArtifact(emit);
     const generated_vh = run_emit.captureStdOut(.{});
     const update_vh = b.addUpdateSourceFiles();
-    update_vh.addCopyFileToSource(generated_vh, "fpga/rtl/q1a8/q1a8_regs.vh");
-    b.step("regmap", "Generate fpga/rtl/q1a8/q1a8_regs.vh from fpga/regmap/q1a8.regmap").dependOn(&update_vh.step);
+    update_vh.addCopyFileToSource(generated_vh, "fpga/rtl/matmul/matmul_regs.vh");
+    b.step("regmap", "Generate fpga/rtl/matmul/matmul_regs.vh from fpga/regmap/matmul.regmap").dependOn(&update_vh.step);
 
-    // Verilator lint of the deployable q1a8 RTL, including kernel_top + the
+    // Verilator lint of the deployable matmul RTL, including matmul_top + the
     // counter bank + the generated header. This is the structural gate for the
     // gateware that the cosim (which drives the core) does not exercise.
     const lint = b.addSystemCommand(&.{
         "sh",                                                                                                                                                                     "-c",
-        "verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/q1a8 --top-module q1a8_kernel_mc_top " ++ mc_rtl_args,
+        "verilator --lint-only -Wall -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/matmul --top-module matmul_top " ++ matmul_rtl_args,
     });
-    b.step("lint-rtl", "Verilator lint the q1a8 RTL").dependOn(&lint.step);
+    b.step("lint-rtl", "Verilator lint the matmul RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl-mc", "Verilator cosim: multi-column q1a8_kernel_mc vs matmul_ref", "q1a8_kernel_mc", "fpga/sim/q1a8_kernel_mc", &mc_rtl, 16);
-    addCosim(b, target, optimize, "test-rtl-mc-top", "Verilator cosim: four-port q1a8_kernel_mc_top zip vs matmul_ref", "q1a8_kernel_mc_top", "fpga/sim/q1a8_kernel_mc_top", &mc_top_rtl, 16);
+    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl, 16);
+    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl, 16);
 }
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, rows: usize) void {
@@ -162,7 +161,7 @@ fn addCosim(
     vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "--Mdir", gen });
-    vcmd.addArg("+incdir+fpga/rtl/q1a8");
+    vcmd.addArg("+incdir+fpga/rtl/matmul");
     vcmd.addArgs(rtl);
 
     const tb_mod = b.createModule(.{
@@ -275,7 +274,7 @@ fn createSharedModule(
     });
 }
 
-/// The generated register map (offsets/resets parsed from fpga/regmap/q1a8.regmap),
+/// The generated register map (offsets/resets parsed from fpga/regmap/matmul.regmap),
 /// consumed by the device PL driver. A cross-boundary contract module, like shared.
 fn createRegmapModule(
     b: *std.Build,
@@ -283,7 +282,7 @@ fn createRegmapModule(
     optimize: std.builtin.OptimizeMode,
 ) *std.Build.Module {
     return b.createModule(.{
-        .root_source_file = b.path("fpga/regmap/q1a8.zig"),
+        .root_source_file = b.path("fpga/regmap/matmul.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -393,7 +392,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/protocol/wire.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/profiling.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/q1a8.zig", target, optimize, shared);
-    addSharedTest(b, test_step, "fpga/regmap/q1a8.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "fpga/regmap/matmul.zig", target, optimize, shared);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/mem/heap.zig", target, optimize, build_options, shared);

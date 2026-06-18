@@ -1,6 +1,6 @@
-// q1a8_kernel_mc_top - AXI-Lite top for the multi-column Q1A8 kernel (v8).
+// matmul_top - AXI-Lite top for the multi-column matmul kernel (v8).
 //
-// Wraps q1a8_kernel_mc. The host sets NUM_Q1_BLOCKS, NUM_ROWBLOCKS and NUM_COLS,
+// Wraps matmul_kernel. The host sets NUM_Q1_BLOCKS, NUM_ROWBLOCKS and NUM_COLS,
 // then strobes CTRL.start. Weights stream in as four synchronized 128-bit ports;
 // the wrapper zips them into one 512-bit beat for ROWS=16. Each beat is MAC'd
 // against all NUM_COLS activation columns before the next, so prefill (cols>1)
@@ -10,7 +10,7 @@
 
 `default_nettype none
 
-module q1a8_kernel_mc_top #(
+module matmul_top #(
     // Set by the Vivado BD build from the propagated clk_wiz output frequency.
     // Keep this as a build parameter, not a regmap reset, so one checked-in
     // regmap can serve f125/f200/f250/f300 bitstream variants.
@@ -135,10 +135,10 @@ module q1a8_kernel_mc_top #(
 );
     localparam integer ROWS = 16;
 
-    // Register offsets and RO reset values, generated from fpga/regmap/q1a8.regmap
+    // Register offsets and RO reset values, generated from fpga/regmap/matmul.regmap
     // by `zig build regmap`. ID/VERSION/ROWS resets and every offset live here so
     // the RTL decode and the Zig MMIO driver never drift.
-    `include "q1a8_regs.vh"
+    `include "matmul_regs.vh"
 
     wire clk   = s_axi_aclk;
     wire rst_n = s_axi_aresetn;
@@ -167,7 +167,7 @@ module q1a8_kernel_mc_top #(
     assign s_axis_w2_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w3_tvalid;
     assign s_axis_w3_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w2_tvalid;
 
-    q1a8_kernel_mc #(.ROWS(ROWS), .COLS_MAX(8), .MAX_SUB_INDEX(256)) u_kernel (
+    matmul_kernel #(.ROWS(ROWS), .COLS_MAX(8), .MAX_SUB_INDEX(256)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
         .start_kernel(start_strobe),
@@ -251,19 +251,19 @@ module q1a8_kernel_mc_top #(
 
             if (write_commit) begin
                 case (awaddr_q[7:0])
-                    Q1A8_OFF_CTRL[7:0]: begin
+                    MATMUL_OFF_CTRL[7:0]: begin
                         if (s_axi_wstrb[0] && s_axi_wdata[0])
                             start_strobe <= 1'b1;
                     end
-                    Q1A8_OFF_NUM_Q1_BLOCKS[7:0]: begin
+                    MATMUL_OFF_NUM_Q1_BLOCKS[7:0]: begin
                         if (s_axi_wstrb[0]) num_q1_blocks_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_q1_blocks_q[15:8] <= s_axi_wdata[15:8];
                     end
-                    Q1A8_OFF_NUM_ROWBLOCKS[7:0]: begin
+                    MATMUL_OFF_NUM_ROWBLOCKS[7:0]: begin
                         if (s_axi_wstrb[0]) num_rowblocks_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_rowblocks_q[15:8] <= s_axi_wdata[15:8];
                     end
-                    Q1A8_OFF_NUM_COLS[7:0]: begin
+                    MATMUL_OFF_NUM_COLS[7:0]: begin
                         if (s_axi_wstrb[0]) num_cols_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_cols_q[15:8] <= s_axi_wdata[15:8];
                     end
@@ -288,22 +288,22 @@ module q1a8_kernel_mc_top #(
             if (read_accept) begin
                 rvalid_q <= 1'b1;
                 case (s_axi_araddr[7:0])
-                    Q1A8_OFF_ID[7:0]:            rdata_q <= Q1A8_RST_ID;
-                    Q1A8_OFF_VERSION[7:0]:       rdata_q <= Q1A8_RST_VERSION;
-                    Q1A8_OFF_STATUS[7:0]:        rdata_q <= {30'd0, done_latched, kernel_busy};
-                    Q1A8_OFF_NUM_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, num_q1_blocks_q};
-                    Q1A8_OFF_NUM_ROWBLOCKS[7:0]: rdata_q <= {16'd0, num_rowblocks_q};
-                    Q1A8_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
-                    Q1A8_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
-                    Q1A8_OFF_ROWS[7:0]:          rdata_q <= Q1A8_RST_ROWS;
-                    Q1A8_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;
-                    Q1A8_OFF_W_STALL[7:0]:       rdata_q <= w_stall_q;
-                    Q1A8_OFF_A_STALL[7:0]:       rdata_q <= a_stall_q;
-                    Q1A8_OFF_R_STALL[7:0]:       rdata_q <= r_stall_q;
-                    Q1A8_OFF_W_BEATS[7:0]:       rdata_q <= w_beats_q;
-                    Q1A8_OFF_A_BEATS[7:0]:       rdata_q <= a_beats_q;
-                    Q1A8_OFF_R_BEATS[7:0]:       rdata_q <= r_beats_q;
-                    Q1A8_OFF_WEIGHT_PORTS[7:0]:  rdata_q <= Q1A8_RST_WEIGHT_PORTS;
+                    MATMUL_OFF_ID[7:0]:            rdata_q <= MATMUL_RST_ID;
+                    MATMUL_OFF_VERSION[7:0]:       rdata_q <= MATMUL_RST_VERSION;
+                    MATMUL_OFF_STATUS[7:0]:        rdata_q <= {30'd0, done_latched, kernel_busy};
+                    MATMUL_OFF_NUM_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, num_q1_blocks_q};
+                    MATMUL_OFF_NUM_ROWBLOCKS[7:0]: rdata_q <= {16'd0, num_rowblocks_q};
+                    MATMUL_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
+                    MATMUL_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
+                    MATMUL_OFF_ROWS[7:0]:          rdata_q <= MATMUL_RST_ROWS;
+                    MATMUL_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;
+                    MATMUL_OFF_W_STALL[7:0]:       rdata_q <= w_stall_q;
+                    MATMUL_OFF_A_STALL[7:0]:       rdata_q <= a_stall_q;
+                    MATMUL_OFF_R_STALL[7:0]:       rdata_q <= r_stall_q;
+                    MATMUL_OFF_W_BEATS[7:0]:       rdata_q <= w_beats_q;
+                    MATMUL_OFF_A_BEATS[7:0]:       rdata_q <= a_beats_q;
+                    MATMUL_OFF_R_BEATS[7:0]:       rdata_q <= r_beats_q;
+                    MATMUL_OFF_WEIGHT_PORTS[7:0]:  rdata_q <= MATMUL_RST_WEIGHT_PORTS;
                     default: rdata_q <= 32'd0;
                 endcase
             end else if (rvalid_q && s_axi_rready) begin

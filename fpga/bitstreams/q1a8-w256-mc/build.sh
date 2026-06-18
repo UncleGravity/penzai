@@ -8,7 +8,7 @@
 #   ./build.sh                         # uses VARIANT from config.env
 #   ./build.sh w512-p4-f125-wc250      # explicit variant
 #
-# The kernel_top `include`s q1a8_regs.vh; regenerate it first if the regmap
+# matmul_top `include`s matmul_regs.vh; regenerate it first if the regmap
 # changed:  (cd ../../.. && zig build regmap)
 
 set -euo pipefail
@@ -21,23 +21,24 @@ set -a; source config.env; set +a
 : "${VM_DIR:?config.env must set VM_DIR (build dir on the VM)}"
 VARIANT="${1:-${VARIANT:-w512-p4-f125-wc250}}"
 BIT_PREFIX="penzai-q1a8-mc"
-RTL_DIR="../../rtl/q1a8"
+RTL_MATMUL="../../rtl/matmul"
+RTL_FP="../../rtl/fp"
 
-# v8 multi-column RTL set. q1a8_regs.vh must exist — generate with
+# v8 multi-column RTL set. matmul_regs.vh must exist — generate with
 # `zig build regmap`.
 RTL_FILES=(
-  "$RTL_DIR/q1a8_kernel_mc_top.v"
-  "$RTL_DIR/q1a8_kernel_mc.v"
-  "$RTL_DIR/q1a8_rowblock_mc.v"
-  "$RTL_DIR/q1a8_reducer_pipe.v"
-  "$RTL_DIR/fp32_add_pipe.v"
-  "$RTL_DIR/fp32_mul_pipe.v"
-  "$RTL_DIR/fp16_to_fp32.v"
-  "$RTL_DIR/int_to_fp32.v"
-  "$RTL_DIR/q1a8_regs.vh"
+  "$RTL_MATMUL/matmul_top.v"
+  "$RTL_MATMUL/matmul_kernel.v"
+  "$RTL_MATMUL/matmul_rowblock.v"
+  "$RTL_MATMUL/matmul_reducer.v"
+  "$RTL_FP/fp32_add_pipe.v"
+  "$RTL_FP/fp32_mul_pipe.v"
+  "$RTL_FP/fp16_to_fp32.v"
+  "$RTL_FP/int_to_fp32.v"
+  "$RTL_MATMUL/matmul_regs.vh"
 )
 for f in "${RTL_FILES[@]}"; do
-  [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for q1a8_regs.vh)" >&2; exit 1; }
+  [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for matmul_regs.vh)" >&2; exit 1; }
 done
 
 echo "== sync FPGA inputs -> $VM:$VM_DIR =="

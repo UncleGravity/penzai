@@ -1,9 +1,9 @@
-#include "Vq1a8_kernel_mc.h"
+#include "Vmatmul_kernel.h"
 #include "verilated.h"
 #include "shim.h"
 
 struct Dut {
-    Vq1a8_kernel_mc *t;
+    Vmatmul_kernel *t;
 };
 
 double sc_time_stamp() { return 0; }
@@ -12,7 +12,7 @@ extern "C" {
 
 Dut *dut_new(void) {
     Dut *d = new Dut();
-    d->t = new Vq1a8_kernel_mc();
+    d->t = new Vmatmul_kernel();
     return d;
 }
 void dut_free(Dut *d) {

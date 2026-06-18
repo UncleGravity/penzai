@@ -1,13 +1,13 @@
-//! Single source of truth for the Q1A8 kernel AXI-Lite register map.
+//! Single source of truth for the matmul kernel AXI-Lite register map.
 //!
-//! `q1a8.regmap` is the schema; this module comptime-parses it so the Zig MMIO
+//! `matmul.regmap` is the schema; this module comptime-parses it so the Zig MMIO
 //! driver (device/pl, P2) reads register offsets straight from the table and the
-//! RTL gets the same constants via `emitVerilog` (the generated `q1a8_regs.vh`).
+//! RTL gets the same constants via `emitVerilog` (the generated `matmul_regs.vh`).
 //! Nothing else may hand-duplicate these constants — change the `.regmap`.
 
 const std = @import("std");
 
-const raw = @embedFile("q1a8.regmap");
+const raw = @embedFile("matmul.regmap");
 
 pub const Access = enum { ro, rw, wo };
 
@@ -18,7 +18,7 @@ pub const Reg = struct {
     reset: u32,
 };
 
-/// All registers, in schema order. Parsed at comptime from `q1a8.regmap`.
+/// All registers, in schema order. Parsed at comptime from `matmul.regmap`.
 pub const table: [countRegs(raw)]Reg = parse(raw);
 
 /// Offset of a named register, resolved at comptime (`@compileError` if absent).
@@ -26,7 +26,7 @@ pub fn offsetOf(comptime name: []const u8) u32 {
     inline for (table) |reg| {
         if (comptime std.mem.eql(u8, reg.name, name)) return reg.offset;
     }
-    @compileError("unknown q1a8 register: " ++ name);
+    @compileError("unknown matmul register: " ++ name);
 }
 
 /// Reset value of a named register, resolved at comptime.
@@ -34,7 +34,7 @@ pub fn resetOf(comptime name: []const u8) u32 {
     inline for (table) |reg| {
         if (comptime std.mem.eql(u8, reg.name, name)) return reg.reset;
     }
-    @compileError("unknown q1a8 register: " ++ name);
+    @compileError("unknown matmul register: " ++ name);
 }
 
 fn isDataLine(line: []const u8) bool {
@@ -81,14 +81,14 @@ fn parse(comptime text: []const u8) [countRegs(text)]Reg {
 /// step alongside the RTL in P2.)
 pub fn emitVerilog(buf: []u8) std.fmt.BufPrintError![]const u8 {
     var cursor: usize = 0;
-    cursor += (try std.fmt.bufPrint(buf[cursor..], "// Generated from fpga/regmap/q1a8.regmap — do not edit.\n", .{})).len;
-    cursor += (try std.fmt.bufPrint(buf[cursor..], "`ifndef Q1A8_REGS_VH\n`define Q1A8_REGS_VH\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "// Generated from fpga/regmap/matmul.regmap — do not edit.\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "`ifndef MATMUL_REGS_VH\n`define MATMUL_REGS_VH\n", .{})).len;
     for (table) |reg| {
-        cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [11:0] Q1A8_OFF_{s} = 12'h{X:0>3};\n", .{ reg.name, reg.offset })).len;
+        cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [11:0] MATMUL_OFF_{s} = 12'h{X:0>3};\n", .{ reg.name, reg.offset })).len;
     }
     for (table) |reg| {
         if (reg.access != .ro) continue;
-        cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [31:0] Q1A8_RST_{s} = 32'h{X:0>8};\n", .{ reg.name, reg.reset })).len;
+        cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [31:0] MATMUL_RST_{s} = 32'h{X:0>8};\n", .{ reg.name, reg.reset })).len;
     }
     cursor += (try std.fmt.bufPrint(buf[cursor..], "`endif\n", .{})).len;
     return buf[0..cursor];
@@ -108,8 +108,8 @@ test "regmap parses known offsets and resets" {
 test "emitVerilog contains offsets and ro reset values" {
     var buf: [4096]u8 = undefined;
     const out = try emitVerilog(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Q1A8_OFF_W_STALL = 12'h020;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "Q1A8_RST_ID = 32'hB05A2000;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_W_STALL = 12'h020;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_ID = 32'hB05A2000;") != null);
     // wo/rw registers must not get a reset localparam.
-    try std.testing.expect(std.mem.indexOf(u8, out, "Q1A8_RST_CTRL") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_CTRL") == null);
 }

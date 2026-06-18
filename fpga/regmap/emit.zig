@@ -1,9 +1,9 @@
-//! Generator for the RTL register header. Writes the q1a8_regs.vh contents to
-//! stdout; the build's `regmap` step copies it to fpga/rtl/q1a8/q1a8_regs.vh so
+//! Generator for the RTL register header. Writes the matmul_regs.vh contents to
+//! stdout; the build's `regmap` step copies it to fpga/rtl/matmul/matmul_regs.vh so
 //! the Verilog `case` decode and the Zig MMIO driver share one source.
 
 const std = @import("std");
-const regmap = @import("q1a8.zig");
+const regmap = @import("matmul.zig");
 
 pub fn main(init: std.process.Init) !void {
     var buf: [8192]u8 = undefined;

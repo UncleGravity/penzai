@@ -1,4 +1,4 @@
-// q1a8_rowblock_mc - multi-column rowblock: accumulate up to COLS_MAX activation
+// matmul_rowblock - multi-column rowblock: accumulate up to COLS_MAX activation
 // columns against ROWS rows, time-multiplexing the SAME ROWS reducers.
 //
 // A weight beat (ROWS x one Q8 sub-block) is held by the caller while it sweeps
@@ -17,7 +17,7 @@
 
 `default_nettype none
 
-module q1a8_rowblock_mc #(
+module matmul_rowblock #(
     parameter integer ROWS        = 8,
     parameter integer COLS_MAX    = 8,
     // Decode (single_col) accumulator pool depth: consecutive sub-blocks are
@@ -50,7 +50,7 @@ module q1a8_rowblock_mc #(
     output reg                        done,
     output wire [ROWS*32-1:0]         results_flat
 );
-    // q1a8_reducer plus one cycle for this rowblock to sample its registered
+    // reducer pipeline plus one cycle for this rowblock to sample its registered
     // output contribution.
     localparam integer LAT = 8;
     localparam integer ADD_LAT = 5;
@@ -106,7 +106,7 @@ module q1a8_rowblock_mc #(
             wire [31:0] add_acc = add_acc_q[row*32 +: 32];
             wire [31:0] add_contribution = add_contribution_q[row*32 +: 32];
 
-            q1a8_reducer_pipe u_reducer (
+            matmul_reducer u_reducer (
                 .clk(clk),
                 .rst_n(rst_n),
                 .valid_in(valid_in),

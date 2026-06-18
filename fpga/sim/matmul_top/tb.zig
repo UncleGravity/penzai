@@ -1,4 +1,4 @@
-//! Cosim for q1a8_kernel_mc_top: drives the deployable AXI-Lite wrapper with
+//! Cosim for matmul_top: drives the deployable AXI-Lite wrapper with
 //! four 128-bit resident weight streams and checks that the top zips them into
 //! the same 512-bit core order as packWeightsWide.
 
@@ -262,5 +262,5 @@ pub fn main() !void {
 
     try runCase(a, ROWS, 2, 3, 0x4001, false);
     try runCase(a, ROWS * 2, 3, 1, 0x4002, true);
-    std.debug.print("all mc top cosim cases passed\n", .{});
+    std.debug.print("all matmul top cosim cases passed\n", .{});
 }

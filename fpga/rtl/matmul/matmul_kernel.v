@@ -1,5 +1,5 @@
-// q1a8_kernel_mc - multi-column Q1A8 matmul: one weight stream, up to COLS_MAX
-// activation columns. Generalizes q1a8_kernel_wide (which is the COLS=1 case).
+// matmul_kernel - multi-column matmul: one weight stream, up to COLS_MAX
+// activation columns. Generalizes the single-column kernel (which is the COLS=1 case).
 //
 // Weight stream (ROWS*32-bit beats), per q1block per rowblock: 1 scale beat then
 // 4 wbit beats (one Q8 subblock for all ROWS). Each wbit beat is HELD while the
@@ -14,11 +14,11 @@
 
 `default_nettype none
 
-module q1a8_kernel_mc #(
+module matmul_kernel #(
     parameter integer ROWS          = 16,
     parameter integer COLS_MAX      = 8,
     parameter integer MAX_SUB_INDEX = 64,
-    // Decode accumulator-pool depth (see q1a8_rowblock_mc): >= the accumulate
+    // Decode accumulator-pool depth (see matmul_rowblock): >= the accumulate
     // recurrence latency, <= COLS_MAX.
     parameter integer ACCUM_DEPTH   = 8
 ) (
@@ -146,7 +146,7 @@ module q1a8_kernel_mc #(
         end
     endgenerate
 
-    q1a8_rowblock_mc #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .ACCUM_DEPTH(ACCUM_DEPTH)) u_rowblock (
+    matmul_rowblock #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .ACCUM_DEPTH(ACCUM_DEPTH)) u_rowblock (
         .clk(clk),
         .rst_n(rst_n),
         .start(rowblock_start),

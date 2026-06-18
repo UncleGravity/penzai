@@ -35,7 +35,7 @@ const kernel_base: i64 = 0xA005_0000; // kernel AXI-Lite
 const acts_staging_cap: usize = 256 * 1024; // COLS_MAX columns of acts
 const result_staging_cap: usize = 8 * 1024 * 1024; // num_rb * COLS_MAX * result_bytes_per_rb
 
-// Columns multiplied per kernel run. Must match q1a8_kernel_mc COLS_MAX in the
+// Columns multiplied per kernel run. Must match matmul_kernel COLS_MAX in the
 // loaded bitstream. Prefill matmuls (cols>1) are tiled into groups of this many.
 const mc_cols_max: usize = 8;
 const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gather.zig

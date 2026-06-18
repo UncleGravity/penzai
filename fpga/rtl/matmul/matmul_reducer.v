@@ -1,7 +1,7 @@
-// Q1A8 reducer - pipelined for the multi-column ROWS=16 kernel.
+// matmul reducer - pipelined for the multi-column ROWS=16 kernel.
 //
 // Produces contribution = (fp32) weight_scale * act_scale *
-// Sigma_i (b_i ? +a_i : -a_i). Math is the same as q1a8_reducer.v; the path is
+// Sigma_i (b_i ? +a_i : -a_i). Math is the same as the unpipelined reducer; the path is
 // explicitly pipelined for higher fclk.
 //
 // Latency:    7 cycles
@@ -9,7 +9,7 @@
 
 `default_nettype none
 
-module q1a8_reducer_pipe (
+module matmul_reducer (
     input  wire         clk,
     input  wire         rst_n,
     input  wire         valid_in,

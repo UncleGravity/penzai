@@ -1,6 +1,6 @@
 # build.tcl - KR260 Q1A8 matmul bitstream (v8 four-port vertical slice).
 #
-# Design: one q1a8_kernel_top fed by six AXI DMA/control blocks.
+# Design: one matmul_top fed by six AXI DMA/control blocks.
 #   PS pl_clk0 @ ~100 MHz -> clk_wiz -> fabric clock (fclk_mhz from variant)
 #   PS M_AXI_HPM0_FPD -> AXI-Lite -> dma_w0..dma_w3 + dma_a + kernel
 #   dma_wN MM2S: DDR/HPN -> kernel.S_AXIS_WN
@@ -74,10 +74,10 @@ set_property target_language Verilog [current_project]
 set rtl_files [glob -nocomplain [file normalize ./rtl/*.v]]
 if {[llength $rtl_files] == 0} { error "missing RTL files under ./rtl" }
 add_files -norecurse $rtl_files
-# kernel_top `include`s the generated q1a8_regs.vh. For a BD `module` reference
+# kernel_top `include`s the generated matmul_regs.vh. For a BD `module` reference
 # to elaborate, Vivado needs the header added to the project (as a Verilog header,
 # not a compilable module) *and* its directory on the include path.
-set vh_file [file normalize ./rtl/q1a8_regs.vh]
+set vh_file [file normalize ./rtl/matmul_regs.vh]
 add_files -norecurse $vh_file
 set_property file_type "Verilog Header" [get_files $vh_file]
 set_property include_dirs [list [file normalize ./rtl]] [get_filesets sources_1]
@@ -196,7 +196,7 @@ proc make_clk_conv {name bytes} {
     ] [get_bd_cells $name]
 }
 
-create_bd_cell -type module -reference q1a8_kernel_mc_top kernel
+create_bd_cell -type module -reference matmul_top kernel
 
 # Acts: dma_a(wclk) -> 128->64(wclk) -> clock converter -> kernel(fclk).
 make_clk_conv clk_conv_a 8

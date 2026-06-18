@@ -1,8 +1,8 @@
-//! Cosim for q1a8_kernel_mc: one weight stream, num_cols activation columns.
+//! Cosim for matmul_kernel: one weight stream, num_cols activation columns.
 //! Drives the kernel at C=1 (must match the wide kernel) and C>1, checking every
 //! column's results against matmul_ref. The win it proves: weights are read once
 //! regardless of C (prefill amortization), and the column-pipeline alignment in
-//! q1a8_rowblock_mc is bit-exact-within-ε.
+//! matmul_rowblock is bit-exact-within-ε.
 
 const std = @import("std");
 const q1a8 = @import("q1a8");
@@ -32,7 +32,7 @@ const Dut = struct {
 };
 
 /// Per-run handshake counters, mirroring the silicon bank in
-/// q1a8_kernel_mc_top.v:160-172 exactly: counted only while `busy`, beats =
+/// matmul_top.v:160-172 exactly: counted only while `busy`, beats =
 /// valid&&ready, stalls = ready&&!valid. Lets the cosim print the same MAC/cyc,
 /// util%, and W_STALL the board's `--prof` matmul detail shows — no translation.
 const Counters = struct {
@@ -118,7 +118,7 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
             ri += 8;
         }
         // Counter bank, sampled post-eval/pre-edge — the values the RTL's posedge
-        // logic in q1a8_kernel_mc_top.v:160-172 would latch. m_ready is tied high
+        // logic in matmul_top.v:160-172 would latch. m_ready is tied high
         // here, so r_stall stays 0 (the S2MM sink is always ready), as on silicon.
         if (c.dut_busy(dut.h) != 0) {
             ctr.busy += 1;
@@ -252,5 +252,5 @@ pub fn main() !void {
         .{ .num_rb = 8, .blocks = 16, .cols = 8, .feed = .{ .w_rate = 0.5, .w_burst = 1.0 }, .note = "prefill @ 0.5 beat/cyc" },
     };
     for (cases, 0..) |cs, i| try runCase(a, cs.num_rb * ROWS, cs.blocks, cs.cols, 0x2000 + i, cs.feed, cs.note);
-    std.debug.print("all mc cosim cases passed\n", .{});
+    std.debug.print("all matmul cosim cases passed\n", .{});
 }

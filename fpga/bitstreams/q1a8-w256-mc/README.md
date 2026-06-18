@@ -1,6 +1,6 @@
-# q1a8-w256-mc — KR260 Q1A8 matmul bitstream (v8 four-port slice)
+# q1a8-w256-mc — KR260 matmul bitstream (v8 four-port slice)
 
-The deployable v8 vertical slice for the PL Q1A8 matmul: `q1a8_kernel_mc` with
+The deployable v8 vertical slice for the PL matmul: `matmul_kernel` with
 ROWS=16, a 512-bit internal weight stream, and four 128-bit HP weight lanes at
 `wclk` feeding synchronized 128-bit AXIS ports. One weight stream is MAC'd
 against up to 8 columns/run, so decode (cols=1) and prefill share the same
@@ -16,7 +16,7 @@ the per-format matmul detail fills in stall/beat-derived utilization.
 - The KR260 board (`BOARD`) reachable over ssh with passwordless `sudo`.
 - The generated register header in place:
   ```
-  (cd ../../.. && zig build regmap)   # writes ../../rtl/q1a8/q1a8_regs.vh
+  (cd ../../.. && zig build regmap)   # writes ../../rtl/matmul/matmul_regs.vh
   ```
 
 ## Build
@@ -26,7 +26,7 @@ cp config.env.example config.env   # then edit VM / BOARD paths
 ./build.sh                          # variant from config.env (w512-p4-f125-wc250)
 ```
 
-`build.sh` syncs the v8 RTL set + `q1a8_regs.vh` + the TCL/BAT to the VM,
+`build.sh` syncs the v8 RTL set + `matmul_regs.vh` + the TCL/BAT to the VM,
 runs `vivado -mode batch -source build.tcl`, refuses to emit a bitstream if
 routing isn't timing-clean, and fetches
 `out/penzai-q1a8-mc-w512-p4-f125-wc250.bit(.bin)`.
