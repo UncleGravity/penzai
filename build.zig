@@ -76,14 +76,9 @@ pub fn build(b: *std.Build) void {
 }
 
 // q1a8 RTL file sets (paths relative to the repo root, where `zig build` runs).
-const core_rtl = [_][]const u8{
-    "fpga/rtl/q1a8/q1a8_rowblock.v", "fpga/rtl/q1a8/q1a8_reducer.v",
-    "fpga/rtl/q1a8/fp32_add.v",      "fpga/rtl/q1a8/fp32_mul.v",
-    "fpga/rtl/q1a8/fp16_to_fp32.v",  "fpga/rtl/q1a8/int_to_fp32.v",
-};
-const narrow_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel.v"} ++ core_rtl;
-const wide_rtl = [_][]const u8{"fpga/rtl/q1a8/q1a8_kernel_wide.v"} ++ core_rtl;
-// The multi-column kernel uses its own rowblock; the rest of the core is shared.
+// The multi-column kernel + its pipelined reducer + the fp helpers are the only
+// shipping datapath. The single-column narrow/wide kernels and the unpipelined
+// reducer/fp units were deleted (rebuild 1D-2); see plan-fpga-6 deletion inventory.
 const reducer_rtl = [_][]const u8{
     "fpga/rtl/q1a8/q1a8_reducer_pipe.v", "fpga/rtl/q1a8/fp32_add_pipe.v",
     "fpga/rtl/q1a8/fp32_mul_pipe.v",     "fpga/rtl/q1a8/fp16_to_fp32.v",
@@ -96,7 +91,6 @@ const mc_top_rtl = [_][]const u8{
     "fpga/rtl/q1a8/q1a8_kernel_mc_top.v",
 } ++ mc_rtl;
 
-const core_rtl_args = "fpga/rtl/q1a8/q1a8_rowblock.v fpga/rtl/q1a8/q1a8_reducer.v fpga/rtl/q1a8/fp32_add.v fpga/rtl/q1a8/fp32_mul.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
 const mc_rtl_args = "fpga/rtl/q1a8/q1a8_kernel_mc_top.v fpga/rtl/q1a8/q1a8_kernel_mc.v fpga/rtl/q1a8/q1a8_rowblock_mc.v fpga/rtl/q1a8/q1a8_reducer_pipe.v fpga/rtl/q1a8/fp32_add_pipe.v fpga/rtl/q1a8/fp32_mul_pipe.v fpga/rtl/q1a8/fp16_to_fp32.v fpga/rtl/q1a8/int_to_fp32.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -124,8 +118,6 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
     b.step("lint-rtl", "Verilator lint the q1a8 RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl", "Verilator cosim: narrow q1a8_kernel vs matmul_ref", "q1a8_kernel", "fpga/sim/q1a8_kernel", &narrow_rtl, 8);
-    addCosim(b, target, optimize, "test-rtl-wide", "Verilator cosim: wide q1a8_kernel_wide vs matmul_ref", "q1a8_kernel_wide", "fpga/sim/q1a8_kernel_wide", &wide_rtl, 8);
     addCosim(b, target, optimize, "test-rtl-mc", "Verilator cosim: multi-column q1a8_kernel_mc vs matmul_ref", "q1a8_kernel_mc", "fpga/sim/q1a8_kernel_mc", &mc_rtl, 16);
     addCosim(b, target, optimize, "test-rtl-mc-top", "Verilator cosim: four-port q1a8_kernel_mc_top zip vs matmul_ref", "q1a8_kernel_mc_top", "fpga/sim/q1a8_kernel_mc_top", &mc_top_rtl, 16);
 }
