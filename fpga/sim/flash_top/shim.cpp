@@ -66,18 +66,28 @@ uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }
 void dut_set_q(Dut *d, const uint32_t *w8, int valid) {
     set_w8(d->t->s_axis_q_tdata, w8);
     d->t->s_axis_q_tvalid = valid;
+    // Sideband the DMA path would drive; the kernel counts beats from shape regs,
+    // so tie TKEEP all-valid and TLAST low (cosim doesn't model packet framing).
+    d->t->s_axis_q_tkeep = 0xFFFFFFFFu;
+    d->t->s_axis_q_tlast = 0;
 }
 void dut_set_k(Dut *d, const uint32_t *w4, int valid) {
     set_w4(d->t->s_axis_k_tdata, w4);
     d->t->s_axis_k_tvalid = valid;
+    d->t->s_axis_k_tkeep = 0xFFFFu;
+    d->t->s_axis_k_tlast = 0;
 }
 void dut_set_v(Dut *d, const uint32_t *w4, int valid) {
     set_w4(d->t->s_axis_v_tdata, w4);
     d->t->s_axis_v_tvalid = valid;
+    d->t->s_axis_v_tkeep = 0xFFFFu;
+    d->t->s_axis_v_tlast = 0;
 }
 void dut_set_mask(Dut *d, uint16_t v, int valid) {
     d->t->s_axis_mask_tdata = v;
     d->t->s_axis_mask_tvalid = valid;
+    d->t->s_axis_mask_tkeep = 0x3u;
+    d->t->s_axis_mask_tlast = 0;
 }
 void dut_set_o_ready(Dut *d, int v) { d->t->m_axis_o_tready = v; }
 

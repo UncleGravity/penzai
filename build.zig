@@ -159,7 +159,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     run_flash_vh.addArgs(&.{ "flash", "vh" });
     update.addCopyFileToSource(run_flash_vh.captureStdOut(.{}), "fpga/rtl/flash_attn/flash_regs.vh");
 
-    b.step("regmap", "Generate matmul/flash register headers + matmul address_map.tcl").dependOn(&update.step);
+    const run_flash_tcl = b.addRunArtifact(emit);
+    run_flash_tcl.addArgs(&.{ "flash", "tcl" });
+    update.addCopyFileToSource(run_flash_tcl.captureStdOut(.{}), "fpga/bitstreams/flash-v1/tcl/address_map.tcl");
+
+    b.step("regmap", "Generate matmul/flash register headers + address maps").dependOn(&update.step);
 
     // Verilator lint of the deployable matmul RTL, including matmul_top + the
     // counter bank + the generated header. This is the structural gate for the

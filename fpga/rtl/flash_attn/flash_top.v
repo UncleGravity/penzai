@@ -60,6 +60,10 @@ module flash_top #(
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_Q TDATA" *)
     input  wire [255:0] s_axis_q_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_Q TKEEP" *)
+    input  wire [31:0]  s_axis_q_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_Q TLAST" *)
+    input  wire         s_axis_q_tlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_Q TVALID" *)
     input  wire         s_axis_q_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_Q TREADY" *)
@@ -67,6 +71,10 @@ module flash_top #(
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_K TDATA" *)
     input  wire [127:0] s_axis_k_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_K TKEEP" *)
+    input  wire [15:0]  s_axis_k_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_K TLAST" *)
+    input  wire         s_axis_k_tlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_K TVALID" *)
     input  wire         s_axis_k_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_K TREADY" *)
@@ -74,6 +82,10 @@ module flash_top #(
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_V TDATA" *)
     input  wire [127:0] s_axis_v_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_V TKEEP" *)
+    input  wire [15:0]  s_axis_v_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_V TLAST" *)
+    input  wire         s_axis_v_tlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_V TVALID" *)
     input  wire         s_axis_v_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_V TREADY" *)
@@ -81,6 +93,10 @@ module flash_top #(
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_MASK TDATA" *)
     input  wire [15:0]  s_axis_mask_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_MASK TKEEP" *)
+    input  wire [1:0]   s_axis_mask_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_MASK TLAST" *)
+    input  wire         s_axis_mask_tlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_MASK TVALID" *)
     input  wire         s_axis_mask_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 S_AXIS_MASK TREADY" *)
@@ -88,6 +104,10 @@ module flash_top #(
 
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS_O TDATA" *)
     output wire [255:0] m_axis_o_tdata,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS_O TKEEP" *)
+    output wire [31:0]  m_axis_o_tkeep,
+    (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS_O TLAST" *)
+    output wire         m_axis_o_tlast,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS_O TVALID" *)
     output wire         m_axis_o_tvalid,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS_O TREADY" *)
@@ -104,7 +124,8 @@ module flash_top #(
     reg [31:0] cycle_count_q;
 
     wire kernel_busy, kernel_done;
-    wire q_tready_w, k_tready_w, v_tready_w, mask_tready_w, o_tvalid_w;
+    wire q_tready_w, k_tready_w, v_tready_w, mask_tready_w, o_tvalid_w, o_tlast_w;
+    wire [31:0] o_tkeep_w;
 
     flash_kernel #(.HEAD_DIM_MAX(HEAD_DIM_MAX), .LANES(FLASH_LANES)) u_kernel (
         .clk(clk), .rst_n(rst_n),
@@ -116,7 +137,12 @@ module flash_top #(
         .k_tdata(s_axis_k_tdata),       .k_tvalid(s_axis_k_tvalid),       .k_tready(k_tready_w),
         .v_tdata(s_axis_v_tdata),       .v_tvalid(s_axis_v_tvalid),       .v_tready(v_tready_w),
         .mask_tdata(s_axis_mask_tdata), .mask_tvalid(s_axis_mask_tvalid), .mask_tready(mask_tready_w),
-        .o_tdata(m_axis_o_tdata),       .o_tvalid(o_tvalid_w),            .o_tready(m_axis_o_tready)
+        .o_tdata(m_axis_o_tdata),       .o_tvalid(o_tvalid_w),            .o_tready(m_axis_o_tready),
+        .q_tlast(s_axis_q_tlast),       .q_tkeep(s_axis_q_tkeep),
+        .k_tlast(s_axis_k_tlast),       .k_tkeep(s_axis_k_tkeep),
+        .v_tlast(s_axis_v_tlast),       .v_tkeep(s_axis_v_tkeep),
+        .mask_tlast(s_axis_mask_tlast), .mask_tkeep(s_axis_mask_tkeep),
+        .o_tlast(o_tlast_w),            .o_tkeep(o_tkeep_w)
     );
 
     assign s_axis_q_tready    = q_tready_w;
@@ -124,6 +150,8 @@ module flash_top #(
     assign s_axis_v_tready    = v_tready_w;
     assign s_axis_mask_tready = mask_tready_w;
     assign m_axis_o_tvalid    = o_tvalid_w;
+    assign m_axis_o_tlast     = o_tlast_w;
+    assign m_axis_o_tkeep     = o_tkeep_w;
 
     always @(posedge clk) begin
         if (!rst_n)            done_latched <= 1'b0;

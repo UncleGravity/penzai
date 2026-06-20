@@ -19,12 +19,11 @@ pub fn main(init: std.process.Init) !void {
     const kind = args.next() orelse "vh";
 
     var buf: [8192]u8 = undefined;
+    const tcl = std.mem.eql(u8, kind, "tcl");
     const text = if (std.mem.eql(u8, op, "flash"))
-        try flash.emitVerilog(&buf) // flash: register header only (no bitstream yet)
-    else if (std.mem.eql(u8, kind, "tcl"))
-        try matmul.emitAddrTcl(&buf)
+        (if (tcl) try flash.emitAddrTcl(&buf) else try flash.emitVerilog(&buf))
     else
-        try matmul.emitVerilog(&buf);
+        (if (tcl) try matmul.emitAddrTcl(&buf) else try matmul.emitVerilog(&buf));
 
     var out_buf: [4096]u8 = undefined;
     var stdout = std.Io.File.stdout().writerStreaming(init.io, &out_buf);

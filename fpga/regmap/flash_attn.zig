@@ -138,6 +138,26 @@ pub fn emitVerilog(buf: []u8) std.fmt.BufPrintError![]const u8 {
     return buf[0..cursor];
 }
 
+/// Emit the Vivado address-map TCL into `buf`. The bitstream build.tcl `source`s the
+/// generated file and iterates `$flash_address_map` ({cell intf offset} per AXI-Lite
+/// block) so the addresses Vivado assigns and the addresses device/pl maps never drift.
+pub fn emitAddrTcl(buf: []u8) std.fmt.BufPrintError![]const u8 {
+    var cursor: usize = 0;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "# Generated from fpga/regmap/flash_attn.zig — do not edit.\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "# AXI-Lite address map for the flash bitstream; {{cell intf offset}} per block.\n", .{})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "set flash_address_map {{\n", .{})).len;
+    const dmas = .{
+        .{ "dma_q", addr.dma_q }, .{ "dma_k", addr.dma_k },   .{ "dma_v", addr.dma_v },
+        .{ "dma_mask", addr.dma_mask }, .{ "dma_o", addr.dma_o },
+    };
+    inline for (dmas) |d| {
+        cursor += (try std.fmt.bufPrint(buf[cursor..], "    {{{s} S_AXI_LITE 0x{X:0>8}}}\n", .{ d[0], @as(u32, @intCast(d[1])) })).len;
+    }
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "    {{kernel S_AXI 0x{X:0>8}}}\n", .{@as(u32, @intCast(addr.kernel))})).len;
+    cursor += (try std.fmt.bufPrint(buf[cursor..], "}}\n", .{})).len;
+    return buf[0..cursor];
+}
+
 test "regmap parses known offsets and resets" {
     try std.testing.expect(table.len >= 18);
     try std.testing.expectEqual(@as(u32, 0x00), offsetOf("ID"));
@@ -165,4 +185,13 @@ test "address map and caps are internally consistent" {
     try std.testing.expectEqual(@as(i64, 0xA015_0000), addr.kernel);
     try std.testing.expectEqual(@as(u32, 8), caps.lanes);
     try std.testing.expectEqual(@as(u32, 0), caps.head_dim_max % caps.lanes);
+}
+
+test "emitAddrTcl matches the deployed address map" {
+    var buf: [4096]u8 = undefined;
+    const out = try emitAddrTcl(&buf);
+    try std.testing.expect(std.mem.indexOf(u8, out, "set flash_address_map {") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{dma_q S_AXI_LITE 0xA0100000}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{dma_o S_AXI_LITE 0xA0140000}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "{kernel S_AXI 0xA0150000}") != null);
 }

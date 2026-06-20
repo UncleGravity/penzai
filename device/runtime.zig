@@ -55,21 +55,27 @@ pub fn RuntimeFor(comptime Heap: type) type {
             };
             if (comptime pl_supported) {
                 self.pl_verify = plVerifyEnabled();
-                if (PlBackend.init(allocator, &self.heap)) |backend| {
-                    self.pl = backend;
-                    std.debug.print("pl: q1a8 kernel ready (version {d}, counters {}, verify {})\n", .{
-                        backend.kernel.version, backend.hasCounters(), self.pl_verify,
-                    });
-                } else |err| {
-                    // PL unavailable (non-root /dev/mem, wrong/no bitstream, …) —
-                    // run PS-only rather than failing the daemon.
-                    std.debug.print("pl: unavailable ({s}); falling back to PS matmul\n", .{@errorName(err)});
+                // Only probe op backends whose IP the resident bitstream actually has.
+                // A /dev/mem read of an unmapped PL address is a bus fault (DECERR ->
+                // SError -> SIGBUS), NOT a catchable Zig error — so the else-branch
+                // fallback can't save us; we must avoid touching the address at all.
+                if (plOpEnabled("matmul")) {
+                    if (PlBackend.init(allocator, &self.heap)) |backend| {
+                        self.pl = backend;
+                        std.debug.print("pl: q1a8 kernel ready (version {d}, counters {}, verify {})\n", .{
+                            backend.kernel.version, backend.hasCounters(), self.pl_verify,
+                        });
+                    } else |err| {
+                        std.debug.print("pl: matmul unavailable ({s}); falling back to PS matmul\n", .{@errorName(err)});
+                    }
                 }
-                if (FlashBackend.init(allocator, &self.heap)) |backend| {
-                    self.flash = backend;
-                    std.debug.print("pl: flash kernel ready\n", .{});
-                } else |err| {
-                    std.debug.print("pl: flash unavailable ({s}); falling back to PS flash\n", .{@errorName(err)});
+                if (plOpEnabled("flash")) {
+                    if (FlashBackend.init(allocator, &self.heap)) |backend| {
+                        self.flash = backend;
+                        std.debug.print("pl: flash kernel ready\n", .{});
+                    } else |err| {
+                        std.debug.print("pl: flash unavailable ({s}); falling back to PS flash\n", .{@errorName(err)});
+                    }
                 }
             }
             return self;
@@ -227,10 +233,82 @@ pub fn RuntimeFor(comptime Heap: type) type {
             if (nbad > 0) std.debug.print("pl verify rows={d} k={d}: {d}/{d} mismatch (max_abs={d:.4} max_rel={d:.4})\n", .{ mm.rows, mm.k, nbad, n, max_abs, max_rel });
         }
 
+        /// Debug cross-check (PENZAI_PL_VERIFY=1): run the PS flash oracle into
+        /// scratch and compare against the PL result already in `dst`. The PL
+        /// kernel uses LUT-based exp/recip and a different fp reduction order, so
+        /// the tolerance is tighter than matmul's (rel > 0.01 vs 0.02): the
+        /// silicon run showed byte-identical output, so the real max_rel is well
+        /// under 1%, and a tighter gate catches numerical regressions from the
+        /// upcoming pipelined kernel rewrite. Logs mismatches; never changes
+        /// results.
+        fn verifyFlash(self: *Self, attn: wire.FlashAttnF32) void {
+            const q = self.heap.read(attn.q) catch return;
+            const k = self.heap.read(attn.k) catch return;
+            const v = self.heap.read(attn.v) catch return;
+            const mask: ?[]const u8 = if (attn.has_mask)
+                (self.heap.read(attn.mask) catch return)
+            else
+                null;
+            const dst = self.heap.bytes(attn.dst) catch return; // holds the PL result
+            const scratch = self.allocator.alloc(u8, dst.len) catch return;
+            defer self.allocator.free(scratch);
+            ps_flash_attn.runBytes(q, k, v, mask, scratch, .{
+                .head_dim_q = attn.head_dim_q,
+                .head_dim_v = attn.head_dim_v,
+                .n_heads = attn.n_heads,
+                .n_head_kv = attn.n_head_kv,
+                .n_kv = attn.n_kv,
+                .n_tokens = attn.n_tokens,
+                .scale = attn.scale,
+                .q_nb1 = attn.q_nb1,
+                .q_nb2 = attn.q_nb2,
+                .k_nb1 = attn.k_nb1,
+                .k_nb2 = attn.k_nb2,
+                .v_nb1 = attn.v_nb1,
+                .v_nb2 = attn.v_nb2,
+                .mask_nb1 = attn.mask_nb1,
+                .dst_nb1 = attn.dst_nb1,
+                .dst_nb2 = attn.dst_nb2,
+            }) catch return;
+            var max_abs: f32 = 0;
+            var max_rel: f32 = 0;
+            var nbad: usize = 0;
+            const n = dst.len / @sizeOf(f32);
+            for (0..n) |i| {
+                const a: f32 = @bitCast(std.mem.readInt(u32, dst[i * 4 ..][0..4], .little));
+                const b: f32 = @bitCast(std.mem.readInt(u32, scratch[i * 4 ..][0..4], .little));
+                const d = @abs(a - b);
+                const rel = d / @max(@abs(b), 1e-6);
+                max_abs = @max(max_abs, d);
+                max_rel = @max(max_rel, rel);
+                if (rel > 0.01 and d > 1e-3) nbad += 1;
+            }
+            if (nbad > 0) std.debug.print("pl verify flash hdq={d} nkv={d} ntok={d}: {d}/{d} mismatch (max_abs={d:.4} max_rel={d:.4})\n", .{ attn.head_dim_q, attn.n_kv, attn.n_tokens, nbad, n, max_abs, max_rel });
+        }
+
         fn plVerifyEnabled() bool {
             const raw = std.c.getenv("PENZAI_PL_VERIFY") orelse return false;
             const v = std.mem.span(raw);
             return v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+
+        /// Which op backends to probe on /dev/mem. The KR260 holds one bitstream at a
+        /// time, so probing an op whose IP is absent faults fatally (see init). Set
+        /// `PENZAI_PL_OPS` to match the resident bitstream:
+        ///   unset/"matmul" → matmul only (pre-flash default; the matmul bitstream)
+        ///   "flash"        → flash only (the flash bitstream)
+        ///   "matmul,flash" / "all" → both (a combined bitstream)
+        ///   "none"         → neither (pure PS)
+        fn plOpEnabled(op: []const u8) bool {
+            const raw = std.c.getenv("PENZAI_PL_OPS") orelse return std.mem.eql(u8, op, "matmul");
+            const v = std.mem.span(raw);
+            if (std.mem.eql(u8, v, "all")) return true;
+            if (std.mem.eql(u8, v, "none")) return false;
+            var it = std.mem.tokenizeScalar(u8, v, ',');
+            while (it.next()) |tok| {
+                if (std.mem.eql(u8, std.mem.trim(u8, tok, " \t"), op)) return true;
+            }
+            return false;
         }
 
         fn execute(self: *Self, command: wire.Command, io: ?std.Io) RuntimeError!void {
@@ -348,7 +426,10 @@ pub fn RuntimeFor(comptime Heap: type) type {
                                 std.debug.print("pl flash failed: {s}\n", .{@errorName(err)});
                                 return error.BackendFailure;
                             };
-                            if (maybe) |_| return;
+                            if (maybe) |_| {
+                                if (self.pl_verify) self.verifyFlash(attn);
+                                return;
+                            }
                         }
                     }
                     const q = self.heap.read(attn.q) catch |err| return mapHeapError(err);

@@ -235,12 +235,17 @@
                 PENZAI_PORT="''${PENZAI_PORT:-29092}"
                 PENZAI_MEM="''${PENZAI_MEM:-xrt}"
                 PENZAI_HEAP_MIB="''${PENZAI_HEAP_MIB:-768}"
+                # Which PL op backends to probe — must match the resident bitstream
+                # (probing an absent IP faults fatally). Default matmul (the matmul
+                # bitstream); set PENZAI_PL_OPS=flash for the flash bitstream.
+                PENZAI_PL_OPS="''${PENZAI_PL_OPS:-matmul}"
+                PENZAI_PL_VERIFY="''${PENZAI_PL_VERIFY:-0}"
                 REMOTE_BIN="$BOARD_TMP/penzaid"
 
-                echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB =="
+                echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB pl_ops=$PENZAI_PL_OPS verify=$PENZAI_PL_VERIFY =="
                 # shellcheck disable=SC2029
-                # Must run as root for PL to work
-                exec ssh "$BOARD" "sudo '$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
+                # Must run as root for PL to work. sudo strips env, so forward via `env`.
+                exec ssh "$BOARD" "sudo env PENZAI_PL_OPS='$PENZAI_PL_OPS' PENZAI_PL_VERIFY='$PENZAI_PL_VERIFY' '$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
               '';
             };
 

@@ -44,7 +44,16 @@ module flash_kernel #(
     input  wire [127:0] k_tdata,    input wire k_tvalid,    output wire k_tready,
     input  wire [127:0] v_tdata,    input wire v_tvalid,    output wire v_tready,
     input  wire [15:0]  mask_tdata, input wire mask_tvalid, output wire mask_tready,
-    output wire [255:0] o_tdata,    output wire o_tvalid,   input wire o_tready
+    output wire [255:0] o_tdata,    output wire o_tvalid,   input wire o_tready,
+    // Sideband the DMA/converter path expects. The kernel counts beats from the
+    // shape registers (like matmul), so the input TLAST/TKEEP are unused; the
+    // output TKEEP is all-valid and TLAST marks the final O beat so the S2MM DMA
+    // and the 256->128 data-width converter get clean packet framing.
+    input  wire        q_tlast,    input  wire [31:0] q_tkeep,
+    input  wire        k_tlast,    input  wire [15:0] k_tkeep,
+    input  wire        v_tlast,    input  wire [15:0] v_tkeep,
+    input  wire        mask_tlast, input  wire [1:0]  mask_tkeep,
+    output wire        o_tlast,    output wire [31:0] o_tkeep
 );
     localparam integer MAXB = HEAD_DIM_MAX / LANES;
     localparam integer BW   = (MAXB <= 1) ? 1 : $clog2(MAXB);
@@ -133,6 +142,8 @@ module flash_kernel #(
 
     assign o_tdata  = {224'd0, wao};
     assign o_tvalid = (state == S_EMITW) && wav;
+    assign o_tkeep  = 32'hFFFFFFFF;
+    assign o_tlast  = (state == S_EMITW) && wav && last_elem && last_head && last_tok;
 
     assign q_tready    = (state == S_QLOAD);
     assign k_tready    = (state == S_DOTF) || (state == S_SKIPK);
@@ -221,8 +232,8 @@ module flash_kernel #(
                 S_NORMF: state <= S_NORMW;
                 S_NORMW: if (rec_v) begin inv_l_q <= rec_out; elem_i <= 0; walk_axpy <= 1'b0; state <= S_EMITF; end
                 S_EMITF: state <= S_EMITW;
-                S_EMITW: if (wav) begin
-                    // O[elem] = wao on o_tdata (valid this cycle); assume sink ready.
+                S_EMITW: if (wav && o_tready) begin
+                    // O[elem] = wao on o_tdata (valid this cycle); hold until sink ready.
                     if (last_elem) state <= S_HEADN;
                     else begin elem_i <= elem_i + 16'd1; state <= S_EMITF; end
                 end
@@ -242,5 +253,7 @@ module flash_kernel #(
         end
     end
 
-    wire _unused = &{1'b0, soft_grew, m2v, dot_v, o_tready};
+    wire _unused = &{1'b0, soft_grew, m2v, dot_v,
+        q_tlast, k_tlast, v_tlast, mask_tlast,
+        q_tkeep, k_tkeep, v_tkeep, mask_tkeep};
 endmodule
