@@ -106,6 +106,15 @@ const flash_fp_rtl = [_][]const u8{
     "fpga/rtl/fp/fp16_to_fp32.v",
     "fpga/rtl/fp/int_to_fp32.v",
 };
+// The online-softmax transform on the exp leaf (+ its interp/fp deps).
+const flash_softmax_rtl = [_][]const u8{
+    "fpga/rtl/flash_attn/flash_softmax.v",
+    "fpga/rtl/flash_attn/fp_exp.v",
+    "fpga/rtl/flash_attn/fp_interp.v",
+    "fpga/rtl/fp/fp32_add_pipe.v",
+    "fpga/rtl/fp/fp32_mul_pipe.v",
+    "fpga/rtl/fp/int_to_fp32.v",
+};
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
@@ -142,16 +151,24 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl);
     addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl);
-    addFlashFpCosim(b, target, optimize);
+    addFlashCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl);
+    addFlashCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl);
 }
 
-// Verilator cosim of the flash fp leaves, driven from Zig, checked vs flash_ref.
+// Verilator cosim of a flash RTL top, driven from Zig, checked vs flash_ref.
 // Separate from addCosim because the flash tb imports the standalone flash_ref
 // model (no layout/pack/matmul_ref) and includes the flash LUT header.
-fn addFlashFpCosim(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const top = "flash_fp_top";
-    const dir = "fpga/sim/flash_fp";
-    const step = b.step("test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip vs flash_ref");
+fn addFlashCosim(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    step_name: []const u8,
+    desc: []const u8,
+    top: []const u8,
+    dir: []const u8,
+    rtl: []const []const u8,
+) void {
+    const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
         const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
         step.dependOn(&msg.step);
@@ -166,7 +183,7 @@ fn addFlashFpCosim(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "--Mdir", gen });
     vcmd.addArg("+incdir+fpga/rtl/flash_attn");
-    vcmd.addArgs(&flash_fp_rtl);
+    vcmd.addArgs(rtl);
 
     const tb_mod = b.createModule(.{
         .root_source_file = b.path(b.fmt("{s}/tb.zig", .{dir})),
