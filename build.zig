@@ -92,6 +92,21 @@ const matmul_top_rtl = [_][]const u8{
 
 const matmul_rtl_args = "fpga/rtl/matmul/matmul_top.v fpga/rtl/matmul/matmul_kernel.v fpga/rtl/matmul/matmul_rowblock.v fpga/rtl/matmul/matmul_reducer.v fpga/rtl/fp/fp32_add_pipe.v fpga/rtl/fp/fp32_mul_pipe.v fpga/rtl/fp/fp16_to_fp32.v fpga/rtl/fp/int_to_fp32.v";
 
+// Flash-attention fp leaves (rebuild 1D-4): exp + reciprocal LUT units and their
+// shared interpolation, on the rtl/fp leaf library. The cosim harness top wraps
+// both leaves so one Verilator model exercises them against flash_ref.
+const flash_fp_rtl = [_][]const u8{
+    "fpga/rtl/flash_attn/flash_fp_top.v",
+    "fpga/rtl/flash_attn/fp_exp.v",
+    "fpga/rtl/flash_attn/fp_recip.v",
+    "fpga/rtl/flash_attn/fp_dot.v",
+    "fpga/rtl/flash_attn/fp_interp.v",
+    "fpga/rtl/fp/fp32_add_pipe.v",
+    "fpga/rtl/fp/fp32_mul_pipe.v",
+    "fpga/rtl/fp/fp16_to_fp32.v",
+    "fpga/rtl/fp/int_to_fp32.v",
+};
+
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
     // matmul regmap module). One emitter, two artifacts: the Verilog register
@@ -127,6 +142,58 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl);
     addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl);
+    addFlashFpCosim(b, target, optimize);
+}
+
+// Verilator cosim of the flash fp leaves, driven from Zig, checked vs flash_ref.
+// Separate from addCosim because the flash tb imports the standalone flash_ref
+// model (no layout/pack/matmul_ref) and includes the flash LUT header.
+fn addFlashFpCosim(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const top = "flash_fp_top";
+    const dir = "fpga/sim/flash_fp";
+    const step = b.step("test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip vs flash_ref");
+    const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
+        const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
+        step.dependOn(&msg.step);
+        return;
+    };
+    const vroot = std.mem.trim(u8, b.run(&.{ verilator, "--getenv", "VERILATOR_ROOT" }), " \n\r");
+    const gen = b.fmt("{s}/obj_dir", .{dir});
+
+    const vcmd = b.addSystemCommand(&.{ verilator, "--cc", "--build", "--lib-create" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
+    vcmd.addArg(top);
+    vcmd.addArgs(&.{ "--Mdir", gen });
+    vcmd.addArg("+incdir+fpga/rtl/flash_attn");
+    vcmd.addArgs(&flash_fp_rtl);
+
+    const tb_mod = b.createModule(.{
+        .root_source_file = b.path(b.fmt("{s}/tb.zig", .{dir})),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    tb_mod.addImport("flash_ref", b.createModule(.{
+        .root_source_file = b.path("fpga/sim/support/flash_ref.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    tb_mod.addIncludePath(b.path(dir));
+    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
+    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
+    tb_mod.addIncludePath(b.path(gen));
+    tb_mod.addCSourceFile(.{
+        .file = b.path(b.fmt("{s}/shim.cpp", .{dir})),
+        .flags = &.{ "-std=c++17", b.fmt("-I{s}", .{gen}), b.fmt("-I{s}/include", .{vroot}), b.fmt("-I{s}/include/vltstd", .{vroot}) },
+    });
+    tb_mod.addObjectFile(b.path(b.fmt("{s}/lib{s}.a", .{ gen, top })));
+    tb_mod.linkSystemLibrary("pthread", .{});
+    tb_mod.link_libcpp = true;
+
+    const tb = b.addExecutable(.{ .name = b.fmt("{s}-cosim", .{top}), .root_module = tb_mod });
+    tb.step.dependOn(&vcmd.step);
+    step.dependOn(&b.addRunArtifact(tb).step);
 }
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
