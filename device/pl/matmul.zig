@@ -13,7 +13,8 @@
 const std = @import("std");
 const shared = @import("shared");
 const regmap = @import("regmap");
-const mmio = @import("mmio.zig");
+const regwin = @import("regwin.zig");
+const dma_mod = @import("dma.zig");
 const gather = @import("gather.zig");
 const profile = @import("../profile.zig");
 
@@ -40,7 +41,108 @@ const result_staging_cap: usize = regmap.caps.result_staging_bytes; // num_rb * 
 const mc_cols_max: usize = regmap.caps.cols_max;
 const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gather.zig
 
-pub const Error = mmio.Error || error{ HeapFailure, OutOfMemory };
+// Errors this op can raise: the DMA substrate's, this kernel's, plus heap failures.
+const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock };
+pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory };
+
+// ---- The matmul kernel AXI-Lite driver (a tenant on the PL substrate) -------
+// Moved out of the former mmio.zig: the run signature, identity/shape checks, and
+// counter accessors are matmul-specific. Register offsets come from the generated
+// `regmap` module — no hand-duplicated constants.
+
+const CTRL_START: u32 = 1 << 0;
+const STATUS_DONE: u32 = 1 << 1;
+
+/// Minimum kernel VERSION the driver accepts. v8 is the ROWS=16 four-port kernel and
+/// reads the v8 resident layout; older kernels are incompatible with the current host
+/// packer and must fall back to PS instead of corrupting results. This is policy (the
+/// oldest compatible kernel), distinct from the current build's VERSION reset — so it
+/// is not sourced from the regmap.
+pub const min_version: u32 = 8;
+pub const version_with_counters: u32 = 5;
+/// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
+/// reset column (the gateware's self-described values) so the runtime check and the
+/// bitstream can never disagree.
+pub const expected_id: u32 = regmap.resetOf("ID");
+pub const expected_rows: u32 = regmap.resetOf("ROWS");
+pub const expected_weight_ports: u32 = regmap.resetOf("WEIGHT_PORTS");
+
+comptime {
+    // The minimum we accept must not exceed what this build self-describes.
+    std.debug.assert(min_version <= regmap.resetOf("VERSION"));
+}
+
+pub const Kernel = struct {
+    win: regwin.RegWindow,
+    version: u32,
+    clk_hz: u32,
+
+    pub fn open(base: i64) KernelError!Kernel {
+        var win = try regwin.RegWindow.mapWindow(base);
+        errdefer win.deinit();
+        const id = win.rd(regmap.offsetOf("ID"));
+        if (id != expected_id) return error.BadId;
+        const version = win.rd(regmap.offsetOf("VERSION"));
+        if (version < min_version) return error.BadVersion;
+        if (win.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
+        if (win.rd(regmap.offsetOf("WEIGHT_PORTS")) != expected_weight_ports) return error.BadWeightPorts;
+        const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
+        if (clk_hz == 0) return error.BadClock;
+        return .{ .win = win, .version = version, .clk_hz = clk_hz };
+    }
+
+    pub fn deinit(self: *Kernel) void {
+        self.win.deinit();
+    }
+
+    pub fn hasCounters(self: Kernel) bool {
+        return self.version >= version_with_counters;
+    }
+
+    /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
+    pub fn clkMhz(self: Kernel) f64 {
+        return @as(f64, @floatFromInt(self.clk_hz)) / 1_000_000.0;
+    }
+
+    /// Set dims then strobe start. done_latched clears on the strobe.
+    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32) void {
+        self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
+        self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
+        self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
+        self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
+    }
+
+    pub fn waitDone(self: *Kernel) KernelError!void {
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
+        }
+        return error.KernelTimeout;
+    }
+
+    pub fn cycles(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("CYCLES"));
+    }
+
+    pub fn wStall(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("W_STALL"));
+    }
+    pub fn aStall(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("A_STALL"));
+    }
+    pub fn rStall(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("R_STALL"));
+    }
+    pub fn wBeats(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("W_BEATS"));
+    }
+    pub fn aBeats(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("A_BEATS"));
+    }
+    pub fn rBeats(self: Kernel) u32 {
+        return self.win.rd(regmap.offsetOf("R_BEATS"));
+    }
+};
 
 /// Temporary per-segment timing accumulator for localizing per-call overhead.
 const Seg = struct {
@@ -69,9 +171,9 @@ pub fn Backend(comptime Heap: type) type {
         const Self = @This();
 
         allocator: std.mem.Allocator,
-        kernel: mmio.Kernel,
-        dma_w: [layout.weight_ports]mmio.Dma,
-        dma_a: mmio.Dma,
+        kernel: Kernel,
+        dma_w: [layout.weight_ports]dma_mod.Dma,
+        dma_a: dma_mod.Dma,
         acts_staging: wire.TensorRange,
         result_staging: wire.TensorRange,
         // Reusable per-call scratch, grown on demand (steady state: no realloc).
@@ -84,16 +186,16 @@ pub fn Backend(comptime Heap: type) type {
             // The resident weight packing splits each 16-row block across this
             // many DMA ports; the address table must expose exactly that many.
             comptime std.debug.assert(dma_w_bases.len == layout.weight_ports);
-            var kernel = try mmio.Kernel.open(kernel_base);
+            var kernel = try Kernel.open(kernel_base);
             errdefer kernel.deinit();
-            var dma_w: [layout.weight_ports]mmio.Dma = undefined;
+            var dma_w: [layout.weight_ports]dma_mod.Dma = undefined;
             var opened: usize = 0;
             errdefer for (dma_w[0..opened]) |*dma| dma.deinit();
             for (&dma_w, dma_w_bases[0..]) |*dma, base| {
-                dma.* = try mmio.Dma.open(base);
+                dma.* = try dma_mod.Dma.open(base);
                 opened += 1;
             }
-            var dma_a = try mmio.Dma.open(dma_a_base);
+            var dma_a = try dma_mod.Dma.open(dma_a_base);
             errdefer dma_a.deinit();
 
             const acts_staging = heap.allocate(acts_staging_cap, 4096) catch return error.HeapFailure;

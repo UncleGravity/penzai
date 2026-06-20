@@ -14,6 +14,7 @@ const ps_select = @import("ps/select.zig");
 const ps_pad = @import("ps/pad.zig");
 const ps_softmax = @import("ps/softmax.zig");
 const pl_matmul = @import("pl/matmul.zig");
+const pl_flash = @import("pl/flash_attn.zig");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
@@ -37,10 +38,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
         // (XRT on the board); the fake heap has none, so it stays PS-only.
         const pl_supported = @hasDecl(Heap, "deviceAddress");
         const PlBackend = if (pl_supported) pl_matmul.Backend(Heap) else void;
+        const FlashBackend = if (pl_supported) pl_flash.Backend(Heap) else void;
 
         allocator: std.mem.Allocator,
         heap: Heap,
         pl: ?PlBackend = null,
+        flash: ?FlashBackend = null,
         pl_verify: bool = false,
         /// PL counters from the most recent matmul, consumed by the profiler.
         pl_last: ?profile.PlCounters = null,
@@ -62,6 +65,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     // run PS-only rather than failing the daemon.
                     std.debug.print("pl: unavailable ({s}); falling back to PS matmul\n", .{@errorName(err)});
                 }
+                if (FlashBackend.init(allocator, &self.heap)) |backend| {
+                    self.flash = backend;
+                    std.debug.print("pl: flash kernel ready\n", .{});
+                } else |err| {
+                    std.debug.print("pl: flash unavailable ({s}); falling back to PS flash\n", .{@errorName(err)});
+                }
             }
             return self;
         }
@@ -69,6 +78,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
         pub fn deinit(self: *Self) void {
             if (comptime pl_supported) {
                 if (self.pl) |*backend| backend.deinit();
+                if (self.flash) |*backend| backend.deinit();
             }
             self.heap.deinit();
             self.* = undefined;
@@ -332,6 +342,15 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     ps_rows.getRowsF32Bytes(get_rows, src, indices, dst) catch |err| return mapKernelError(err);
                 },
                 .flash_attn_f32 => |attn| {
+                    if (comptime pl_supported) {
+                        if (self.flash) |*backend| {
+                            const maybe = backend.tryFlashAttn(&self.heap, attn, io) catch |err| {
+                                std.debug.print("pl flash failed: {s}\n", .{@errorName(err)});
+                                return error.BackendFailure;
+                            };
+                            if (maybe) |_| return;
+                        }
+                    }
                     const q = self.heap.read(attn.q) catch |err| return mapHeapError(err);
                     const k = self.heap.read(attn.k) catch |err| return mapHeapError(err);
                     const v = self.heap.read(attn.v) catch |err| return mapHeapError(err);

@@ -128,6 +128,10 @@ const flash_kernel_rtl = [_][]const u8{
     "fpga/rtl/fp/fp16_to_fp32.v",
     "fpga/rtl/fp/int_to_fp32.v",
 };
+// The AXI-Lite/DMA wrapper (includes the generated flash_regs.vh) + the kernel.
+const flash_top_rtl = [_][]const u8{
+    "fpga/rtl/flash_attn/flash_top.v",
+} ++ flash_kernel_rtl;
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
@@ -144,14 +148,18 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const update = b.addUpdateSourceFiles();
 
     const run_vh = b.addRunArtifact(emit);
-    run_vh.addArg("vh");
+    run_vh.addArgs(&.{ "matmul", "vh" });
     update.addCopyFileToSource(run_vh.captureStdOut(.{}), "fpga/rtl/matmul/matmul_regs.vh");
 
     const run_tcl = b.addRunArtifact(emit);
-    run_tcl.addArg("tcl");
+    run_tcl.addArgs(&.{ "matmul", "tcl" });
     update.addCopyFileToSource(run_tcl.captureStdOut(.{}), "fpga/bitstreams/q1a8-w256-mc/tcl/address_map.tcl");
 
-    b.step("regmap", "Generate matmul_regs.vh + address_map.tcl from fpga/regmap/matmul.zig").dependOn(&update.step);
+    const run_flash_vh = b.addRunArtifact(emit);
+    run_flash_vh.addArgs(&.{ "flash", "vh" });
+    update.addCopyFileToSource(run_flash_vh.captureStdOut(.{}), "fpga/rtl/flash_attn/flash_regs.vh");
+
+    b.step("regmap", "Generate matmul/flash register headers + matmul address_map.tcl").dependOn(&update.step);
 
     // Verilator lint of the deployable matmul RTL, including matmul_top + the
     // counter bank + the generated header. This is the structural gate for the
@@ -167,6 +175,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     addFlashCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl);
     addFlashCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl);
     addFlashCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl);
+    addFlashCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl);
 }
 
 // Verilator cosim of a flash RTL top, driven from Zig, checked vs flash_ref.
@@ -207,6 +216,13 @@ fn addFlashCosim(
     });
     tb_mod.addImport("flash_ref", b.createModule(.{
         .root_source_file = b.path("fpga/sim/support/flash_ref.zig"),
+        .target = target,
+        .optimize = optimize,
+    }));
+    // The flash regmap (offsets/resets), so the flash_top tb drives AXI-Lite from the
+    // single source. Harmless to the other flash tbs, which simply don't import it.
+    tb_mod.addImport("regmap", b.createModule(.{
+        .root_source_file = b.path("fpga/regmap/flash_attn.zig"),
         .target = target,
         .optimize = optimize,
     }));
@@ -394,6 +410,19 @@ fn createRegmapModule(
     });
 }
 
+/// The flash_attn register map, consumed by the PL flash tenant (device/pl/flash_attn.zig).
+fn createFlashRegmapModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = b.path("fpga/regmap/flash_attn.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+}
+
 fn createRuntimeModule(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -408,6 +437,7 @@ fn createRuntimeModule(
     });
     addCommonImports(runtime, build_options, shared);
     runtime.addImport("regmap", createRegmapModule(b, target, optimize));
+    runtime.addImport("flash_regmap", createFlashRegmapModule(b, target, optimize));
     return runtime;
 }
 
@@ -499,6 +529,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/profiling.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/layout.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/matmul.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "fpga/regmap/flash_attn.zig", target, optimize, shared);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/mem/heap.zig", target, optimize, build_options, shared);
@@ -514,6 +545,7 @@ fn addTests(
     addDeviceTest(b, test_step, "device/ps/pad.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/ps/softmax.zig", target, optimize, build_options, shared);
     addSharedTest(b, test_step, "device/pl/gather.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "device/pl/flash_feed.zig", target, optimize, shared);
     addDeviceRuntimeTest(b, test_step, "device/main.zig", target, optimize, build_options, shared, runtime, server);
 
     addHostTest(b, test_step, "host/run.zig", target, optimize, build_options, shared, runtime, server, link, llama_config, c_mod, true);
@@ -555,6 +587,7 @@ fn addDeviceTest(
     });
     addCommonImports(mod, build_options, shared);
     mod.addImport("regmap", createRegmapModule(b, target, optimize));
+    mod.addImport("flash_regmap", createFlashRegmapModule(b, target, optimize));
     const test_exe = b.addTest(.{ .root_module = mod });
     step.dependOn(&b.addRunArtifact(test_exe).step);
 }
