@@ -116,36 +116,42 @@ pub fn main() !void {
         for (0..HDV) |d| o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;
     };
 
-    // ---- input streams in consumption order ----
+    // ---- input streams in the kv-major kernel's consumption order ----
+    // Q per (token, head); K/V/mask kv-major, NON-replicated (one per kv-head).
     var q_seq: [NTOK * NH * QB][8]u32 = undefined;
-    var k_seq: [NTOK * NH * NKV * QB][4]u32 = undefined;
-    var v_seq: [NTOK * NH * NKV * VB][4]u32 = undefined;
-    var mask_seq: [NTOK * NH * NKV]u16 = undefined;
+    var k_seq: [NTOK * NKV * NHKV * QB][4]u32 = undefined;
+    var v_seq: [NTOK * NKV * NHKV * VB][4]u32 = undefined;
+    var mask_seq: [NTOK * NKV]u16 = undefined;
     var qi: usize = 0;
     var ki: usize = 0;
     var vi: usize = 0;
     var mi: usize = 0;
-    for (0..NTOK) |t| for (0..NH) |h| {
-        const kvh = h / HEAD_RATIO;
-        for (0..QB) |b| {
-            for (0..8) |i| q_seq[qi][i] = f32bits(q[(t * NH + h) * HDQ + b * 8 + i]);
-            qi += 1;
+    for (0..NTOK) |t| {
+        for (0..NH) |h| {
+            for (0..QB) |b| {
+                for (0..8) |i| q_seq[qi][i] = f32bits(q[(t * NH + h) * HDQ + b * 8 + i]);
+                qi += 1;
+            }
         }
         for (0..NKV) |kv| {
             mask_seq[mi] = mask[t * NKV + kv];
             mi += 1;
-            for (0..QB) |b| {
-                for (0..4) |w| k_seq[ki][w] = @as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w]) |
-                    (@as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w + 1]) << 16);
-                ki += 1;
+            for (0..NHKV) |kvh| {
+                for (0..QB) |b| {
+                    for (0..4) |w| k_seq[ki][w] = @as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w]) |
+                        (@as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w + 1]) << 16);
+                    ki += 1;
+                }
             }
-            for (0..VB) |b| {
-                for (0..4) |w| v_seq[vi][w] = @as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w]) |
-                    (@as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w + 1]) << 16);
-                vi += 1;
+            for (0..NHKV) |kvh| {
+                for (0..VB) |b| {
+                    for (0..4) |w| v_seq[vi][w] = @as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w]) |
+                        (@as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w + 1]) << 16);
+                    vi += 1;
+                }
             }
         }
-    };
+    }
 
     var dut = Dut.init();
     defer dut.deinit();
@@ -168,6 +174,8 @@ pub fn main() !void {
     dut.axiWrite(regmap.offsetOf("HEAD_DIM_Q"), HDQ);
     dut.axiWrite(regmap.offsetOf("HEAD_DIM_V"), HDV);
     dut.axiWrite(regmap.offsetOf("N_HEADS"), NH);
+    dut.axiWrite(regmap.offsetOf("N_HEAD_KV"), NHKV);
+    dut.axiWrite(regmap.offsetOf("HEAD_RATIO"), HEAD_RATIO);
     dut.axiWrite(regmap.offsetOf("N_KV"), NKV);
     dut.axiWrite(regmap.offsetOf("N_TOKENS"), NTOK);
     dut.axiWrite(regmap.offsetOf("SCALE"), f32bits(SCALE));
@@ -199,9 +207,13 @@ pub fn main() !void {
         const kf = kv_ and c.dut_k_ready(dut.h) != 0;
         const vf = vv and c.dut_v_ready(dut.h) != 0;
         const mf = mv and c.dut_mask_ready(dut.h) != 0;
-        if (c.dut_o_valid(dut.h) != 0 and oc < o_got.len) {
-            o_got[oc] = bitsf32(c.dut_o_data(dut.h));
-            oc += 1;
+        if (c.dut_o_valid(dut.h) != 0 and oc + 8 <= o_got.len) {
+            var beat: [8]u32 = undefined;
+            c.dut_o_data(dut.h, &beat);
+            for (0..8) |i| {
+                o_got[oc] = bitsf32(beat[i]);
+                oc += 1;
+            }
         }
         dut.step();
         if (qf) qc += 1;
@@ -209,7 +221,7 @@ pub fn main() !void {
         if (vf) vc += 1;
         if (mf) mc += 1;
     }
-    // streams idle, then let the kernel finish (last O beat → S_HEADN → S_DONE → IDLE)
+    // streams idle, then let the kernel finish (last O beat → S_TNEXT → S_DONE → IDLE)
     // before polling status/counters.
     c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
     c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
@@ -257,9 +269,11 @@ pub fn main() !void {
         ok = false;
     }
     const exp_q = NTOK * NH * QB;
-    const exp_o = NTOK * NH * HDV;
-    if (q_beats != exp_q or o_beats != exp_o) {
-        std.debug.print("  FAIL: counters q={d}(exp {d}) o={d}(exp {d})\n", .{ q_beats, exp_q, o_beats, exp_o });
+    const exp_o = NTOK * NH * VB; // packed O: VB beats/head (8 f32 each), not HDV
+    const exp_k = NTOK * NKV * NHKV * QB; // kv-major, non-replicated; all kv consumed (incl. masked skip)
+    const exp_v = NTOK * NKV * NHKV * VB;
+    if (q_beats != exp_q or o_beats != exp_o or k_beats != exp_k or v_beats != exp_v) {
+        std.debug.print("  FAIL: counters q={d}(exp {d}) k={d}(exp {d}) v={d}(exp {d}) o={d}(exp {d})\n", .{ q_beats, exp_q, k_beats, exp_k, v_beats, exp_v, o_beats, exp_o });
         ok = false;
     }
     if (!ok) return error.Failed;

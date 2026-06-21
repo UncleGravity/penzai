@@ -1,10 +1,17 @@
-# penzai flash-attention bitstream (v1)
+# penzai flash-attention bitstream (flash-v1 dir; kv-major v2 kernel)
 
 One `flash_top` fed by five AXI DMAs on a single fabric clock — the device-side of
 flash attention on PL. The kernel and wrapper are cosim-verified
 (`zig build test-rtl-flash-kernel test-rtl-flash-top`); this packages them into a
-KR260 bitstream. v1 is correctness-first (the kernel is sequential, not yet
-bandwidth-optimized), so a single clock domain and the timing-safe `f100` variant.
+KR260 bitstream.
+
+The kernel is now the **kv-major v2** (regmap `VERSION` = 2): it consumes the KV cache
+in its native layout (kv-position-major, GQA done in hardware), so the host DMAs
+Q/K/V/mask straight from the resident tensors with **no gather** — the v1 host gather
+was ~89% of a decode call. The dot is pipelined (`fp_addtree` sums the per-beat
+`fp_dot` partials) and O is emitted 8-wide packed. **Rebuild required:** a v1 bitstream
+self-reports `VERSION` = 1 and the v2 daemon (`min_version` = 2) will reject it and fall
+back to PS. The dir/artifact name stays `flash-v1`; the kernel version is the contract.
 
 ## Layout
 - `tcl/build.tcl` — Vivado block design: PS + clk_wiz + 5 DMAs + width converters +

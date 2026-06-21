@@ -63,16 +63,12 @@ pub const addr = struct {
 pub const caps = struct {
     pub const lanes: u32 = 8;
     pub const head_dim_max: u32 = 128;
-    // Host staging reservations (DMA buffers), reserved once from the heap. The flash
-    // tenant materializes the GQA-replicated Q/K/V/mask streams into these; a call
-    // whose gathered streams exceed them falls back to the PS oracle. K/V dominate
-    // (n_tokens·n_heads·n_kv·head_dim·2); 4 MiB bounds decode to n_kv ≲ 1024 at the
-    // 1.7B shape. The O staging holds 256-bit-per-element beats (the v1 emit).
-    pub const q_staging_bytes: usize = 64 * 1024;
-    pub const k_staging_bytes: usize = 4 * 1024 * 1024;
-    pub const v_staging_bytes: usize = 4 * 1024 * 1024;
-    pub const mask_staging_bytes: usize = 64 * 1024;
-    pub const o_staging_bytes: usize = 256 * 1024;
+    // The only host staging the v2 tenant reserves: the DMA sink for the kernel's
+    // packed 8-wide O emit (dense n_tokens·n_heads·head_dim_v f32). Q/K/V/mask are
+    // DMA'd straight from the resident tensors in their native layout — there is no
+    // input staging (that materialized-and-replicated gather was the v1 bottleneck).
+    // 128 KiB covers the 1.7B/8B decode output with margin; a larger O falls back to PS.
+    pub const o_staging_bytes: usize = 128 * 1024;
 };
 
 comptime {
@@ -159,20 +155,23 @@ pub fn emitAddrTcl(buf: []u8) std.fmt.BufPrintError![]const u8 {
 }
 
 test "regmap parses known offsets and resets" {
-    try std.testing.expect(table.len >= 18);
+    try std.testing.expect(table.len >= 20);
     try std.testing.expectEqual(@as(u32, 0x00), offsetOf("ID"));
     try std.testing.expectEqual(@as(u32, 0xF1A54A00), resetOf("ID"));
+    try std.testing.expectEqual(@as(u32, 2), resetOf("VERSION"));
     try std.testing.expectEqual(@as(u32, 0x08), offsetOf("CTRL"));
-    try std.testing.expectEqual(@as(u32, 0x24), offsetOf("SCALE"));
-    try std.testing.expectEqual(@as(u32, 0x34), offsetOf("Q_BEATS"));
-    try std.testing.expectEqual(@as(u32, 0x4C), offsetOf("O_STALL"));
+    try std.testing.expectEqual(@as(u32, 0x1C), offsetOf("N_HEAD_KV"));
+    try std.testing.expectEqual(@as(u32, 0x20), offsetOf("HEAD_RATIO"));
+    try std.testing.expectEqual(@as(u32, 0x2C), offsetOf("SCALE"));
+    try std.testing.expectEqual(@as(u32, 0x3C), offsetOf("Q_BEATS"));
+    try std.testing.expectEqual(@as(u32, 0x54), offsetOf("O_STALL"));
     try std.testing.expectEqual(@as(u32, 8), resetOf("LANES"));
 }
 
 test "emitVerilog contains offsets and ro reset values" {
     var buf: [4096]u8 = undefined;
     const out = try emitVerilog(&buf);
-    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_OFF_SCALE = 12'h024;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_OFF_SCALE = 12'h02C;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_ID = 32'hF1A54A00;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_CTRL") == null);

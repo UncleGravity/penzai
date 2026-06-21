@@ -119,6 +119,8 @@ const flash_softmax_rtl = [_][]const u8{
 const flash_kernel_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_kernel.v",
     "fpga/rtl/flash_attn/fp_dot.v",
+    "fpga/rtl/flash_attn/fp_addtree.v",
+    "fpga/rtl/flash_attn/fp_axpy8.v",
     "fpga/rtl/flash_attn/flash_softmax.v",
     "fpga/rtl/flash_attn/fp_exp.v",
     "fpga/rtl/flash_attn/fp_recip.v",

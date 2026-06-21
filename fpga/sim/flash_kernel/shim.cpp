@@ -31,10 +31,12 @@ void dut_eval(Dut *d) { d->t->eval(); }
 void dut_set_clk(Dut *d, int v) { d->t->clk = v; }
 void dut_set_rst_n(Dut *d, int v) { d->t->rst_n = v; }
 void dut_set_start(Dut *d, int v) { d->t->start = v; }
-void dut_set_config(Dut *d, uint16_t hdq, uint16_t hdv, uint16_t nh, uint16_t nkv, uint16_t ntok, uint32_t scale) {
+void dut_set_config(Dut *d, uint16_t hdq, uint16_t hdv, uint16_t nh, uint16_t nhkv, uint16_t ratio, uint16_t nkv, uint16_t ntok, uint32_t scale) {
     d->t->head_dim_q = hdq;
     d->t->head_dim_v = hdv;
     d->t->n_heads = nh;
+    d->t->n_head_kv = nhkv;
+    d->t->head_ratio = ratio;
     d->t->n_kv = nkv;
     d->t->n_tokens = ntok;
     d->t->scale = scale;
@@ -65,5 +67,7 @@ int dut_k_ready(Dut *d) { return d->t->k_tready; }
 int dut_v_ready(Dut *d) { return d->t->v_tready; }
 int dut_mask_ready(Dut *d) { return d->t->mask_tready; }
 int dut_o_valid(Dut *d) { return d->t->o_tvalid; }
-uint32_t dut_o_data(Dut *d) { return d->t->o_tdata[0]; }
+void dut_o_data(Dut *d, uint32_t *w8) {
+    for (int i = 0; i < 8; i++) w8[i] = d->t->o_tdata[i];
+}
 }

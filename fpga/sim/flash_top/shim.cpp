@@ -96,5 +96,7 @@ int dut_k_ready(Dut *d) { return d->t->s_axis_k_tready; }
 int dut_v_ready(Dut *d) { return d->t->s_axis_v_tready; }
 int dut_mask_ready(Dut *d) { return d->t->s_axis_mask_tready; }
 int dut_o_valid(Dut *d) { return d->t->m_axis_o_tvalid; }
-uint32_t dut_o_data(Dut *d) { return d->t->m_axis_o_tdata[0]; }
+void dut_o_data(Dut *d, uint32_t *w8) {
+    for (int i = 0; i < 8; i++) w8[i] = d->t->m_axis_o_tdata[i];
+}
 }

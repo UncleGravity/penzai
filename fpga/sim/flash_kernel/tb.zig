@@ -110,30 +110,36 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
         }
     }
 
-    // ---- build input streams in the kernel's consumption order ----
+    // ---- build input streams in the kv-major kernel's consumption order ----
+    // Q: per (token, head) resident. K/V/mask: kv-major, NON-replicated (one per
+    // kv-head — the native cache layout the device DMAs directly). GQA is done in the
+    // kernel, so heads sharing a kv-head are no longer expanded in the feed.
     var q_seq: [NTOK * NH * QB][8]u32 = undefined;
-    var k_seq: [NTOK * NH * NKV * QB][4]u32 = undefined;
-    var v_seq: [NTOK * NH * NKV * VB][4]u32 = undefined;
-    var mask_seq: [NTOK * NH * NKV]u16 = undefined;
+    var k_seq: [NTOK * NKV * NHKV * QB][4]u32 = undefined;
+    var v_seq: [NTOK * NKV * NHKV * VB][4]u32 = undefined;
+    var mask_seq: [NTOK * NKV]u16 = undefined;
     var qi: usize = 0;
     var ki: usize = 0;
     var vi: usize = 0;
     var mi: usize = 0;
     for (0..NTOK) |t| {
         for (0..NH) |h| {
-            const kvh = h / HEAD_RATIO;
             for (0..QB) |b| {
                 for (0..8) |i| q_seq[qi][i] = f32bits(q[(t * NH + h) * HDQ + b * 8 + i]);
                 qi += 1;
             }
-            for (0..NKV) |kv| {
-                mask_seq[mi] = mask[t * NKV + kv];
-                mi += 1;
+        }
+        for (0..NKV) |kv| {
+            mask_seq[mi] = mask[t * NKV + kv];
+            mi += 1;
+            for (0..NHKV) |kvh| {
                 for (0..QB) |b| {
                     for (0..4) |w| k_seq[ki][w] = @as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w]) |
                         (@as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w + 1]) << 16);
                     ki += 1;
                 }
+            }
+            for (0..NHKV) |kvh| {
                 for (0..VB) |b| {
                     for (0..4) |w| v_seq[vi][w] = @as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w]) |
                         (@as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w + 1]) << 16);
@@ -144,7 +150,7 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     }
 
     // config + start pulse (dut already reset by the caller; returns to IDLE after done)
-    c.dut_set_config(dut.h, @intCast(HDQ), @intCast(HDV), @intCast(NH), @intCast(NKV), @intCast(NTOK), f32bits(SCALE));
+    c.dut_set_config(dut.h, @intCast(HDQ), @intCast(HDV), @intCast(NH), @intCast(NHKV), @intCast(HEAD_RATIO), @intCast(NKV), @intCast(NTOK), f32bits(SCALE));
     c.dut_set_start(dut.h, 1);
     dut.step();
     c.dut_set_start(dut.h, 0);
@@ -174,9 +180,13 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
         const kf = kv_ and c.dut_k_ready(dut.h) != 0;
         const vf = vv and c.dut_v_ready(dut.h) != 0;
         const mf = mv and c.dut_mask_ready(dut.h) != 0;
-        if (c.dut_o_valid(dut.h) != 0 and oc < o_got.len) {
-            o_got[oc] = bitsf32(c.dut_o_data(dut.h));
-            oc += 1;
+        if (c.dut_o_valid(dut.h) != 0 and oc + 8 <= o_got.len) {
+            var beat: [8]u32 = undefined;
+            c.dut_o_data(dut.h, &beat);
+            for (0..8) |i| {
+                o_got[oc] = bitsf32(beat[i]);
+                oc += 1;
+            }
         }
         const is_done = c.dut_done(dut.h) != 0;
 
@@ -233,5 +243,8 @@ pub fn main() !void {
     try runCfg(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .masked_kv = 2 }, &dut, 0xF1A54EE7);
     try runCfg(.{ .hdq = 24, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 3, .ntok = 2, .scale = 0.125, .masked_kv = -1 }, &dut, 0xBEEF01);
     try runCfg(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .masked_kv = 0 }, &dut, 0xC0FFEE);
+    // Bonsai decode shape: head_dim 128 (qbeats=16, full adder tree, no zero-pad),
+    // 16 query heads over 8 kv-heads (GQA r2, full pool), real 1/sqrt(128) scale.
+    try runCfg(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4 }, &dut, 0xD00D);
     std.debug.print("  all flash_kernel cosim configs passed\n\n", .{});
 }

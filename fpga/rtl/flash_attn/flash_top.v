@@ -118,7 +118,7 @@ module flash_top #(
     wire clk   = s_axi_aclk;
     wire rst_n = s_axi_aresetn;
 
-    reg [15:0] head_dim_q_q, head_dim_v_q, n_heads_q, n_kv_q, n_tokens_q;
+    reg [15:0] head_dim_q_q, head_dim_v_q, n_heads_q, n_head_kv_q, head_ratio_q, n_kv_q, n_tokens_q;
     reg [31:0] scale_q;
     reg        start_strobe, done_latched;
     reg [31:0] cycle_count_q;
@@ -131,7 +131,8 @@ module flash_top #(
         .clk(clk), .rst_n(rst_n),
         .start(start_strobe),
         .head_dim_q(head_dim_q_q), .head_dim_v(head_dim_v_q),
-        .n_heads(n_heads_q), .n_kv(n_kv_q), .n_tokens(n_tokens_q), .scale(scale_q),
+        .n_heads(n_heads_q), .n_head_kv(n_head_kv_q), .head_ratio(head_ratio_q),
+        .n_kv(n_kv_q), .n_tokens(n_tokens_q), .scale(scale_q),
         .busy(kernel_busy), .done(kernel_done),
         .q_tdata(s_axis_q_tdata),       .q_tvalid(s_axis_q_tvalid),       .q_tready(q_tready_w),
         .k_tdata(s_axis_k_tdata),       .k_tvalid(s_axis_k_tvalid),       .k_tready(k_tready_w),
@@ -191,8 +192,8 @@ module flash_top #(
     always @(posedge clk) begin
         if (!rst_n) begin
             awready_q <= 1'b0; wready_q <= 1'b0; bvalid_q <= 1'b0; awaddr_q <= 8'd0;
-            head_dim_q_q <= 0; head_dim_v_q <= 0; n_heads_q <= 0; n_kv_q <= 0; n_tokens_q <= 0;
-            scale_q <= 32'd0; start_strobe <= 1'b0;
+            head_dim_q_q <= 0; head_dim_v_q <= 0; n_heads_q <= 0; n_head_kv_q <= 0; head_ratio_q <= 0;
+            n_kv_q <= 0; n_tokens_q <= 0; scale_q <= 32'd0; start_strobe <= 1'b0;
         end else begin
             start_strobe <= 1'b0;
             awready_q <= write_accept;
@@ -207,6 +208,8 @@ module flash_top #(
                     FLASH_OFF_HEAD_DIM_Q[7:0]: begin if (s_axi_wstrb[0]) head_dim_q_q[7:0] <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) head_dim_q_q[15:8] <= s_axi_wdata[15:8]; end
                     FLASH_OFF_HEAD_DIM_V[7:0]: begin if (s_axi_wstrb[0]) head_dim_v_q[7:0] <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) head_dim_v_q[15:8] <= s_axi_wdata[15:8]; end
                     FLASH_OFF_N_HEADS[7:0]:    begin if (s_axi_wstrb[0]) n_heads_q[7:0]    <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) n_heads_q[15:8]    <= s_axi_wdata[15:8]; end
+                    FLASH_OFF_N_HEAD_KV[7:0]:  begin if (s_axi_wstrb[0]) n_head_kv_q[7:0]  <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) n_head_kv_q[15:8]  <= s_axi_wdata[15:8]; end
+                    FLASH_OFF_HEAD_RATIO[7:0]: begin if (s_axi_wstrb[0]) head_ratio_q[7:0] <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) head_ratio_q[15:8] <= s_axi_wdata[15:8]; end
                     FLASH_OFF_N_KV[7:0]:       begin if (s_axi_wstrb[0]) n_kv_q[7:0]       <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) n_kv_q[15:8]       <= s_axi_wdata[15:8]; end
                     FLASH_OFF_N_TOKENS[7:0]:   begin if (s_axi_wstrb[0]) n_tokens_q[7:0]   <= s_axi_wdata[7:0]; if (s_axi_wstrb[1]) n_tokens_q[15:8]   <= s_axi_wdata[15:8]; end
                     FLASH_OFF_SCALE[7:0]: begin
@@ -240,6 +243,8 @@ module flash_top #(
                     FLASH_OFF_HEAD_DIM_Q[7:0]: rdata_q <= {16'd0, head_dim_q_q};
                     FLASH_OFF_HEAD_DIM_V[7:0]: rdata_q <= {16'd0, head_dim_v_q};
                     FLASH_OFF_N_HEADS[7:0]:    rdata_q <= {16'd0, n_heads_q};
+                    FLASH_OFF_N_HEAD_KV[7:0]:  rdata_q <= {16'd0, n_head_kv_q};
+                    FLASH_OFF_HEAD_RATIO[7:0]: rdata_q <= {16'd0, head_ratio_q};
                     FLASH_OFF_N_KV[7:0]:       rdata_q <= {16'd0, n_kv_q};
                     FLASH_OFF_N_TOKENS[7:0]:   rdata_q <= {16'd0, n_tokens_q};
                     FLASH_OFF_SCALE[7:0]:      rdata_q <= scale_q;

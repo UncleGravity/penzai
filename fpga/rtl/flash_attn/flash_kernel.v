@@ -1,30 +1,33 @@
-// flash_kernel - flash attention, correctness-first v1.
+// flash_kernel - flash attention, kv-major (v2).
 //
-// Composes the verified leaves (fp_dot, flash_softmax, fp_recip) into the full
-// online-softmax attention. For each (token, head): load Q (resident), stream K/V
-// per kv, run the online softmax, accumulate p·V, normalize by 1/l, emit O.
+// Consumes the KV cache in its NATIVE layout — kv-position-major, n_head_kv heads,
+// NOT GQA-replicated — so the device DMAs Q/K/V/mask straight from the resident
+// tensors with no host gather (the v1 gather was ~89% of a decode call). GQA is done
+// here: one kv-head's K/V fans out to its `head_ratio` query heads. All n_heads carry
+// an independent online-softmax state (m,l,acc) at once, so streaming kv-major updates
+// every head per kv. The dot is pipelined (stream head_dim/8 beats through fp_dot into
+// a 16-deep buffer, sum with fp_addtree — no per-beat recurrence), replacing v1's
+// ~320-cyc/kv sequential dot. O is emitted 8-wide packed.
 //
-//   for token, for head:
-//     load q_buf <- Q stream (head_dim_q/8 beats of 8×f32)
-//     m=-inf, l=0, acc[*]=0
-//     for kv in 0..n_kv:
-//       mask <- mask stream (1×f16);  if -inf: consume+discard K/V, continue
-//       dot   = Σ over head_dim_q/8 beats fp_dot(q_buf, K beat)
-//       score = dot*scale + mask
-//       (m,l,p,corr) = flash_softmax(m,l,score)
-//       v_buf <- V stream ; acc[d] = acc[d]*corr + p*f32(v_buf[d])
-//     inv_l = recip(l) ; O[d] = acc[d]*inv_l -> O stream (1 f32/beat in lane 0)
+//   load Q[token] (all heads, resident); init pool m=-inf,l=0,acc=0
+//   for kv:
+//     read mask[kv] (one value, all heads); if -inf: consume+skip K[kv],V[kv]
+//     load K[kv] block (n_head_kv heads); for each query head h (kvh=h/ratio):
+//        dot = treeSum(fp_dot beats of Q[h]·K[kvh]); score=dot*scale+mask
+//        (m[h],l[h],p[h],corr[h]) = softmax(m[h],l[h],score)
+//     load V[kv] block; for each query head h:  acc[h] = acc[h]*corr[h] + p[h]·V[kvh]
+//   finalize per head:  O[h] = acc[h] * recip(l[h])  -> M_AXIS (8 f32 / beat)
 //
-// v1 is fully sequential + handshake-driven: combinational `fire` signals decoded
-// from the FSM state, each fp op completing before the next starts, indices held
-// stable across an op's FIRE→WAIT. Slow but robust and bit-checkable vs
-// flash_ref.attendHead. GQA is in the feed order, not here. Perf (interleave, GQA
-// reuse, pipelined walks) is the next pass.
+// Sequential-handshake FSM (each fp op completes before the next; indices stable
+// across an op) like v1, except the dot and the per-beat axpy/emit, which pipeline.
+// Cosim-checked vs flash_ref.attendHead.
 
 `default_nettype none
 
 module flash_kernel #(
     parameter integer HEAD_DIM_MAX = 128,
+    parameter integer MAX_HEADS    = 16,
+    parameter integer MAX_HEAD_KV  = 8,
     parameter integer LANES        = 8
 ) (
     input  wire        clk,
@@ -34,6 +37,8 @@ module flash_kernel #(
     input  wire [15:0] head_dim_q,
     input  wire [15:0] head_dim_v,
     input  wire [15:0] n_heads,
+    input  wire [15:0] n_head_kv,
+    input  wire [15:0] head_ratio,   // n_heads / n_head_kv (device-computed; no divider here)
     input  wire [15:0] n_kv,
     input  wire [15:0] n_tokens,
     input  wire [31:0] scale,
@@ -45,112 +50,143 @@ module flash_kernel #(
     input  wire [127:0] v_tdata,    input wire v_tvalid,    output wire v_tready,
     input  wire [15:0]  mask_tdata, input wire mask_tvalid, output wire mask_tready,
     output wire [255:0] o_tdata,    output wire o_tvalid,   input wire o_tready,
-    // Sideband the DMA/converter path expects. The kernel counts beats from the
-    // shape registers (like matmul), so the input TLAST/TKEEP are unused; the
-    // output TKEEP is all-valid and TLAST marks the final O beat so the S2MM DMA
-    // and the 256->128 data-width converter get clean packet framing.
+    // Sideband the DMA/converter path expects; the kernel counts beats from the shape
+    // registers, so input TLAST/TKEEP are unused. Output TLAST marks the final O beat
+    // and TKEEP is all-valid for clean S2MM / data-width-converter packet framing.
     input  wire        q_tlast,    input  wire [31:0] q_tkeep,
     input  wire        k_tlast,    input  wire [15:0] k_tkeep,
     input  wire        v_tlast,    input  wire [15:0] v_tkeep,
     input  wire        mask_tlast, input  wire [1:0]  mask_tkeep,
     output wire        o_tlast,    output wire [31:0] o_tkeep
 );
-    localparam integer MAXB = HEAD_DIM_MAX / LANES;
-    localparam integer BW   = (MAXB <= 1) ? 1 : $clog2(MAXB);
-    localparam integer EW   = $clog2(HEAD_DIM_MAX);
-    localparam integer LSH  = $clog2(LANES);
+    localparam integer MAXB  = HEAD_DIM_MAX / LANES;         // 16 max Q/K/V beats per head
+    localparam integer LSH   = $clog2(LANES);                // 3
+    localparam integer LMAXB = $clog2(MAXB);                 // 4 (beat occupies the low bits)
+    localparam integer AW    = $clog2(MAX_HEADS * MAXB);     // acc/q_buf addr width (8)
+    localparam integer KW    = $clog2(MAX_HEAD_KV * MAXB);   // k_buf/v_buf addr width (7)
     localparam [31:0]  NEG_INF = 32'hFF800000;
     localparam [15:0]  F16_NEG_INF = 16'hFC00;
 
-    wire [15:0] qbeats = head_dim_q >> LSH;  // head_dim is a multiple of LANES (v1)
+    wire [15:0] qbeats = head_dim_q >> LSH;   // head dims are multiples of LANES (v1 invariant)
     wire [15:0] vbeats = head_dim_v >> LSH;
 
-    reg [255:0] q_buf [0:MAXB-1];
-    reg [31:0]  acc   [0:HEAD_DIM_MAX-1];
-    reg [15:0]  v_buf [0:HEAD_DIM_MAX-1];
+    // ---- resident / pooled storage (indexed [head*MAXB + beat], MAXB a power of 2) ----
+    reg [255:0] q_buf [0:MAX_HEADS*MAXB-1];   // Q for the current token, 8 f32/beat
+    reg [127:0] k_buf [0:MAX_HEAD_KV*MAXB-1]; // K for the current kv, 8 f16/beat
+    reg [127:0] v_buf [0:MAX_HEAD_KV*MAXB-1]; // V for the current kv, 8 f16/beat
+    reg [255:0] acc   [0:MAX_HEADS*MAXB-1];   // running output accumulator, 8 f32/beat
+    reg [31:0]  mpool [0:MAX_HEADS-1];        // running max per head
+    reg [31:0]  lpool [0:MAX_HEADS-1];        // running denom per head
+    reg [31:0]  ppool [0:MAX_HEADS-1];        // this-kv softmax weight per head
+    reg [31:0]  cpool [0:MAX_HEADS-1];        // this-kv rescale factor per head
+    reg [31:0]  dot_parts [0:MAXB-1];         // per-beat fp_dot partials for the active head
 
-    reg [31:0] m_q, l_q, dot_q, score_q, corr_q, p_q, inv_l_q, mask_f32_q, dot_beat_q;
-    reg [15:0] tok_i, head_i, kv_i, beat_i, elem_i;
-    reg        walk_axpy;
+    reg [15:0] tok_i, kv_i, head_i, kvh_i, ratio_cnt;
+    reg [15:0] ld_a, ld_b;     // two-level load/clear counters (outer head/kvh, inner beat)
+    reg [15:0] di, ci;         // dot issue / capture indices
+    reg [15:0] ax_iss, ax_wb;  // axpy issue / writeback indices
+    reg [15:0] bi;             // emit beat index
+    reg [31:0] mask_f32_q, dot_q, score_q, inv_l_q;
+    reg [255:0] emit_buf;
 
     localparam [4:0]
-        S_IDLE  = 5'd0,  S_QLOAD = 5'd1,  S_KVINIT= 5'd2,  S_CLR   = 5'd3,
-        S_MASK  = 5'd4,  S_DOTF  = 5'd5,  S_DOTW  = 5'd6,  S_DACCF = 5'd7,
-        S_DACCW = 5'd8,  S_SKIPK = 5'd9,  S_SCRF  = 5'd10, S_SCRW  = 5'd11,
-        S_ADDF  = 5'd12, S_ADDW  = 5'd13, S_SOFTF = 5'd14, S_SOFTW = 5'd15,
-        S_VLOAD = 5'd16, S_SKIPV = 5'd17, S_AXPYF = 5'd18, S_AXPYW = 5'd19,
-        S_KVNXT = 5'd20, S_NORMF = 5'd21, S_NORMW = 5'd22, S_EMITF = 5'd23,
-        S_EMITW = 5'd24, S_HEADN = 5'd25, S_DONE  = 5'd26;
+        S_IDLE   = 5'd0,  S_QLOAD  = 5'd1,  S_TINIT  = 5'd2,  S_MASK   = 5'd3,
+        S_KLOAD  = 5'd4,  S_DOTISS = 5'd5,  S_DOTTF  = 5'd6,  S_DOTTW  = 5'd7,
+        S_SCRF   = 5'd8,  S_SCRW   = 5'd9,  S_ADDF   = 5'd10, S_ADDW   = 5'd11,
+        S_SOFTF  = 5'd12, S_SOFTW  = 5'd13, S_VLOAD  = 5'd14, S_AXPY   = 5'd15,
+        S_KSKIP  = 5'd16, S_VSKIP  = 5'd17, S_KVNEXT = 5'd18, S_FRECF  = 5'd19,
+        S_FRECW  = 5'd20, S_FEMITF = 5'd21, S_FEMITW = 5'd22, S_FEMITE = 5'd23,
+        S_TNEXT  = 5'd24, S_DONE   = 5'd25;
     reg [4:0] state;
 
-    wire [BW-1:0] beat = beat_i[BW-1:0];
-    wire [EW-1:0] elem = elem_i[EW-1:0];
-    wire last_kv   = (kv_i + 16'd1 == n_kv);
-    wire last_head = (head_i + 16'd1 == n_heads);
-    wire last_tok  = (tok_i + 16'd1 == n_tokens);
-    wire last_qb   = (beat_i + 16'd1 == qbeats);
-    wire last_vb   = (beat_i + 16'd1 == vbeats);
-    wire last_elem = (elem_i + 16'd1 == head_dim_v);
+    // ---- combinational addressing: address = head·MAXB + beat. MAXB is a power of
+    // two and beat < MAXB, so this is a concat (head/kv-head upper, beat low LMAXB
+    // bits) — no multiplier, exact width. ----
+    wire [AW-1:0] q_dot_addr = {head_i[AW-LMAXB-1:0], di[LMAXB-1:0]};
+    wire [KW-1:0] k_dot_addr = {kvh_i[KW-LMAXB-1:0],  di[LMAXB-1:0]};
+    wire [AW-1:0] q_ld_addr  = {ld_a[AW-LMAXB-1:0],   ld_b[LMAXB-1:0]};
+    wire [KW-1:0] kv_ld_addr = {ld_a[KW-LMAXB-1:0],   ld_b[LMAXB-1:0]};
+    wire [AW-1:0] acc_ax_rd  = {head_i[AW-LMAXB-1:0], ax_iss[LMAXB-1:0]};
+    wire [AW-1:0] acc_ax_wr  = {head_i[AW-LMAXB-1:0], ax_wb[LMAXB-1:0]};
+    wire [AW-1:0] acc_em_rd  = {head_i[AW-LMAXB-1:0], bi[LMAXB-1:0]};
+    wire [KW-1:0] v_ax_addr  = {kvh_i[KW-LMAXB-1:0],  ax_iss[LMAXB-1:0]};
 
-    // ---- combinational fire signals (one-cycle pulses decoded from state) ----
-    wire dot_fire  = (state == S_DOTF) && k_tvalid;
-    wire dacc_fire = (state == S_DACCF);
+    // ---- fire pulses + last-beat flags ----
+    wire dot_fire  = (state == S_DOTISS) && (di < qbeats);
+    wire tree_fire = (state == S_DOTTF);
     wire smul_fire = (state == S_SCRF);
     wire sadd_fire = (state == S_ADDF);
     wire soft_fire = (state == S_SOFTF);
-    wire rec_fire  = (state == S_NORMF);
-    wire walk_fire = (state == S_AXPYF) || (state == S_EMITF);
+    wire rec_fire  = (state == S_FRECF);
+    wire axpy_fire = (state == S_AXPY) && (ax_iss < vbeats);
+    wire emit_fire = (state == S_FEMITF);
 
-    // ---- fp blocks ----
+    wire last_head = (head_i + 16'd1 == n_heads);
+    wire last_kv   = (kv_i  + 16'd1 == n_kv);
+    wire last_tok  = (tok_i + 16'd1 == n_tokens);
+
+    // ---- fp_dot: one beat's Q·K (feed-forward, latency 14) ----
     wire        dot_v;  wire [31:0] dot_beat;
     fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire),
-        .q(q_buf[beat]), .k(k_tdata), .valid_out(dot_v), .sum(dot_beat));
+        .q(q_buf[q_dot_addr]), .k(k_buf[k_dot_addr]), .valid_out(dot_v), .sum(dot_beat));
 
-    wire        dacc_v; wire [31:0] dacc_out;
-    fp32_add_pipe u_dacc (.clk(clk), .rst_n(rst_n), .valid_in(dacc_fire),
-        .a(dot_q), .b(dot_beat_q), .valid_out(dacc_v), .out(dacc_out));
+    // ---- fp_addtree: sum the per-beat partials (zero-padded, latency 16) ----
+    wire [511:0] tree_in;
+    genvar g;
+    generate
+        for (g = 0; g < MAXB; g = g + 1) begin : g_tree_in
+            assign tree_in[g*32 +: 32] = (g < qbeats) ? dot_parts[g] : 32'd0;
+        end
+    endgenerate
+    wire tree_v;  wire [31:0] tree_sum;
+    fp_addtree u_tree (.clk(clk), .rst_n(rst_n), .valid_in(tree_fire),
+        .in(tree_in), .valid_out(tree_v), .sum(tree_sum));
 
-    wire        smul_v; wire [31:0] smul_out;
+    // ---- score = dot*scale + mask ----
+    wire smul_v; wire [31:0] smul_out;
     fp32_mul_pipe u_smul (.clk(clk), .rst_n(rst_n), .valid_in(smul_fire),
         .a(dot_q), .b(scale), .valid_out(smul_v), .out(smul_out));
-    wire        sadd_v; wire [31:0] sadd_out;
+    wire sadd_v; wire [31:0] sadd_out;
     fp32_add_pipe u_sadd (.clk(clk), .rst_n(rst_n), .valid_in(sadd_fire),
         .a(score_q), .b(mask_f32_q), .valid_out(sadd_v), .out(sadd_out));
 
+    // ---- online softmax step (per head) ----
     wire soft_v; wire [31:0] soft_m, soft_l, soft_p, soft_corr; wire soft_grew;
     flash_softmax u_soft (.clk(clk), .rst_n(rst_n), .valid_in(soft_fire),
-        .m_in(m_q), .l_in(l_q), .score(score_q), .valid_out(soft_v),
+        .m_in(mpool[head_i[3:0]]), .l_in(lpool[head_i[3:0]]), .score(score_q), .valid_out(soft_v),
         .m_out(soft_m), .l_out(soft_l), .p(soft_p), .corr(soft_corr), .grew(soft_grew));
 
+    // ---- reciprocal of the denominator (per head, at finalize) ----
     wire rec_v; wire [31:0] rec_out;
     fp_recip u_recip (.clk(clk), .rst_n(rst_n), .valid_in(rec_fire),
-        .l(l_q), .valid_out(rec_v), .y(rec_out));
+        .l(lpool[head_i[3:0]]), .valid_out(rec_v), .y(rec_out));
+
+    // ---- shared 8-wide axpy: acc*corr + p·V (accumulate) OR acc*inv_l (emit) ----
+    wire [255:0] ax_acc_in = emit_fire ? acc[acc_em_rd] : acc[acc_ax_rd];
+    wire [127:0] ax_v_in   = axpy_fire ? v_buf[v_ax_addr] : 128'd0;
+    wire [31:0]  ax_s1     = emit_fire ? inv_l_q : cpool[head_i[3:0]];
+    wire [31:0]  ax_p      = emit_fire ? 32'd0   : ppool[head_i[3:0]];
+    wire ax_fire = axpy_fire | emit_fire;
+    wire ax_v;  wire [255:0] ax_out;
+    fp_axpy8 u_axpy (.clk(clk), .rst_n(rst_n), .valid_in(ax_fire),
+        .acc(ax_acc_in), .v(ax_v_in), .s1(ax_s1), .p(ax_p), .valid_out(ax_v), .out(ax_out));
 
     wire [31:0] mask_f32_w;
     fp16_to_fp32 u_maskw (.in(mask_tdata), .out(mask_f32_w));
 
-    // ---- per-element walk: acc[d] = acc[d]*(corr|inv_l) + (axpy ? p*f32(v[d]) : 0) ----
-    wire [31:0] vf32_w;
-    fp16_to_fp32 u_vw (.in(v_buf[elem]), .out(vf32_w));
-    wire m1v, m2v, wav;  wire [31:0] m1o, m2o, wao;
-    fp32_mul_pipe u_w1 (.clk(clk), .rst_n(rst_n), .valid_in(walk_fire),
-        .a(acc[elem]), .b(walk_axpy ? corr_q : inv_l_q), .valid_out(m1v), .out(m1o));
-    fp32_mul_pipe u_w2 (.clk(clk), .rst_n(rst_n), .valid_in(walk_fire),
-        .a(walk_axpy ? p_q : 32'd0), .b(walk_axpy ? vf32_w : 32'd0), .valid_out(m2v), .out(m2o));
-    fp32_add_pipe u_w3 (.clk(clk), .rst_n(rst_n), .valid_in(m1v),
-        .a(m1o), .b(m2o), .valid_out(wav), .out(wao));
-
-    assign o_tdata  = {224'd0, wao};
-    assign o_tvalid = (state == S_EMITW) && wav;
+    // ---- outputs ----
+    assign o_tdata  = emit_buf;
+    assign o_tvalid = (state == S_FEMITE);
     assign o_tkeep  = 32'hFFFFFFFF;
-    assign o_tlast  = (state == S_EMITW) && wav && last_elem && last_head && last_tok;
-
+    assign o_tlast  = (state == S_FEMITE) && (bi + 16'd1 == vbeats) && last_head && last_tok;
     assign q_tready    = (state == S_QLOAD);
-    assign k_tready    = (state == S_DOTF) || (state == S_SKIPK);
-    assign v_tready    = (state == S_VLOAD) || (state == S_SKIPV);
+    assign k_tready    = (state == S_KLOAD) || (state == S_KSKIP);
+    assign v_tready    = (state == S_VLOAD) || (state == S_VSKIP);
     assign mask_tready = (state == S_MASK);
 
-    integer i;
+    // ---- helper: advance head_i + kvh_i (kvh increments every head_ratio heads) ----
+    // applied inline at the dot-pass and axpy-pass head boundaries.
+
     always @(posedge clk) begin
         if (!rst_n) begin
             state <= S_IDLE; busy <= 1'b0; done <= 1'b0;
@@ -158,94 +194,139 @@ module flash_kernel #(
             done <= 1'b0;
             case (state)
                 S_IDLE: if (start) begin
-                    busy <= 1'b1; tok_i <= 0; head_i <= 0; beat_i <= 0; state <= S_QLOAD;
+                    busy <= 1'b1; tok_i <= 0; ld_a <= 0; ld_b <= 0; state <= S_QLOAD;
                 end
 
+                // ---- load Q for the current token: n_heads × qbeats beats ----
                 S_QLOAD: if (q_tvalid) begin
-                    q_buf[beat] <= q_tdata;
-                    if (last_qb) begin beat_i <= 0; state <= S_KVINIT; end
-                    else beat_i <= beat_i + 16'd1;
+                    q_buf[q_ld_addr] <= q_tdata;
+                    if (ld_b + 16'd1 == qbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_heads) begin ld_a <= 0; ld_b <= 0; state <= S_TINIT; end
+                        else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
                 end
 
-                S_KVINIT: begin m_q <= NEG_INF; l_q <= 32'd0; kv_i <= 0; elem_i <= 0; state <= S_CLR; end
-                S_CLR: begin
-                    acc[elem] <= 32'd0;
-                    if (last_elem) begin elem_i <= 0; state <= S_MASK; end
-                    else elem_i <= elem_i + 16'd1;
+                // ---- init the per-head pool for this token (acc=0, m=-inf, l=0) ----
+                S_TINIT: begin
+                    acc[q_ld_addr] <= 256'd0;
+                    if (ld_b == 16'd0) begin mpool[ld_a[3:0]] <= NEG_INF; lpool[ld_a[3:0]] <= 32'd0; end
+                    if (ld_b + 16'd1 == vbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_heads) begin kv_i <= 0; state <= S_MASK; end
+                        else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
                 end
 
+                // ---- read this kv's mask (shared by all heads); branch skip/process ----
                 S_MASK: if (mask_tvalid) begin
-                    mask_f32_q <= mask_f32_w; dot_q <= 32'd0; beat_i <= 0;
-                    state <= (mask_tdata == F16_NEG_INF) ? S_SKIPK : S_DOTF;
+                    mask_f32_q <= mask_f32_w;
+                    ld_a <= 0; ld_b <= 0;
+                    state <= (mask_tdata == F16_NEG_INF) ? S_KSKIP : S_KLOAD;
                 end
 
-                // dot: per beat, fp_dot then accumulate
-                S_DOTF: if (k_tvalid) state <= S_DOTW;             // dot_fire pulses this cycle
-                S_DOTW: if (dot_v) begin dot_beat_q <= dot_beat; state <= S_DACCF; end
-                S_DACCF: state <= S_DACCW;
-                S_DACCW: if (dacc_v) begin
-                    dot_q <= dacc_out;
-                    if (last_qb) state <= S_SCRF;
-                    else begin beat_i <= beat_i + 16'd1; state <= S_DOTF; end
-                end
-                S_SKIPK: if (k_tvalid) begin
-                    if (last_qb) begin beat_i <= 0; state <= S_SKIPV; end
-                    else beat_i <= beat_i + 16'd1;
+                // ---- load K[kv]: n_head_kv heads × qbeats beats (native, non-replicated) ----
+                S_KLOAD: if (k_tvalid) begin
+                    k_buf[kv_ld_addr] <= k_tdata;
+                    if (ld_b + 16'd1 == qbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_head_kv) begin
+                            head_i <= 0; kvh_i <= 0; ratio_cnt <= 0; di <= 0; ci <= 0; state <= S_DOTISS;
+                        end else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
                 end
 
-                // score = dot*scale + mask
+                // ---- dot-pass: pipelined Q[h]·K[kvh] for the active head ----
+                S_DOTISS: begin
+                    if (di < qbeats) di <= di + 16'd1;
+                    if (dot_v) begin
+                        dot_parts[ci[3:0]] <= dot_beat;
+                        if (ci + 16'd1 == qbeats) state <= S_DOTTF;
+                        else ci <= ci + 16'd1;
+                    end
+                end
+                S_DOTTF: state <= S_DOTTW;                 // tree_fire pulses this cycle
+                S_DOTTW: if (tree_v) begin dot_q <= tree_sum; state <= S_SCRF; end
+
                 S_SCRF: state <= S_SCRW;
                 S_SCRW: if (smul_v) begin score_q <= smul_out; state <= S_ADDF; end
                 S_ADDF: state <= S_ADDW;
                 S_ADDW: if (sadd_v) begin score_q <= sadd_out; state <= S_SOFTF; end
 
-                // online softmax
                 S_SOFTF: state <= S_SOFTW;
                 S_SOFTW: if (soft_v) begin
-                    m_q <= soft_m; l_q <= soft_l; p_q <= soft_p; corr_q <= soft_corr;
-                    beat_i <= 0; state <= S_VLOAD;
+                    mpool[head_i[3:0]] <= soft_m; lpool[head_i[3:0]] <= soft_l;
+                    ppool[head_i[3:0]] <= soft_p; cpool[head_i[3:0]] <= soft_corr;
+                    if (last_head) begin ld_a <= 0; ld_b <= 0; state <= S_VLOAD; end
+                    else begin
+                        head_i <= head_i + 16'd1;
+                        if (ratio_cnt + 16'd1 == head_ratio) begin ratio_cnt <= 0; kvh_i <= kvh_i + 16'd1; end
+                        else ratio_cnt <= ratio_cnt + 16'd1;
+                        di <= 0; ci <= 0; state <= S_DOTISS;
+                    end
                 end
 
-                // load V, then axpy walk
+                // ---- load V[kv]: n_head_kv heads × vbeats beats ----
                 S_VLOAD: if (v_tvalid) begin
-                    for (i = 0; i < LANES; i = i + 1)
-                        v_buf[beat_i*LANES + i] <= v_tdata[i*16 +: 16];
-                    if (last_vb) begin elem_i <= 0; walk_axpy <= 1'b1; state <= S_AXPYF; end
-                    else beat_i <= beat_i + 16'd1;
-                end
-                S_SKIPV: if (v_tvalid) begin
-                    if (last_vb) begin beat_i <= 0; state <= S_KVNXT; end
-                    else beat_i <= beat_i + 16'd1;
-                end
-
-                S_AXPYF: state <= S_AXPYW;
-                S_AXPYW: if (wav) begin
-                    acc[elem] <= wao;
-                    if (last_elem) state <= S_KVNXT;
-                    else begin elem_i <= elem_i + 16'd1; state <= S_AXPYF; end
+                    v_buf[kv_ld_addr] <= v_tdata;
+                    if (ld_b + 16'd1 == vbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_head_kv) begin
+                            head_i <= 0; kvh_i <= 0; ratio_cnt <= 0; ax_iss <= 0; ax_wb <= 0; state <= S_AXPY;
+                        end else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
                 end
 
-                S_KVNXT: if (last_kv) state <= S_NORMF;
-                         else begin kv_i <= kv_i + 16'd1; state <= S_MASK; end
-
-                // normalize + emit
-                S_NORMF: state <= S_NORMW;
-                S_NORMW: if (rec_v) begin inv_l_q <= rec_out; elem_i <= 0; walk_axpy <= 1'b0; state <= S_EMITF; end
-                S_EMITF: state <= S_EMITW;
-                S_EMITW: if (wav && o_tready) begin
-                    // O[elem] = wao on o_tdata (valid this cycle); hold until sink ready.
-                    if (last_elem) state <= S_HEADN;
-                    else begin elem_i <= elem_i + 16'd1; state <= S_EMITF; end
+                // ---- axpy-pass: acc[h] = acc[h]*corr[h] + p[h]·V[kvh], pipelined per beat ----
+                S_AXPY: begin
+                    if (ax_iss < vbeats) ax_iss <= ax_iss + 16'd1;
+                    if (ax_v) begin
+                        acc[acc_ax_wr] <= ax_out;
+                        if (ax_wb + 16'd1 == vbeats) begin
+                            if (last_head) state <= S_KVNEXT;
+                            else begin
+                                head_i <= head_i + 16'd1;
+                                if (ratio_cnt + 16'd1 == head_ratio) begin ratio_cnt <= 0; kvh_i <= kvh_i + 16'd1; end
+                                else ratio_cnt <= ratio_cnt + 16'd1;
+                                ax_iss <= 0; ax_wb <= 0;
+                            end
+                        end else ax_wb <= ax_wb + 16'd1;
+                    end
                 end
 
-                S_HEADN: begin
-                    beat_i <= 0;
-                    if (last_head) begin
-                        head_i <= 0;
-                        if (last_tok) state <= S_DONE;
-                        else begin tok_i <= tok_i + 16'd1; state <= S_QLOAD; end
-                    end else begin head_i <= head_i + 16'd1; state <= S_QLOAD; end
+                // ---- masked kv: consume + discard the K and V blocks ----
+                S_KSKIP: if (k_tvalid) begin
+                    if (ld_b + 16'd1 == qbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_head_kv) begin ld_a <= 0; ld_b <= 0; state <= S_VSKIP; end
+                        else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
                 end
+                S_VSKIP: if (v_tvalid) begin
+                    if (ld_b + 16'd1 == vbeats) begin
+                        ld_b <= 0;
+                        if (ld_a + 16'd1 == n_head_kv) state <= S_KVNEXT;
+                        else ld_a <= ld_a + 16'd1;
+                    end else ld_b <= ld_b + 16'd1;
+                end
+
+                S_KVNEXT: if (last_kv) begin head_i <= 0; bi <= 0; state <= S_FRECF; end
+                          else begin kv_i <= kv_i + 16'd1; state <= S_MASK; end
+
+                // ---- finalize per head: O[h] = acc[h] * recip(l[h]), 8-wide packed ----
+                S_FRECF: begin bi <= 0; state <= S_FRECW; end
+                S_FRECW: if (rec_v) begin inv_l_q <= rec_out; state <= S_FEMITF; end
+                S_FEMITF: state <= S_FEMITW;              // emit_fire pulses this cycle
+                S_FEMITW: if (ax_v) begin emit_buf <= ax_out; state <= S_FEMITE; end
+                S_FEMITE: if (o_tready) begin
+                    if (bi + 16'd1 == vbeats) begin
+                        if (last_head) state <= S_TNEXT;
+                        else begin head_i <= head_i + 16'd1; state <= S_FRECF; end
+                    end else begin bi <= bi + 16'd1; state <= S_FEMITF; end
+                end
+
+                S_TNEXT: if (last_tok) state <= S_DONE;
+                         else begin tok_i <= tok_i + 16'd1; ld_a <= 0; ld_b <= 0; state <= S_QLOAD; end
 
                 S_DONE: begin busy <= 1'b0; done <= 1'b1; state <= S_IDLE; end
                 default: state <= S_IDLE;
@@ -253,7 +334,6 @@ module flash_kernel #(
         end
     end
 
-    wire _unused = &{1'b0, soft_grew, m2v, dot_v,
-        q_tlast, k_tlast, v_tlast, mask_tlast,
-        q_tkeep, k_tkeep, v_tkeep, mask_tkeep};
+    wire _unused = &{1'b0, soft_grew, dot_v, smul_v, sadd_v, tree_v,
+        q_tlast, k_tlast, v_tlast, mask_tlast, q_tkeep, k_tkeep, v_tkeep, mask_tkeep};
 endmodule

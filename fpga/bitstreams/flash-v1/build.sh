@@ -28,6 +28,8 @@ RTL_FILES=(
   "$RTL_FLASH/flash_top.v"
   "$RTL_FLASH/flash_kernel.v"
   "$RTL_FLASH/fp_dot.v"
+  "$RTL_FLASH/fp_addtree.v"
+  "$RTL_FLASH/fp_axpy8.v"
   "$RTL_FLASH/flash_softmax.v"
   "$RTL_FLASH/fp_exp.v"
   "$RTL_FLASH/fp_recip.v"

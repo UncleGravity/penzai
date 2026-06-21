@@ -1,19 +1,16 @@
-//! Pure feed preparation for the PL flash tenant: gather the ggml-strided Q/K/V/mask
-//! tensors into the contiguous order the flash kernel consumes them (per token, per
-//! head: a Q row, then per kv a mask + a K row + a V row), and scatter the kernel's O
-//! beats back into the strided destination. GQA lives here — the kernel is GQA-
-//! agnostic, so the K/V rows are replicated per query head sharing a kv head. This is
-//! the substantive, board-independent logic, tested in isolation; the DMA + register
-//! orchestration around it (flash_attn.zig) is mechanical and mirrors pl/matmul.zig.
+//! Pure feed helpers for the kv-major PL flash tenant. v2 DMAs Q/K/V/mask **directly
+//! from the resident ggml tensors** in their native layout — no gather, no GQA
+//! replication (that was ~89% of a v1 decode call). The kernel consumes the cache
+//! kv-position-major and does GQA in hardware, so all this module owns is: the masked
+//! KV-extent scan (clamp the −∞ padding), the native-layout contiguity check that
+//! gates the direct-DMA path, and the packed-O scatter back to the strided dst.
 //!
-//! Kernel stream geometry: Q/O are f32, K/V are f16; the kernel reads Q in 8×f32
-//! beats, K/V in 8×f16 beats, mask as one f16, and emits O one f32 per 256-bit beat
-//! (lane 0). `head_dim_q`/`head_dim_v` must be multiples of 8 (the LANES width).
+//! Kernel stream geometry: Q/O are f32, K/V are f16. The kernel reads Q in 8×f32 beats,
+//! K/V in 8×f16 beats, mask as one f16, and emits O 8×f32 per 256-bit beat (packed).
 
 const std = @import("std");
 
 pub const LANES: usize = 8;
-pub const o_beat_bytes: usize = 32; // 256-bit O beat; the f32 sits in lane 0
 
 pub const Shape = struct {
     head_dim_q: usize,
@@ -35,94 +32,89 @@ pub const Shape = struct {
     pub fn headRatio(s: Shape) usize {
         return s.n_heads / s.n_head_kv;
     }
-    /// The kernel requires head dims to be a whole number of 8-lane beats.
+    /// The kernel requires head dims to be a whole number of 8-lane beats, and GQA to
+    /// divide evenly.
     pub fn beatAligned(s: Shape) bool {
         return s.head_dim_q % LANES == 0 and s.head_dim_v % LANES == 0 and
             s.n_heads % s.n_head_kv == 0;
     }
-    pub fn qBytes(s: Shape) usize {
-        return s.n_tokens * s.n_heads * s.head_dim_q * @sizeOf(f32);
+
+    /// Can the kernel consume Q/K/V straight from the resident tensors with one
+    /// contiguous DMA each (the no-repack fast path)? True when this is a single-token
+    /// (decode) call and the cache has no inter-{kv,head} padding — the K/V layout is
+    /// `[head_dim, n_head_kv, n_kv]` packed (kv-position outer, kv-heads adjacent), Q
+    /// is `[head_dim, n_heads]` packed. Bonsai GQA satisfies this; anything else (a
+    /// padded/strided cache, multi-token prefill) defers to the PS oracle.
+    pub fn directDmaCapable(s: Shape) bool {
+        const h: usize = @sizeOf(f16);
+        const f: usize = @sizeOf(f32);
+        return s.n_tokens == 1 and
+            s.k_nb2 == s.head_dim_q * h and
+            s.k_nb1 == s.n_head_kv * s.head_dim_q * h and
+            s.v_nb2 == s.head_dim_v * h and
+            s.v_nb1 == s.n_head_kv * s.head_dim_v * h and
+            s.q_nb2 == s.head_dim_q * f; // n_tokens=1 ⇒ heads are contiguous
     }
-    pub fn kBytes(s: Shape) usize {
-        return s.n_tokens * s.n_heads * s.n_kv * s.head_dim_q * @sizeOf(f16);
+
+    // ---- direct-DMA stream byte lengths (kv_hi = the real masked extent) ----
+    /// Q for the one token: all heads, contiguous (head·head_dim_q f32).
+    pub fn qStreamBytes(s: Shape) usize {
+        return s.n_heads * s.head_dim_q * @sizeOf(f32);
     }
-    pub fn vBytes(s: Shape) usize {
-        return s.n_tokens * s.n_heads * s.n_kv * s.head_dim_v * @sizeOf(f16);
+    /// K for kv 0..kv_hi: a contiguous prefix of the cache (kv is the outer dim).
+    pub fn kStreamBytes(s: Shape, kv_hi: usize) usize {
+        return kv_hi * s.k_nb1;
     }
-    pub fn maskBytes(s: Shape) usize {
-        return s.n_tokens * s.n_heads * s.n_kv * @sizeOf(f16);
+    pub fn vStreamBytes(s: Shape, kv_hi: usize) usize {
+        return kv_hi * s.v_nb1;
     }
+    /// One mask value per kv (this token), contiguous f16.
+    pub fn maskStreamBytes(_: Shape, kv_hi: usize) usize {
+        return kv_hi * @sizeOf(f16);
+    }
+    /// Packed O: 8 f32 per beat, head_dim_v/8 beats per head — i.e. the dense output.
     pub fn oBytes(s: Shape) usize {
-        return s.n_tokens * s.n_heads * s.head_dim_v * o_beat_bytes;
+        return s.n_tokens * s.n_heads * s.head_dim_v * @sizeOf(f32);
     }
 };
 
-/// Q row per (token, head), contiguous (head_dim_q f32 each), in (token, head) order.
-pub fn gatherQ(s: Shape, q_data: []const u8, out: []u8) void {
-    const row = s.head_dim_q * @sizeOf(f32);
-    var off: usize = 0;
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |h| {
-        const base = t * s.q_nb1 + h * s.q_nb2;
-        @memcpy(out[off..][0..row], q_data[base..][0..row]);
-        off += row;
-    };
-}
+/// f16 −∞ bit pattern. flash_kernel.v skips a kv whose mask is exactly this
+/// (F16_NEG_INF), so the real extent is the last kv that is *not* it.
+pub const f16_neg_inf: u16 = 0xFC00;
 
-/// K row per (token, head, kv): K[kv][kv_head(h)], replicated per query head (GQA).
-pub fn gatherK(s: Shape, k_data: []const u8, out: []u8) void {
-    const row = s.head_dim_q * @sizeOf(f16);
-    const ratio = s.headRatio();
-    var off: usize = 0;
-    for (0..s.n_tokens) |_| for (0..s.n_heads) |h| {
-        const kv_head = h / ratio;
-        for (0..s.n_kv) |kv| {
-            const base = kv * s.k_nb1 + kv_head * s.k_nb2;
-            @memcpy(out[off..][0..row], k_data[base..][0..row]);
-            off += row;
+/// Real (unmasked) KV extent: 1 + the largest kv index carrying a finite mask entry,
+/// maximized over the query-token rows. Clamping the kernel to [0, kv_hi) is
+/// bit-identical to walking [0, n_kv): the dropped tail is exactly the −∞-masked
+/// positions the kernel already skips (each contributes exp(−∞)=0 to the running l
+/// and acc). A null mask means no padding — the whole extent is real. Shrinking n_kv
+/// shrinks the K/V DMA and the kernel walk together.
+pub fn maskedExtent(s: Shape, mask_data: ?[]const u8) usize {
+    const m = mask_data orelse return s.n_kv;
+    var hi: usize = 0;
+    for (0..s.n_tokens) |t| {
+        // Scan this token's row from the top down to the current bound; the first
+        // finite entry is its last real kv. Later tokens only extend the bound.
+        var kv: usize = s.n_kv;
+        while (kv > hi) : (kv -= 1) {
+            const bits = std.mem.readInt(u16, m[t * s.mask_nb1 + (kv - 1) * @sizeOf(f16) ..][0..2], .little);
+            if (bits != f16_neg_inf) {
+                hi = kv;
+                break;
+            }
         }
-    };
+    }
+    return if (hi == 0) s.n_kv else hi;
 }
 
-/// V row per (token, head, kv): V[kv][kv_head(h)], replicated per query head (GQA).
-pub fn gatherV(s: Shape, v_data: []const u8, out: []u8) void {
-    const row = s.head_dim_v * @sizeOf(f16);
-    const ratio = s.headRatio();
-    var off: usize = 0;
-    for (0..s.n_tokens) |_| for (0..s.n_heads) |h| {
-        const kv_head = h / ratio;
-        for (0..s.n_kv) |kv| {
-            const base = kv * s.v_nb1 + kv_head * s.v_nb2;
-            @memcpy(out[off..][0..row], v_data[base..][0..row]);
-            off += row;
-        }
-    };
-}
-
-/// Mask f16 per (token, head, kv): mask[token][kv], replicated per head. Null mask →
-/// all-zero (finite, so the kernel processes every kv).
-pub fn gatherMask(s: Shape, mask_data: ?[]const u8, out: []u8) void {
-    var off: usize = 0;
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |_| {
-        for (0..s.n_kv) |kv| {
-            const bits: u16 = if (mask_data) |m|
-                std.mem.readInt(u16, m[t * s.mask_nb1 + kv * @sizeOf(f16) ..][0..2], .little)
-            else
-                0;
-            std.mem.writeInt(u16, out[off..][0..2], bits, .little);
-            off += @sizeOf(f16);
-        }
-    };
-}
-
-/// Scatter the kernel's O beats (one f32 in lane 0 of each 256-bit beat, emitted in
-/// (token, head, d) order) into the strided destination: dst[head*dst_nb1 +
-/// token*dst_nb2 + d*4].
-pub fn scatterO(s: Shape, o_beats: []const u8, dst: []u8) void {
+/// Scatter the kernel's packed O (dense f32 in (token, head, d) order — the 8-wide
+/// emit, read back as a flat f32 array) into the strided destination:
+/// dst[head*dst_nb1 + token*dst_nb2 + d*4].
+pub fn scatterO(s: Shape, o_f32: []const u8, dst: []u8) void {
     var idx: usize = 0;
     for (0..s.n_tokens) |t| for (0..s.n_heads) |h| {
         const base = h * s.dst_nb1 + t * s.dst_nb2;
         for (0..s.head_dim_v) |d| {
-            @memcpy(dst[base + d * @sizeOf(f32) ..][0..4], o_beats[idx * o_beat_bytes ..][0..4]);
+            @memcpy(dst[base + d * @sizeOf(f32) ..][0..4], o_f32[idx * @sizeOf(f32) ..][0..4]);
             idx += 1;
         }
     };
@@ -134,109 +126,76 @@ fn f16bits(v: f32) u16 {
     return @bitCast(@as(f16, @floatCast(v)));
 }
 
-test "gatherQ lays rows out in (token, head) order" {
-    const a = std.testing.allocator;
-    // head_dim_q=8, n_heads=2, n_tokens=2; ggml layout [hd, n_tok, n_heads].
-    const s: Shape = .{
-        .head_dim_q = 8, .head_dim_v = 8, .n_heads = 2, .n_head_kv = 1,
-        .n_kv = 1, .n_tokens = 2,
-        .q_nb1 = 8 * 4, .q_nb2 = 2 * 8 * 4, // nb1 = stride/token, nb2 = stride/head
-        .k_nb1 = 0, .k_nb2 = 0, .v_nb1 = 0, .v_nb2 = 0, .mask_nb1 = 0, .dst_nb1 = 0, .dst_nb2 = 0,
-    };
-    const q = try a.alloc(u8, s.n_tokens * s.n_heads * s.head_dim_q * 4);
-    defer a.free(q);
-    // q[(token*nh+head)*hd + d] layout via the strides; mark each f32 with a tag.
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |h| for (0..s.head_dim_q) |d| {
-        const off = t * s.q_nb1 + h * s.q_nb2 + d * 4;
-        std.mem.writeInt(u32, q[off..][0..4], @intCast((t * 10 + h) * 100 + d), .little);
-    };
-    const out = try a.alloc(u8, s.qBytes());
-    defer a.free(out);
-    gatherQ(s, q, out);
-    // out is contiguous (t,h,d). Check a few.
-    var i: usize = 0;
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |h| for (0..s.head_dim_q) |d| {
-        const got = std.mem.readInt(u32, out[i * 4 ..][0..4], .little);
-        try std.testing.expectEqual(@as(u32, @intCast((t * 10 + h) * 100 + d)), got);
-        i += 1;
-    };
-}
-
-test "gatherK/V replicate the shared kv head across query heads (GQA)" {
-    const a = std.testing.allocator;
-    // n_heads=4, n_head_kv=2 -> ratio 2: heads 0,1 share kv_head 0; heads 2,3 share 1.
-    const s: Shape = .{
-        .head_dim_q = 8, .head_dim_v = 8, .n_heads = 4, .n_head_kv = 2,
-        .n_kv = 3, .n_tokens = 1,
-        .q_nb1 = 0, .q_nb2 = 0,
-        .k_nb1 = 8 * 2, .k_nb2 = 3 * 8 * 2, // [hd, n_kv, n_head_kv]
-        .v_nb1 = 8 * 2, .v_nb2 = 3 * 8 * 2,
-        .mask_nb1 = 0, .dst_nb1 = 0, .dst_nb2 = 0,
-    };
-    const k = try a.alloc(u8, s.n_kv * s.n_head_kv * s.head_dim_q * 2);
-    defer a.free(k);
-    for (0..s.n_kv) |kv| for (0..s.n_head_kv) |kh| for (0..s.head_dim_q) |d| {
-        const off = kv * s.k_nb1 + kh * s.k_nb2 + d * 2;
-        std.mem.writeInt(u16, k[off..][0..2], @intCast((kv * 10 + kh) * 8 + d), .little);
-    };
-    const out = try a.alloc(u8, s.kBytes());
-    defer a.free(out);
-    gatherK(s, k, out);
-    // out order: (h, kv, d). head h uses kv_head h/2.
-    var i: usize = 0;
-    for (0..s.n_heads) |h| {
-        const kh = h / s.headRatio();
-        for (0..s.n_kv) |kv| for (0..s.head_dim_q) |d| {
-            const got = std.mem.readInt(u16, out[i * 2 ..][0..2], .little);
-            try std.testing.expectEqual(@as(u16, @intCast((kv * 10 + kh) * 8 + d)), got);
-            i += 1;
-        };
-    }
-}
-
-test "gatherMask replicates per head; null mask is all-zero" {
-    const a = std.testing.allocator;
-    const s: Shape = .{
-        .head_dim_q = 8, .head_dim_v = 8, .n_heads = 2, .n_head_kv = 1,
-        .n_kv = 3, .n_tokens = 1,
+test "maskedExtent clamps to the finite prefix and tolerates a null mask" {
+    const base: Shape = .{
+        .head_dim_q = 8, .head_dim_v = 8, .n_heads = 1, .n_head_kv = 1,
+        .n_kv = 8, .n_tokens = 1,
         .q_nb1 = 0, .q_nb2 = 0, .k_nb1 = 0, .k_nb2 = 0, .v_nb1 = 0, .v_nb2 = 0,
-        .mask_nb1 = 3 * 2, .dst_nb1 = 0, .dst_nb2 = 0,
+        .mask_nb1 = 8 * @sizeOf(f16), .dst_nb1 = 0, .dst_nb2 = 0,
     };
-    var mask: [3]u16 = .{ f16bits(0), f16bits(-std.math.inf(f32)), f16bits(0) };
-    const out = try a.alloc(u8, s.maskBytes());
-    defer a.free(out);
-    gatherMask(s, std.mem.sliceAsBytes(mask[0..]), out);
-    // (h, kv): both heads see the same mask row.
-    for (0..s.n_heads) |h| for (0..s.n_kv) |kv| {
-        const got = std.mem.readInt(u16, out[(h * s.n_kv + kv) * 2 ..][0..2], .little);
-        try std.testing.expectEqual(mask[kv], got);
+    // Causal decode: finite prefix [0,3), −∞ tail → extent 3.
+    var row = [_]u16{ 0, 0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf };
+    try std.testing.expectEqual(@as(usize, 3), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    // A finite entry above a masked hole still bounds the extent (last real + 1).
+    row = .{ 0, f16_neg_inf, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf };
+    try std.testing.expectEqual(@as(usize, 3), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    // All masked → defensive fallback to the full padded extent.
+    @memset(row[0..], f16_neg_inf);
+    try std.testing.expectEqual(@as(usize, 8), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    // Null mask → the whole extent is real.
+    try std.testing.expectEqual(@as(usize, 8), maskedExtent(base, null));
+    // Two tokens: the bound is the max real extent across rows (t0→2, t1→5).
+    var two = base;
+    two.n_tokens = 2;
+    const rows = [_]u16{
+        0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf,
+        0, 0, 0, 0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf,
     };
-    gatherMask(s, null, out);
-    for (out) |b| try std.testing.expectEqual(@as(u8, 0), b);
+    try std.testing.expectEqual(@as(usize, 5), maskedExtent(two, std.mem.sliceAsBytes(rows[0..])));
 }
 
-test "scatterO extracts lane 0 into the strided destination" {
+test "directDmaCapable accepts the packed Bonsai decode layout, rejects padding/prefill" {
+    // Bonsai decode: [head_dim, n_head_kv, n_kv] packed, Q [head_dim, n_heads] packed.
+    const ok: Shape = .{
+        .head_dim_q = 128, .head_dim_v = 128, .n_heads = 16, .n_head_kv = 8,
+        .n_kv = 256, .n_tokens = 1,
+        .q_nb1 = 128 * 4, .q_nb2 = 128 * 4,
+        .k_nb1 = 8 * 128 * 2, .k_nb2 = 128 * 2,
+        .v_nb1 = 8 * 128 * 2, .v_nb2 = 128 * 2,
+        .mask_nb1 = 256 * 2, .dst_nb1 = 128 * 4, .dst_nb2 = 16 * 128 * 4,
+    };
+    try std.testing.expect(ok.directDmaCapable());
+    var prefill = ok; // multi-token Q is strided per head → not direct
+    prefill.n_tokens = 5;
+    prefill.q_nb2 = 128 * 5 * 4;
+    try std.testing.expect(!prefill.directDmaCapable());
+    var padded = ok; // inter-kv padding in the cache → not contiguous
+    padded.k_nb1 = 8 * 128 * 2 + 64;
+    try std.testing.expect(!padded.directDmaCapable());
+}
+
+test "scatterO places dense f32 into the strided destination" {
     const a = std.testing.allocator;
+    // head_dim_v=4, n_heads=2, n_tokens=1; dst [hd_v, n_heads, n_tokens] strided.
     const s: Shape = .{
         .head_dim_q = 8, .head_dim_v = 4, .n_heads = 2, .n_head_kv = 1,
         .n_kv = 1, .n_tokens = 1,
         .q_nb1 = 0, .q_nb2 = 0, .k_nb1 = 0, .k_nb2 = 0, .v_nb1 = 0, .v_nb2 = 0, .mask_nb1 = 0,
-        .dst_nb1 = 4 * 4, .dst_nb2 = 2 * 4 * 4, // dst [hd_v, n_heads, n_tokens]
+        .dst_nb1 = 4 * 4, .dst_nb2 = 2 * 4 * 4,
     };
+    // packed O: dense f32 in (h, d) order; tag = h*100 + d.
     const o = try a.alloc(u8, s.oBytes());
     defer a.free(o);
-    @memset(o, 0);
-    // beat idx = (t*nh+h)*hd_v + d ; lane 0 = a tag.
     var idx: usize = 0;
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |h| for (0..s.head_dim_v) |d| {
-        std.mem.writeInt(u32, o[idx * o_beat_bytes ..][0..4], @intCast((t * 2 + h) * 100 + d), .little);
+    for (0..s.n_heads) |h| for (0..s.head_dim_v) |d| {
+        std.mem.writeInt(u32, o[idx * 4 ..][0..4], @intCast(h * 100 + d), .little);
         idx += 1;
     };
-    const dst = try a.alloc(u8, s.n_tokens * s.n_heads * s.head_dim_v * 4);
+    const dst = try a.alloc(u8, s.n_heads * s.head_dim_v * 4);
     defer a.free(dst);
     scatterO(s, o, dst);
-    for (0..s.n_tokens) |t| for (0..s.n_heads) |h| for (0..s.head_dim_v) |d| {
-        const got = std.mem.readInt(u32, dst[h * s.dst_nb1 + t * s.dst_nb2 + d * 4 ..][0..4], .little);
-        try std.testing.expectEqual(@as(u32, @intCast((t * 2 + h) * 100 + d)), got);
+    for (0..s.n_heads) |h| for (0..s.head_dim_v) |d| {
+        const got = std.mem.readInt(u32, dst[h * s.dst_nb1 + d * 4 ..][0..4], .little);
+        try std.testing.expectEqual(@as(u32, @intCast(h * 100 + d)), got);
     };
 }

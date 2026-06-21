@@ -1,13 +1,13 @@
-//! PL flash-attention backend: drives the flash_top fabric kernel for a wire
-//! flash_attn_f32 command. A second tenant on the PL substrate (regwin/dma), beside
+//! PL flash-attention backend (v2, kv-major): drives the flash_top fabric kernel for a
+//! wire flash_attn_f32 command. A tenant on the PL substrate (regwin/dma), beside
 //! pl/matmul.zig.
 //!
-//! Q/K/V/mask are gathered (flash_feed) from their ggml-strided ranges into the
-//! kernel's contiguous consumption order — GQA replicated, kv-major within a head —
-//! DMA'd in; O DMAs out and scatters back to the strided destination. v1 materializes
-//! the (GQA-replicated) streams into staging, so it supports the shapes that fit the
-//! reservations and otherwise returns null to defer to the PS oracle. The kernel is
-//! correctness-first (sequential); the feed and the kernel both get faster later.
+//! The kernel consumes the KV cache in its NATIVE layout (kv-position-major,
+//! n_head_kv heads, GQA done in hardware), so this tenant **DMAs Q/K/V/mask straight
+//! from the resident ggml tensors** — no gather, no GQA replication, no input staging.
+//! That gather was ~89% of a v1 decode call. The mask gives the real KV extent (clamp
+//! the −∞ padding); O comes back 8-wide packed and scatters (or DMAs straight) to dst.
+//! Decode-only (single token, contiguous cache); anything else defers to the PS oracle.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -27,12 +27,19 @@ const caps = flash_regmap.caps;
 const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-const min_version: u32 = 1;
+/// Oldest kernel VERSION the driver accepts. v2 is the kv-major kernel (GQA-in-HW,
+/// pipelined dot, packed O); a v1 bitstream uses the head-major replicated feed and is
+/// incompatible with this tenant, so it must fall back to PS rather than corrupt output.
+const min_version: u32 = 2;
 const expected_id: u32 = flash_regmap.resetOf("ID");
 const expected_lanes: u32 = flash_regmap.resetOf("LANES");
 
-/// Per-run hardware counters from the flash kernel (Q/K/V/O streams). Returned to the
-/// runtime; profiler wiring is a later step.
+comptime {
+    std.debug.assert(min_version <= flash_regmap.resetOf("VERSION"));
+}
+
+/// Per-run hardware counters from the flash kernel (Q/K/V/O streams). Surfaced to the
+/// `flash seg` stderr diagnostic; full `--prof` wiring is a later step.
 pub const FlashCounters = struct {
     cycles: u64 = 0,
     q_beats: u64 = 0,
@@ -66,10 +73,12 @@ pub const Kernel = struct {
         self.win.deinit();
     }
 
-    pub fn run(self: *Kernel, hdq: u32, hdv: u32, nh: u32, nkv: u32, ntok: u32, scale_bits: u32) void {
+    pub fn run(self: *Kernel, hdq: u32, hdv: u32, nh: u32, nhkv: u32, ratio: u32, nkv: u32, ntok: u32, scale_bits: u32) void {
         self.win.wr(flash_regmap.offsetOf("HEAD_DIM_Q"), hdq);
         self.win.wr(flash_regmap.offsetOf("HEAD_DIM_V"), hdv);
         self.win.wr(flash_regmap.offsetOf("N_HEADS"), nh);
+        self.win.wr(flash_regmap.offsetOf("N_HEAD_KV"), nhkv);
+        self.win.wr(flash_regmap.offsetOf("HEAD_RATIO"), ratio);
         self.win.wr(flash_regmap.offsetOf("N_KV"), nkv);
         self.win.wr(flash_regmap.offsetOf("N_TOKENS"), ntok);
         self.win.wr(flash_regmap.offsetOf("SCALE"), scale_bits);
@@ -82,6 +91,11 @@ pub const Kernel = struct {
             if (self.win.rd(flash_regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
         }
         return error.KernelTimeout;
+    }
+
+    /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
+    pub fn clkMhz(self: Kernel) f64 {
+        return @as(f64, @floatFromInt(self.clk_hz)) / 1_000_000.0;
     }
 
     fn readCounters(self: *Kernel) FlashCounters {
@@ -98,6 +112,33 @@ pub const Kernel = struct {
     }
 };
 
+/// Temporary per-segment timing accumulator (mirrors pl/matmul.zig's Seg) for the
+/// `flash seg` stderr line. With the v2 direct-DMA feed the host side is `prep` (mask
+/// read + kv-extent scan) + `sync_to` (flush the resident sources) + `setup` (DMA arm)
+/// + `scatter` (O back to dst) — the ~14 ms `gather` is gone — and `wait` ≈ the PL
+/// kernel. The HW counters say whether the kernel is feed-starved (K/V stalls) or
+/// compute-bound (busy cycles, low stalls).
+const Seg = struct {
+    calls: u64 = 0,
+    prep_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    scatter_ns: u64 = 0,
+    cycles: u64 = 0,
+    k_stall: u64 = 0,
+    v_stall: u64 = 0,
+    o_stall: u64 = 0,
+};
+const seg_report_interval: u64 = 200;
+
+fn lapNs(io: ?std.Io, last: *u64) u64 {
+    const now = shared.profiling.nowNs(io);
+    const d = if (now >= last.*) now - last.* else 0;
+    last.* = now;
+    return d;
+}
+
 /// Generic over the heap so the runtime composes it only for heaps with physical
 /// addressing (XRT); the fake heap never instantiates it.
 pub fn Backend(comptime Heap: type) type {
@@ -111,11 +152,9 @@ pub fn Backend(comptime Heap: type) type {
         dma_v: dma_mod.Dma,
         dma_mask: dma_mod.Dma,
         dma_o: dma_mod.Dma,
-        q_staging: wire.TensorRange,
-        k_staging: wire.TensorRange,
-        v_staging: wire.TensorRange,
-        mask_staging: wire.TensorRange,
         o_staging: wire.TensorRange,
+        seg: Seg = .{},
+        logged_reject: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             var kernel = try Kernel.open(addr.kernel);
@@ -131,10 +170,8 @@ pub fn Backend(comptime Heap: type) type {
             var dma_o = try dma_mod.Dma.open(addr.dma_o);
             errdefer dma_o.deinit();
 
-            const q_staging = heap.allocate(caps.q_staging_bytes, 4096) catch return error.HeapFailure;
-            const k_staging = heap.allocate(caps.k_staging_bytes, 4096) catch return error.HeapFailure;
-            const v_staging = heap.allocate(caps.v_staging_bytes, 4096) catch return error.HeapFailure;
-            const mask_staging = heap.allocate(caps.mask_staging_bytes, 4096) catch return error.HeapFailure;
+            // The only host reservation: the packed-O DMA sink (used when dst is not
+            // contiguous). Q/K/V/mask DMA straight from the resident tensors.
             const o_staging = heap.allocate(caps.o_staging_bytes, 4096) catch return error.HeapFailure;
 
             return .{
@@ -145,10 +182,6 @@ pub fn Backend(comptime Heap: type) type {
                 .dma_v = dma_v,
                 .dma_mask = dma_mask,
                 .dma_o = dma_o,
-                .q_staging = q_staging,
-                .k_staging = k_staging,
-                .v_staging = v_staging,
-                .mask_staging = mask_staging,
                 .o_staging = o_staging,
             };
         }
@@ -191,45 +224,68 @@ pub fn Backend(comptime Heap: type) type {
         /// Run `attn` on the PL if its shape is supported; null defers to the PS
         /// kernel. Errors are hardware/heap failures the runtime should surface.
         pub fn tryFlashAttn(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, io: ?std.Io) Error!?FlashCounters {
-            _ = io;
-            const s = shapeOf(attn);
+            var s = shapeOf(attn);
             // Unsupported shape → defer to PS (not an error).
             if (s.head_dim_q == 0 or s.head_dim_v == 0 or s.n_heads == 0 or s.n_head_kv == 0 or
                 s.n_kv == 0 or s.n_tokens == 0) return null;
+            if (!attn.has_mask) return null; // the mask gives kv_hi and feeds the kernel's skip
             if (!s.beatAligned()) return null;
             if (s.head_dim_q > caps.head_dim_max or s.head_dim_v > caps.head_dim_max) return null;
-            if (s.qBytes() > caps.q_staging_bytes or s.kBytes() > caps.k_staging_bytes or
-                s.vBytes() > caps.v_staging_bytes or s.maskBytes() > caps.mask_staging_bytes or
-                s.oBytes() > caps.o_staging_bytes) return null;
+            if (!s.directDmaCapable()) {
+                // One-shot bring-up diagnostic: if a decode op falls back to PS, this
+                // says which stride assumption missed (no `flash seg` line ⇒ PS path).
+                if (!self.logged_reject) {
+                    self.logged_reject = true;
+                    const h: usize = @sizeOf(f16);
+                    const f: usize = @sizeOf(f32);
+                    std.debug.print("pl flash: directDmaCapable rejected → PS (n_tok={d} k_nb1={d}/exp{d} k_nb2={d}/exp{d} v_nb1={d}/exp{d} v_nb2={d}/exp{d} q_nb2={d}/exp{d})\n", .{
+                        s.n_tokens,
+                        s.k_nb1, s.n_head_kv * s.head_dim_q * h, s.k_nb2, s.head_dim_q * h,
+                        s.v_nb1, s.n_head_kv * s.head_dim_v * h, s.v_nb2, s.head_dim_v * h,
+                        s.q_nb2, s.head_dim_q * f,
+                    });
+                }
+                return null; // native packed cache + single token only
+            }
+            if (s.oBytes() > caps.o_staging_bytes) return null;
 
-            const q_data = heap.read(attn.q) catch return error.HeapFailure;
-            const k_data = heap.read(attn.k) catch return error.HeapFailure;
-            const v_data = heap.read(attn.v) catch return error.HeapFailure;
-            const mask_data: ?[]const u8 = if (attn.has_mask)
-                (heap.read(attn.mask) catch return error.HeapFailure)
-            else
-                null;
+            var seg: Seg = .{};
+            var last = shared.profiling.nowNs(io);
 
-            // Gather into the staging buffers (the kernel's consumption order).
-            const q_sub = subRange(self.q_staging, s.qBytes());
-            const k_sub = subRange(self.k_staging, s.kBytes());
-            const v_sub = subRange(self.v_staging, s.vBytes());
-            const mask_sub = subRange(self.mask_staging, s.maskBytes());
-            const o_sub = subRange(self.o_staging, s.oBytes());
-            feed.gatherQ(s, q_data, heap.bytes(q_sub) catch return error.HeapFailure);
-            feed.gatherK(s, k_data, heap.bytes(k_sub) catch return error.HeapFailure);
-            feed.gatherV(s, v_data, heap.bytes(v_sub) catch return error.HeapFailure);
-            feed.gatherMask(s, mask_data, heap.bytes(mask_sub) catch return error.HeapFailure);
-            heap.syncToDevice(q_sub) catch return error.HeapFailure;
-            heap.syncToDevice(k_sub) catch return error.HeapFailure;
-            heap.syncToDevice(v_sub) catch return error.HeapFailure;
-            heap.syncToDevice(mask_sub) catch return error.HeapFailure;
+            // Real KV extent from the mask → clamp the −∞ padding (shrinks the K/V DMA
+            // and the kernel walk; bit-identical, the dropped tail is what the kernel
+            // already skips). Then size each native stream.
+            const mask_data = heap.read(attn.mask) catch return error.HeapFailure;
+            const kv_hi = feed.maskedExtent(s, mask_data);
+            s.n_kv = kv_hi;
+            const q_bytes = s.qStreamBytes();
+            const k_bytes = s.kStreamBytes(kv_hi);
+            const v_bytes = s.vStreamBytes(kv_hi);
+            const mask_bytes = s.maskStreamBytes(kv_hi);
+            const o_bytes = s.oBytes();
+            // O straight to dst when it's contiguous f32 (the common decode case, one
+            // token, heads adjacent), else into the packed staging + scatter.
+            const dst_contig = s.dst_nb1 == s.head_dim_v * @sizeOf(f32);
+            const o_range = if (dst_contig) srcRange(attn.dst, o_bytes) else subRange(self.o_staging, o_bytes);
+            seg.prep_ns += lapNs(io, &last);
 
-            const q_phys = heap.deviceAddress(q_sub) catch return error.HeapFailure;
-            const k_phys = heap.deviceAddress(k_sub) catch return error.HeapFailure;
-            const v_phys = heap.deviceAddress(v_sub) catch return error.HeapFailure;
-            const mask_phys = heap.deviceAddress(mask_sub) catch return error.HeapFailure;
-            const o_phys = heap.deviceAddress(o_sub) catch return error.HeapFailure;
+            // Flush the A53's writes to the resident sources so the PL DMA reads current
+            // DDR (the KV cache was just written by set_rows; the mask was uploaded).
+            const q_src = srcRange(attn.q, q_bytes);
+            const k_src = srcRange(attn.k, k_bytes);
+            const v_src = srcRange(attn.v, v_bytes);
+            const mask_src = srcRange(attn.mask, mask_bytes);
+            heap.syncToDevice(q_src) catch return error.HeapFailure;
+            heap.syncToDevice(k_src) catch return error.HeapFailure;
+            heap.syncToDevice(v_src) catch return error.HeapFailure;
+            heap.syncToDevice(mask_src) catch return error.HeapFailure;
+            seg.sync_to_ns += lapNs(io, &last);
+
+            const q_phys = heap.deviceAddress(q_src) catch return error.HeapFailure;
+            const k_phys = heap.deviceAddress(k_src) catch return error.HeapFailure;
+            const v_phys = heap.deviceAddress(v_src) catch return error.HeapFailure;
+            const mask_phys = heap.deviceAddress(mask_src) catch return error.HeapFailure;
+            const o_phys = heap.deviceAddress(o_range) catch return error.HeapFailure;
 
             // Arm the output capture first, then the input feeds, then strobe start.
             try self.dma_o.resetS2mm();
@@ -237,32 +293,96 @@ pub fn Backend(comptime Heap: type) type {
             try self.dma_k.resetMm2s();
             try self.dma_v.resetMm2s();
             try self.dma_mask.resetMm2s();
-            try self.dma_o.startWriteToDdr(o_phys, s.oBytes());
-            try self.dma_q.startReadFromDdr(q_phys, s.qBytes());
-            try self.dma_k.startReadFromDdr(k_phys, s.kBytes());
-            try self.dma_v.startReadFromDdr(v_phys, s.vBytes());
-            try self.dma_mask.startReadFromDdr(mask_phys, s.maskBytes());
+            try self.dma_o.startWriteToDdr(o_phys, o_bytes);
+            try self.dma_q.startReadFromDdr(q_phys, q_bytes);
+            try self.dma_k.startReadFromDdr(k_phys, k_bytes);
+            try self.dma_v.startReadFromDdr(v_phys, v_bytes);
+            try self.dma_mask.startReadFromDdr(mask_phys, mask_bytes);
 
-            self.kernel.run(attn.head_dim_q, attn.head_dim_v, attn.n_heads, attn.n_kv, attn.n_tokens, @bitCast(attn.scale));
+            self.kernel.run(attn.head_dim_q, attn.head_dim_v, attn.n_heads, attn.n_head_kv, @intCast(s.headRatio()), @intCast(kv_hi), attn.n_tokens, @bitCast(attn.scale));
+            seg.setup_ns += lapNs(io, &last);
             try self.kernel.waitDone();
             try self.dma_q.waitReadDone();
             try self.dma_k.waitReadDone();
             try self.dma_v.waitReadDone();
             try self.dma_mask.waitReadDone();
             try self.dma_o.waitWriteDone();
+            seg.wait_ns += lapNs(io, &last);
 
             const counters = self.kernel.readCounters();
 
-            heap.syncFromDevice(o_sub) catch return error.HeapFailure;
-            const o_beats = heap.read(o_sub) catch return error.HeapFailure;
-            const dst = heap.bytes(attn.dst) catch return error.HeapFailure;
-            feed.scatterO(s, o_beats, dst);
+            // Make the DMA's O writes visible to the A53, then (only if dst wasn't the
+            // DMA target) scatter the packed result into the strided destination.
+            heap.syncFromDevice(o_range) catch return error.HeapFailure;
+            if (!dst_contig) {
+                const o_packed = heap.read(o_range) catch return error.HeapFailure;
+                const dst = heap.bytes(attn.dst) catch return error.HeapFailure;
+                feed.scatterO(s, o_packed, dst);
+            }
+            seg.scatter_ns += lapNs(io, &last);
+
+            // Fold this call's segments + the kernel's hardware counters into the
+            // window accumulator; flush a mean every `seg_report_interval` calls.
+            self.seg.calls += 1;
+            self.seg.prep_ns += seg.prep_ns;
+            self.seg.sync_to_ns += seg.sync_to_ns;
+            self.seg.setup_ns += seg.setup_ns;
+            self.seg.wait_ns += seg.wait_ns;
+            self.seg.scatter_ns += seg.scatter_ns;
+            self.seg.cycles += counters.cycles;
+            self.seg.k_stall += counters.k_stall;
+            self.seg.v_stall += counters.v_stall;
+            self.seg.o_stall += counters.o_stall;
+            if (self.seg.calls % seg_report_interval == 0) self.flushSeg();
 
             return counters;
+        }
+
+        /// Print mean per-segment times for the last window of flash PL calls to
+        /// stderr, then reset. Temporary diagnostic for the per-call cost: host-side
+        /// prep/sync/scatter (A53) vs PL `wait`, plus `kernel` busy time (cycles ÷
+        /// clock) and K/V/O stall fractions.
+        fn flushSeg(self: *Self) void {
+            const s = self.seg;
+            if (s.calls == 0) return;
+            const n: f64 = @floatFromInt(s.calls);
+            const us = struct {
+                fn f(ns: u64, count: f64) f64 {
+                    return @as(f64, @floatFromInt(ns)) / count / 1000.0;
+                }
+            }.f;
+            const pct = struct {
+                fn f(part: u64, whole: u64) f64 {
+                    if (whole == 0) return 0;
+                    return 100.0 * @as(f64, @floatFromInt(part)) / @as(f64, @floatFromInt(whole));
+                }
+            }.f;
+            const cyc_per_call = @as(f64, @floatFromInt(s.cycles)) / n;
+            const kernel_us = if (s.cycles == 0) 0 else cyc_per_call / self.kernel.clkMhz();
+            std.debug.print("flash seg us/call (n={d}): prep={d:.1} sync_to={d:.1} setup={d:.1} wait={d:.1} scatter={d:.1} | kernel={d:.1} (cyc/call={d:.0}) k_stall%={d:.1} v_stall%={d:.1} o_stall%={d:.1}\n", .{
+                s.calls,
+                us(s.prep_ns, n),
+                us(s.sync_to_ns, n),
+                us(s.setup_ns, n),
+                us(s.wait_ns, n),
+                us(s.scatter_ns, n),
+                kernel_us,
+                cyc_per_call,
+                pct(s.k_stall, s.cycles),
+                pct(s.v_stall, s.cycles),
+                pct(s.o_stall, s.cycles),
+            });
+            self.seg = .{};
         }
     };
 }
 
 fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
     return .{ .handle = staging.handle, .offset = 0, .nbytes = nbytes };
+}
+
+/// A prefix of a resident source tensor (same handle/offset, fewer bytes) — what the
+/// direct DMA reads and what we flush before it.
+fn srcRange(base: wire.TensorRange, nbytes: usize) wire.TensorRange {
+    return .{ .handle = base.handle, .offset = base.offset, .nbytes = nbytes };
 }
