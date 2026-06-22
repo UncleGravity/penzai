@@ -83,7 +83,7 @@ const fp_rtl = [_][]const u8{
     "fpga/rtl/fp/fp16_to_fp32.v",  "fpga/rtl/fp/int_to_fp32.v",
 };
 const matmul_rtl = [_][]const u8{
-    "fpga/rtl/matmul/matmul_kernel.v", "fpga/rtl/matmul/matmul_rowblock.v",
+    "fpga/rtl/matmul/matmul_kernel.v",  "fpga/rtl/matmul/matmul_rowblock.v",
     "fpga/rtl/matmul/matmul_reducer.v",
 } ++ fp_rtl;
 const matmul_top_rtl = [_][]const u8{
@@ -171,83 +171,21 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // counter bank + the generated header. This is the structural gate for the
     // gateware that the cosim (which drives the core) does not exercise.
     const lint = b.addSystemCommand(&.{
-        "sh",                                                                                                                                                                     "-c",
+        "sh",                                                                                                                                                 "-c",
         "verilator --lint-only -Wall -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/matmul --top-module matmul_top " ++ matmul_rtl_args,
     });
     b.step("lint-rtl", "Verilator lint the matmul RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl);
-    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl);
-    addFlashCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl);
-    addFlashCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl);
-    addFlashCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl);
-    addFlashCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl);
+    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
+    addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
+    addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
+    addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
 }
 
-// Verilator cosim of a flash RTL top, driven from Zig, checked vs flash_ref.
-// Separate from addCosim because the flash tb imports the standalone flash_ref
-// model (no layout/pack/matmul_ref) and includes the flash LUT header.
-fn addFlashCosim(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    step_name: []const u8,
-    desc: []const u8,
-    top: []const u8,
-    dir: []const u8,
-    rtl: []const []const u8,
-) void {
-    const step = b.step(step_name, desc);
-    const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
-        const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
-        step.dependOn(&msg.step);
-        return;
-    };
-    const vroot = std.mem.trim(u8, b.run(&.{ verilator, "--getenv", "VERILATOR_ROOT" }), " \n\r");
-    const gen = b.fmt("{s}/obj_dir", .{dir});
-
-    const vcmd = b.addSystemCommand(&.{ verilator, "--cc", "--build", "--lib-create" });
-    vcmd.addArg(top);
-    vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
-    vcmd.addArg(top);
-    vcmd.addArgs(&.{ "--Mdir", gen });
-    vcmd.addArg("+incdir+fpga/rtl/flash_attn");
-    vcmd.addArgs(rtl);
-
-    const tb_mod = b.createModule(.{
-        .root_source_file = b.path(b.fmt("{s}/tb.zig", .{dir})),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    });
-    tb_mod.addImport("flash_ref", b.createModule(.{
-        .root_source_file = b.path("fpga/sim/support/flash_ref.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    // The flash regmap (offsets/resets), so the flash_top tb drives AXI-Lite from the
-    // single source. Harmless to the other flash tbs, which simply don't import it.
-    tb_mod.addImport("regmap", b.createModule(.{
-        .root_source_file = b.path("fpga/regmap/flash_attn.zig"),
-        .target = target,
-        .optimize = optimize,
-    }));
-    tb_mod.addIncludePath(b.path(dir));
-    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
-    tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
-    tb_mod.addIncludePath(b.path(gen));
-    tb_mod.addCSourceFile(.{
-        .file = b.path(b.fmt("{s}/shim.cpp", .{dir})),
-        .flags = &.{ "-std=c++17", b.fmt("-I{s}", .{gen}), b.fmt("-I{s}/include", .{vroot}), b.fmt("-I{s}/include/vltstd", .{vroot}) },
-    });
-    tb_mod.addObjectFile(b.path(b.fmt("{s}/lib{s}.a", .{ gen, top })));
-    tb_mod.linkSystemLibrary("pthread", .{});
-    tb_mod.link_libcpp = true;
-
-    const tb = b.addExecutable(.{ .name = b.fmt("{s}-cosim", .{top}), .root_module = tb_mod });
-    tb.step.dependOn(&vcmd.step);
-    step.dependOn(&b.addRunArtifact(tb).step);
-}
+// Which software model the cosim tb checks against; selects the module imports.
+const CosimKind = enum { matmul, flash };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -264,7 +202,8 @@ fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.R
     mod.addImport("matmul_ref", ref);
 }
 
-// Verilator cosim of a kernel top, driven from Zig, checked vs matmul_ref.
+// Verilator cosim of an RTL top, driven from Zig. `kind` picks the reference
+// model + RTL incdir: .matmul (layout/pack/matmul_ref) or .flash (flash_ref + regmap).
 fn addCosim(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
@@ -274,6 +213,7 @@ fn addCosim(
     top: []const u8,
     dir: []const u8,
     rtl: []const []const u8,
+    kind: CosimKind,
 ) void {
     const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
@@ -289,7 +229,10 @@ fn addCosim(
     vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "--Mdir", gen });
-    vcmd.addArg("+incdir+fpga/rtl/matmul");
+    vcmd.addArg(switch (kind) {
+        .matmul => "+incdir+fpga/rtl/matmul",
+        .flash => "+incdir+fpga/rtl/flash_attn",
+    });
     vcmd.addArgs(rtl);
 
     const tb_mod = b.createModule(.{
@@ -298,7 +241,23 @@ fn addCosim(
         .optimize = optimize,
         .link_libc = true,
     });
-    attachCosimSupport(b, tb_mod, target, optimize);
+    switch (kind) {
+        .matmul => attachCosimSupport(b, tb_mod, target, optimize),
+        .flash => {
+            tb_mod.addImport("flash_ref", b.createModule(.{
+                .root_source_file = b.path("fpga/sim/support/flash_ref.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+            // The flash regmap (offsets/resets), so the flash_top tb drives AXI-Lite
+            // from the single source. Harmless to the other flash tbs, which don't import it.
+            tb_mod.addImport("regmap", b.createModule(.{
+                .root_source_file = b.path("fpga/regmap/flash_attn.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+        },
+    }
     tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include/vltstd", .{vroot}) });
