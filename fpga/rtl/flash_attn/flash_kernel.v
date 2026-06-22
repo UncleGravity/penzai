@@ -71,10 +71,18 @@ module flash_kernel #(
     wire [15:0] vbeats = head_dim_v >> LSH;
 
     // ---- resident / pooled storage (indexed [head*MAXB + beat], MAXB a power of 2) ----
-    reg [255:0] q_buf [0:MAX_HEADS*MAXB-1];   // Q for the current token, 8 f32/beat
-    reg [127:0] k_buf [0:MAX_HEAD_KV*MAXB-1]; // K for the current kv, 8 f16/beat
-    reg [127:0] v_buf [0:MAX_HEAD_KV*MAXB-1]; // V for the current kv, 8 f16/beat
-    reg [255:0] acc   [0:MAX_HEADS*MAXB-1];   // running output accumulator, 8 f32/beat
+    // Lever 2: q/k/v/acc are forced to block RAM (synchronous read below) so they stop
+    // burning LUTs as distributed RAM. ram_style=block makes the intent explicit.
+    (* ram_style = "block" *) reg [255:0] q_buf [0:MAX_HEADS*MAXB-1];   // Q for the current token, 8 f32/beat
+    (* ram_style = "block" *) reg [127:0] k_buf [0:MAX_HEAD_KV*MAXB-1]; // K for the current kv, 8 f16/beat
+    (* ram_style = "block" *) reg [127:0] v_buf [0:MAX_HEAD_KV*MAXB-1]; // V for the current kv, 8 f16/beat
+    (* ram_style = "block" *) reg [255:0] acc   [0:MAX_HEADS*MAXB-1];   // running output accumulator, 8 f32/beat
+    // Synchronous read-data registers for the four block RAMs (data lands one cycle
+    // after the address; consumers' valids are delayed one cycle to match).
+    reg [255:0] q_rd;
+    reg [127:0] k_rd;
+    reg [127:0] v_rd;
+    reg [255:0] acc_rd;
     reg [31:0]  mpool [0:MAX_HEADS-1];        // running max per head
     reg [31:0]  lpool [0:MAX_HEADS-1];        // running denom per head
     reg [31:0]  ppool [0:MAX_HEADS-1];        // this-kv softmax weight per head
@@ -125,10 +133,18 @@ module flash_kernel #(
     wire last_kv   = (kv_i  + 16'd1 == n_kv);
     wire last_tok  = (tok_i + 16'd1 == n_tokens);
 
-    // ---- fp_dot: one beat's Q·K (feed-forward, latency 14) ----
+    // ---- fp_dot: one beat's Q·K (feed-forward, latency 14). q_buf/k_buf are now
+    // synchronous-read BRAMs (q_rd/k_rd land one cycle after the address), so the issue
+    // strobe is delayed one cycle to match. The dot loop is self-timed off dot_v, so the
+    // extra cycle just shifts the whole pipeline by one. ----
+    reg dot_fire_q;
+    always @(posedge clk) begin
+        if (!rst_n) dot_fire_q <= 1'b0;
+        else        dot_fire_q <= dot_fire;
+    end
     wire        dot_v;  wire [31:0] dot_beat;
-    fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire),
-        .q(q_buf[q_dot_addr]), .k(k_buf[k_dot_addr]), .valid_out(dot_v), .sum(dot_beat));
+    fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire_q),
+        .q(q_rd), .k(k_rd), .valid_out(dot_v), .sum(dot_beat));
 
     // ---- fp_addtree: sum the per-beat partials (zero-padded, latency 16) ----
     wire [511:0] tree_in;
@@ -162,14 +178,53 @@ module flash_kernel #(
         .l(lpool[head_i[3:0]]), .valid_out(rec_v), .y(rec_out));
 
     // ---- shared 8-wide axpy: acc*corr + p·V (accumulate) OR acc*inv_l (emit) ----
-    wire [255:0] ax_acc_in = emit_fire ? acc[acc_em_rd] : acc[acc_ax_rd];
-    wire [127:0] ax_v_in   = axpy_fire ? v_buf[v_ax_addr] : 128'd0;
-    wire [31:0]  ax_s1     = emit_fire ? inv_l_q : cpool[head_i[3:0]];
-    wire [31:0]  ax_p      = emit_fire ? 32'd0   : ppool[head_i[3:0]];
+    // acc and V are now synchronous-read BRAMs (acc_rd / v_rd arrive one cycle after the
+    // address is presented), so the matching control strobes are delayed one cycle to
+    // realign with the data. ax_axpy_q selects v_rd (accumulate) vs zero (emit).
+    wire [31:0]  ax_s1 = emit_fire ? inv_l_q : cpool[head_i[3:0]];
+    wire [31:0]  ax_p  = emit_fire ? 32'd0   : ppool[head_i[3:0]];
     wire ax_fire = axpy_fire | emit_fire;
+    reg        ax_fire_q, ax_axpy_q;
+    reg [31:0] ax_s1_q, ax_p_q;
+    always @(posedge clk) begin
+        if (!rst_n) begin ax_fire_q <= 1'b0; ax_axpy_q <= 1'b0; end
+        else        begin ax_fire_q <= ax_fire; ax_axpy_q <= axpy_fire; end
+        ax_s1_q <= ax_s1;
+        ax_p_q  <= ax_p;
+    end
+    wire [127:0] ax_v_eff = ax_axpy_q ? v_rd : 128'd0;
     wire ax_v;  wire [255:0] ax_out;
-    fp_axpy8 u_axpy (.clk(clk), .rst_n(rst_n), .valid_in(ax_fire),
-        .acc(ax_acc_in), .v(ax_v_in), .s1(ax_s1), .p(ax_p), .valid_out(ax_v), .out(ax_out));
+    fp_axpy8 u_axpy (.clk(clk), .rst_n(rst_n), .valid_in(ax_fire_q),
+        .acc(acc_rd), .v(ax_v_eff), .s1(ax_s1_q), .p(ax_p_q), .valid_out(ax_v), .out(ax_out));
+
+    // ---- block-RAM storage: each array gets one write port + one synchronous read
+    // port — the template Vivado maps to BRAM instead of LUTRAM. ----
+    // q_buf: written while loading Q (S_QLOAD); read during the dot pass (S_DOTISS).
+    always @(posedge clk) begin
+        if ((state == S_QLOAD) && q_tvalid) q_buf[q_ld_addr] <= q_tdata;
+        q_rd <= q_buf[q_dot_addr];
+    end
+    // k_buf: written while loading K (S_KLOAD); read during the dot pass.
+    always @(posedge clk) begin
+        if ((state == S_KLOAD) && k_tvalid) k_buf[kv_ld_addr] <= k_tdata;
+        k_rd <= k_buf[k_dot_addr];
+    end
+    // v_buf: written while loading V (S_VLOAD); read during the axpy pass (S_AXPY).
+    always @(posedge clk) begin
+        if ((state == S_VLOAD) && v_tvalid) v_buf[kv_ld_addr] <= v_tdata;
+        v_rd <= v_buf[v_ax_addr];
+    end
+    // acc: write port muxes the per-token zero-init (S_TINIT) and the axpy writeback
+    // (S_AXPY, on ax_v); read port muxes the axpy and emit addresses. Issue leads
+    // writeback by the axpy latency, so a beat's read and its write never share a cycle.
+    wire          acc_we    = (state == S_TINIT) || ((state == S_AXPY) && ax_v);
+    wire [AW-1:0] acc_waddr = (state == S_TINIT) ? q_ld_addr : acc_ax_wr;
+    wire [255:0]  acc_wdata = (state == S_TINIT) ? 256'd0    : ax_out;
+    wire [AW-1:0] acc_raddr = emit_fire ? acc_em_rd : acc_ax_rd;
+    always @(posedge clk) begin
+        if (acc_we) acc[acc_waddr] <= acc_wdata;
+        acc_rd <= acc[acc_raddr];
+    end
 
     wire [31:0] mask_f32_w;
     fp16_to_fp32 u_maskw (.in(mask_tdata), .out(mask_f32_w));
@@ -199,7 +254,6 @@ module flash_kernel #(
 
                 // ---- load Q for the current token: n_heads × qbeats beats ----
                 S_QLOAD: if (q_tvalid) begin
-                    q_buf[q_ld_addr] <= q_tdata;
                     if (ld_b + 16'd1 == qbeats) begin
                         ld_b <= 0;
                         if (ld_a + 16'd1 == n_heads) begin ld_a <= 0; ld_b <= 0; state <= S_TINIT; end
@@ -209,7 +263,6 @@ module flash_kernel #(
 
                 // ---- init the per-head pool for this token (acc=0, m=-inf, l=0) ----
                 S_TINIT: begin
-                    acc[q_ld_addr] <= 256'd0;
                     if (ld_b == 16'd0) begin mpool[ld_a[3:0]] <= NEG_INF; lpool[ld_a[3:0]] <= 32'd0; end
                     if (ld_b + 16'd1 == vbeats) begin
                         ld_b <= 0;
@@ -227,7 +280,6 @@ module flash_kernel #(
 
                 // ---- load K[kv]: n_head_kv heads × qbeats beats (native, non-replicated) ----
                 S_KLOAD: if (k_tvalid) begin
-                    k_buf[kv_ld_addr] <= k_tdata;
                     if (ld_b + 16'd1 == qbeats) begin
                         ld_b <= 0;
                         if (ld_a + 16'd1 == n_head_kv) begin
@@ -268,7 +320,6 @@ module flash_kernel #(
 
                 // ---- load V[kv]: n_head_kv heads × vbeats beats ----
                 S_VLOAD: if (v_tvalid) begin
-                    v_buf[kv_ld_addr] <= v_tdata;
                     if (ld_b + 16'd1 == vbeats) begin
                         ld_b <= 0;
                         if (ld_a + 16'd1 == n_head_kv) begin
@@ -281,7 +332,6 @@ module flash_kernel #(
                 S_AXPY: begin
                     if (ax_iss < vbeats) ax_iss <= ax_iss + 16'd1;
                     if (ax_v) begin
-                        acc[acc_ax_wr] <= ax_out;
                         if (ax_wb + 16'd1 == vbeats) begin
                             if (last_head) state <= S_KVNEXT;
                             else begin

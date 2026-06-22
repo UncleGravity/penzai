@@ -21,8 +21,13 @@ module matmul_kernel #(
     parameter integer COLS_MAX      = 8,
     parameter integer MAX_SUB_INDEX = 64,
     // Decode accumulator-pool depth (see matmul_rowblock): >= the accumulate
-    // recurrence latency, <= COLS_MAX.
-    parameter integer ACCUM_DEPTH   = 8
+    // recurrence latency, <= COLS_MAX (8). Drives the decode emit-sum tree size:
+    // ROWS*(ACCUM_DEPTH-1) fp32 adders (each ~500 LUTs). Lowered 8->5 to reclaim
+    // ~48 emit adders (~21k LUTs) for the combined matmul+flash bitstream fit. 5 is
+    // the recurrence floor (==ADD_LAT): the registered-writeback bypass in
+    // matmul_rowblock covers it, so decode stays bit-exact at 100% util — verified
+    // cycle-accurately (test-rtl-matmul, incl. attn-size decode).
+    parameter integer ACCUM_DEPTH   = 5
 ) (
     input  wire                  clk,
     input  wire                  rst_n,

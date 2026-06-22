@@ -4,16 +4,53 @@ pub const ActivationError = error{
     InvalidLength,
 };
 
-// Vectorized over fixed-width lanes (portable @Vector → NEON on the A53). The
-// load/multiply/divide vectorize; @exp on a vector lowers to one libm exp per
-// lane, so the result is bit-identical to the scalar path (the remaining scalar
-// cost is the transcendental itself — a future vector-exp approximation).
+// Vectorized over fixed-width lanes (portable @Vector → NEON on the A53).
+//
+// The transcendental is the whole cost: `@exp` on a @Vector lowers to one libm
+// `exp` call PER LANE, so the old "vector" path ran at scalar speed (~87 MiB/s).
+// expVec replaces it with a true vector expf — range reduction + a degree-5
+// polynomial, all @Vector arithmetic (FMUL/FADD/FRINTN → NEON, no libcall) — so a
+// whole lane group is one transcendental's worth of work. siluScalar stays on libm
+// exp as the exact reference (tests + the sub-lane remainder); the vector path
+// tracks it to ~1 ULP, far inside this 1-bit model's quantization noise.
 const lanes = 16;
 const Vf32 = @Vector(lanes, f32);
 
+// exp(x) for a vector lane group (Cephes single-precision algorithm): n=round(x/ln2),
+// r=x-n·ln2 ∈ [-ln2/2, ln2/2], exp(r) via Horner poly, then scale by 2^n built from
+// the float exponent bits. x is clamped so the result stays finite in f32.
+inline fn expVec(x_in: Vf32) Vf32 {
+    const log2ef: Vf32 = @splat(1.44269504088896341);
+    const c1: Vf32 = @splat(0.693359375); // ln2, hi part
+    const c2: Vf32 = @splat(-2.12194440e-4); // ln2, lo part (c1 + c2 ≈ ln2)
+    const half: Vf32 = @splat(0.5);
+    const one: Vf32 = @splat(1.0);
+    // exp(88) ≈ 1.65e38 < FLT_MAX; below ~-88 the result underflows to 0. Clamping
+    // here keeps SiLU correct at the tails (large +x → x, large -x → 0).
+    const x0 = @min(@max(x_in, @as(Vf32, @splat(-88.0))), @as(Vf32, @splat(88.0)));
+
+    const fx = @floor(x0 * log2ef + half); // n as float, round-to-nearest
+    const r = (x0 - fx * c1) - fx * c2; // reduced argument
+
+    const z = r * r;
+    var y: Vf32 = @splat(1.9875691500e-4);
+    y = y * r + @as(Vf32, @splat(1.3981999507e-3));
+    y = y * r + @as(Vf32, @splat(8.3334519073e-3));
+    y = y * r + @as(Vf32, @splat(4.1665795894e-2));
+    y = y * r + @as(Vf32, @splat(1.6666665459e-1));
+    y = y * r + @as(Vf32, @splat(5.0000001201e-1));
+    y = y * z + r + one;
+
+    // 2^n by writing n into the f32 exponent field. n+127 ∈ [0,254] over the clamp.
+    const n: @Vector(lanes, i32) = @intFromFloat(fx);
+    const biased: @Vector(lanes, u32) = @intCast(n + @as(@Vector(lanes, i32), @splat(127)));
+    const pow2n: Vf32 = @bitCast(biased << @as(@Vector(lanes, u5), @splat(23)));
+    return y * pow2n;
+}
+
 inline fn siluVec(x: Vf32) Vf32 {
     const one: Vf32 = @splat(1.0);
-    return x / (one + @exp(-x));
+    return x / (one + expVec(-x));
 }
 
 pub fn siluScalar(x: f32) f32 {
@@ -116,21 +153,37 @@ test "activation byte wrappers use little-endian f32 values" {
     try expectApprox(1.4621172, readF32(&dst, 1), 0.000001);
 }
 
-test "swiglu/silu vector path is bit-exact vs scalar over a wide span" {
-    const n = 37; // > lanes (16), with remainder
+test "swiglu/silu vector path tracks libm scalar within tolerance over a wide span" {
+    const n = 200; // > lanes (16), with remainder; spans the range reduction + clamp
     var gate: [n * @sizeOf(f32)]u8 = undefined;
     var up: [n * @sizeOf(f32)]u8 = undefined;
     var dst: [n * @sizeOf(f32)]u8 = undefined;
     var prng = std.Random.DefaultPrng.init(0x5111);
     const rnd = prng.random();
     for (0..n) |i| {
-        writeF32(&gate, i, rnd.float(f32) * 8 - 4);
+        writeF32(&gate, i, rnd.float(f32) * 60 - 30); // [-30, 30]: positive/negative saturation + mid
         writeF32(&up, i, rnd.float(f32) * 2 - 1);
     }
 
+    // The vector path uses a polynomial exp (no per-lane libm call), so it is no
+    // longer bit-identical to siluScalar — it tracks it to ~1 ULP. The tolerance is
+    // ~100x the approximation error: tight enough to catch a broken poly/range
+    // reduction, loose enough to never flake.
+    const tol = struct {
+        fn of(want: f32) f32 {
+            return 1e-4 + @abs(want) * 1e-5;
+        }
+    }.of;
+
     try siluBytes(&gate, &dst);
-    for (0..n) |i| try std.testing.expectEqual(siluScalar(readF32(&gate, i)), readF32(&dst, i));
+    for (0..n) |i| {
+        const want = siluScalar(readF32(&gate, i));
+        try expectApprox(want, readF32(&dst, i), tol(want));
+    }
 
     try swigluBytes(&gate, &up, &dst);
-    for (0..n) |i| try std.testing.expectEqual(siluScalar(readF32(&gate, i)) * readF32(&up, i), readF32(&dst, i));
+    for (0..n) |i| {
+        const want = siluScalar(readF32(&gate, i)) * readF32(&up, i);
+        try expectApprox(want, readF32(&dst, i), tol(want));
+    }
 }

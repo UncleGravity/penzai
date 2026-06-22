@@ -142,10 +142,21 @@ pub fn setRowsF32ToF16Bytes(command: wire.SetRows, src: []const u8, indices: []c
 }
 
 fn copyRowF32ToF16(src: []const u8, dst: []u8, head_dim: usize) void {
-    for (0..head_dim) |d| {
-        const value = readF32(src, d);
-        writeF16(dst, d, @floatCast(value));
+    // Vectorized f32→f16 narrowing (NEON FCVTN on the A53). @floatCast is the same
+    // round-to-nearest used by the scalar tail, and the byte loads/stores are native
+    // little-endian — identical to readF32/writeF16 on the LE device — so the result
+    // is bit-for-bit the old scalar path, just ~one transcendental-free copy instead
+    // of head_dim unaligned scalar read/convert/write triples (the old 50 MiB/s).
+    const lanes = 16;
+    const Vf32 = @Vector(lanes, f32);
+    const Vf16 = @Vector(lanes, f16);
+    var d: usize = 0;
+    while (d + lanes <= head_dim) : (d += lanes) {
+        const xv: Vf32 = @bitCast(src[d * @sizeOf(f32) ..][0 .. lanes * @sizeOf(f32)].*);
+        const hv: Vf16 = @floatCast(xv);
+        dst[d * @sizeOf(f16) ..][0 .. lanes * @sizeOf(f16)].* = @bitCast(hv);
     }
+    while (d < head_dim) : (d += 1) writeF16(dst, d, @floatCast(readF32(src, d)));
 }
 
 fn readIndex(index_type: wire.IndexType, bytes: []const u8) RowsError!usize {

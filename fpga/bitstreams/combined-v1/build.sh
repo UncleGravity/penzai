@@ -1,0 +1,83 @@
+#!/usr/bin/env bash
+# build.sh - drive the Vivado COMBINED (matmul + flash) bitstream build on the VM.
+#
+# Syncs both RTL sets (matmul + flash + the shared fp/ leaves, deduped) + both generated
+# register headers + the flash LUTs + both generated address maps, runs Vivado, fetches
+# the .bit/.bit.bin to ./out. Run after `cp config.env.example config.env`.
+#
+#   ./build.sh                       # uses VARIANT from config.env
+#   ./build.sh w512-p4-f200-wc300    # explicit; f = shared kernel clock (both ops), wc = matmul weight clock
+#
+# Regenerate the generated inputs first if the regmaps changed:
+#   (cd ../../.. && zig build regmap)   # writes matmul_regs.vh, flash_regs.vh, both address_map.tcl
+
+set -euo pipefail
+cd "$(dirname "$0")"
+
+[[ -f config.env ]] || { echo "ERROR: missing config.env; copy config.env.example first" >&2; exit 1; }
+set -a; source config.env; set +a
+
+: "${VM:?config.env must set VM (Windows Vivado host)}"
+: "${VM_DIR:?config.env must set VM_DIR (build dir on the VM)}"
+VARIANT="${1:-${VARIANT:-w512-p4-f200-wc300}}"
+BIT_PREFIX="penzai-combined-v1"
+RTL_MATMUL="../../rtl/matmul"
+RTL_FLASH="../../rtl/flash_attn"
+RTL_FP="../../rtl/fp"
+
+# Union of both RTL sets. The fp/ leaves are shared by matmul and flash — included once.
+RTL_FILES=(
+  # matmul
+  "$RTL_MATMUL/matmul_top.v"
+  "$RTL_MATMUL/matmul_kernel.v"
+  "$RTL_MATMUL/matmul_rowblock.v"
+  "$RTL_MATMUL/matmul_reducer.v"
+  "$RTL_MATMUL/matmul_regs.vh"
+  # flash
+  "$RTL_FLASH/flash_top.v"
+  "$RTL_FLASH/flash_kernel.v"
+  "$RTL_FLASH/fp_dot.v"
+  "$RTL_FLASH/fp_addtree.v"
+  "$RTL_FLASH/fp_axpy8.v"
+  "$RTL_FLASH/flash_softmax.v"
+  "$RTL_FLASH/fp_exp.v"
+  "$RTL_FLASH/fp_recip.v"
+  "$RTL_FLASH/fp_interp.v"
+  "$RTL_FLASH/flash_regs.vh"
+  "$RTL_FLASH/flash_luts.vh"
+  # shared fp leaves (one copy)
+  "$RTL_FP/fp32_add_pipe.v"
+  "$RTL_FP/fp32_mul_pipe.v"
+  "$RTL_FP/fp16_to_fp32.v"
+  "$RTL_FP/int_to_fp32.v"
+)
+for f in "${RTL_FILES[@]}"; do
+  [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for the *_regs.vh)" >&2; exit 1; }
+done
+
+# Both generated address maps (build.tcl sources them, renamed). One source: the regmaps.
+MATMUL_ADDR="../q1a8-w256-mc/tcl/address_map.tcl"
+FLASH_ADDR="../flash-v1/tcl/address_map.tcl"
+for f in "$MATMUL_ADDR" "$FLASH_ADDR"; do
+  [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap')" >&2; exit 1; }
+done
+
+echo "== sync FPGA inputs -> $VM:$VM_DIR =="
+ssh "$VM" "if not exist $VM_DIR mkdir $VM_DIR" || true
+ssh "$VM" "if not exist $VM_DIR\\rtl mkdir $VM_DIR\\rtl" || true
+scp tcl/build.tcl build.bat "$VM:$VM_DIR/"
+scp "$MATMUL_ADDR" "$VM:$VM_DIR/matmul_address_map.tcl"
+scp "$FLASH_ADDR"  "$VM:$VM_DIR/flash_address_map.tcl"
+scp "${RTL_FILES[@]}" "$VM:$VM_DIR/rtl/"
+
+echo "== Vivado build variant=$VARIANT on $VM =="
+ssh "$VM" "cd $VM_DIR && build.bat $VARIANT"
+
+echo "== fetch outputs -> ./out =="
+mkdir -p out
+scp "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT.bit.bin" \
+    "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT.bit" out/
+# Fetch the resource/timing reports too (the combined-fit answer).
+scp "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT"_*.rpt out/ 2>/dev/null || true
+ls -la "out/$BIT_PREFIX-$VARIANT.bit.bin"
+echo "Done. Deploy with: ./deploy.sh $VARIANT"
