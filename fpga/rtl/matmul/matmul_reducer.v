@@ -4,7 +4,7 @@
 // Sigma_i (b_i ? +a_i : -a_i). Math is the same as the unpipelined reducer; the path is
 // explicitly pipelined for higher fclk.
 //
-// Latency:    7 cycles
+// Latency:    10 cycles (4 stages + two serial fp32_mul_pipe at MUL_LAT=3)
 // Throughput: 1 sub-block / cycle
 
 `default_nettype none
@@ -149,15 +149,19 @@ module matmul_reducer (
     wire [31:0] sub_sum_f32;
     int_to_fp32 #(.WIDTH(14)) u_int (.in(sub_sum_s3), .out(sub_sum_f32));
 
+    // Delay the int->fp32 sub-sum by MUL_LAT (now 3) to meet combined_f32 at u_contrib.
     reg [31:0] sub_sum_f32_s4;
     reg [31:0] sub_sum_f32_s5;
+    reg [31:0] sub_sum_f32_s6;
     always @(posedge clk) begin
         if (!rst_n) begin
             sub_sum_f32_s4 <= 32'd0;
             sub_sum_f32_s5 <= 32'd0;
+            sub_sum_f32_s6 <= 32'd0;
         end else begin
             sub_sum_f32_s4 <= sub_sum_f32;
             sub_sum_f32_s5 <= sub_sum_f32_s4;
+            sub_sum_f32_s6 <= sub_sum_f32_s5;
         end
     end
 
@@ -166,7 +170,7 @@ module matmul_reducer (
         .rst_n(rst_n),
         .valid_in(combined_valid),
         .a(combined_f32),
-        .b(sub_sum_f32_s5),
+        .b(sub_sum_f32_s6),
         .valid_out(valid_out),
         .out(contribution)
     );

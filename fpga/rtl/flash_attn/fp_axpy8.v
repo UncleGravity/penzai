@@ -4,8 +4,9 @@
 //   scale-only: p = 0                               -> acc[i]*s1 (e.g. emit ·1/l)
 //
 // Feed-forward (no accumulation), 8 lanes in parallel, latency MUL_LAT + ADD_LAT =
-// 2 + 4 = 6. The kernel streams one acc beat (8 elements) per cycle through this and
-// writes the result back — replacing the v1 one-element-at-a-time walk.
+// 3 + 4 = 7. The kernel streams one acc beat (8 elements) per cycle through this and
+// writes the result back — replacing the v1 one-element-at-a-time walk. Self-timed:
+// the adder follows the mul's valid, so the extra mul cycle needs no caller change.
 
 `default_nettype none
 

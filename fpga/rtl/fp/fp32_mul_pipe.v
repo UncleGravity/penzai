@@ -1,7 +1,10 @@
 // fp32_mul_pipe - pipelined version of fp32_mul.
 //
 // Same truncating/saturating semantics as fp32_mul.v. Latency from valid_in to
-// valid_out is two cycles.
+// valid_out is three cycles. An input-register stage captures the decoded operands
+// before the 24x24 mantissa multiply so it runs register-to-register (the input regs
+// pack into the DSP's A/B registers) instead of combinationally off the operand
+// source (a BRAM read + fp16->fp32 widen) -- the long path that capped fclk at ~200 MHz.
 
 `default_nettype none
 
@@ -26,6 +29,34 @@ module fp32_mul_pipe (
                              + $signed({2'b00, eb})
                              - 10'sd127;
 
+    // ---- input-register stage: capture the decoded operands BEFORE the multiply so
+    // the 24x24 mantissa product runs register-to-register (Vivado packs mant_a_i /
+    // mant_b_i into the DSP A/B input registers). Adds one cycle of latency. ----
+    reg        valid_i;
+    reg        zero_i;
+    reg        sign_i;
+    reg signed [9:0] exp_pre_i;
+    reg [23:0] mant_a_i;
+    reg [23:0] mant_b_i;
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_i   <= 1'b0;
+            zero_i    <= 1'b0;
+            sign_i    <= 1'b0;
+            exp_pre_i <= 10'sd0;
+            mant_a_i  <= 24'd0;
+            mant_b_i  <= 24'd0;
+        end else begin
+            valid_i   <= valid_in;
+            zero_i    <= is_zero;
+            sign_i    <= sr;
+            exp_pre_i <= er_pre;
+            mant_a_i  <= {1'b1, ma};
+            mant_b_i  <= {1'b1, mb};
+        end
+    end
+
     reg        valid_s0;
     reg        zero_s0;
     reg        sign_s0;
@@ -40,11 +71,11 @@ module fp32_mul_pipe (
             exp_pre_s0 <= 10'sd0;
             prod_s0    <= 48'd0;
         end else begin
-            valid_s0   <= valid_in;
-            zero_s0    <= is_zero;
-            sign_s0    <= sr;
-            exp_pre_s0 <= er_pre;
-            prod_s0    <= {1'b1, ma} * {1'b1, mb};
+            valid_s0   <= valid_i;
+            zero_s0    <= zero_i;
+            sign_s0    <= sign_i;
+            exp_pre_s0 <= exp_pre_i;
+            prod_s0    <= mant_a_i * mant_b_i;
         end
     end
 

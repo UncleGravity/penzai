@@ -5,8 +5,8 @@
 //
 //   frac = lo + (t / 256) * (hi - lo)        t in [0,255], lo/hi/frac fp32
 //
-// Latency valid_in -> valid_out: ADD_LAT + MUL_LAT + ADD_LAT = 10 cycles. The META
-// bus (the caller's ldexp shift + guard flags) is delayed by the same 10 so it
+// Latency valid_in -> valid_out: ADD_LAT + MUL_LAT + ADD_LAT = 11 cycles. The META
+// bus (the caller's ldexp shift + guard flags) is delayed by the same 11 so it
 // arrives with frac.
 
 `default_nettype none
@@ -26,8 +26,8 @@ module fp_interp #(
     output wire [META_W-1:0] meta_out
 );
     localparam integer ADD_LAT = 4; // fp32_add_pipe valid_in -> valid_out
-    localparam integer MUL_LAT = 2; // fp32_mul_pipe valid_in -> valid_out
-    localparam integer TOTAL   = ADD_LAT + MUL_LAT + ADD_LAT; // 10
+    localparam integer MUL_LAT = 3; // fp32_mul_pipe valid_in -> valid_out
+    localparam integer TOTAL   = ADD_LAT + MUL_LAT + ADD_LAT; // 11
     localparam [31:0]  INV256  = 32'h3B800000; // 2^-8
 
     integer i;
@@ -51,7 +51,7 @@ module fp_interp #(
         .a(t_f32), .b(INV256), .valid_out(ts_v), .out(t_scaled)
     );
     // Delay t_scaled (ready @ MUL_LAT) to ADD_LAT so it meets delta.
-    localparam integer TS_DLY = ADD_LAT - MUL_LAT; // 2
+    localparam integer TS_DLY = ADD_LAT - MUL_LAT; // 1
     reg [31:0] ts_q [0:TS_DLY-1];
     always @(posedge clk) begin
         ts_q[0] <= t_scaled;
@@ -66,8 +66,8 @@ module fp_interp #(
         .a(ts_q[TS_DLY-1]), .b(delta), .valid_out(prod_v), .out(prod)
     );
 
-    // lo delayed to meet prod (+ADD_LAT+MUL_LAT = 6).
-    localparam integer LO_DLY = ADD_LAT + MUL_LAT; // 6
+    // lo delayed to meet prod (+ADD_LAT+MUL_LAT = 7).
+    localparam integer LO_DLY = ADD_LAT + MUL_LAT; // 7
     reg [31:0] lo_q [0:LO_DLY-1];
     always @(posedge clk) begin
         lo_q[0] <= lo;

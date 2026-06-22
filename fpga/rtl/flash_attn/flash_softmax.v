@@ -12,7 +12,7 @@
 // `acc *= corr; acc += p·V` (corr=1 is a no-op), so `grew` is only an optional hint
 // to skip the rescale walk.
 //
-// Latency valid_in -> valid_out: L_SUB + L_EXP + L_MUL + L_ADD = 4 + 15 + 2 + 4 = 25.
+// Latency valid_in -> valid_out: L_SUB + L_EXP + L_MUL + L_ADD = 4 + 17 + 3 + 4 = 28.
 
 `default_nettype none
 
@@ -31,11 +31,11 @@ module flash_softmax (
     output reg         grew
 );
     localparam integer L_SUB = 4;  // fp32_add_pipe
-    localparam integer L_EXP = 15; // fp_exp (mul2 + 2 regs + interp10 + out1)
-    localparam integer L_MUL = 2;  // fp32_mul_pipe
+    localparam integer L_EXP = 17; // fp_exp (mul3 + 2 regs + interp11 + out1)
+    localparam integer L_MUL = 3;  // fp32_mul_pipe
     localparam integer L_ADD = 4;  // fp32_add_pipe
-    localparam integer D1 = L_SUB + L_EXP;        // 19: input -> exp output
-    localparam integer D2 = L_MUL + L_ADD;        // 6 : exp output -> valid_out
+    localparam integer D1 = L_SUB + L_EXP;        // 21: input -> exp output
+    localparam integer D2 = L_MUL + L_ADD;        // 7 : exp output -> valid_out
 
     integer i;
 
@@ -67,7 +67,7 @@ module flash_softmax (
     fp_exp u_ec (.clk(clk), .rst_n(rst_n), .valid_in(dcv), .x(d_corr), .valid_out(cv), .y(corr_e));
     fp_exp u_ep (.clk(clk), .rst_n(rst_n), .valid_in(dpv), .x(d_p),    .valid_out(pv), .y(p_e));
 
-    // ---- carry {m_new, grew, l_in} to the exp output (D1 = 19) ----
+    // ---- carry {m_new, grew, l_in} to the exp output (D1 = 21) ----
     reg [31:0] mnew_pre [0:D1-1];
     reg        grew_pre [0:D1-1];
     reg [31:0] lin_pre  [0:D1-1];
@@ -81,24 +81,24 @@ module flash_softmax (
             lin_pre[i]  <= lin_pre[i-1];
         end
     end
-    wire [31:0] m_new_19 = mnew_pre[D1-1];
-    wire        grew_19  = grew_pre[D1-1];
-    wire [31:0] l_in_19  = lin_pre[D1-1];
+    wire [31:0] m_new_e = mnew_pre[D1-1];
+    wire        grew_e  = grew_pre[D1-1];
+    wire [31:0] l_in_e  = lin_pre[D1-1];
 
     // ---- l_out = l_in*corr + p ----
     wire        lmv, lav;
     wire [31:0] l_mul, l_sum;
-    fp32_mul_pipe u_lmul (.clk(clk), .rst_n(rst_n), .valid_in(cv),  .a(l_in_19), .b(corr_e), .valid_out(lmv), .out(l_mul));
+    fp32_mul_pipe u_lmul (.clk(clk), .rst_n(rst_n), .valid_in(cv),  .a(l_in_e), .b(corr_e), .valid_out(lmv), .out(l_mul));
 
-    // carry {m_new, grew, corr, p} from the exp output to valid_out (D2 = 6);
-    // p is also tapped at L_MUL (delay 2) to meet l_mul at the adder.
+    // carry {m_new, grew, corr, p} from the exp output to valid_out (D2 = 7);
+    // p is also tapped at L_MUL (delay 3) to meet l_mul at the adder.
     reg [31:0] mnew_post [0:D2-1];
     reg        grew_post [0:D2-1];
     reg [31:0] corr_post [0:D2-1];
     reg [31:0] p_post    [0:D2-1];
     always @(posedge clk) begin
-        mnew_post[0] <= m_new_19;
-        grew_post[0] <= grew_19;
+        mnew_post[0] <= m_new_e;
+        grew_post[0] <= grew_e;
         corr_post[0] <= corr_e;
         p_post[0]    <= p_e;
         for (i = 1; i < D2; i = i + 1) begin
@@ -108,8 +108,8 @@ module flash_softmax (
             p_post[i]    <= p_post[i-1];
         end
     end
-    wire [31:0] p_21 = p_post[L_MUL-1]; // p delayed L_MUL, aligned with l_mul
-    fp32_add_pipe u_ladd (.clk(clk), .rst_n(rst_n), .valid_in(lmv), .a(l_mul), .b(p_21), .valid_out(lav), .out(l_sum));
+    wire [31:0] p_lmul = p_post[L_MUL-1]; // p delayed L_MUL, aligned with l_mul
+    fp32_add_pipe u_ladd (.clk(clk), .rst_n(rst_n), .valid_in(lmv), .a(l_mul), .b(p_lmul), .valid_out(lav), .out(l_sum));
 
     // ---- register outputs (all aligned at +25) ----
     always @(posedge clk) begin

@@ -30,17 +30,18 @@ module fp_exp (
     wire g_one_0  = (~sgn) | (xabs == 31'd0);          // x >= 0 (or +-0) -> exp = 1
     wire g_zero_0 = sgn & (ax >= X87);                 // x <= -87 -> 0
 
-    // ---- a = |x| * log2e (MUL_LAT = 2) ----
+    // ---- a = |x| * log2e (MUL_LAT = 3) ----
     wire        a_v;
     wire [31:0] a_fp;
     fp32_mul_pipe u_log2e (
         .clk(clk), .rst_n(rst_n), .valid_in(valid_in),
         .a(ax), .b(LOG2E), .valid_out(a_v), .out(a_fp)
     );
-    reg g_one_m0, g_one_m1, g_zero_m0, g_zero_m1;
+    // guards delayed to meet a_v (fp32_mul_pipe latency 3, was 2).
+    reg g_one_m0, g_one_m1, g_one_m2, g_zero_m0, g_zero_m1, g_zero_m2;
     always @(posedge clk) begin
-        g_one_m0  <= g_one_0;  g_one_m1  <= g_one_m0;
-        g_zero_m0 <= g_zero_0; g_zero_m1 <= g_zero_m0;
+        g_one_m0  <= g_one_0;  g_one_m1  <= g_one_m0;  g_one_m2  <= g_one_m1;
+        g_zero_m0 <= g_zero_0; g_zero_m1 <= g_zero_m0; g_zero_m2 <= g_zero_m1;
     end
 
     // ---- fp32 -> Q8.16 fixed (a_fp >= 0; live range exp <= 133 -> right shift) ----
@@ -57,7 +58,7 @@ module fp_exp (
     always @(posedge clk) begin
         if (!rst_n) v_fx <= 1'b0;
         else        v_fx <= a_v;
-        g1_fx <= g_one_m1; g0_fx <= g_zero_m1;
+        g1_fx <= g_one_m2; g0_fx <= g_zero_m2;
         ai_fx <= ai_c; idx_fx <= idx_c; t_fx <= t_c;
     end
 

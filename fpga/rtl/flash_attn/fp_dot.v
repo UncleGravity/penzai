@@ -9,7 +9,8 @@
 // of duplicating matmul_rowblock's ACCUM_DEPTH machinery inside the leaf.
 //
 // LANES = 8 (a 128-bit K beat / 256-bit Q beat). Latency valid_in→valid_out:
-// MUL_LAT + 3·ADD_LAT = 2 + 12 = 14.
+// MUL_LAT + 3·ADD_LAT = 3 + 12 = 15. Self-timed: the adder tree follows the mul's
+// valid, so the extra mul cycle just shifts the whole pipeline (no caller change).
 
 `default_nettype none
 

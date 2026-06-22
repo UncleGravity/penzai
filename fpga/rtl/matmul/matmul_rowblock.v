@@ -50,9 +50,10 @@ module matmul_rowblock #(
     output reg                        done,
     output wire [ROWS*32-1:0]         results_flat
 );
-    // reducer pipeline plus one cycle for this rowblock to sample its registered
-    // output contribution.
-    localparam integer LAT = 8;
+    // col_pipe / last_pipe depth = the reducer's valid_in->valid_out latency
+    // (4 stages + two serial fp32_mul_pipe, each MUL_LAT). MUL_LAT went 2->3 when the
+    // mul was pipelined for f250, so the reducer is now 4 + 2*3 = 10 and LAT tracks it.
+    localparam integer LAT = 10;
     localparam integer ADD_LAT = 5;
     localparam integer DONE_DELAY = (ACCUM_DEPTH - 1) * ADD_LAT + 3;
 
