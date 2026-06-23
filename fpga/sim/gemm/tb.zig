@@ -340,6 +340,7 @@ pub fn main() !void {
     var pf_sats: usize = 0;
     for (0..C) |col| {
         c.dut_set_read_col(dut.h, @intCast(col));
+        dut.step(); // readout-resolve pipeline: one clock for rdS_q/rdC_q to capture this column
         for (0..rows) |row| {
             c.dut_set_read_row(dut.h, @intCast(row));
             dut.eval();

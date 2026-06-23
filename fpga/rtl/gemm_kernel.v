@@ -178,16 +178,21 @@ module gemm_kernel #(
     wire pc_presenting = (state == ST_PRECOMPUTE) && (pc_col < num_cols);
 
     reg [ROWS*ACC_W-1:0] rb_acc_q;    // R1: read_col-muxed bank (gemm_rowblock acc[*][pc_col])
-    reg [EBW-1:0]        pc_beat_q;
-    reg                  pc_vld_q;
+    reg [EBW-1:0]        pc_beat_d, pc_beat_q;
+    reg                  pc_vld_a, pc_vld_q;
     wire [2*ACC_W-1:0]   acc_pair_c = rb_acc_q[pc_beat_q*(2*ACC_W) +: 2*ACC_W];
     reg [2*ACC_W-1:0]    acc_pair_q;  // R2: beat-muxed lane pair
     reg                  pc_vld_q2;
+    // gemm_rowblock now resolves accS+accC through one register (the readout-resolve pipeline),
+    // so rowblock_acc lags read_col (=pc_col) by one extra cycle. Match it: pc_beat is delayed 2
+    // (pc_beat_d→pc_beat_q) to align with rb_acc_q's column, and the valid carries one extra stage
+    // (pc_vld_a). The wr_idx collector is latency-tolerant, so nothing else moves.
     always @(posedge clk) begin
-        if (!rst_n) begin pc_vld_q <= 1'b0; pc_vld_q2 <= 1'b0; end
-        else        begin pc_vld_q <= pc_presenting; pc_vld_q2 <= pc_vld_q; end
+        if (!rst_n) begin pc_vld_a <= 1'b0; pc_vld_q <= 1'b0; pc_vld_q2 <= 1'b0; end
+        else        begin pc_vld_a <= pc_presenting; pc_vld_q <= pc_vld_a; pc_vld_q2 <= pc_vld_q; end
         rb_acc_q   <= rowblock_acc;
-        pc_beat_q  <= pc_beat;
+        pc_beat_d  <= pc_beat;
+        pc_beat_q  <= pc_beat_d;
         acc_pair_q <= acc_pair_c;
     end
 

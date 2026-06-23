@@ -333,9 +333,17 @@ module gemm_rowblock #(
                     end
                 end
             end
-            // resolve the redundant pair for readout — the single carry-propagate add, once per
-            // output (off the throughput path; pipeline here if the combined build needs it).
-            assign acc_flat[r*ACC_W +: ACC_W] = accS[read_col] + accC[read_col];
+            // resolve the redundant pair for readout, PIPELINED: register the read_col-muxed pair
+            // (rdS_q/rdC_q) then add, so the single 104-bit carry-propagate add is a clean
+            // FF→add→FF — no read_col mux in series with it. Off the throughput path; costs +1
+            // readout latency, which gemm_kernel realigns (pc_beat/pc_vld). The accumulate
+            // recurrence (the CSA above) is untouched and stays single-cycle.
+            reg signed [ACC_W-1:0] rdS_q, rdC_q;
+            always @(posedge clk) begin
+                rdS_q <= accS[read_col];
+                rdC_q <= accC[read_col];
+            end
+            assign acc_flat[r*ACC_W +: ACC_W] = rdS_q + rdC_q;
         end
     endgenerate
 endmodule
