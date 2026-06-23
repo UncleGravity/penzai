@@ -50,11 +50,13 @@ module matmul_rowblock #(
     output reg                        done,
     output wire [ROWS*32-1:0]         results_flat
 );
-    // col_pipe / last_pipe depth = the reducer's valid_in->valid_out latency
-    // (4 stages + two serial fp32_mul_pipe, each MUL_LAT). MUL_LAT went 2->3 when the
-    // mul was pipelined for f250, so the reducer is now 4 + 2*3 = 10 and LAT tracks it.
-    localparam integer LAT = 10;
-    localparam integer ADD_LAT = 5;
+    `include "fmt.vh"
+
+    // col_pipe / last_pipe depth = the reducer's valid_in->valid_out latency; the add
+    // metadata pipe = the fp32 add latency + the caller's valid register. Both derive
+    // from numeric/fmt.vh now — the MUL_LAT 2->3 ripple lands in one edit there, not six.
+    localparam integer LAT = MATMUL_REDUCER_LATENCY;
+    localparam integer ADD_LAT = MATMUL_ROWBLOCK_ADD_LAT;
     localparam integer DONE_DELAY = (ACCUM_DEPTH - 1) * ADD_LAT + 3;
 
     wire [ROWS-1:0]    reducer_valid;

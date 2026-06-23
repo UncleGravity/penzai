@@ -135,6 +135,60 @@ const flash_top_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_top.v",
 } ++ flash_kernel_rtl;
 
+// numeric/ leaf library differential harness: each new leaf beside the proven rtl/fp
+// leaf it replaces. Grows as leaves land (fmul/cvt/reduce next).
+const numeric_diff_rtl = [_][]const u8{
+    "fpga/rtl/numeric/numeric_diff_top.v",
+    "fpga/rtl/numeric/fadd.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/cvt.v",
+    "fpga/rtl/numeric/reduce.v",
+    "fpga/rtl/numeric/interp.v",
+    "fpga/rtl/numeric/exp.v",
+    "fpga/rtl/numeric/recip.v",
+    // old leaves the new ones are gated against (flash_luts.vh resolves via incdir)
+    "fpga/rtl/fp/fp32_add_pipe.v",
+    "fpga/rtl/fp/fp32_mul_pipe.v",
+    "fpga/rtl/fp/fp16_to_fp32.v",
+    "fpga/rtl/fp/int_to_fp32.v",
+    "fpga/rtl/flash_attn/fp_addtree.v",
+    "fpga/rtl/flash_attn/fp_interp.v",
+    "fpga/rtl/flash_attn/fp_exp.v",
+    "fpga/rtl/flash_attn/fp_recip.v",
+};
+
+// numeric/fma (fixed-point DSP-MAC) oracle cosim vs matmul_ref.windowedRow.
+const numeric_fma_rtl = [_][]const u8{
+    "fpga/rtl/numeric/fma_top.v",
+    "fpga/rtl/numeric/fma.v",
+};
+
+// gemm decode datapath: the front-end (f16 decompose + Σ±a reduce) + ROWS fma lanes,
+// gated bit-exact vs matmul_ref.windowedRow (exact-in-window). Composes the proven fma.
+const numeric_gemm_rtl = [_][]const u8{
+    "fpga/rtl/gemm_top.v",
+    "fpga/rtl/gemm.v",
+    "fpga/rtl/numeric/fma.v",
+};
+
+// gemm_kernel: the full fixed-point matmul kernel (FSM + banked gemm_rowblock + time-muxed
+// gemm_emit), gated bit-exact vs matmul_ref.windowedFixedOutput (C=1 decode + C>1 prefill).
+const gemm_kernel_rtl = [_][]const u8{
+    "fpga/rtl/gemm_kernel.v",
+    "fpga/rtl/gemm.v",
+    "fpga/rtl/numeric/fma.v",
+};
+
+// decode_top: the deployable AXI-Lite top (matmul_top re-extracted with gemm_kernel + the
+// EMIN config register). Includes the generated matmul_regs.vh. Gated bit-exact vs
+// windowedFixedOutput through the four-port weight zip + AXI-Lite config (incl. EMIN).
+const decode_top_rtl = [_][]const u8{
+    "fpga/rtl/decode_top.v",
+    "fpga/rtl/gemm_kernel.v",
+    "fpga/rtl/gemm.v",
+    "fpga/rtl/numeric/fma.v",
+};
+
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
     // matmul regmap module). One emitter, two artifacts: the Verilog register
@@ -172,12 +226,17 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     // gateware that the cosim (which drives the core) does not exercise.
     const lint = b.addSystemCommand(&.{
         "sh",                                                                                                                                                 "-c",
-        "verilator --lint-only -Wall -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/matmul --top-module matmul_top " ++ matmul_rtl_args,
+        "verilator --lint-only -Wall -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/matmul +incdir+fpga/rtl/numeric --top-module matmul_top " ++ matmul_rtl_args,
     });
     b.step("lint-rtl", "Verilator lint the matmul RTL").dependOn(&lint.step);
 
     addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl, .matmul);
     addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-numeric", "Verilator cosim: numeric/ leaves differential vs rtl/fp", "numeric_diff_top", "fpga/sim/numeric_diff", &numeric_diff_rtl, .numeric);
+    addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite gemm top, four-port zip + EMIN) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
     addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
@@ -185,7 +244,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
-const CosimKind = enum { matmul, flash };
+// `numeric` is differential (new leaf vs the proven rtl/fp leaf) — no software ref.
+const CosimKind = enum { matmul, flash, numeric };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -229,10 +289,13 @@ fn addCosim(
     vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "--Mdir", gen });
-    vcmd.addArg(switch (kind) {
-        .matmul => "+incdir+fpga/rtl/matmul",
-        .flash => "+incdir+fpga/rtl/flash_attn",
-    });
+    switch (kind) {
+        // matmul reducer/rowblock `include "fmt.vh" from numeric/ (the format+latency contract).
+        .matmul => vcmd.addArgs(&.{ "+incdir+fpga/rtl/matmul", "+incdir+fpga/rtl/numeric" }),
+        .flash => vcmd.addArg("+incdir+fpga/rtl/flash_attn"),
+        // numeric exp/recip `include flash_luts.vh (still in flash_attn/ pre-swap).
+        .numeric => vcmd.addArgs(&.{ "+incdir+fpga/rtl/numeric", "+incdir+fpga/rtl/flash_attn" }),
+    }
     vcmd.addArgs(rtl);
 
     const tb_mod = b.createModule(.{
@@ -242,6 +305,7 @@ fn addCosim(
         .link_libc = true,
     });
     switch (kind) {
+        .numeric => {}, // differential harness: new leaf vs old leaf, no software ref imports
         .matmul => attachCosimSupport(b, tb_mod, target, optimize),
         .flash => {
             tb_mod.addImport("flash_ref", b.createModule(.{
@@ -495,6 +559,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/layout.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/matmul.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/flash_attn.zig", target, optimize, shared);
+    addSupportTest(b, test_step, "fpga/sim/support/matmul_ref.zig", target, optimize);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/mem/heap.zig", target, optimize, build_options, shared);
@@ -531,6 +596,25 @@ fn addSharedTest(
         .optimize = optimize,
     });
     mod.addImport("shared", shared);
+    const test_exe = b.addTest(.{ .root_module = mod });
+    step.dependOn(&b.addRunArtifact(test_exe).step);
+}
+
+// Cosim support module (matmul_ref/pack) test: needs the layout->shared_layout import
+// chain the cosim builds (build.zig:193-200), so its own unit tests run under `zig
+// build test` rather than only being compiled into the Verilator model.
+fn addSupportTest(
+    b: *std.Build,
+    step: *std.Build.Step,
+    path: []const u8,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) void {
+    const shared_layout = b.createModule(.{ .root_source_file = b.path("shared/layout.zig"), .target = target, .optimize = optimize });
+    const layout = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/layout.zig"), .target = target, .optimize = optimize });
+    layout.addImport("shared_layout", shared_layout);
+    const mod = b.createModule(.{ .root_source_file = b.path(path), .target = target, .optimize = optimize });
+    mod.addImport("layout", layout);
     const test_exe = b.addTest(.{ .root_module = mod });
     step.dependOn(&b.addRunArtifact(test_exe).step);
 }

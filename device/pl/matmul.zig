@@ -53,12 +53,12 @@ pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemor
 const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Minimum kernel VERSION the driver accepts. v8 is the ROWS=16 four-port kernel and
-/// reads the v8 resident layout; older kernels are incompatible with the current host
-/// packer and must fall back to PS instead of corrupting results. This is policy (the
-/// oldest compatible kernel), distinct from the current build's VERSION reset — so it
-/// is not sourced from the regmap.
-pub const min_version: u32 = 8;
+/// Minimum kernel VERSION the driver accepts. v9 is the fixed-window gemm kernel (104-bit
+/// accumulator, EMIN baked in as a format constant — no EMIN register). The driver no longer
+/// writes a window floor, so an older v8 kernel (whose EMIN register resets to 0 → garbage
+/// logits) is incompatible and must fall back to PS. Policy (the oldest compatible kernel),
+/// distinct from the current build's VERSION reset — so it is not sourced from the regmap.
+pub const min_version: u32 = 9;
 pub const version_with_counters: u32 = 5;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
@@ -188,6 +188,10 @@ pub fn Backend(comptime Heap: type) type {
             comptime std.debug.assert(dma_w_bases.len == layout.weight_ports);
             var kernel = try Kernel.open(kernel_base);
             errdefer kernel.deinit();
+
+            // The gemm window floor is baked into the kernel (decode_top.EMIN_FLOOR), so there
+            // is nothing to write here — the 104-bit accumulator covers the full f16 range with
+            // no per-model calibration.
             var dma_w: [layout.weight_ports]dma_mod.Dma = undefined;
             var opened: usize = 0;
             errdefer for (dma_w[0..opened]) |*dma| dma.deinit();

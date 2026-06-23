@@ -1,0 +1,3 @@
+== OOC synth FULL gemm_kernel (FSM + banked rowblock + pipelined emit + result_buf) @ 3.333ns ==
+RESULT top=gemm_kernel_ooc dsp=288 lut=0 carry8=637 ff=15678 wns_ns=-0.293 fmax_mhz=275.8 (period=3.333ns)
+== gemm_kernel OOC DONE ==

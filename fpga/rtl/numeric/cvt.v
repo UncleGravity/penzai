@@ -1,0 +1,55 @@
+// cvt - numeric conversions (the file subsumes fp16_to_fp32 + int_to_fp32).
+//
+// Combinational, truncating. Two consumer-shaped conversions:
+//   cvt_f16_f32 : f16 -> fp32 widen (attention K/V/mask)         ≡ fp16_to_fp32
+//   cvt_i2f     : signed int(WIDTH) -> fp32 (interp t, etc.)     ≡ int_to_fp32
+// Both gated bit-identical to their rtl/fp predecessors (differential cosim,
+// exhaustive over the input domain). The new fixed->fp emit path lives with the
+// gemm datapath (oracle-gated vs windowedFixedOutput), not here.
+
+`default_nettype none
+
+// f16 -> fp32. Subnormals flush to signed zero; Inf/NaN not expected (quant scales
+// are finite/normal). Bit-identical to fp16_to_fp32.
+module cvt_f16_f32 (
+    input  wire [15:0] in,
+    output wire [31:0] out
+);
+    wire       sign    = in[15];
+    wire [4:0] exp_in  = in[14:10];
+    wire [9:0] mant_in = in[9:0];
+    wire       is_zero_sub = (exp_in == 5'd0);
+    wire [7:0]  exp_out  = {3'd0, exp_in} + 8'd112; // rebias 15 -> 127
+    wire [22:0] mant_out = {mant_in, 13'd0};
+    assign out = is_zero_sub ? {sign, 31'd0} : {sign, exp_out, mant_out};
+endmodule
+
+// signed int(WIDTH) -> fp32, truncating (round-toward-zero). Bit-identical to
+// int_to_fp32. WIDTH<=24 keeps the magnitude exact in the fp32 mantissa.
+module cvt_i2f #(
+    parameter integer WIDTH = 14
+) (
+    input  wire signed [WIDTH-1:0] in,
+    output wire        [31:0]      out
+);
+    localparam integer MAG_W = WIDTH - 1;
+
+    wire                    sign   = in[WIDTH-1];
+    wire signed [WIDTH-1:0] neg_in = -in;
+    wire [MAG_W-1:0]        mag    = sign ? neg_in[MAG_W-1:0] : in[MAG_W-1:0];
+
+    reg [4:0] msb_pos;
+    integer i;
+    always @(*) begin
+        msb_pos = 5'd0;
+        for (i = 0; i < MAG_W; i = i + 1)
+            if (mag[i]) msb_pos = i[4:0];
+    end
+
+    wire [MAG_W-1:0] mag_norm = mag << ((MAG_W - 1) - {27'd0, msb_pos});
+    wire [22:0]      mantissa = {mag_norm[MAG_W-2:0], {(23 - (MAG_W-1)){1'b0}}};
+    wire [7:0]       exponent = 8'd127 + {3'd0, msb_pos};
+    wire             is_zero  = (mag == {MAG_W{1'b0}});
+
+    assign out = is_zero ? 32'd0 : {sign, exponent, mantissa};
+endmodule

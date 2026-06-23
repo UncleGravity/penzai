@@ -21,17 +21,20 @@ set -a; source config.env; set +a
 : "${VM_DIR:?config.env must set VM_DIR (build dir on the VM)}"
 VARIANT="${1:-${VARIANT:-w512-p4-f200-wc300}}"
 BIT_PREFIX="penzai-combined-v1"
+RTL_ROOT="../../rtl"
 RTL_MATMUL="../../rtl/matmul"
 RTL_FLASH="../../rtl/flash_attn"
 RTL_FP="../../rtl/fp"
+RTL_NUMERIC="../../rtl/numeric"
 
 # Union of both RTL sets. The fp/ leaves are shared by matmul and flash — included once.
 RTL_FILES=(
-  # matmul
-  "$RTL_MATMUL/matmul_top.v"
-  "$RTL_MATMUL/matmul_kernel.v"
-  "$RTL_MATMUL/matmul_rowblock.v"
-  "$RTL_MATMUL/matmul_reducer.v"
+  # matmul = the plan-7 fixed-point gemm path (decode_top replaces matmul_top; the legacy
+  # matmul_{top,kernel,rowblock,reducer}.v stay on disk for the cosims but are not built).
+  "$RTL_ROOT/decode_top.v"
+  "$RTL_ROOT/gemm_kernel.v"
+  "$RTL_ROOT/gemm.v"
+  "$RTL_NUMERIC/fma.v"
   "$RTL_MATMUL/matmul_regs.vh"
   # flash
   "$RTL_FLASH/flash_top.v"
@@ -50,6 +53,8 @@ RTL_FILES=(
   "$RTL_FP/fp32_mul_pipe.v"
   "$RTL_FP/fp16_to_fp32.v"
   "$RTL_FP/int_to_fp32.v"
+  # numeric contract (format + latency single source; included by matmul reducer/rowblock)
+  "$RTL_NUMERIC/fmt.vh"
 )
 for f in "${RTL_FILES[@]}"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for the *_regs.vh)" >&2; exit 1; }
@@ -64,7 +69,10 @@ done
 
 echo "== sync FPGA inputs -> $VM:$VM_DIR =="
 ssh "$VM" "if not exist $VM_DIR mkdir $VM_DIR" || true
-ssh "$VM" "if not exist $VM_DIR\\rtl mkdir $VM_DIR\\rtl" || true
+# Clean rtl/ before sync so a changed RTL_FILES list (matmul_* -> gemm) leaves no stale
+# modules for build.tcl's `glob ./rtl/*.v` to pick up (e.g. a dead matmul_top.v).
+ssh "$VM" "if exist $VM_DIR\\rtl rmdir /s /q $VM_DIR\\rtl" || true
+ssh "$VM" "mkdir $VM_DIR\\rtl" || true
 scp tcl/build.tcl build.bat "$VM:$VM_DIR/"
 scp "$MATMUL_ADDR" "$VM:$VM_DIR/matmul_address_map.tcl"
 scp "$FLASH_ADDR"  "$VM:$VM_DIR/flash_address_map.tcl"

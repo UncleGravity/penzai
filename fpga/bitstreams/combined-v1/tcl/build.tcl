@@ -76,8 +76,9 @@ set rtl_files [glob -nocomplain [file normalize ./rtl/*.v]]
 if {[llength $rtl_files] == 0} { error "missing RTL files under ./rtl" }
 add_files -norecurse $rtl_files
 # Verilog headers: matmul_top includes matmul_regs.vh; flash_top includes flash_regs.vh;
-# fp_exp/fp_recip include flash_luts.vh. All must be added as headers + on the include path.
-foreach vh {matmul_regs.vh flash_regs.vh flash_luts.vh} {
+# fp_exp/fp_recip include flash_luts.vh; matmul reducer/rowblock include fmt.vh (the
+# numeric format+latency contract). All must be added as headers + on the include path.
+foreach vh {matmul_regs.vh flash_regs.vh flash_luts.vh fmt.vh} {
     set f [file normalize ./rtl/$vh]
     if {![file exists $f]} { error "missing ./rtl/$vh (run 'zig build regmap' for the *_regs.vh)" }
     add_files -norecurse $f
@@ -198,7 +199,7 @@ foreach dma {dma_w0 dma_w1 dma_w2 dma_w3 dma_a} {
 }
 make_dwc dwc_a 16 8 ;# acts    128 -> 64
 make_dwc dwc_r 8 16 ;# results  64 -> 128
-create_bd_cell -type module -reference matmul_top kernel_mm
+create_bd_cell -type module -reference decode_top kernel_mm ;# plan-7 fixed-point gemm (was matmul_top)
 
 # Acts: dma_a(wclk) -> 128->64(wclk) -> clk_conv -> kernel_mm(fclk).
 make_clk_conv clk_conv_a 8

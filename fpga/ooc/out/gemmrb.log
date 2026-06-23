@@ -1,0 +1,5 @@
+== sync gemm OOC probe -> 10.211.55.3:penzai-ooc ==
+sign_and_send_pubkey: signing failed for ED25519 "master-ssh-key" from agent: communication with agent failed
+== OOC synth gemm_rowblock @ 3.333ns (f300) ==
+RESULT top=gemm_rb_ooc dsp=288 lut=0 carry8=656 ff=4889 wns_ns=-1.376 fmax_mhz=212.4 (period=3.333ns)
+== gemm OOC DONE ==

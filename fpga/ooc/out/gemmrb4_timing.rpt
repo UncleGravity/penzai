@@ -1,0 +1,749 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+--------------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version      : Vivado v.2025.2.1 (win64) Build 6403652 Thu Mar 19 19:48:24 GMT 2026
+| Date              : Mon Jun 22 03:39:16 2026
+| Host              : ANGELVIERA7B7F running 64-bit major release  (build 9200)
+| Command           : report_timing_summary -max_paths 5 -file gemmrb4_timing.rpt
+| Design            : gemm_rb_ooc
+| Device            : xck26-sfvc784
+| Speed File        : -2LV  PRODUCTION 1.31 12-08-2025
+| Design State      : Synthesized
+| Temperature Grade : C
+--------------------------------------------------------------------------------------------------------------------------------------------------
+
+Timing Summary Report
+
+------------------------------------------------------------------------------------------------
+| Timer Settings
+| --------------
+------------------------------------------------------------------------------------------------
+
+  Enable Multi Corner Analysis               :  Yes
+  Enable Pessimism Removal                   :  Yes
+  Pessimism Removal Resolution               :  Nearest Common Node
+  Enable Input Delay Default Clock           :  No
+  Enable Preset / Clear Arcs                 :  No
+  Disable Flight Delays                      :  No
+  Ignore I/O Paths                           :  No
+  Timing Early Launch at Borrowing Latches   :  No
+  Borrow Time for Max Delay Exceptions       :  Yes
+  Merge Timing Exceptions                    :  Yes
+  Inter-SLR Compensation                     :  Conservative
+
+  Corner  Analyze    Analyze    
+  Name    Max Paths  Min Paths  
+  ------  ---------  ---------  
+  Slow    Yes        Yes        
+  Fast    Yes        Yes        
+
+
+------------------------------------------------------------------------------------------------
+| Report Methodology
+| ------------------
+------------------------------------------------------------------------------------------------
+
+No report available as report_methodology has not been run prior. Run report_methodology on the current design for the summary of methodology violations.
+
+
+
+check_timing report
+
+Table of Contents
+-----------------
+1. checking no_clock (0)
+2. checking constant_clock (0)
+3. checking pulse_width_clock (0)
+4. checking unconstrained_internal_endpoints (0)
+5. checking no_input_delay (1057)
+6. checking no_output_delay (1152)
+7. checking multiple_clock (0)
+8. checking generated_clocks (0)
+9. checking loops (0)
+10. checking partial_input_delay (0)
+11. checking partial_output_delay (0)
+12. checking latch_loops (0)
+
+1. checking no_clock (0)
+------------------------
+ There are 0 register/latch pins with no clock.
+
+
+2. checking constant_clock (0)
+------------------------------
+ There are 0 register/latch pins with constant_clock.
+
+
+3. checking pulse_width_clock (0)
+---------------------------------
+ There are 0 register/latch pins which need pulse_width check
+
+
+4. checking unconstrained_internal_endpoints (0)
+------------------------------------------------
+ There are 0 pins that are not constrained for maximum delay.
+
+ There are 0 pins that are not constrained for maximum delay due to constant clock.
+
+
+5. checking no_input_delay (1057)
+---------------------------------
+ There are 0 input ports with no input delay specified.
+
+ There are 1057 input ports with no input delay but user has a false path constraint. (MEDIUM)
+
+
+6. checking no_output_delay (1152)
+----------------------------------
+ There are 0 ports with no output delay specified.
+
+ There are 1152 ports with no output delay but user has a false path constraint (MEDIUM)
+
+ There are 0 ports with no output delay but with a timing clock defined on it or propagating through it
+
+
+7. checking multiple_clock (0)
+------------------------------
+ There are 0 register/latch pins with multiple clocks.
+
+
+8. checking generated_clocks (0)
+--------------------------------
+ There are 0 generated clocks that are not connected to a clock source.
+
+
+9. checking loops (0)
+---------------------
+ There are 0 combinational loops in the design.
+
+
+10. checking partial_input_delay (0)
+------------------------------------
+ There are 0 input ports with partial input delay specified.
+
+
+11. checking partial_output_delay (0)
+-------------------------------------
+ There are 0 ports with partial output delay specified.
+
+
+12. checking latch_loops (0)
+----------------------------
+ There are 0 combinational latch loops in the design through latch input
+
+
+
+------------------------------------------------------------------------------------------------
+| Design Timing Summary
+| ---------------------
+------------------------------------------------------------------------------------------------
+
+    WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints     WPWS(ns)     TPWS(ns)  TPWS Failing Endpoints  TPWS Total Endpoints  
+    -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------     --------     --------  ----------------------  --------------------  
+      0.826        0.000                      0                27293        0.105        0.000                      0                27293        0.904        0.000                       0                 16590  
+
+
+All user specified timing constraints are met.
+
+
+------------------------------------------------------------------------------------------------
+| Clock Summary
+| -------------
+------------------------------------------------------------------------------------------------
+
+Clock  Waveform(ns)         Period(ns)      Frequency(MHz)
+-----  ------------         ----------      --------------
+clk    {0.000 1.666}        3.333           300.030         
+
+
+------------------------------------------------------------------------------------------------
+| Intra Clock Table
+| -----------------
+------------------------------------------------------------------------------------------------
+
+Clock             WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints     WPWS(ns)     TPWS(ns)  TPWS Failing Endpoints  TPWS Total Endpoints  
+-----             -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------     --------     --------  ----------------------  --------------------  
+clk                 0.826        0.000                      0                27293        0.105        0.000                      0                27293        0.904        0.000                       0                 16590  
+
+
+------------------------------------------------------------------------------------------------
+| Inter Clock Table
+| -----------------
+------------------------------------------------------------------------------------------------
+
+From Clock    To Clock          WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints  
+----------    --------          -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------  
+
+
+------------------------------------------------------------------------------------------------
+| Other Path Groups Table
+| -----------------------
+------------------------------------------------------------------------------------------------
+
+Path Group    From Clock    To Clock          WNS(ns)      TNS(ns)  TNS Failing Endpoints  TNS Total Endpoints      WHS(ns)      THS(ns)  THS Failing Endpoints  THS Total Endpoints  
+----------    ----------    --------          -------      -------  ---------------------  -------------------      -------      -------  ---------------------  -------------------  
+
+
+------------------------------------------------------------------------------------------------
+| Timing Details
+| --------------
+------------------------------------------------------------------------------------------------
+
+
+---------------------------------------------------------------------------------------------------
+From Clock:  clk
+  To Clock:  clk
+
+Setup :            0  Failing Endpoints,  Worst Slack        0.826ns,  Total Violation        0.000ns
+Hold  :            0  Failing Endpoints,  Worst Slack        0.105ns,  Total Violation        0.000ns
+PW    :            0  Failing Endpoints,  Worst Slack        0.904ns,  Total Violation        0.000ns
+---------------------------------------------------------------------------------------------------
+
+
+Max Delay Paths
+--------------------------------------------------------------------------------------
+Slack (MET) :             0.826ns  (required time - arrival time)
+  Source:                 u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[26]
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            3.333ns  (clk rise@3.333ns - clk rise@0.000ns)
+  Data Path Delay:        2.464ns  (logic 2.142ns (86.932%)  route 0.322ns (13.068%))
+  Logic Levels:           5  (DSP_A_B_DATA=1 DSP_ALU=1 DSP_M_DATA=1 DSP_MULTIPLIER=1 DSP_PREADD_DATA=1)
+  Clock Path Skew:        -0.022ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.055ns = ( 3.388 - 3.333 ) 
+    Source Clock Delay      (SCD):    0.077ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.077     0.077    u_rb/gen_lane[0].u_ms/psig1_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+  -------------------------------------------------------------------    -------------------
+                         DSP_OUTPUT (Prop_DSP_OUTPUT_CLK_P[23])
+                                                      0.276     0.353 f  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/P[23]
+                         net (fo=7, unplaced)         0.322     0.675    u_rb/gen_lane[0].u_ms/prod2_reg/A[25]
+                         DSP_A_B_DATA (Prop_DSP_A_B_DATA_A[25]_A2_DATA[25])
+                                                      0.258     0.933 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA_INST/A2_DATA[25]
+                         net (fo=1, unplaced)         0.000     0.933    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA.A2_DATA<25>
+                         DSP_PREADD_DATA (Prop_DSP_PREADD_DATA_A2_DATA[25]_A2A1[25])
+                                                      0.114     1.047 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA_INST/A2A1[25]
+                         net (fo=1, unplaced)         0.000     1.047    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA.A2A1<25>
+                         DSP_MULTIPLIER (Prop_DSP_MULTIPLIER_A2A1[25]_U[26])
+                                                      0.700     1.747 f  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER_INST/U[26]
+                         net (fo=1, unplaced)         0.000     1.747    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER.U<26>
+                         DSP_M_DATA (Prop_DSP_M_DATA_U[26]_U_DATA[26])
+                                                      0.067     1.814 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA_INST/U_DATA[26]
+                         net (fo=1, unplaced)         0.000     1.814    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA.U_DATA<26>
+                         DSP_ALU (Prop_DSP_ALU_U_DATA[26]_ALU_OUT[26])
+                                                      0.727     2.541 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU_INST/ALU_OUT[26]
+                         net (fo=1, unplaced)         0.000     2.541    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU.ALU_OUT<26>
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[26]
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        3.333     3.333 r  
+                                                      0.000     3.333 r  clk (IN)
+                         net (fo=16733, unset)        0.055     3.388    u_rb/gen_lane[0].u_ms/prod2_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/CLK
+                         clock pessimism              0.000     3.388    
+                         clock uncertainty           -0.035     3.353    
+                         DSP_OUTPUT (Setup_DSP_OUTPUT_CLK_ALU_OUT[26])
+                                                      0.014     3.367    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST
+  -------------------------------------------------------------------
+                         required time                          3.367    
+                         arrival time                          -2.541    
+  -------------------------------------------------------------------
+                         slack                                  0.826    
+
+Slack (MET) :             0.826ns  (required time - arrival time)
+  Source:                 u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[27]
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            3.333ns  (clk rise@3.333ns - clk rise@0.000ns)
+  Data Path Delay:        2.464ns  (logic 2.142ns (86.932%)  route 0.322ns (13.068%))
+  Logic Levels:           5  (DSP_A_B_DATA=1 DSP_ALU=1 DSP_M_DATA=1 DSP_MULTIPLIER=1 DSP_PREADD_DATA=1)
+  Clock Path Skew:        -0.022ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.055ns = ( 3.388 - 3.333 ) 
+    Source Clock Delay      (SCD):    0.077ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.077     0.077    u_rb/gen_lane[0].u_ms/psig1_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+  -------------------------------------------------------------------    -------------------
+                         DSP_OUTPUT (Prop_DSP_OUTPUT_CLK_P[23])
+                                                      0.276     0.353 f  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/P[23]
+                         net (fo=7, unplaced)         0.322     0.675    u_rb/gen_lane[0].u_ms/prod2_reg/A[25]
+                         DSP_A_B_DATA (Prop_DSP_A_B_DATA_A[25]_A2_DATA[25])
+                                                      0.258     0.933 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA_INST/A2_DATA[25]
+                         net (fo=1, unplaced)         0.000     0.933    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA.A2_DATA<25>
+                         DSP_PREADD_DATA (Prop_DSP_PREADD_DATA_A2_DATA[25]_A2A1[25])
+                                                      0.114     1.047 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA_INST/A2A1[25]
+                         net (fo=1, unplaced)         0.000     1.047    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA.A2A1<25>
+                         DSP_MULTIPLIER (Prop_DSP_MULTIPLIER_A2A1[25]_U[27])
+                                                      0.700     1.747 f  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER_INST/U[27]
+                         net (fo=1, unplaced)         0.000     1.747    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER.U<27>
+                         DSP_M_DATA (Prop_DSP_M_DATA_U[27]_U_DATA[27])
+                                                      0.067     1.814 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA_INST/U_DATA[27]
+                         net (fo=1, unplaced)         0.000     1.814    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA.U_DATA<27>
+                         DSP_ALU (Prop_DSP_ALU_U_DATA[27]_ALU_OUT[27])
+                                                      0.727     2.541 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU_INST/ALU_OUT[27]
+                         net (fo=1, unplaced)         0.000     2.541    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU.ALU_OUT<27>
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[27]
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        3.333     3.333 r  
+                                                      0.000     3.333 r  clk (IN)
+                         net (fo=16733, unset)        0.055     3.388    u_rb/gen_lane[0].u_ms/prod2_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/CLK
+                         clock pessimism              0.000     3.388    
+                         clock uncertainty           -0.035     3.353    
+                         DSP_OUTPUT (Setup_DSP_OUTPUT_CLK_ALU_OUT[27])
+                                                      0.014     3.367    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST
+  -------------------------------------------------------------------
+                         required time                          3.367    
+                         arrival time                          -2.541    
+  -------------------------------------------------------------------
+                         slack                                  0.826    
+
+Slack (MET) :             0.826ns  (required time - arrival time)
+  Source:                 u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[28]
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            3.333ns  (clk rise@3.333ns - clk rise@0.000ns)
+  Data Path Delay:        2.464ns  (logic 2.142ns (86.932%)  route 0.322ns (13.068%))
+  Logic Levels:           5  (DSP_A_B_DATA=1 DSP_ALU=1 DSP_M_DATA=1 DSP_MULTIPLIER=1 DSP_PREADD_DATA=1)
+  Clock Path Skew:        -0.022ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.055ns = ( 3.388 - 3.333 ) 
+    Source Clock Delay      (SCD):    0.077ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.077     0.077    u_rb/gen_lane[0].u_ms/psig1_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+  -------------------------------------------------------------------    -------------------
+                         DSP_OUTPUT (Prop_DSP_OUTPUT_CLK_P[23])
+                                                      0.276     0.353 f  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/P[23]
+                         net (fo=7, unplaced)         0.322     0.675    u_rb/gen_lane[0].u_ms/prod2_reg/A[25]
+                         DSP_A_B_DATA (Prop_DSP_A_B_DATA_A[25]_A2_DATA[25])
+                                                      0.258     0.933 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA_INST/A2_DATA[25]
+                         net (fo=1, unplaced)         0.000     0.933    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA.A2_DATA<25>
+                         DSP_PREADD_DATA (Prop_DSP_PREADD_DATA_A2_DATA[25]_A2A1[25])
+                                                      0.114     1.047 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA_INST/A2A1[25]
+                         net (fo=1, unplaced)         0.000     1.047    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA.A2A1<25>
+                         DSP_MULTIPLIER (Prop_DSP_MULTIPLIER_A2A1[25]_U[28])
+                                                      0.700     1.747 f  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER_INST/U[28]
+                         net (fo=1, unplaced)         0.000     1.747    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER.U<28>
+                         DSP_M_DATA (Prop_DSP_M_DATA_U[28]_U_DATA[28])
+                                                      0.067     1.814 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA_INST/U_DATA[28]
+                         net (fo=1, unplaced)         0.000     1.814    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA.U_DATA<28>
+                         DSP_ALU (Prop_DSP_ALU_U_DATA[28]_ALU_OUT[28])
+                                                      0.727     2.541 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU_INST/ALU_OUT[28]
+                         net (fo=1, unplaced)         0.000     2.541    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU.ALU_OUT<28>
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[28]
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        3.333     3.333 r  
+                                                      0.000     3.333 r  clk (IN)
+                         net (fo=16733, unset)        0.055     3.388    u_rb/gen_lane[0].u_ms/prod2_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/CLK
+                         clock pessimism              0.000     3.388    
+                         clock uncertainty           -0.035     3.353    
+                         DSP_OUTPUT (Setup_DSP_OUTPUT_CLK_ALU_OUT[28])
+                                                      0.014     3.367    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST
+  -------------------------------------------------------------------
+                         required time                          3.367    
+                         arrival time                          -2.541    
+  -------------------------------------------------------------------
+                         slack                                  0.826    
+
+Slack (MET) :             0.826ns  (required time - arrival time)
+  Source:                 u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[29]
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            3.333ns  (clk rise@3.333ns - clk rise@0.000ns)
+  Data Path Delay:        2.464ns  (logic 2.142ns (86.932%)  route 0.322ns (13.068%))
+  Logic Levels:           5  (DSP_A_B_DATA=1 DSP_ALU=1 DSP_M_DATA=1 DSP_MULTIPLIER=1 DSP_PREADD_DATA=1)
+  Clock Path Skew:        -0.022ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.055ns = ( 3.388 - 3.333 ) 
+    Source Clock Delay      (SCD):    0.077ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.077     0.077    u_rb/gen_lane[0].u_ms/psig1_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+  -------------------------------------------------------------------    -------------------
+                         DSP_OUTPUT (Prop_DSP_OUTPUT_CLK_P[23])
+                                                      0.276     0.353 f  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/P[23]
+                         net (fo=7, unplaced)         0.322     0.675    u_rb/gen_lane[0].u_ms/prod2_reg/A[25]
+                         DSP_A_B_DATA (Prop_DSP_A_B_DATA_A[25]_A2_DATA[25])
+                                                      0.258     0.933 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA_INST/A2_DATA[25]
+                         net (fo=1, unplaced)         0.000     0.933    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA.A2_DATA<25>
+                         DSP_PREADD_DATA (Prop_DSP_PREADD_DATA_A2_DATA[25]_A2A1[25])
+                                                      0.114     1.047 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA_INST/A2A1[25]
+                         net (fo=1, unplaced)         0.000     1.047    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA.A2A1<25>
+                         DSP_MULTIPLIER (Prop_DSP_MULTIPLIER_A2A1[25]_U[29])
+                                                      0.700     1.747 f  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER_INST/U[29]
+                         net (fo=1, unplaced)         0.000     1.747    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER.U<29>
+                         DSP_M_DATA (Prop_DSP_M_DATA_U[29]_U_DATA[29])
+                                                      0.067     1.814 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA_INST/U_DATA[29]
+                         net (fo=1, unplaced)         0.000     1.814    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA.U_DATA<29>
+                         DSP_ALU (Prop_DSP_ALU_U_DATA[29]_ALU_OUT[29])
+                                                      0.727     2.541 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU_INST/ALU_OUT[29]
+                         net (fo=1, unplaced)         0.000     2.541    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU.ALU_OUT<29>
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[29]
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        3.333     3.333 r  
+                                                      0.000     3.333 r  clk (IN)
+                         net (fo=16733, unset)        0.055     3.388    u_rb/gen_lane[0].u_ms/prod2_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/CLK
+                         clock pessimism              0.000     3.388    
+                         clock uncertainty           -0.035     3.353    
+                         DSP_OUTPUT (Setup_DSP_OUTPUT_CLK_ALU_OUT[29])
+                                                      0.014     3.367    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST
+  -------------------------------------------------------------------
+                         required time                          3.367    
+                         arrival time                          -2.541    
+  -------------------------------------------------------------------
+                         slack                                  0.826    
+
+Slack (MET) :             0.826ns  (required time - arrival time)
+  Source:                 u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[30]
+                            (rising edge-triggered cell DSP_OUTPUT clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Setup (Max at Slow Process Corner)
+  Requirement:            3.333ns  (clk rise@3.333ns - clk rise@0.000ns)
+  Data Path Delay:        2.464ns  (logic 2.142ns (86.932%)  route 0.322ns (13.068%))
+  Logic Levels:           5  (DSP_A_B_DATA=1 DSP_ALU=1 DSP_M_DATA=1 DSP_MULTIPLIER=1 DSP_PREADD_DATA=1)
+  Clock Path Skew:        -0.022ns (DCD - SCD + CPR)
+    Destination Clock Delay (DCD):    0.055ns = ( 3.388 - 3.333 ) 
+    Source Clock Delay      (SCD):    0.077ns
+    Clock Pessimism Removal (CPR):    0.000ns
+  Clock Uncertainty:      0.035ns  ((TSJ^2 + TIJ^2)^1/2 + DJ) / 2 + PE
+    Total System Jitter     (TSJ):    0.071ns
+    Total Input Jitter      (TIJ):    0.000ns
+    Discrete Jitter          (DJ):    0.000ns
+    Phase Error              (PE):    0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.077     0.077    u_rb/gen_lane[0].u_ms/psig1_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/CLK
+  -------------------------------------------------------------------    -------------------
+                         DSP_OUTPUT (Prop_DSP_OUTPUT_CLK_P[23])
+                                                      0.276     0.353 f  u_rb/gen_lane[0].u_ms/psig1_reg/DSP_OUTPUT_INST/P[23]
+                         net (fo=7, unplaced)         0.322     0.675    u_rb/gen_lane[0].u_ms/prod2_reg/A[25]
+                         DSP_A_B_DATA (Prop_DSP_A_B_DATA_A[25]_A2_DATA[25])
+                                                      0.258     0.933 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA_INST/A2_DATA[25]
+                         net (fo=1, unplaced)         0.000     0.933    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_A_B_DATA.A2_DATA<25>
+                         DSP_PREADD_DATA (Prop_DSP_PREADD_DATA_A2_DATA[25]_A2A1[25])
+                                                      0.114     1.047 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA_INST/A2A1[25]
+                         net (fo=1, unplaced)         0.000     1.047    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_PREADD_DATA.A2A1<25>
+                         DSP_MULTIPLIER (Prop_DSP_MULTIPLIER_A2A1[25]_U[30])
+                                                      0.700     1.747 f  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER_INST/U[30]
+                         net (fo=1, unplaced)         0.000     1.747    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_MULTIPLIER.U<30>
+                         DSP_M_DATA (Prop_DSP_M_DATA_U[30]_U_DATA[30])
+                                                      0.067     1.814 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA_INST/U_DATA[30]
+                         net (fo=1, unplaced)         0.000     1.814    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_M_DATA.U_DATA<30>
+                         DSP_ALU (Prop_DSP_ALU_U_DATA[30]_ALU_OUT[30])
+                                                      0.727     2.541 r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU_INST/ALU_OUT[30]
+                         net (fo=1, unplaced)         0.000     2.541    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_ALU.ALU_OUT<30>
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/ALU_OUT[30]
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        3.333     3.333 r  
+                                                      0.000     3.333 r  clk (IN)
+                         net (fo=16733, unset)        0.055     3.388    u_rb/gen_lane[0].u_ms/prod2_reg/CLK
+                         DSP_OUTPUT                                   r  u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST/CLK
+                         clock pessimism              0.000     3.388    
+                         clock uncertainty           -0.035     3.353    
+                         DSP_OUTPUT (Setup_DSP_OUTPUT_CLK_ALU_OUT[30])
+                                                      0.014     3.367    u_rb/gen_lane[0].u_ms/prod2_reg/DSP_OUTPUT_INST
+  -------------------------------------------------------------------
+                         required time                          3.367    
+                         arrival time                          -2.541    
+  -------------------------------------------------------------------
+                         slack                                  0.826    
+
+
+
+
+
+Min Delay Paths
+--------------------------------------------------------------------------------------
+Slack (MET) :             0.105ns  (arrival time - required time)
+  Source:                 u_rb/gen_lane[0].p_exp_d_reg[0][0]__0/C
+                            (rising edge-triggered cell FDRE clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].p_exp_d_reg[2][0]_srl2/D
+                            (rising edge-triggered cell SRL16E clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (clk rise@0.000ns - clk rise@0.000ns)
+  Data Path Delay:        0.167ns  (logic 0.082ns (49.102%)  route 0.085ns (50.898%))
+  Logic Levels:           0  
+  Clock Path Skew:        0.043ns (DCD - SCD - CPR)
+    Destination Clock Delay (DCD):    0.057ns
+    Source Clock Delay      (SCD):    0.014ns
+    Clock Pessimism Removal (CPR):    -0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.014     0.014    u_rb/clk
+                         FDRE                                         r  u_rb/gen_lane[0].p_exp_d_reg[0][0]__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_FDRE_C_Q)         0.082     0.096 r  u_rb/gen_lane[0].p_exp_d_reg[0][0]__0/Q
+                         net (fo=1, unplaced)         0.085     0.181    u_rb/gen_lane[0].p_exp_d_reg[0][0]__0_n_0
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][0]_srl2/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.057     0.057    u_rb/clk
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][0]_srl2/CLK
+                         clock pessimism              0.000     0.057    
+                         SRL16E (Hold_SRL16E_CLK_D)
+                                                      0.019     0.076    u_rb/gen_lane[0].p_exp_d_reg[2][0]_srl2
+  -------------------------------------------------------------------
+                         required time                         -0.076    
+                         arrival time                           0.181    
+  -------------------------------------------------------------------
+                         slack                                  0.105    
+
+Slack (MET) :             0.105ns  (arrival time - required time)
+  Source:                 u_rb/gen_lane[0].p_exp_d_reg[0][1]__0/C
+                            (rising edge-triggered cell FDRE clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].p_exp_d_reg[2][1]_srl2/D
+                            (rising edge-triggered cell SRL16E clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (clk rise@0.000ns - clk rise@0.000ns)
+  Data Path Delay:        0.167ns  (logic 0.082ns (49.102%)  route 0.085ns (50.898%))
+  Logic Levels:           0  
+  Clock Path Skew:        0.043ns (DCD - SCD - CPR)
+    Destination Clock Delay (DCD):    0.057ns
+    Source Clock Delay      (SCD):    0.014ns
+    Clock Pessimism Removal (CPR):    -0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.014     0.014    u_rb/clk
+                         FDRE                                         r  u_rb/gen_lane[0].p_exp_d_reg[0][1]__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_FDRE_C_Q)         0.082     0.096 r  u_rb/gen_lane[0].p_exp_d_reg[0][1]__0/Q
+                         net (fo=1, unplaced)         0.085     0.181    u_rb/gen_lane[0].p_exp_d_reg[0][1]__0_n_0
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][1]_srl2/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.057     0.057    u_rb/clk
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][1]_srl2/CLK
+                         clock pessimism              0.000     0.057    
+                         SRL16E (Hold_SRL16E_CLK_D)
+                                                      0.019     0.076    u_rb/gen_lane[0].p_exp_d_reg[2][1]_srl2
+  -------------------------------------------------------------------
+                         required time                         -0.076    
+                         arrival time                           0.181    
+  -------------------------------------------------------------------
+                         slack                                  0.105    
+
+Slack (MET) :             0.105ns  (arrival time - required time)
+  Source:                 u_rb/gen_lane[0].p_exp_d_reg[0][4]__0/C
+                            (rising edge-triggered cell FDRE clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].p_exp_d_reg[2][4]_srl2/D
+                            (rising edge-triggered cell SRL16E clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (clk rise@0.000ns - clk rise@0.000ns)
+  Data Path Delay:        0.167ns  (logic 0.082ns (49.102%)  route 0.085ns (50.898%))
+  Logic Levels:           0  
+  Clock Path Skew:        0.043ns (DCD - SCD - CPR)
+    Destination Clock Delay (DCD):    0.057ns
+    Source Clock Delay      (SCD):    0.014ns
+    Clock Pessimism Removal (CPR):    -0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.014     0.014    u_rb/clk
+                         FDRE                                         r  u_rb/gen_lane[0].p_exp_d_reg[0][4]__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_FDRE_C_Q)         0.082     0.096 r  u_rb/gen_lane[0].p_exp_d_reg[0][4]__0/Q
+                         net (fo=1, unplaced)         0.085     0.181    u_rb/gen_lane[0].p_exp_d_reg[0][4]__0_n_0
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][4]_srl2/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.057     0.057    u_rb/clk
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][4]_srl2/CLK
+                         clock pessimism              0.000     0.057    
+                         SRL16E (Hold_SRL16E_CLK_D)
+                                                      0.019     0.076    u_rb/gen_lane[0].p_exp_d_reg[2][4]_srl2
+  -------------------------------------------------------------------
+                         required time                         -0.076    
+                         arrival time                           0.181    
+  -------------------------------------------------------------------
+                         slack                                  0.105    
+
+Slack (MET) :             0.105ns  (arrival time - required time)
+  Source:                 u_rb/gen_lane[0].p_exp_d_reg[0][5]__0/C
+                            (rising edge-triggered cell FDRE clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[0].p_exp_d_reg[2][5]_srl2/D
+                            (rising edge-triggered cell SRL16E clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (clk rise@0.000ns - clk rise@0.000ns)
+  Data Path Delay:        0.167ns  (logic 0.082ns (49.102%)  route 0.085ns (50.898%))
+  Logic Levels:           0  
+  Clock Path Skew:        0.043ns (DCD - SCD - CPR)
+    Destination Clock Delay (DCD):    0.057ns
+    Source Clock Delay      (SCD):    0.014ns
+    Clock Pessimism Removal (CPR):    -0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.014     0.014    u_rb/clk
+                         FDRE                                         r  u_rb/gen_lane[0].p_exp_d_reg[0][5]__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_FDRE_C_Q)         0.082     0.096 r  u_rb/gen_lane[0].p_exp_d_reg[0][5]__0/Q
+                         net (fo=1, unplaced)         0.085     0.181    u_rb/gen_lane[0].p_exp_d_reg[0][5]__0_n_0
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][5]_srl2/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.057     0.057    u_rb/clk
+                         SRL16E                                       r  u_rb/gen_lane[0].p_exp_d_reg[2][5]_srl2/CLK
+                         clock pessimism              0.000     0.057    
+                         SRL16E (Hold_SRL16E_CLK_D)
+                                                      0.019     0.076    u_rb/gen_lane[0].p_exp_d_reg[2][5]_srl2
+  -------------------------------------------------------------------
+                         required time                         -0.076    
+                         arrival time                           0.181    
+  -------------------------------------------------------------------
+                         slack                                  0.105    
+
+Slack (MET) :             0.105ns  (arrival time - required time)
+  Source:                 u_rb/gen_lane[10].p_exp_d_reg[0][0]__0/C
+                            (rising edge-triggered cell FDRE clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Destination:            u_rb/gen_lane[10].p_exp_d_reg[2][0]_srl2/D
+                            (rising edge-triggered cell SRL16E clocked by clk  {rise@0.000ns fall@1.666ns period=3.333ns})
+  Path Group:             clk
+  Path Type:              Hold (Min at Fast Process Corner)
+  Requirement:            0.000ns  (clk rise@0.000ns - clk rise@0.000ns)
+  Data Path Delay:        0.167ns  (logic 0.082ns (49.102%)  route 0.085ns (50.898%))
+  Logic Levels:           0  
+  Clock Path Skew:        0.043ns (DCD - SCD - CPR)
+    Destination Clock Delay (DCD):    0.057ns
+    Source Clock Delay      (SCD):    0.014ns
+    Clock Pessimism Removal (CPR):    -0.000ns
+
+    Location             Delay type                Incr(ns)  Path(ns)    Netlist Resource(s)
+  -------------------------------------------------------------------    -------------------
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.014     0.014    u_rb/clk
+                         FDRE                                         r  u_rb/gen_lane[10].p_exp_d_reg[0][0]__0/C
+  -------------------------------------------------------------------    -------------------
+                         FDRE (Prop_FDRE_C_Q)         0.082     0.096 r  u_rb/gen_lane[10].p_exp_d_reg[0][0]__0/Q
+                         net (fo=1, unplaced)         0.085     0.181    u_rb/gen_lane[10].p_exp_d_reg[0][0]__0_n_0
+                         SRL16E                                       r  u_rb/gen_lane[10].p_exp_d_reg[2][0]_srl2/D
+  -------------------------------------------------------------------    -------------------
+
+                         (clock clk rise edge)        0.000     0.000 r  
+                                                      0.000     0.000 r  clk (IN)
+                         net (fo=16733, unset)        0.057     0.057    u_rb/clk
+                         SRL16E                                       r  u_rb/gen_lane[10].p_exp_d_reg[2][0]_srl2/CLK
+                         clock pessimism              0.000     0.057    
+                         SRL16E (Hold_SRL16E_CLK_D)
+                                                      0.019     0.076    u_rb/gen_lane[10].p_exp_d_reg[2][0]_srl2
+  -------------------------------------------------------------------
+                         required time                         -0.076    
+                         arrival time                           0.181    
+  -------------------------------------------------------------------
+                         slack                                  0.105    
+
+
+
+
+
+Pulse Width Checks
+--------------------------------------------------------------------------------------
+Clock Name:         clk
+Waveform(ns):       { 0.000 1.666 }
+Period(ns):         3.333
+Sources:            { clk }
+
+Check Type        Corner  Lib Pin     Reference Pin  Required(ns)  Actual(ns)  Slack(ns)  Location  Pin
+Min Period        n/a     SRL16E/CLK  n/a            1.524         3.333       1.809                u_rb/as_sig_d_reg[1][0]_srl2/CLK
+Min Period        n/a     SRL16E/CLK  n/a            1.524         3.333       1.809                u_rb/as_sig_d_reg[1][10]_srl2/CLK
+Min Period        n/a     SRL16E/CLK  n/a            1.524         3.333       1.809                u_rb/as_sig_d_reg[1][11]_srl2/CLK
+Min Period        n/a     SRL16E/CLK  n/a            1.524         3.333       1.809                u_rb/as_sig_d_reg[1][1]_srl2/CLK
+Min Period        n/a     SRL16E/CLK  n/a            1.524         3.333       1.809                u_rb/as_sig_d_reg[1][2]_srl2/CLK
+Low Pulse Width   Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][0]_srl2/CLK
+Low Pulse Width   Fast    SRL16E/CLK  n/a            0.762         1.667       0.905                u_rb/as_sig_d_reg[1][0]_srl2/CLK
+Low Pulse Width   Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][10]_srl2/CLK
+Low Pulse Width   Fast    SRL16E/CLK  n/a            0.762         1.667       0.905                u_rb/as_sig_d_reg[1][10]_srl2/CLK
+Low Pulse Width   Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][11]_srl2/CLK
+High Pulse Width  Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][0]_srl2/CLK
+High Pulse Width  Fast    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][0]_srl2/CLK
+High Pulse Width  Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][10]_srl2/CLK
+High Pulse Width  Fast    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][10]_srl2/CLK
+High Pulse Width  Slow    SRL16E/CLK  n/a            0.762         1.666       0.904                u_rb/as_sig_d_reg[1][11]_srl2/CLK
+
+
+

@@ -1,0 +1,585 @@
+
+****** Vivado v2025.2.1 (64-bit)
+  **** SW Build 6403652 on Thu Mar 19 19:48:24 GMT 2026
+  **** IP Build 6403511 on Thu Mar 19 12:41:45 MDT 2026
+  **** SharedData Build 6403650 on Thu Mar 19 14:02:13 MDT 2026
+  **** Start of session at: Sun Jun 21 22:29:11 2026
+    ** Copyright 1986-2022 Xilinx, Inc. All Rights Reserved.
+    ** Copyright 2022-2026 Advanced Micro Devices, Inc. All Rights Reserved.
+
+source ooc_synth.tcl
+# set part xck26-sfvc784-2LV-c
+# set top     [lindex $argv 0]
+# set period  [lindex $argv 1]
+# set outpfx  [lindex $argv 2]
+# set rtls    [lrange $argv 3 end]
+# puts "==> OOC synth: top=$top period=${period}ns part=$part"
+==> OOC synth: top=mac_array period=3.333ns part=xck26-sfvc784-2LV-c
+# puts "==> rtl: $rtls"
+==> rtl: fp_fixed_mac.v mac_array.v
+# foreach f $rtls { read_verilog $f }
+# synth_design -mode out_of_context -part $part -top $top
+Command: synth_design -mode out_of_context -part xck26-sfvc784-2LV-c -top mac_array
+Starting synth_design
+Attempting to get a license for feature 'Synthesis' and/or device 'xck26'
+INFO: [Common 17-349] Got license for feature 'Synthesis' and/or device 'xck26'
+INFO: [Synth 8-7079] Multithreading enabled for synth_design using a maximum of 2 processes.
+INFO: [Synth 8-7078] Launching helper process for spawning children vivado processes
+INFO: [Synth 8-7075] Helper process launched with PID 2536
+---------------------------------------------------------------------------------
+Starting Synthesize : Time (s): cpu = 00:00:05 ; elapsed = 00:00:05 . Memory (MB): peak = 1190.520 ; gain = 537.383
+---------------------------------------------------------------------------------
+INFO: [Synth 8-6157] synthesizing module 'mac_array' [C:/Users/angel/penzai-ooc/mac_array.v:10]
+INFO: [Synth 8-6157] synthesizing module 'fp_fixed_mac' [C:/Users/angel/penzai-ooc/fp_fixed_mac.v:23]
+	Parameter WS_SIG_W bound to: 11 - type: integer 
+	Parameter AS_SIG_W bound to: 11 - type: integer 
+	Parameter S_W bound to: 14 - type: integer 
+	Parameter EXP_W bound to: 5 - type: integer 
+	Parameter ACC_W bound to: 72 - type: integer 
+INFO: [Synth 8-6155] done synthesizing module 'fp_fixed_mac' (0#1) [C:/Users/angel/penzai-ooc/fp_fixed_mac.v:23]
+INFO: [Synth 8-6155] done synthesizing module 'mac_array' (0#1) [C:/Users/angel/penzai-ooc/mac_array.v:10]
+---------------------------------------------------------------------------------
+Finished Synthesize : Time (s): cpu = 00:00:06 ; elapsed = 00:00:06 . Memory (MB): peak = 1308.691 ; gain = 655.555
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Constraint Validation : Time (s): cpu = 00:00:06 ; elapsed = 00:00:07 . Memory (MB): peak = 1308.691 ; gain = 655.555
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Loading Part and Timing Information
+---------------------------------------------------------------------------------
+Loading part: xck26-sfvc784-2LV-c
+INFO: [Synth 8-6742] Reading net delay rules and data
+---------------------------------------------------------------------------------
+INFO: [Device 21-403] Loading part xck26-sfvc784-2LV-c
+Finished Loading Part and Timing Information : Time (s): cpu = 00:00:06 ; elapsed = 00:00:07 . Memory (MB): peak = 1308.691 ; gain = 655.555
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished RTL Optimization Phase 2 : Time (s): cpu = 00:00:07 ; elapsed = 00:00:07 . Memory (MB): peak = 1308.691 ; gain = 655.555
+---------------------------------------------------------------------------------
+No constraint files found.
+---------------------------------------------------------------------------------
+Start RTL Component Statistics 
+---------------------------------------------------------------------------------
+Detailed RTL Component Info : 
++---Adders : 
+	   2 Input    6 Bit       Adders := 16    
++---Registers : 
+	               72 Bit    Registers := 16    
+	               14 Bit    Registers := 16    
+	               11 Bit    Registers := 16    
+	                7 Bit    Registers := 16    
+	                6 Bit    Registers := 16    
+	                5 Bit    Registers := 32    
+	                1 Bit    Registers := 128   
++---Muxes : 
+	   2 Input    7 Bit        Muxes := 16    
+	   2 Input    1 Bit        Muxes := 32    
+---------------------------------------------------------------------------------
+Finished RTL Component Statistics 
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Part Resource Summary
+---------------------------------------------------------------------------------
+Part Resources:
+DSPs: 1248 (col length:96)
+BRAMs: 288 (col length: RAMB18 96 RAMB36 48)
+---------------------------------------------------------------------------------
+Finished Part Resource Summary
+---------------------------------------------------------------------------------
+No constraint files found.
+---------------------------------------------------------------------------------
+Start Cross Boundary and Area Optimization
+---------------------------------------------------------------------------------
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+DSP Report: Generating DSP p_sig1_reg, operation Mode is: (A2*B2)'.
+DSP Report: register as_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register ws_sig0_reg is absorbed into DSP p_sig1_reg.
+DSP Report: register p_sig1_reg is absorbed into DSP p_sig1_reg.
+DSP Report: operator p_sig10 is absorbed into DSP p_sig1_reg.
+DSP Report: Generating DSP prod2_reg, operation Mode is: (A*B'')'.
+DSP Report: register s_sum0_reg is absorbed into DSP prod2_reg.
+DSP Report: register s_sum1_reg is absorbed into DSP prod2_reg.
+DSP Report: register prod2_reg is absorbed into DSP prod2_reg.
+DSP Report: operator prod20 is absorbed into DSP prod2_reg.
+---------------------------------------------------------------------------------
+Finished Cross Boundary and Area Optimization : Time (s): cpu = 00:00:20 ; elapsed = 00:00:22 . Memory (MB): peak = 2130.312 ; gain = 1477.176
+---------------------------------------------------------------------------------
+ Sort Area is  prod2_reg_11 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_13 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_15 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_17 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_19 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_1b : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_1d : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_1f : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_2 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_21 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_5 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_7 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_9 : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_b : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_d : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  prod2_reg_f : 0 0 : 2291 2291 : Used 1 time 100
+ Sort Area is  p_sig1_reg_0 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_10 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_12 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_14 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_16 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_18 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_1a : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_1c : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_1e : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_20 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_4 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_6 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_8 : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_a : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_c : 0 0 : 907 907 : Used 1 time 100
+ Sort Area is  p_sig1_reg_e : 0 0 : 907 907 : Used 1 time 100
+---------------------------------------------------------------------------------
+Start ROM, RAM, DSP, Shift Register and Retiming Reporting
+---------------------------------------------------------------------------------
+
+DSP: Preliminary Mapping Report (see note below. The ' indicates corresponding REG is set)
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+|Module Name  | DSP Mapping | A Size | B Size | C Size | D Size | P Size | AREG | BREG | CREG | DREG | ADREG | MREG | PREG | 
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A2*B2)'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 1    | 0    | 
+|fp_fixed_mac | (A*B'')'    | 23     | 14     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 1    | 0    | 
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+
+Note: The table above is a preliminary report that shows the DSPs inferred at the current stage of the synthesis flow. Some DSP may be reimplemented as non DSP primitives later in the synthesis flow. Multiple instantiated DSPs are reported only once.
+---------------------------------------------------------------------------------
+Finished ROM, RAM, DSP, Shift Register and Retiming Reporting
+---------------------------------------------------------------------------------
+No constraint files found.
+---------------------------------------------------------------------------------
+Start Timing Optimization
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Timing Optimization : Time (s): cpu = 00:00:20 ; elapsed = 00:00:22 . Memory (MB): peak = 2130.312 ; gain = 1477.176
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Technology Mapping
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Technology Mapping : Time (s): cpu = 00:00:21 ; elapsed = 00:00:23 . Memory (MB): peak = 2130.312 ; gain = 1477.176
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Flattening Before IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Flattening Before IO Insertion
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Final Netlist Cleanup
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Final Netlist Cleanup
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished IO Insertion : Time (s): cpu = 00:00:25 ; elapsed = 00:00:27 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Instances
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Instances : Time (s): cpu = 00:00:25 ; elapsed = 00:00:27 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Rebuilding User Hierarchy
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Rebuilding User Hierarchy : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Ports
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Ports : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Handling Custom Attributes
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Handling Custom Attributes : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Renaming Generated Nets
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Finished Renaming Generated Nets : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start ROM, RAM, DSP, Shift Register and Retiming Reporting
+---------------------------------------------------------------------------------
+
+Static Shift Register Report:
++------------+------------------------------+--------+-------+--------------+--------------------+-------------------+--------+---------+
+|Module Name | RTL Name                     | Length | Width | Reset Signal | Pull out first Reg | Pull out last Reg | SRL16E | SRLC32E | 
++------------+------------------------------+--------+-------+--------------+--------------------+-------------------+--------+---------+
+|mac_array   | gen_lane[15].u_lane/clr3_reg | 4      | 2     | YES          | NO                 | YES               | 2      | 0       | 
++------------+------------------------------+--------+-------+--------------+--------------------+-------------------+--------+---------+
+
+---------------------------------------------------------------------------------
+Finished ROM, RAM, DSP, Shift Register and Retiming Reporting
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+Start Writing Synthesis Report
+---------------------------------------------------------------------------------
+
+DSP Final Report (the ' indicates corresponding REG is set)
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+|Module Name  | DSP Mapping | A Size | B Size | C Size | D Size | P Size | AREG | BREG | CREG | DREG | ADREG | MREG | PREG | 
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A'*B')'    | 11     | 11     | -      | -      | 22     | 1    | 1    | -    | -    | -     | 0    | 1    | 
+|fp_fixed_mac | (A*B'')'    | 22     | 18     | -      | -      | 37     | 0    | 2    | -    | -    | -     | 0    | 1    | 
++-------------+-------------+--------+--------+--------+--------+--------+------+------+------+------+-------+------+------+
+
+
+Report BlackBoxes: 
++-+--------------+----------+
+| |BlackBox name |Instances |
++-+--------------+----------+
++-+--------------+----------+
+
+Report Cell Usage: 
++------+----------------+------+
+|      |Cell            |Count |
++------+----------------+------+
+|1     |CARRY8          |   144|
+|2     |DSP_ALU         |    32|
+|3     |DSP_A_B_DATA    |    32|
+|4     |DSP_C_DATA      |    32|
+|5     |DSP_MULTIPLIER  |    32|
+|6     |DSP_M_DATA      |    32|
+|7     |DSP_OUTPUT      |    32|
+|8     |DSP_PREADD      |    32|
+|9     |DSP_PREADD_DATA |    32|
+|10    |LUT1            |     1|
+|11    |LUT2            |    35|
+|12    |LUT3            |  1457|
+|13    |LUT4            |   400|
+|14    |LUT5            |   880|
+|15    |LUT6            |  2080|
+|16    |SRL16E          |     2|
+|17    |FDRE            |  2663|
++------+----------------+------+
+
+Report Instance Areas: 
++------+------------------------+-------------------------------------------+------+
+|      |Instance                |Module                                     |Cells |
++------+------------------------+-------------------------------------------+------+
+|1     |top                     |                                           |  7918|
+|2     |  \gen_lane[0].u_lane   |fp_fixed_mac                               |   494|
+|3     |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__12  |     8|
+|4     |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__2    |     8|
+|5     |  \gen_lane[10].u_lane  |fp_fixed_mac_0                             |   494|
+|6     |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__14  |     8|
+|7     |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__1    |     8|
+|8     |  \gen_lane[11].u_lane  |fp_fixed_mac_1                             |   494|
+|9     |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__13  |     8|
+|10    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__13   |     8|
+|11    |  \gen_lane[12].u_lane  |fp_fixed_mac_2                             |   494|
+|12    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__3   |     8|
+|13    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__7    |     8|
+|14    |  \gen_lane[13].u_lane  |fp_fixed_mac_3                             |   494|
+|15    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__4   |     8|
+|16    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__4    |     8|
+|17    |  \gen_lane[14].u_lane  |fp_fixed_mac_4                             |   494|
+|18    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__2   |     8|
+|19    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__6    |     8|
+|20    |  \gen_lane[15].u_lane  |fp_fixed_mac_5                             |   505|
+|21    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__1   |     8|
+|22    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__5    |     8|
+|23    |  \gen_lane[1].u_lane   |fp_fixed_mac_6                             |   494|
+|24    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__9   |     8|
+|25    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__11   |     8|
+|26    |  \gen_lane[2].u_lane   |fp_fixed_mac_7                             |   494|
+|27    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__6   |     8|
+|28    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__12   |     8|
+|29    |  \gen_lane[3].u_lane   |fp_fixed_mac_8                             |   494|
+|30    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel      |     8|
+|31    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel       |     8|
+|32    |  \gen_lane[4].u_lane   |fp_fixed_mac_9                             |   494|
+|33    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__7   |     8|
+|34    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__15   |     8|
+|35    |  \gen_lane[5].u_lane   |fp_fixed_mac_10                            |   494|
+|36    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__5   |     8|
+|37    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__10   |     8|
+|38    |  \gen_lane[6].u_lane   |fp_fixed_mac_11                            |   494|
+|39    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__15  |     8|
+|40    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__8    |     8|
+|41    |  \gen_lane[7].u_lane   |fp_fixed_mac_12                            |   494|
+|42    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__11  |     8|
+|43    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__14   |     8|
+|44    |  \gen_lane[8].u_lane   |fp_fixed_mac_13                            |   494|
+|45    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__10  |     8|
+|46    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__9    |     8|
+|47    |  \gen_lane[9].u_lane   |fp_fixed_mac_14                            |   494|
+|48    |    p_sig1_reg          |\gen_lane[3].u_lane/p_sig1_reg_funnel__8   |     8|
+|49    |    prod2_reg           |\gen_lane[3].u_lane/prod2_reg_funnel__3    |     8|
++------+------------------------+-------------------------------------------+------+
+---------------------------------------------------------------------------------
+Finished Writing Synthesis Report : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+---------------------------------------------------------------------------------
+Synthesis finished with 0 errors, 0 critical warnings and 0 warnings.
+Synthesis Optimization Runtime : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+Synthesis Optimization Complete : Time (s): cpu = 00:00:26 ; elapsed = 00:00:28 . Memory (MB): peak = 2325.801 ; gain = 1672.664
+INFO: [Project 1-571] Translating synthesized netlist
+Netlist sorting complete. Time (s): cpu = 00:00:01 ; elapsed = 00:00:00.070 . Memory (MB): peak = 2343.332 ; gain = 0.000
+INFO: [Netlist 29-17] Analyzing 176 Unisim elements for replacement
+INFO: [Netlist 29-28] Unisim Transformation completed in 0 CPU seconds
+INFO: [Project 1-570] Preparing netlist for logic optimization
+INFO: [Opt 31-138] Pushed 0 inverter(s) to 0 load pin(s).
+Netlist sorting complete. Time (s): cpu = 00:00:00 ; elapsed = 00:00:00.002 . Memory (MB): peak = 2462.242 ; gain = 0.000
+INFO: [Project 1-111] Unisim Transformation Summary:
+  A total of 32 instances were transformed.
+  DSP48E2 => DSP48E2 (DSP_ALU, DSP_A_B_DATA, DSP_C_DATA, DSP_MULTIPLIER, DSP_M_DATA, DSP_OUTPUT, DSP_PREADD, DSP_PREADD_DATA): 32 instances
+
+Synth Design complete | Checksum: b8db7938
+INFO: [Common 17-83] Releasing license: Synthesis
+17 Infos, 0 Warnings, 0 Critical Warnings and 0 Errors encountered.
+synth_design completed successfully
+synth_design: Time (s): cpu = 00:00:29 ; elapsed = 00:00:33 . Memory (MB): peak = 2462.242 ; gain = 1815.066
+# create_clock -name clk -period $period [get_ports clk]
+create_clock: Time (s): cpu = 00:00:09 ; elapsed = 00:00:09 . Memory (MB): peak = 2462.242 ; gain = 0.000
+# set_false_path -from [all_inputs]
+# set_false_path -to   [all_outputs]
+# report_utilization      -file ${outpfx}_util.rpt
+# report_timing_summary   -max_paths 5 -file ${outpfx}_timing.rpt
+INFO: [Timing 38-35] Done setting XDC timing constraints.
+INFO: [Timing 38-91] UpdateTimingParams: Speed grade: -2LV, Temperature grade: C, Delay Type: min_max.
+INFO: [Timing 38-191] Multithreading enabled for timing update using a maximum of 2 CPUs
+WARNING: [Timing 38-242] The property HD.CLK_SRC of clock port "clk" is not set. In out-of-context mode, this prevents timing estimation for clock delay/skew
+Resolution: Set the HD.CLK_SRC property of the out-of-context port to the location of the clock buffer instance in the top-level design
+report_timing_summary: Time (s): cpu = 00:00:20 ; elapsed = 00:00:20 . Memory (MB): peak = 3647.105 ; gain = 1184.863
+# set luts   [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == LUT}]]
+# set carry8 [llength [get_cells -hier -quiet -filter {REF_NAME == CARRY8}]]
+# set dsps   [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == DSP || REF_NAME =~ DSP*}]]
+# set ffs    [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == REGISTER || PRIMITIVE_SUBGROUP == SDR || REF_NAME =~ FD*}]]
+# set wns "n/a"
+# set fmax "n/a"
+# set paths [get_timing_paths -quiet -max_paths 1 -nworst 1 -setup]
+# if {[llength $paths] > 0} {
+#     set wns [get_property SLACK [lindex $paths 0]]
+#     if {$wns != ""} {
+#         set achieved [expr {$period - $wns}]
+#         if {$achieved > 0} { set fmax [format "%.1f" [expr {1000.0 / $achieved}]] }
+#     }
+# }
+# puts "RESULT top=$top dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs wns_ns=$wns fmax_mhz=$fmax (period=${period}ns)"
+RESULT top=mac_array dsp=288 lut=0 carry8=144 ff=2663 wns_ns=0.893 fmax_mhz=409.8 (period=3.333ns)
+INFO: [Common 17-206] Exiting Vivado at Sun Jun 21 22:30:20 2026...

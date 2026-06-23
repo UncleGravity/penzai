@@ -4,7 +4,7 @@
 // Sigma_i (b_i ? +a_i : -a_i). Math is the same as the unpipelined reducer; the path is
 // explicitly pipelined for higher fclk.
 //
-// Latency:    10 cycles (4 stages + two serial fp32_mul_pipe at MUL_LAT=3)
+// Latency:    MATMUL_REDUCER_LATENCY (numeric/fmt.vh) = MATMUL_REDUCER_STAGES + 2*FP32_MUL_LATENCY.
 // Throughput: 1 sub-block / cycle
 
 `default_nettype none
@@ -22,6 +22,8 @@ module matmul_reducer (
     output wire         valid_out,
     output wire [31:0]  contribution
 );
+    `include "fmt.vh"
+
     function automatic signed [13:0] sext_act;
         input [7:0] a;
         sext_act = $signed({{6{a[7]}}, a});
@@ -149,19 +151,17 @@ module matmul_reducer (
     wire [31:0] sub_sum_f32;
     int_to_fp32 #(.WIDTH(14)) u_int (.in(sub_sum_s3), .out(sub_sum_f32));
 
-    // Delay the int->fp32 sub-sum by MUL_LAT (now 3) to meet combined_f32 at u_contrib.
-    reg [31:0] sub_sum_f32_s4;
-    reg [31:0] sub_sum_f32_s5;
-    reg [31:0] sub_sum_f32_s6;
+    // Delay the int->fp32 sub-sum by FP32_MUL_LATENCY to meet combined_f32 at u_contrib.
+    // Depth tracks the leaf latency in numeric/fmt.vh — no hand-counted pipe to ripple.
+    reg [31:0] sub_sum_f32_dly [0:FP32_MUL_LATENCY-1];
+    integer d;
     always @(posedge clk) begin
         if (!rst_n) begin
-            sub_sum_f32_s4 <= 32'd0;
-            sub_sum_f32_s5 <= 32'd0;
-            sub_sum_f32_s6 <= 32'd0;
+            for (d = 0; d < FP32_MUL_LATENCY; d = d + 1) sub_sum_f32_dly[d] <= 32'd0;
         end else begin
-            sub_sum_f32_s4 <= sub_sum_f32;
-            sub_sum_f32_s5 <= sub_sum_f32_s4;
-            sub_sum_f32_s6 <= sub_sum_f32_s5;
+            sub_sum_f32_dly[0] <= sub_sum_f32;
+            for (d = 1; d < FP32_MUL_LATENCY; d = d + 1)
+                sub_sum_f32_dly[d] <= sub_sum_f32_dly[d-1];
         end
     end
 
@@ -170,7 +170,7 @@ module matmul_reducer (
         .rst_n(rst_n),
         .valid_in(combined_valid),
         .a(combined_f32),
-        .b(sub_sum_f32_s6),
+        .b(sub_sum_f32_dly[FP32_MUL_LATENCY-1]),
         .valid_out(valid_out),
         .out(contribution)
     );

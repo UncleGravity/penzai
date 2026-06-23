@@ -1,0 +1,188 @@
+// fadd - MANT_W-parameterized truncating IEEE-style float addition.
+//
+// fp32 (MANT_W=23) and bf16 (MANT_W=7) are the SAME module, different param. The
+// exponent stays 8-bit (fp32 range) for both formats — plan-fpga-7.md: "bf16 keeps
+// fp32's full 8-bit exponent ... cuts the mantissa." Truncating (no rounding), same
+// semantics as the rtl/fp leaf it replaces.
+//
+// At MANT_W=23 this is bit-identical to fp32_add_pipe and preserves its pipeline depth
+// (the differential cosim, test-rtl-numeric, is the gate). Format on the wire:
+//   { sign[1], exp[8], mant[MANT_W] }   width = MANT_W + 9.
+
+`default_nettype none
+
+module fadd #(
+    parameter integer MANT_W = 23                 // FMT_FP32_MANT; 7 for bf16
+) (
+    input  wire                clk,
+    input  wire                rst_n,
+    input  wire                valid_in,
+    input  wire [MANT_W+8:0]   a,
+    input  wire [MANT_W+8:0]   b,
+    output reg                 valid_out,
+    output reg  [MANT_W+8:0]   out
+);
+    localparam integer OUT_W = MANT_W + 9;        // sign + 8 exp + mantissa
+    localparam integer SIG_W = MANT_W + 1;        // significand incl. hidden 1
+    localparam integer SUM_W = MANT_W + 2;        // sum incl. carry
+    localparam integer LPW   = $clog2(SUM_W);     // lead-pos / shift-amount width
+    localparam [7:0]        ALIGN_MAX = SIG_W[7:0]; // align past this -> 0
+    localparam [LPW-1:0]    MANT_W_LP = MANT_W[LPW-1:0];
+
+    // ---- decode ----
+    wire              sa = a[OUT_W-1];
+    wire [7:0]        ea = a[OUT_W-2 -: 8];
+    wire [MANT_W-1:0] ma = a[MANT_W-1:0];
+    wire              sb = b[OUT_W-1];
+    wire [7:0]        eb = b[OUT_W-2 -: 8];
+    wire [MANT_W-1:0] mb = b[MANT_W-1:0];
+    wire              a_ge_b = (ea >= eb);
+
+    // ---- stage 0: decode + select larger-exponent operand ----
+    reg              valid_s0;
+    reg [OUT_W-1:0]  a_s0, b_s0;
+    reg              a_zero_s0, b_zero_s0;
+    reg [7:0]        exp_big_s0, exp_diff_s0;
+    reg [SIG_W-1:0]  mant_big_s0, mant_small_s0;
+    reg              sign_big_s0, sign_small_s0;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s0 <= 1'b0; a_s0 <= 0; b_s0 <= 0; a_zero_s0 <= 1'b0; b_zero_s0 <= 1'b0;
+            exp_big_s0 <= 0; exp_diff_s0 <= 0; mant_big_s0 <= 0; mant_small_s0 <= 0;
+            sign_big_s0 <= 1'b0; sign_small_s0 <= 1'b0;
+        end else begin
+            valid_s0      <= valid_in;
+            a_s0          <= a;
+            b_s0          <= b;
+            a_zero_s0     <= (ea == 8'd0);
+            b_zero_s0     <= (eb == 8'd0);
+            exp_big_s0    <= a_ge_b ? ea : eb;
+            exp_diff_s0   <= a_ge_b ? (ea - eb) : (eb - ea);
+            mant_big_s0   <= a_ge_b ? {1'b1, ma} : {1'b1, mb};
+            mant_small_s0 <= a_ge_b ? {1'b1, mb} : {1'b1, ma};
+            sign_big_s0   <= a_ge_b ? sa : sb;
+            sign_small_s0 <= a_ge_b ? sb : sa;
+        end
+    end
+
+    // ---- stage 1: align the smaller mantissa ----
+    wire [SIG_W-1:0] mant_small_aligned_s0 = (exp_diff_s0 > ALIGN_MAX)
+        ? {SIG_W{1'b0}}
+        : (mant_small_s0 >> exp_diff_s0[LPW-1:0]);
+    reg              valid_s1;
+    reg [OUT_W-1:0]  a_s1, b_s1;
+    reg              a_zero_s1, b_zero_s1;
+    reg [7:0]        exp_big_s1;
+    reg [SIG_W-1:0]  mant_big_s1, mant_small_aligned_s1;
+    reg              sign_big_s1, sign_small_s1;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s1 <= 1'b0; a_s1 <= 0; b_s1 <= 0; a_zero_s1 <= 1'b0; b_zero_s1 <= 1'b0;
+            exp_big_s1 <= 0; mant_big_s1 <= 0; mant_small_aligned_s1 <= 0;
+            sign_big_s1 <= 1'b0; sign_small_s1 <= 1'b0;
+        end else begin
+            valid_s1              <= valid_s0;
+            a_s1                  <= a_s0;
+            b_s1                  <= b_s0;
+            a_zero_s1             <= a_zero_s0;
+            b_zero_s1             <= b_zero_s0;
+            exp_big_s1            <= exp_big_s0;
+            mant_big_s1           <= mant_big_s0;
+            mant_small_aligned_s1 <= mant_small_aligned_s0;
+            sign_big_s1           <= sign_big_s0;
+            sign_small_s1         <= sign_small_s0;
+        end
+    end
+
+    // ---- stage 2: resolve magnitude tie, add/subtract ----
+    wire             small_bigger_s1 = (mant_small_aligned_s1 > mant_big_s1);
+    wire [SIG_W-1:0] m1_s1 = small_bigger_s1 ? mant_small_aligned_s1 : mant_big_s1;
+    wire [SIG_W-1:0] m2_s1 = small_bigger_s1 ? mant_big_s1 : mant_small_aligned_s1;
+    wire             result_sign_s1 = small_bigger_s1 ? sign_small_s1 : sign_big_s1;
+    wire             same_sign_s1 = (sign_big_s1 == sign_small_s1);
+    wire [SUM_W-1:0] mant_sum_s1 = same_sign_s1
+        ? ({1'b0, m1_s1} + {1'b0, m2_s1})
+        : ({1'b0, m1_s1} - {1'b0, m2_s1});
+    reg              valid_s2;
+    reg [OUT_W-1:0]  a_s2, b_s2;
+    reg              a_zero_s2, b_zero_s2;
+    reg              result_sign_s2;
+    reg [7:0]        exp_big_s2;
+    reg [SUM_W-1:0]  mant_sum_s2;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s2 <= 1'b0; a_s2 <= 0; b_s2 <= 0; a_zero_s2 <= 1'b0; b_zero_s2 <= 1'b0;
+            result_sign_s2 <= 1'b0; exp_big_s2 <= 0; mant_sum_s2 <= 0;
+        end else begin
+            valid_s2       <= valid_s1;
+            a_s2           <= a_s1;
+            b_s2           <= b_s1;
+            a_zero_s2      <= a_zero_s1;
+            b_zero_s2      <= b_zero_s1;
+            result_sign_s2 <= result_sign_s1;
+            exp_big_s2     <= exp_big_s1;
+            mant_sum_s2    <= mant_sum_s1;
+        end
+    end
+
+    // ---- stage 3: priority-encode the leading 1 ----
+    reg [LPW-1:0] lead_pos_s2;
+    integer ii;
+    always @(*) begin
+        lead_pos_s2 = {LPW{1'b0}};
+        for (ii = 0; ii < SUM_W; ii = ii + 1)
+            if (mant_sum_s2[ii]) lead_pos_s2 = ii[LPW-1:0];
+    end
+    reg              valid_s3;
+    reg [OUT_W-1:0]  a_s3, b_s3;
+    reg              a_zero_s3, b_zero_s3;
+    reg              result_sign_s3;
+    reg [7:0]        exp_big_s3;
+    reg [SUM_W-1:0]  mant_sum_s3;
+    reg [LPW-1:0]    lead_pos_s3;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_s3 <= 1'b0; a_s3 <= 0; b_s3 <= 0; a_zero_s3 <= 1'b0; b_zero_s3 <= 1'b0;
+            result_sign_s3 <= 1'b0; exp_big_s3 <= 0; mant_sum_s3 <= 0; lead_pos_s3 <= 0;
+        end else begin
+            valid_s3       <= valid_s2;
+            a_s3           <= a_s2;
+            b_s3           <= b_s2;
+            a_zero_s3      <= a_zero_s2;
+            b_zero_s3      <= b_zero_s2;
+            result_sign_s3 <= result_sign_s2;
+            exp_big_s3     <= exp_big_s2;
+            mant_sum_s3    <= mant_sum_s2;
+            lead_pos_s3    <= lead_pos_s2;
+        end
+    end
+
+    // ---- stage 4: normalize + assemble ----
+    wire sum_zero_s3   = (mant_sum_s3 == {SUM_W{1'b0}});
+    wire shift_right_s3 = (lead_pos_s3 > MANT_W_LP);
+    wire [LPW-1:0] right_amount_s3 = shift_right_s3 ? (lead_pos_s3 - MANT_W_LP) : {LPW{1'b0}};
+    wire [LPW-1:0] left_amount_s3  = (lead_pos_s3 < MANT_W_LP) ? (MANT_W_LP - lead_pos_s3) : {LPW{1'b0}};
+    wire [SUM_W-1:0] mant_norm_s3 = shift_right_s3
+        ? (mant_sum_s3 >> right_amount_s3)
+        : (mant_sum_s3 << left_amount_s3);
+    wire signed [9:0] exp_signed_s3 = shift_right_s3
+        ? ($signed({2'b00, exp_big_s3}) + $signed({{(10-LPW){1'b0}}, right_amount_s3}))
+        : ($signed({2'b00, exp_big_s3}) - $signed({{(10-LPW){1'b0}}, left_amount_s3}));
+    wire underflow_s3 = sum_zero_s3 || (exp_signed_s3 <= 10'sd0);
+    wire overflow_s3  = (exp_signed_s3 >= 10'sd255);
+    wire [OUT_W-1:0] out_comb_s3 = a_zero_s3 ? b_s3
+        : b_zero_s3 ? a_s3
+        : underflow_s3 ? {result_sign_s3, {(OUT_W-1){1'b0}}}
+        : overflow_s3  ? {result_sign_s3, 8'hFE, {MANT_W{1'b1}}}
+                       : {result_sign_s3, exp_signed_s3[7:0], mant_norm_s3[MANT_W-1:0]};
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            valid_out <= 1'b0;
+            out       <= 0;
+        end else begin
+            valid_out <= valid_s3;
+            out       <= out_comb_s3;
+        end
+    end
+endmodule

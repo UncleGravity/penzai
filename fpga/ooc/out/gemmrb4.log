@@ -1,0 +1,4 @@
+== re-sync (banked gemm_rowblock: COLS_MAX bank + fma split) ==
+== OOC synth gemm_rb_ooc (COLS_MAX=8 accumulator bank + fma_mulshift) @ 3.333ns ==
+RESULT top=gemm_rb_ooc dsp=288 lut=0 carry8=608 ff=16205 wns_ns=0.826 fmax_mhz=398.9 (period=3.333ns)
+== gemm OOC4 (bank) DONE ==
