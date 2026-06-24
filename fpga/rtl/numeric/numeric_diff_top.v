@@ -49,7 +49,11 @@ module numeric_diff_top (
     output wire        recip_new_valid,
     output wire [31:0] recip_new_out,
     output wire        recip_old_valid,
-    output wire [31:0] recip_old_out
+    output wire [31:0] recip_old_out,
+
+    // cvt bf16 seams (new — no rtl/fp predecessor; the tb checks vs the exact bit-slice def)
+    output wire [15:0] cvt_bf16_narrow_out,  // cvt_f32_bf16(a)
+    output wire [31:0] cvt_bf16_widen_out    // cvt_bf16_f32(c16)
 );
     `include "fmt.vh"
 
@@ -104,4 +108,8 @@ module numeric_diff_top (
         .clk(clk), .rst_n(rst_n), .valid_in(valid_in),
         .l(rc_l), .valid_out(recip_old_valid), .y(recip_old_out)
     );
+
+    // bf16 narrow/widen — reuse the a (f32) and c16 (16-bit) stimulus.
+    cvt_f32_bf16 u_bf16_narrow (.in(a),   .out(cvt_bf16_narrow_out));
+    cvt_bf16_f32 u_bf16_widen  (.in(c16), .out(cvt_bf16_widen_out));
 endmodule

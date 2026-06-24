@@ -59,6 +59,7 @@ module flash_kernel #(
     input  wire        mask_tlast, input  wire [1:0]  mask_tkeep,
     output wire        o_tlast,    output wire [31:0] o_tkeep
 );
+    `include "fmt.vh"
     localparam integer MAXB  = HEAD_DIM_MAX / LANES;         // 16 max Q/K/V beats per head
     localparam integer LSH   = $clog2(LANES);                // 3
     localparam integer LMAXB = $clog2(MAXB);                 // 4 (beat occupies the low bits)
@@ -155,15 +156,15 @@ module flash_kernel #(
         end
     endgenerate
     wire tree_v;  wire [31:0] tree_sum;
-    fp_addtree u_tree (.clk(clk), .rst_n(rst_n), .valid_in(tree_fire),
+    reduce #(.MANT_W(FMT_FP32_MANT), .N(MAXB)) u_tree (.clk(clk), .rst_n(rst_n), .valid_in(tree_fire),
         .in(tree_in), .valid_out(tree_v), .sum(tree_sum));
 
     // ---- score = dot*scale + mask ----
     wire smul_v; wire [31:0] smul_out;
-    fp32_mul_pipe u_smul (.clk(clk), .rst_n(rst_n), .valid_in(smul_fire),
+    fmul #(.MANT_W(FMT_FP32_MANT)) u_smul (.clk(clk), .rst_n(rst_n), .valid_in(smul_fire),
         .a(dot_q), .b(scale), .valid_out(smul_v), .out(smul_out));
     wire sadd_v; wire [31:0] sadd_out;
-    fp32_add_pipe u_sadd (.clk(clk), .rst_n(rst_n), .valid_in(sadd_fire),
+    fadd #(.MANT_W(FMT_FP32_MANT)) u_sadd (.clk(clk), .rst_n(rst_n), .valid_in(sadd_fire),
         .a(score_q), .b(mask_f32_q), .valid_out(sadd_v), .out(sadd_out));
 
     // ---- online softmax step (per head) ----
@@ -174,7 +175,7 @@ module flash_kernel #(
 
     // ---- reciprocal of the denominator (per head, at finalize) ----
     wire rec_v; wire [31:0] rec_out;
-    fp_recip u_recip (.clk(clk), .rst_n(rst_n), .valid_in(rec_fire),
+    recip u_recip (.clk(clk), .rst_n(rst_n), .valid_in(rec_fire),
         .l(lpool[head_i[3:0]]), .valid_out(rec_v), .y(rec_out));
 
     // ---- shared 8-wide axpy: acc*corr + p·V (accumulate) OR acc*inv_l (emit) ----
@@ -227,7 +228,7 @@ module flash_kernel #(
     end
 
     wire [31:0] mask_f32_w;
-    fp16_to_fp32 u_maskw (.in(mask_tdata), .out(mask_f32_w));
+    cvt_f16_f32 u_maskw (.in(mask_tdata), .out(mask_f32_w));
 
     // ---- outputs ----
     assign o_tdata  = emit_buf;

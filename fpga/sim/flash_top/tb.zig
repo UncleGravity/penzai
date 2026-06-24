@@ -110,7 +110,7 @@ pub fn main() !void {
             }
             const p = ref.softmaxExp(8, score - m);
             l += p;
-            for (0..HDV) |d| acc[d] += p * f16val(v[(kv * NHKV + kvh) * HDV + d]);
+            for (0..HDV) |d| acc[d] += ref.bf16MulPV(p, f16val(v[(kv * NHKV + kvh) * HDV + d])); // bf16 p·V (matches fp_axpy8 u_m2)
         }
         const inv_l = ref.recip(8, l);
         for (0..HDV) |d| o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;

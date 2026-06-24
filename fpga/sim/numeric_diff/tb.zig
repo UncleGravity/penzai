@@ -77,6 +77,7 @@ pub fn main() !void {
 
     // ---- combinational cvt sweeps (exhaustive) ----
     var cvt_f16_mm: usize = 0;
+    var bf16_widen_mm: usize = 0; // cvt_bf16_f32(c16) must equal {c16, 16'd0}
     var f16v: u32 = 0;
     while (f16v <= 0xFFFF) : (f16v += 1) {
         c.dut_set_c16(dut.h, f16v);
@@ -86,6 +87,7 @@ pub fn main() !void {
             if (cvt_f16_mm <= 8)
                 std.debug.print("  cvt_f16 MISMATCH @0x{X:0>4}: new=0x{X:0>8} old=0x{X:0>8}\n", .{ f16v, c.dut_cvt_f16_new(dut.h), c.dut_cvt_f16_old(dut.h) });
         }
+        if (c.dut_cvt_bf16_widen(dut.h) != (f16v << 16)) bf16_widen_mm += 1;
     }
     var cvt_i2f_mm: usize = 0;
     var iv: u32 = 0;
@@ -112,6 +114,7 @@ pub fn main() !void {
     var exp_mm: usize = 0;
     var rec_chk: usize = 0;
     var rec_mm: usize = 0;
+    var bf16_narrow_mm: usize = 0; // cvt_f32_bf16(a) must equal a >> 16
     var first_valid_cyc: ?usize = null;
     var cyc: usize = 0;
 
@@ -132,6 +135,7 @@ pub fn main() !void {
         }
         dut.step();
         cyc += 1;
+        if (fed < N and c.dut_cvt_bf16_narrow(dut.h) != (as[fed] >> 16)) bf16_narrow_mm += 1;
 
         if (c.dut_fadd_new_valid(dut.h) != 0 and c.dut_fadd_old_valid(dut.h) != 0) {
             if (first_valid_cyc == null) first_valid_cyc = cyc;
@@ -165,16 +169,18 @@ pub fn main() !void {
             "    exp   vs fp_exp        : checked {d}, mismatches {d}\n" ++
             "    recip vs fp_recip      : checked {d}, mismatches {d}\n" ++
             "    cvt_f16_f32 vs fp16_to_fp32 : 65536 swept, mismatches {d}\n" ++
-            "    cvt_i2f     vs int_to_fp32  : 16384 swept, mismatches {d}\n",
-        .{ N, lat, add_chk, add_mm, mul_chk, mul_mm, red_chk, red_mm, exp_chk, exp_mm, rec_chk, rec_mm, cvt_f16_mm, cvt_i2f_mm },
+            "    cvt_i2f     vs int_to_fp32  : 16384 swept, mismatches {d}\n" ++
+            "    cvt_f32_bf16 (narrow) vs hi16 : {d} checked, mismatches {d}\n" ++
+            "    cvt_bf16_f32 (widen)  vs <<16 : 65536 swept, mismatches {d}\n",
+        .{ N, lat, add_chk, add_mm, mul_chk, mul_mm, red_chk, red_mm, exp_chk, exp_mm, rec_chk, rec_mm, cvt_f16_mm, cvt_i2f_mm, N, bf16_narrow_mm, bf16_widen_mm },
     );
     if (add_chk < N or mul_chk < N or red_chk < N or exp_chk < N or rec_chk < N) {
         std.debug.print("  FAIL: too few streamed outputs — pipe stalled?\n", .{});
         return error.MissingOutputs;
     }
-    if (add_mm + mul_mm + red_mm + exp_mm + rec_mm + cvt_f16_mm + cvt_i2f_mm != 0) {
-        std.debug.print("  FAIL: a numeric leaf diverges from its rtl/fp predecessor\n", .{});
+    if (add_mm + mul_mm + red_mm + exp_mm + rec_mm + cvt_f16_mm + cvt_i2f_mm + bf16_narrow_mm + bf16_widen_mm != 0) {
+        std.debug.print("  FAIL: a numeric leaf diverges from its predecessor / definition\n", .{});
         return error.ResultMismatch;
     }
-    std.debug.print("  all numeric diff cosim cases passed (fadd, fmul, reduce, exp, recip, cvt === rtl/fp)\n\n", .{});
+    std.debug.print("  all numeric diff cosim cases passed (fadd, fmul, reduce, exp, recip, cvt + bf16 cvt)\n\n", .{});
 }

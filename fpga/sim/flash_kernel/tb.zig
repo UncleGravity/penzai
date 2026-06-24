@@ -81,11 +81,13 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     }
 
     // ---- reference O (mirror flash_ref.attendHead with HW exp/recip) ----
-    var o_exp: [NTOK * NH * HDV]f32 = undefined;
+    var o_exp: [NTOK * NH * HDV]f32 = undefined; // bf16 p·V (matches the RTL datapath)
+    var o_fp32: [NTOK * NH * HDV]f32 = undefined; // fp32 p·V (the bf16-vs-fp32 baseline)
     for (0..NTOK) |t| {
         for (0..NH) |h| {
             const kvh = h / HEAD_RATIO;
-            var acc = [_]f32{0} ** HDV;
+            var acc = [_]f32{0} ** HDV; // bf16 p·V (mirrors the RTL)
+            var acc_fp32 = [_]f32{0} ** HDV; // fp32 p·V baseline — shares l/corr/inv_l
             var m: f32 = -std.math.inf(f32);
             var l: f32 = 0;
             for (0..NKV) |kv| {
@@ -99,14 +101,22 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
                     const corr = ref.softmaxExp(8, m - m_new);
                     l *= corr;
                     for (&acc) |*a| a.* *= corr;
+                    for (&acc_fp32) |*a| a.* *= corr;
                     m = m_new;
                 }
                 const p = ref.softmaxExp(8, score - m);
                 l += p;
-                for (0..HDV) |d| acc[d] += p * f16val(v[(kv * NHKV + kvh) * HDV + d]);
+                for (0..HDV) |d| {
+                    const vd = f16val(v[(kv * NHKV + kvh) * HDV + d]);
+                    acc[d] += ref.bf16MulPV(p, vd); // bf16 — matches fp_axpy8 u_m2
+                    acc_fp32[d] += p * vd; // fp32 reference
+                }
             }
             const inv_l = ref.recip(8, l);
-            for (0..HDV) |d| o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;
+            for (0..HDV) |d| {
+                o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;
+                o_fp32[(t * NH + h) * HDV + d] = acc_fp32[d] * inv_l;
+            }
         }
     }
 
@@ -204,6 +214,7 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     }
     var max_rel: f64 = 0;
     var worst: usize = 0;
+    var bf16_vs_fp32: f64 = 0;
     for (0..o_got.len) |i| {
         const e: f64 = o_exp[i];
         const g: f64 = o_got[i];
@@ -212,8 +223,10 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
             max_rel = r;
             worst = i;
         }
+        const dvg = @abs(@as(f64, o_exp[i]) - @as(f64, o_fp32[i])) / @max(@abs(@as(f64, o_fp32[i])), 1.0);
+        if (dvg > bf16_vs_fp32) bf16_vs_fp32 = dvg;
     }
-    std.debug.print("    cfg hdq{d} hdv{d} nh{d} nhkv{d} nkv{d} ntok{d} mask{d}: {d} cyc, O {d}, max_rel={e:.3}\n", .{ HDQ, HDV, NH, NHKV, NKV, NTOK, cfg.masked_kv, cyc, oc, max_rel });
+    std.debug.print("    cfg hdq{d} hdv{d} nh{d} nhkv{d} nkv{d} ntok{d} mask{d}: {d} cyc, O {d}, RTL-vs-ref max_rel={e:.3}, bf16-vs-fp32={e:.3}\n", .{ HDQ, HDV, NH, NHKV, NKV, NTOK, cfg.masked_kv, cyc, oc, max_rel, bf16_vs_fp32 });
     if (max_rel > 0.02) {
         std.debug.print("  FAIL: O exceeds tolerance (worst i={d} exp={d:.5} got={d:.5})\n", .{ worst, o_exp[worst], o_got[worst] });
         return error.ResultMismatch;

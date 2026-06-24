@@ -48,6 +48,8 @@ uint32_t dut_cvt_f16_new(Dut *d) { return d->t->cvt_f16_new_out; }
 uint32_t dut_cvt_f16_old(Dut *d) { return d->t->cvt_f16_old_out; }
 uint32_t dut_cvt_i2f_new(Dut *d) { return d->t->cvt_i2f_new_out; }
 uint32_t dut_cvt_i2f_old(Dut *d) { return d->t->cvt_i2f_old_out; }
+uint32_t dut_cvt_bf16_narrow(Dut *d) { return d->t->cvt_bf16_narrow_out; }
+uint32_t dut_cvt_bf16_widen(Dut *d) { return d->t->cvt_bf16_widen_out; }
 
 int dut_reduce_new_valid(Dut *d) { return d->t->reduce_new_valid; }
 uint32_t dut_reduce_new_out(Dut *d) { return d->t->reduce_new_out; }

@@ -1,6 +1,6 @@
 // cvt - numeric conversions (the file subsumes fp16_to_fp32 + int_to_fp32).
 //
-// Combinational, truncating. Two consumer-shaped conversions:
+// Combinational, truncating. Conversions (cvt_f16_f32, cvt_i2f, + the bf16 narrow/widen):
 //   cvt_f16_f32 : f16 -> fp32 widen (attention K/V/mask)         ≡ fp16_to_fp32
 //   cvt_i2f     : signed int(WIDTH) -> fp32 (interp t, etc.)     ≡ int_to_fp32
 // Both gated bit-identical to their rtl/fp predecessors (differential cosim,
@@ -52,4 +52,23 @@ module cvt_i2f #(
     wire             is_zero  = (mag == {MAG_W{1'b0}});
 
     assign out = is_zero ? 32'd0 : {sign, exponent, mantissa};
+endmodule
+
+// f32 -> bf16 narrow: bf16 is the top 16 bits of an f32 — { sign, exp[8], mant[22:16] }.
+// Truncating (drop the low 16 mantissa bits) to match the leaves' house style and keep
+// bit-exactness vs a truncating reference (no round-to-nearest-even).
+module cvt_f32_bf16 (
+    input  wire [31:0] in,
+    output wire [15:0] out
+);
+    assign out = in[31:16];
+endmodule
+
+// bf16 -> f32 widen: zero-extend the mantissa (bf16 occupies the high 16 bits of an f32).
+// Exact / lossless: { bf16, 16'd0 }.
+module cvt_bf16_f32 (
+    input  wire [15:0] in,
+    output wire [31:0] out
+);
+    assign out = {in, 16'd0};
 endmodule

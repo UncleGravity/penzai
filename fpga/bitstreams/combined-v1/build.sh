@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # build.sh - drive the Vivado COMBINED (matmul + flash) bitstream build on the VM.
 #
-# Syncs both RTL sets (matmul + flash + the shared fp/ leaves, deduped) + both generated
+# Syncs both RTL sets (matmul gemm + flash, both on the shared numeric/ leaves) + both generated
 # register headers + the flash LUTs + both generated address maps, runs Vivado, fetches
 # the .bit/.bit.bin to ./out. Run after `cp config.env.example config.env`.
 #
@@ -27,33 +27,36 @@ RTL_FLASH="../../rtl/flash_attn"
 RTL_FP="../../rtl/fp"
 RTL_NUMERIC="../../rtl/numeric"
 
-# Union of both RTL sets. The fp/ leaves are shared by matmul and flash — included once.
+# Union of both RTL sets — matmul (gemm) and flash now BOTH compose the numeric/ leaf
+# library; rtl/fp is fully retired from the build (no synthesizable consumer left). This
+# set is exactly decode_top's + flash_top's cosim deps (build.zig), so it's proven to elaborate.
 RTL_FILES=(
   # matmul = the plan-7 fixed-point gemm path (decode_top replaces matmul_top; the legacy
   # matmul_{top,kernel,rowblock,reducer}.v stay on disk for the cosims but are not built).
   "$RTL_ROOT/decode_top.v"
   "$RTL_ROOT/gemm_kernel.v"
   "$RTL_ROOT/gemm.v"
-  "$RTL_NUMERIC/fma.v"
   "$RTL_MATMUL/matmul_regs.vh"
-  # flash
+  # flash = the migrated kernel; fp_dot/fp_axpy8/flash_softmax are numeric compositions now
+  # (the old fp_addtree/fp_exp/fp_recip/fp_interp are dead — reduce/exp/recip replace them).
   "$RTL_FLASH/flash_top.v"
   "$RTL_FLASH/flash_kernel.v"
   "$RTL_FLASH/fp_dot.v"
-  "$RTL_FLASH/fp_addtree.v"
   "$RTL_FLASH/fp_axpy8.v"
   "$RTL_FLASH/flash_softmax.v"
-  "$RTL_FLASH/fp_exp.v"
-  "$RTL_FLASH/fp_recip.v"
-  "$RTL_FLASH/fp_interp.v"
   "$RTL_FLASH/flash_regs.vh"
   "$RTL_FLASH/flash_luts.vh"
-  # shared fp leaves (one copy)
-  "$RTL_FP/fp32_add_pipe.v"
-  "$RTL_FP/fp32_mul_pipe.v"
-  "$RTL_FP/fp16_to_fp32.v"
-  "$RTL_FP/int_to_fp32.v"
-  # numeric contract (format + latency single source; included by matmul reducer/rowblock)
+  # numeric/ leaf library: fma (matmul) + the float leaves shared by flash. cvt carries the
+  # f16/f32/bf16 conversions (incl. the bf16 p·V seam); reduce composes fadd; exp/recip
+  # compose interp; fmt.vh is the format+latency contract every leaf includes.
+  "$RTL_NUMERIC/fma.v"
+  "$RTL_NUMERIC/cvt.v"
+  "$RTL_NUMERIC/fmul.v"
+  "$RTL_NUMERIC/fadd.v"
+  "$RTL_NUMERIC/reduce.v"
+  "$RTL_NUMERIC/exp.v"
+  "$RTL_NUMERIC/interp.v"
+  "$RTL_NUMERIC/recip.v"
   "$RTL_NUMERIC/fmt.vh"
 )
 for f in "${RTL_FILES[@]}"; do

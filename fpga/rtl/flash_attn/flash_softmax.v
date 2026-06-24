@@ -30,10 +30,11 @@ module flash_softmax (
     output reg  [31:0] corr,
     output reg         grew
 );
-    localparam integer L_SUB = 4;  // fp32_add_pipe
-    localparam integer L_EXP = 17; // fp_exp (mul3 + 2 regs + interp11 + out1)
-    localparam integer L_MUL = 3;  // fp32_mul_pipe
-    localparam integer L_ADD = 4;  // fp32_add_pipe
+    `include "fmt.vh"
+    localparam integer L_SUB = 4;  // numeric/fadd
+    localparam integer L_EXP = 17; // numeric/exp (mul3 + fx1 + lut1 + interp11 + out1)
+    localparam integer L_MUL = 3;  // numeric/fmul
+    localparam integer L_ADD = 4;  // numeric/fadd
     localparam integer D1 = L_SUB + L_EXP;        // 21: input -> exp output
     localparam integer D2 = L_MUL + L_ADD;        // 7 : exp output -> valid_out
 
@@ -58,14 +59,14 @@ module flash_softmax (
     // ---- subtracts: d_corr = m_in - m_new ; d_p = score - m_new ----
     wire        dcv, dpv;
     wire [31:0] d_corr, d_p;
-    fp32_add_pipe u_dcorr (.clk(clk), .rst_n(rst_n), .valid_in(valid_in), .a(m_in),  .b(neg_m_new0), .valid_out(dcv), .out(d_corr));
-    fp32_add_pipe u_dp    (.clk(clk), .rst_n(rst_n), .valid_in(valid_in), .a(score), .b(neg_m_new0), .valid_out(dpv), .out(d_p));
+    fadd #(.MANT_W(FMT_FP32_MANT)) u_dcorr (.clk(clk), .rst_n(rst_n), .valid_in(valid_in), .a(m_in),  .b(neg_m_new0), .valid_out(dcv), .out(d_corr));
+    fadd #(.MANT_W(FMT_FP32_MANT)) u_dp    (.clk(clk), .rst_n(rst_n), .valid_in(valid_in), .a(score), .b(neg_m_new0), .valid_out(dpv), .out(d_p));
 
     // ---- exp ----
     wire        cv, pv;
     wire [31:0] corr_e, p_e;
-    fp_exp u_ec (.clk(clk), .rst_n(rst_n), .valid_in(dcv), .x(d_corr), .valid_out(cv), .y(corr_e));
-    fp_exp u_ep (.clk(clk), .rst_n(rst_n), .valid_in(dpv), .x(d_p),    .valid_out(pv), .y(p_e));
+    exp u_ec (.clk(clk), .rst_n(rst_n), .valid_in(dcv), .x(d_corr), .valid_out(cv), .y(corr_e));
+    exp u_ep (.clk(clk), .rst_n(rst_n), .valid_in(dpv), .x(d_p),    .valid_out(pv), .y(p_e));
 
     // ---- carry {m_new, grew, l_in} to the exp output (D1 = 21) ----
     reg [31:0] mnew_pre [0:D1-1];
@@ -88,7 +89,7 @@ module flash_softmax (
     // ---- l_out = l_in*corr + p ----
     wire        lmv, lav;
     wire [31:0] l_mul, l_sum;
-    fp32_mul_pipe u_lmul (.clk(clk), .rst_n(rst_n), .valid_in(cv),  .a(l_in_e), .b(corr_e), .valid_out(lmv), .out(l_mul));
+    fmul #(.MANT_W(FMT_FP32_MANT)) u_lmul (.clk(clk), .rst_n(rst_n), .valid_in(cv),  .a(l_in_e), .b(corr_e), .valid_out(lmv), .out(l_mul));
 
     // carry {m_new, grew, corr, p} from the exp output to valid_out (D2 = 7);
     // p is also tapped at L_MUL (delay 3) to meet l_mul at the adder.
@@ -109,7 +110,7 @@ module flash_softmax (
         end
     end
     wire [31:0] p_lmul = p_post[L_MUL-1]; // p delayed L_MUL, aligned with l_mul
-    fp32_add_pipe u_ladd (.clk(clk), .rst_n(rst_n), .valid_in(lmv), .a(l_mul), .b(p_lmul), .valid_out(lav), .out(l_sum));
+    fadd #(.MANT_W(FMT_FP32_MANT)) u_ladd (.clk(clk), .rst_n(rst_n), .valid_in(lmv), .a(l_mul), .b(p_lmul), .valid_out(lav), .out(l_sum));
 
     // ---- register outputs (all aligned at +25) ----
     always @(posedge clk) begin

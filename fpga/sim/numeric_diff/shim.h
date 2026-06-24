@@ -35,6 +35,8 @@ uint32_t dut_cvt_f16_new(Dut *d);
 uint32_t dut_cvt_f16_old(Dut *d);
 uint32_t dut_cvt_i2f_new(Dut *d);
 uint32_t dut_cvt_i2f_old(Dut *d);
+uint32_t dut_cvt_bf16_narrow(Dut *d);   // cvt_f32_bf16(a), 16-bit
+uint32_t dut_cvt_bf16_widen(Dut *d);    // cvt_bf16_f32(c16)
 
 int dut_reduce_new_valid(Dut *d);
 uint32_t dut_reduce_new_out(Dut *d);

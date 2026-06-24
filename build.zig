@@ -101,6 +101,11 @@ const flash_fp_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/fp_recip.v",
     "fpga/rtl/flash_attn/fp_dot.v",
     "fpga/rtl/flash_attn/fp_interp.v",
+    // fp_dot composes numeric leaves now (reduce→fadd); fp_exp/fp_recip/fp_interp stay old cells.
+    "fpga/rtl/numeric/cvt.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/fadd.v",
+    "fpga/rtl/numeric/reduce.v",
     "fpga/rtl/fp/fp32_add_pipe.v",
     "fpga/rtl/fp/fp32_mul_pipe.v",
     "fpga/rtl/fp/fp16_to_fp32.v",
@@ -109,26 +114,26 @@ const flash_fp_rtl = [_][]const u8{
 // The online-softmax transform on the exp leaf (+ its interp/fp deps).
 const flash_softmax_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_softmax.v",
-    "fpga/rtl/flash_attn/fp_exp.v",
-    "fpga/rtl/flash_attn/fp_interp.v",
-    "fpga/rtl/fp/fp32_add_pipe.v",
-    "fpga/rtl/fp/fp32_mul_pipe.v",
-    "fpga/rtl/fp/int_to_fp32.v",
+    "fpga/rtl/numeric/exp.v",
+    "fpga/rtl/numeric/interp.v",
+    "fpga/rtl/numeric/fadd.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/cvt.v",
 };
 // The full kernel composing fp_dot + flash_softmax + fp_recip.
 const flash_kernel_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_kernel.v",
     "fpga/rtl/flash_attn/fp_dot.v",
-    "fpga/rtl/flash_attn/fp_addtree.v",
     "fpga/rtl/flash_attn/fp_axpy8.v",
     "fpga/rtl/flash_attn/flash_softmax.v",
-    "fpga/rtl/flash_attn/fp_exp.v",
-    "fpga/rtl/flash_attn/fp_recip.v",
-    "fpga/rtl/flash_attn/fp_interp.v",
-    "fpga/rtl/fp/fp32_add_pipe.v",
-    "fpga/rtl/fp/fp32_mul_pipe.v",
-    "fpga/rtl/fp/fp16_to_fp32.v",
-    "fpga/rtl/fp/int_to_fp32.v",
+    // numeric/ leaf library — the flash kernel is fully migrated off rtl/fp + flash fp_*.
+    "fpga/rtl/numeric/exp.v",
+    "fpga/rtl/numeric/interp.v",
+    "fpga/rtl/numeric/fadd.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/cvt.v",
+    "fpga/rtl/numeric/reduce.v",
+    "fpga/rtl/numeric/recip.v",
 };
 // The AXI-Lite/DMA wrapper (includes the generated flash_regs.vh) + the kernel.
 const flash_top_rtl = [_][]const u8{
@@ -292,7 +297,7 @@ fn addCosim(
     switch (kind) {
         // matmul reducer/rowblock `include "fmt.vh" from numeric/ (the format+latency contract).
         .matmul => vcmd.addArgs(&.{ "+incdir+fpga/rtl/matmul", "+incdir+fpga/rtl/numeric" }),
-        .flash => vcmd.addArg("+incdir+fpga/rtl/flash_attn"),
+        .flash => vcmd.addArgs(&.{ "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
         // numeric exp/recip `include flash_luts.vh (still in flash_attn/ pre-swap).
         .numeric => vcmd.addArgs(&.{ "+incdir+fpga/rtl/numeric", "+incdir+fpga/rtl/flash_attn" }),
     }

@@ -109,6 +109,46 @@ pub fn recip(comptime B: u5, x: f32) f32 {
     return std.math.ldexp(recipMant(B, fe.significand), -fe.exponent);
 }
 
+// ============================ bf16 (the p·V seam) ============================
+//
+// plan-attention-migration §2: the P·V multiply goes bf16 (operands bf16, fp32
+// accumulate) — the only datapath precision change. P·V is a convex combination
+// (softmax weights sum to 1), so bf16 is benign. These helpers model numeric/fmul at
+// MANT_W=7 BIT-FAITHFULLY (truncating; exp==0 → zero), so a cosim using them is a tight
+// datapath gate, not a loose ε. acc·corr, the dot, m/l and softmax all stay fp32.
+
+/// Truncate an f32 to bf16 (round toward zero) — bf16 is the high 16 bits of an f32.
+pub fn toBf16(x: f32) u16 {
+    return @truncate(@as(u32, @bitCast(x)) >> 16);
+}
+/// Widen a bf16 bit pattern back to an f32 value (mantissa zero-extend).
+pub fn fromBf16(b: u16) f32 {
+    return @bitCast(@as(u32, b) << 16);
+}
+/// Truncating bf16 multiply, bit-faithful to numeric/fmul #(MANT_W=7): exp==0 operand →
+/// +0; else an 8×8 significand product, normalize, truncate to 7 mantissa bits;
+/// underflow → signed zero, overflow → saturate.
+fn bf16MulBits(ab: u16, bb: u16) u16 {
+    const sr: u16 = (ab ^ bb) & 0x8000;
+    const ea: u32 = (ab >> 7) & 0xFF;
+    const eb: u32 = (bb >> 7) & 0xFF;
+    if (ea == 0 or eb == 0) return 0; // is_zero → +0 (all zeros), as the RTL does
+    const siga: u32 = 0x80 | (ab & 0x7F);
+    const sigb: u32 = 0x80 | (bb & 0x7F);
+    const prod: u32 = siga * sigb; // ≤ 16 significant bits → exact
+    const renorm: u32 = (prod >> 15) & 1;
+    const mant: u32 = if (renorm == 1) (prod >> 8) & 0x7F else (prod >> 7) & 0x7F;
+    const exp_i: i32 = @as(i32, @intCast(ea)) + @as(i32, @intCast(eb)) - 127 + @as(i32, @intCast(renorm));
+    if (exp_i <= 0) return sr; // underflow → signed zero
+    if (exp_i >= 255) return sr | 0x7F7F; // overflow → saturate (exp 0xFE, mant 0x7F)
+    return sr | (@as(u16, @intCast(exp_i)) << 7) | @as(u16, @intCast(mant));
+}
+/// One p·V term exactly as the RTL computes it: operands → bf16, truncating bf16
+/// multiply, widened back to f32 for the fp32 accumulate (mirrors fp_axpy8 u_m2 + cvts).
+pub fn bf16MulPV(p: f32, v: f32) f32 {
+    return fromBf16(bf16MulBits(toBf16(p), toBf16(v)));
+}
+
 // ============================ attention schedule =============================
 //
 // Mirrors device/ps/flash_attn.zig (per-head online softmax over the real KV extent).
