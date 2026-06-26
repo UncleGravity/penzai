@@ -162,6 +162,26 @@ const numeric_diff_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/fp_recip.v",
 };
 
+// seq_core (the seq.v descriptor executor) — pure control logic, no software ref.
+const seq_rtl = [_][]const u8{
+    "fpga/rtl/seq/seq_core.v",
+};
+// seq_reg_master: the AXI-Lite master replay adapter (req/gnt -> AXI-Lite).
+const seq_reg_master_rtl = [_][]const u8{
+    "fpga/rtl/seq/seq_reg_master.v",
+};
+// seq_desc_reader: the AXI4 read-master descriptor-fetch adapter.
+const seq_desc_reader_rtl = [_][]const u8{
+    "fpga/rtl/seq/seq_desc_reader.v",
+};
+// seq_top: the BD-ready executor — control AXI-Lite slave + seq_core + both master adapters.
+const seq_top_rtl = [_][]const u8{
+    "fpga/rtl/seq/seq_top.v",
+    "fpga/rtl/seq/seq_core.v",
+    "fpga/rtl/seq/seq_reg_master.v",
+    "fpga/rtl/seq/seq_desc_reader.v",
+};
+
 // numeric/fma (fixed-point DSP-MAC) oracle cosim vs matmul_ref.windowedRow.
 const numeric_fma_rtl = [_][]const u8{
     "fpga/rtl/numeric/fma_top.v",
@@ -246,11 +266,15 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
+    addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core descriptor executor (write-replay/WAIT/END/timeout)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
+    addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
+    addCosim(b, target, optimize, "test-rtl-seq-desc-reader", "Verilator cosim: seq_desc_reader (req/gnt -> AXI4 read master)", "seq_desc_reader", "fpga/sim/seq_desc_reader", &seq_desc_reader_rtl, .seq);
+    addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + core + both masters)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
 // `numeric` is differential (new leaf vs the proven rtl/fp leaf) — no software ref.
-const CosimKind = enum { matmul, flash, numeric };
+const CosimKind = enum { matmul, flash, numeric, seq };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -300,6 +324,7 @@ fn addCosim(
         .flash => vcmd.addArgs(&.{ "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
         // numeric exp/recip `include flash_luts.vh (still in flash_attn/ pre-swap).
         .numeric => vcmd.addArgs(&.{ "+incdir+fpga/rtl/numeric", "+incdir+fpga/rtl/flash_attn" }),
+        .seq => {}, // seq_core has no includes
     }
     vcmd.addArgs(rtl);
 
@@ -310,7 +335,7 @@ fn addCosim(
         .link_libc = true,
     });
     switch (kind) {
-        .numeric => {}, // differential harness: new leaf vs old leaf, no software ref imports
+        .numeric, .seq => {}, // no software ref imports (seq_core is pure control logic)
         .matmul => attachCosimSupport(b, tb_mod, target, optimize),
         .flash => {
             tb_mod.addImport("flash_ref", b.createModule(.{
@@ -581,6 +606,9 @@ fn addTests(
     addDeviceTest(b, test_step, "device/ps/softmax.zig", target, optimize, build_options, shared);
     addSharedTest(b, test_step, "device/pl/gather.zig", target, optimize, shared);
     addSharedTest(b, test_step, "device/pl/flash_feed.zig", target, optimize, shared);
+    // device/pl/ unit tests (seq/dma/matmul). Aggregated under device/pl_tests.zig because
+    // matmul.zig @imports ../profile.zig and so can't be its own test root.
+    addDeviceTest(b, test_step, "device/pl_tests.zig", target, optimize, build_options, shared);
     addDeviceRuntimeTest(b, test_step, "device/main.zig", target, optimize, build_options, shared, runtime, server);
 
     addHostTest(b, test_step, "host/run.zig", target, optimize, build_options, shared, runtime, server, link, llama_config, c_mod, true);
@@ -599,6 +627,9 @@ fn addSharedTest(
         .root_source_file = b.path(path),
         .target = target,
         .optimize = optimize,
+        // Some device/pl units (dma.zig -> bus -> regwin) reference libc (open/mmap); harmless
+        // for the pure ones.
+        .link_libc = true,
     });
     mod.addImport("shared", shared);
     const test_exe = b.addTest(.{ .root_module = mod });

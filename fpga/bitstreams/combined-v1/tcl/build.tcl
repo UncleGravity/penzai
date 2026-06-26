@@ -245,6 +245,13 @@ connect_bd_intf_net [get_bd_intf_pins dwc_mask/M_AXIS]      [get_bd_intf_pins ke
 connect_bd_intf_net [get_bd_intf_pins kernel_fa/M_AXIS_O]   [get_bd_intf_pins dwc_o/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins dwc_o/M_AXIS]         [get_bd_intf_pins dma_o/S_AXIS_S2MM]
 
+# ====================== SEQ.V descriptor executor ===========================
+# seq_top batches the per-op PS->PL register dance: the PS writes a {WRITE|WAIT} descriptor list
+# to DRAM and kicks seq.v once; seq.v replays it into sc_ctrl (M_AXI_REG, a 2nd sc_ctrl master),
+# fetching the list over HPC0 (M_AXI_DESC, coherent — the PS's cached writes are visible w/o flush).
+# Its control slave (S_AXI) is a 13th sc_ctrl target the PS pokes once/run. (docs/plan-seq-impl.md)
+create_bd_cell -type module -reference seq_top seq_top
+
 # ---- Reset (SINGLE domain) --------------------------------------------------
 # One reset (rst, on fclk) for everything. (was: a second rst_fast on wclk for the matmul
 # weight feed — deleted with the CDC.)
@@ -273,6 +280,7 @@ foreach clkpin {
     dma_q/m_axi_mm2s_aclk dma_k/m_axi_mm2s_aclk dma_v/m_axi_mm2s_aclk dma_mask/m_axi_mm2s_aclk
     dma_o/m_axi_s2mm_aclk
     dwc_q/aclk dwc_mask/aclk dwc_o/aclk kernel_fa/s_axi_aclk
+    seq_top/clk
 } { connect_bd_net [get_bd_pins $fclk_pin] [get_bd_pins $clkpin] }
 
 # ---- Reset fan-out (SINGLE reset) -------------------------------------------
@@ -281,20 +289,26 @@ foreach rstpin {
     dwc_a/aresetn dwc_r/aresetn kernel_mm/s_axi_aresetn
     dma_q/axi_resetn dma_k/axi_resetn dma_v/axi_resetn dma_mask/axi_resetn dma_o/axi_resetn
     dwc_q/aresetn dwc_mask/aresetn dwc_o/aresetn kernel_fa/s_axi_aresetn
+    seq_top/rst_n
 } { connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $rstpin] }
 
 # ---- Control path: PS -> 10 DMAs + 2 kernels AXI-Lite (fclk) ----------------
+# TWO masters now: PS (S00) for setup/teardown + seq.v's replay master (S01). They never run
+# concurrently (PS programs -> go -> seq.v runs -> PS polls done), so SmartConnect arbitration is
+# free. 13 targets: the 10 DMAs + 2 kernels + seq_top's own control slave (MI 12).
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_ctrl
-set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {12}] [get_bd_cells sc_ctrl]
+set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {13}] [get_bd_cells sc_ctrl]
 connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins sc_ctrl/aclk]
 connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_ctrl/aresetn]
 connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins sc_ctrl/S00_AXI]
-# MI index -> AXI-Lite slave (order is the address-map's; matmul 0..5, flash 6..11).
+connect_bd_intf_net [get_bd_intf_pins seq_top/M_AXI_REG] [get_bd_intf_pins sc_ctrl/S01_AXI]
+# MI index -> AXI-Lite slave (order is the address-map's; matmul 0..5, flash 6..11, seq 12).
 foreach {idx target} {
     0 dma_w0/S_AXI_LITE   1 dma_w1/S_AXI_LITE   2 dma_w2/S_AXI_LITE   3 dma_w3/S_AXI_LITE
     4 dma_a/S_AXI_LITE    5 kernel_mm/S_AXI
     6 dma_q/S_AXI_LITE    7 dma_k/S_AXI_LITE    8 dma_v/S_AXI_LITE    9 dma_mask/S_AXI_LITE
     10 dma_o/S_AXI_LITE  11 kernel_fa/S_AXI
+    12 seq_top/S_AXI
 } { connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin $idx]] [get_bd_intf_pins $target] }
 
 # ---- Memory paths: each DMA mem master -> its PS HP/HPC port (all fclk) ------
@@ -303,7 +317,7 @@ make_mem_sc sc_hp0  {dma_w0/M_AXI_MM2S dma_w0/M_AXI_S2MM dma_a/M_AXI_MM2S}    S_
 make_mem_sc sc_hp1  {dma_w1/M_AXI_MM2S}                                       S_AXI_HP1_FPD
 make_mem_sc sc_hp2  {dma_w2/M_AXI_MM2S}                                       S_AXI_HP2_FPD
 make_mem_sc sc_hp3  {dma_w3/M_AXI_MM2S}                                       S_AXI_HP3_FPD
-make_mem_sc sc_hpc0 {dma_q/M_AXI_MM2S dma_o/M_AXI_S2MM dma_mask/M_AXI_MM2S}   S_AXI_HPC0_FPD
+make_mem_sc sc_hpc0 {dma_q/M_AXI_MM2S dma_o/M_AXI_S2MM dma_mask/M_AXI_MM2S seq_top/M_AXI_DESC} S_AXI_HPC0_FPD
 make_mem_sc sc_hpc1 {dma_k/M_AXI_MM2S dma_v/M_AXI_MM2S}                       S_AXI_HPC1_FPD
 
 # ---- Address map (generated; single source: fpga/regmap/{matmul,flash_attn}.zig) ----
@@ -319,7 +333,14 @@ foreach {addr_list kcell} [list $matmul_address_map kernel_mm $flash_address_map
             [first_addr_seg [list "$cell/$intf/Reg" "$cell/$intf/*"]]
     }
 }
-# Route the DMA mem masters to PS DDR through their HP/HPC ports.
+# seq_top control slave: a fixed base the host SeqCtrl matches (device/pl/seq.zig seq.base). Above
+# the matmul (0xA00x) / flash (0xA01x) windows. seq_top's M_AXI_REG (a 2nd sc_ctrl master) reaches
+# the DMAs/kernels at their assigned addresses; M_AXI_DESC reaches PS DDR via HPC0 — both handled by
+# the bare assign_bd_address below (it maps every still-unassigned master).
+assign_bd_address -offset 0xA0200000 -range 64K \
+    [first_addr_seg [list "seq_top/S_AXI/Reg" "seq_top/S_AXI/*"]]
+
+# Route the DMA mem masters (and seq_top's M_AXI_REG -> sc_ctrl, M_AXI_DESC -> DDR) to their targets.
 assign_bd_address
 
 validate_bd_design

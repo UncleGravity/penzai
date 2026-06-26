@@ -13,6 +13,8 @@ const std = @import("std");
 const shared = @import("shared");
 const flash_regmap = @import("flash_regmap");
 const regwin = @import("regwin.zig");
+const bus_mod = @import("bus.zig");
+const seq = @import("seq.zig");
 const dma_mod = @import("dma.zig");
 const feed = @import("flash_feed.zig");
 
@@ -53,42 +55,51 @@ pub const FlashCounters = struct {
 
 /// The flash kernel AXI-Lite driver — this op's tenant on the substrate.
 pub const Kernel = struct {
-    win: regwin.RegWindow,
+    bus: bus_mod.Bus,
     version: u32,
     clk_hz: u32,
 
     pub fn open(base: i64) KernelError!Kernel {
-        var win = try regwin.RegWindow.mapWindow(base);
-        errdefer win.deinit();
-        if (win.rd(flash_regmap.offsetOf("ID")) != expected_id) return error.BadId;
-        const version = win.rd(flash_regmap.offsetOf("VERSION"));
+        var b = try bus_mod.Bus.mmio(@intCast(base));
+        errdefer b.deinit();
+        if (b.rd(flash_regmap.offsetOf("ID")) != expected_id) return error.BadId;
+        const version = b.rd(flash_regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
-        if (win.rd(flash_regmap.offsetOf("LANES")) != expected_lanes) return error.BadLanes;
-        const clk_hz = win.rd(flash_regmap.offsetOf("CLK_HZ"));
+        if (b.rd(flash_regmap.offsetOf("LANES")) != expected_lanes) return error.BadLanes;
+        const clk_hz = b.rd(flash_regmap.offsetOf("CLK_HZ"));
         if (clk_hz == 0) return error.BadClock;
-        return .{ .win = win, .version = version, .clk_hz = clk_hz };
+        return .{ .bus = b, .version = version, .clk_hz = clk_hz };
+    }
+
+    /// Record-backed: `run`/`waitDone` append seq.v descriptor entries instead of poking MMIO.
+    pub fn openRecord(base: u32, rec: *seq.Recorder) Kernel {
+        return .{ .bus = bus_mod.Bus.record(base, rec), .version = 0, .clk_hz = 0 };
     }
 
     pub fn deinit(self: *Kernel) void {
-        self.win.deinit();
+        self.bus.deinit();
     }
 
     pub fn run(self: *Kernel, hdq: u32, hdv: u32, nh: u32, nhkv: u32, ratio: u32, nkv: u32, ntok: u32, scale_bits: u32) void {
-        self.win.wr(flash_regmap.offsetOf("HEAD_DIM_Q"), hdq);
-        self.win.wr(flash_regmap.offsetOf("HEAD_DIM_V"), hdv);
-        self.win.wr(flash_regmap.offsetOf("N_HEADS"), nh);
-        self.win.wr(flash_regmap.offsetOf("N_HEAD_KV"), nhkv);
-        self.win.wr(flash_regmap.offsetOf("HEAD_RATIO"), ratio);
-        self.win.wr(flash_regmap.offsetOf("N_KV"), nkv);
-        self.win.wr(flash_regmap.offsetOf("N_TOKENS"), ntok);
-        self.win.wr(flash_regmap.offsetOf("SCALE"), scale_bits);
-        self.win.wr(flash_regmap.offsetOf("CTRL"), CTRL_START);
+        self.bus.wr(flash_regmap.offsetOf("HEAD_DIM_Q"), hdq);
+        self.bus.wr(flash_regmap.offsetOf("HEAD_DIM_V"), hdv);
+        self.bus.wr(flash_regmap.offsetOf("N_HEADS"), nh);
+        self.bus.wr(flash_regmap.offsetOf("N_HEAD_KV"), nhkv);
+        self.bus.wr(flash_regmap.offsetOf("HEAD_RATIO"), ratio);
+        self.bus.wr(flash_regmap.offsetOf("N_KV"), nkv);
+        self.bus.wr(flash_regmap.offsetOf("N_TOKENS"), ntok);
+        self.bus.wr(flash_regmap.offsetOf("SCALE"), scale_bits);
+        self.bus.wr(flash_regmap.offsetOf("CTRL"), CTRL_START);
     }
 
     pub fn waitDone(self: *Kernel) KernelError!void {
+        if (self.bus.isRecording()) {
+            self.bus.recordWait(flash_regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE);
+            return;
+        }
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
-            if (self.win.rd(flash_regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
+            if (self.bus.rd(flash_regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
         }
         return error.KernelTimeout;
     }
@@ -100,14 +111,14 @@ pub const Kernel = struct {
 
     fn readCounters(self: *Kernel) FlashCounters {
         return .{
-            .cycles = self.win.rd(flash_regmap.offsetOf("CYCLES")),
-            .q_beats = self.win.rd(flash_regmap.offsetOf("Q_BEATS")),
-            .k_beats = self.win.rd(flash_regmap.offsetOf("K_BEATS")),
-            .k_stall = self.win.rd(flash_regmap.offsetOf("K_STALL")),
-            .v_beats = self.win.rd(flash_regmap.offsetOf("V_BEATS")),
-            .v_stall = self.win.rd(flash_regmap.offsetOf("V_STALL")),
-            .o_beats = self.win.rd(flash_regmap.offsetOf("O_BEATS")),
-            .o_stall = self.win.rd(flash_regmap.offsetOf("O_STALL")),
+            .cycles = self.bus.rd(flash_regmap.offsetOf("CYCLES")),
+            .q_beats = self.bus.rd(flash_regmap.offsetOf("Q_BEATS")),
+            .k_beats = self.bus.rd(flash_regmap.offsetOf("K_BEATS")),
+            .k_stall = self.bus.rd(flash_regmap.offsetOf("K_STALL")),
+            .v_beats = self.bus.rd(flash_regmap.offsetOf("V_BEATS")),
+            .v_stall = self.bus.rd(flash_regmap.offsetOf("V_STALL")),
+            .o_beats = self.bus.rd(flash_regmap.offsetOf("O_BEATS")),
+            .o_stall = self.bus.rd(flash_regmap.offsetOf("O_STALL")),
         };
     }
 };

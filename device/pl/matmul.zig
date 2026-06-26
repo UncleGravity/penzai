@@ -14,6 +14,9 @@ const std = @import("std");
 const shared = @import("shared");
 const regmap = @import("regmap");
 const regwin = @import("regwin.zig");
+const bus_mod = @import("bus.zig");
+const seq = @import("seq.zig");
+const seq_ctrl_mod = @import("seq_ctrl.zig");
 const dma_mod = @import("dma.zig");
 const gather = @import("gather.zig");
 const profile = @import("../profile.zig");
@@ -40,6 +43,10 @@ const result_staging_cap: usize = regmap.caps.result_staging_bytes; // num_rb * 
 // groups of this many.
 const mc_cols_max: usize = regmap.caps.cols_max;
 const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gather.zig
+
+// seq.v descriptor buffer: generous headroom over one op (~47 entries × 16B ≈ 0.7 KB) so a future
+// batched run (Q/K/V etc.) fits too. Read by seq.v over the coherent HPC0 port (no flush).
+const seq_desc_cap: usize = 64 * 1024;
 
 // Errors this op can raise: the DMA substrate's, this kernel's, plus heap failures.
 const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock };
@@ -73,26 +80,33 @@ comptime {
 }
 
 pub const Kernel = struct {
-    win: regwin.RegWindow,
+    bus: bus_mod.Bus,
     version: u32,
     clk_hz: u32,
 
     pub fn open(base: i64) KernelError!Kernel {
-        var win = try regwin.RegWindow.mapWindow(base);
-        errdefer win.deinit();
-        const id = win.rd(regmap.offsetOf("ID"));
+        var b = try bus_mod.Bus.mmio(@intCast(base));
+        errdefer b.deinit();
+        const id = b.rd(regmap.offsetOf("ID"));
         if (id != expected_id) return error.BadId;
-        const version = win.rd(regmap.offsetOf("VERSION"));
+        const version = b.rd(regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
-        if (win.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
-        if (win.rd(regmap.offsetOf("WEIGHT_PORTS")) != expected_weight_ports) return error.BadWeightPorts;
-        const clk_hz = win.rd(regmap.offsetOf("CLK_HZ"));
+        if (b.rd(regmap.offsetOf("ROWS")) != expected_rows) return error.BadRows;
+        if (b.rd(regmap.offsetOf("WEIGHT_PORTS")) != expected_weight_ports) return error.BadWeightPorts;
+        const clk_hz = b.rd(regmap.offsetOf("CLK_HZ"));
         if (clk_hz == 0) return error.BadClock;
-        return .{ .win = win, .version = version, .clk_hz = clk_hz };
+        return .{ .bus = b, .version = version, .clk_hz = clk_hz };
+    }
+
+    /// Record-backed: `run`/`waitDone` append descriptor entries instead of poking MMIO. The
+    /// init/counter reads aren't used in record mode (the MMIO kernel already validated the
+    /// bitstream at startup), so version/clk_hz are unset.
+    pub fn openRecord(base: u32, rec: *seq.Recorder) Kernel {
+        return .{ .bus = bus_mod.Bus.record(base, rec), .version = 0, .clk_hz = 0 };
     }
 
     pub fn deinit(self: *Kernel) void {
-        self.win.deinit();
+        self.bus.deinit();
     }
 
     pub fn hasCounters(self: Kernel) bool {
@@ -106,43 +120,112 @@ pub const Kernel = struct {
 
     /// Set dims then strobe start. done_latched clears on the strobe.
     pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32) void {
-        self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
-        self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
-        self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
-        self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
+        self.bus.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
+        self.bus.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
+        self.bus.wr(regmap.offsetOf("NUM_COLS"), num_cols);
+        self.bus.wr(regmap.offsetOf("CTRL"), CTRL_START);
     }
 
     pub fn waitDone(self: *Kernel) KernelError!void {
+        if (self.bus.isRecording()) {
+            self.bus.recordWait(regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE);
+            return;
+        }
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
-            if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
+            if (self.bus.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
         }
         return error.KernelTimeout;
     }
 
     pub fn cycles(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("CYCLES"));
+        return self.bus.rd(regmap.offsetOf("CYCLES"));
     }
 
     pub fn wStall(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("W_STALL"));
+        return self.bus.rd(regmap.offsetOf("W_STALL"));
     }
     pub fn aStall(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("A_STALL"));
+        return self.bus.rd(regmap.offsetOf("A_STALL"));
     }
     pub fn rStall(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("R_STALL"));
+        return self.bus.rd(regmap.offsetOf("R_STALL"));
     }
     pub fn wBeats(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("W_BEATS"));
+        return self.bus.rd(regmap.offsetOf("W_BEATS"));
     }
     pub fn aBeats(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("A_BEATS"));
+        return self.bus.rd(regmap.offsetOf("A_BEATS"));
     }
     pub fn rBeats(self: Kernel) u32 {
-        return self.win.rd(regmap.offsetOf("R_BEATS"));
+        return self.bus.rd(regmap.offsetOf("R_BEATS"));
     }
 };
+
+/// The per-column-group register dance: reset the movers, arm the S2MM result, start the four
+/// weight reads + the acts read, strobe the kernel. ONE source of truth — tryMatmul runs it on
+/// MMIO dmas/kernel (silicon), the seq.v builder runs the same on record-mode dmas/kernel to emit
+/// the descriptor. Split from programWaits so tryMatmul can time setup vs wait separately.
+fn programSetup(
+    dma_w: []dma_mod.Dma,
+    dma_a: *dma_mod.Dma,
+    kernel: *Kernel,
+    weight_phys: []const u64,
+    weight_port_bytes: usize,
+    acts_phys: u64,
+    act_total: usize,
+    result_phys: u64,
+    result_bytes: usize,
+    num_q1_blocks: u32,
+    num_rowblocks: u32,
+    num_cols: u32,
+) Error!void {
+    try dma_w[0].reset();
+    for (dma_w[1..]) |*dma| try dma.resetMm2s();
+    try dma_a.resetMm2s();
+    try dma_w[0].startWriteToDdr(result_phys, result_bytes);
+    for (dma_w, 0..) |*dma, port| try dma.startReadFromDdr(weight_phys[port], weight_port_bytes);
+    try dma_a.startReadFromDdr(acts_phys, act_total);
+    kernel.run(num_q1_blocks, num_rowblocks, num_cols);
+}
+
+/// Wait the kernel done + every mover idle (or, on a record bus, emit the matching WAIT entries).
+fn programWaits(dma_w: []dma_mod.Dma, dma_a: *dma_mod.Dma, kernel: *Kernel) Error!void {
+    try kernel.waitDone();
+    for (dma_w) |*dma| try dma.waitReadDone();
+    try dma_a.waitReadDone();
+    try dma_w[0].waitWriteDone();
+}
+
+/// One matmul column-group's addresses + shape — the variable inputs to programSetup.
+pub const RunOp = struct {
+    weight_phys: [layout.weight_ports]u64,
+    weight_port_bytes: usize,
+    acts_phys: u64,
+    act_total: usize,
+    result_phys: u64,
+    result_bytes: usize,
+    num_q1_blocks: u32,
+    num_rowblocks: u32,
+    num_cols: u32,
+};
+
+/// Build a seq.v descriptor for a RUN of consecutive matmul ops (the run-builder, increment 3.3).
+/// The ops must be independent — no PS op between them, e.g. the Q/K/V projections off one normed
+/// input (quant once, results to distinct ranges). Records each op's programSetup/programWaits into
+/// `rec` (so the stream is bit-identical to what tryMatmul pokes per op), then an END marker. seq.v
+/// replays the whole run with no PS in the inner loop.
+pub fn recordRun(rec: *seq.Recorder, ops: []const RunOp) Error!void {
+    var dma_w: [layout.weight_ports]dma_mod.Dma = undefined;
+    for (&dma_w, dma_w_bases[0..]) |*d, base| d.* = dma_mod.Dma.openRecord(@intCast(base), rec);
+    var dma_a = dma_mod.Dma.openRecord(@intCast(dma_a_base), rec);
+    var kernel = Kernel.openRecord(@intCast(kernel_base), rec);
+    for (ops) |op| {
+        try programSetup(dma_w[0..], &dma_a, &kernel, op.weight_phys[0..], op.weight_port_bytes, op.acts_phys, op.act_total, op.result_phys, op.result_bytes, op.num_q1_blocks, op.num_rowblocks, op.num_cols);
+        try programWaits(dma_w[0..], &dma_a, &kernel);
+    }
+    rec.end();
+}
 
 /// Temporary per-segment timing accumulator for localizing per-call overhead.
 const Seg = struct {
@@ -176,6 +259,13 @@ pub fn Backend(comptime Heap: type) type {
         dma_a: dma_mod.Dma,
         acts_staging: wire.TensorRange,
         result_staging: wire.TensorRange,
+        // seq.v dispatch (opt-in via PENZAI_SEQ; the bitstream must carry seq_top). The per-op
+        // register dance is recorded into desc_bo and replayed by seq.v in fabric instead of by the
+        // PS over MMIO. desc_bo/seq_ctrl/desc_phys are valid only when seq_enabled.
+        seq_enabled: bool = false,
+        seq_ctrl: seq_ctrl_mod.SeqCtrl = undefined,
+        desc_bo: wire.TensorRange = undefined,
+        desc_phys: u64 = 0,
         // Reusable per-call scratch, grown on demand (steady state: no realloc).
         column: []f32 = &.{},
         quants: []i8 = &.{},
@@ -205,6 +295,19 @@ pub fn Backend(comptime Heap: type) type {
             const acts_staging = heap.allocate(acts_staging_cap, 4096) catch return error.HeapFailure;
             const result_staging = heap.allocate(result_staging_cap, 4096) catch return error.HeapFailure;
 
+            // Opt-in seq.v dispatch: PENZAI_SEQ set + a bitstream carrying seq_top (else MMIO).
+            var self_seq_enabled = false;
+            var self_seq_ctrl: seq_ctrl_mod.SeqCtrl = undefined;
+            var self_desc_bo: wire.TensorRange = undefined;
+            var self_desc_phys: u64 = 0;
+            if (std.c.getenv("PENZAI_SEQ") != null) {
+                self_seq_ctrl = try seq_ctrl_mod.SeqCtrl.open(seq.ctrl.base);
+                self_desc_bo = heap.allocate(seq_desc_cap, 4096) catch return error.HeapFailure;
+                self_desc_phys = heap.deviceAddress(self_desc_bo) catch return error.HeapFailure;
+                self_seq_enabled = true;
+                std.debug.print("pl: seq.v dispatch ENABLED (desc @ 0x{x})\n", .{self_desc_phys});
+            }
+
             return .{
                 .allocator = allocator,
                 .kernel = kernel,
@@ -212,6 +315,10 @@ pub fn Backend(comptime Heap: type) type {
                 .dma_a = dma_a,
                 .acts_staging = acts_staging,
                 .result_staging = result_staging,
+                .seq_enabled = self_seq_enabled,
+                .seq_ctrl = self_seq_ctrl,
+                .desc_bo = self_desc_bo,
+                .desc_phys = self_desc_phys,
             };
         }
 
@@ -219,6 +326,7 @@ pub fn Backend(comptime Heap: type) type {
             self.allocator.free(self.column);
             self.allocator.free(self.quants);
             self.allocator.free(self.act_scales);
+            if (self.seq_enabled) self.seq_ctrl.deinit();
             self.dma_a.deinit();
             for (&self.dma_w) |*dma| dma.deinit();
             self.kernel.deinit();
@@ -296,23 +404,41 @@ pub fn Backend(comptime Heap: type) type {
                 const acts_phys = heap.deviceAddress(acts_dma) catch return error.HeapFailure;
                 const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
 
-                // 2. Program DMAs (arm result first), run the kernel, wait. Weights
-                // stream from their resident range once for the whole group.
-                try self.dma_w[0].reset();
-                for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
-                try self.dma_a.resetMm2s();
-                try self.dma_w[0].startWriteToDdr(result_phys, result_bytes);
-                for (&self.dma_w, 0..) |*dma, port| {
-                    try dma.startReadFromDdr(weight_phys[port], weight_port_bytes);
+                // 2. Program DMAs (arm result first), run the kernel, wait. Weights stream from
+                // their resident range once for the whole group. The register sequence lives in
+                // programSetup/programWaits — ONE source of truth, so the seq.v descriptor builder
+                // (record-mode dmas/kernel) emits exactly this stream (docs/plan-seq-impl.md).
+                if (self.seq_enabled) {
+                    // Record this op's register dance into the descriptor BO and let seq.v replay it
+                    // (1 op/run for now; batching Q/K/V into one run is the next step). seq.v reads
+                    // the descriptor over coherent HPC0 — no flush.
+                    const desc_bytes: []align(@alignOf(seq.Entry)) u8 =
+                        @alignCast(heap.bytes(self.desc_bo) catch return error.HeapFailure);
+                    var rec = seq.Recorder.init(std.mem.bytesAsSlice(seq.Entry, desc_bytes));
+                    try recordRun(&rec, &.{.{
+                        .weight_phys = weight_phys,
+                        .weight_port_bytes = weight_port_bytes,
+                        .acts_phys = acts_phys,
+                        .act_total = act_total,
+                        .result_phys = result_phys,
+                        .result_bytes = result_bytes,
+                        .num_q1_blocks = @intCast(q1_blocks),
+                        .num_rowblocks = @intCast(num_rb),
+                        .num_cols = @intCast(group),
+                    }});
+                    self.seq_ctrl.run(self.desc_phys, rec.count());
+                    seg.setup_ns += lapNs(io, &last);
+                    self.seq_ctrl.waitDone() catch |e| {
+                        std.debug.print("pl: seq.v run failed ({s}) errIndex={d}\n", .{ @errorName(e), self.seq_ctrl.errIndex() });
+                        return error.KernelTimeout;
+                    };
+                    seg.wait_ns += lapNs(io, &last);
+                } else {
+                    try programSetup(self.dma_w[0..], &self.dma_a, &self.kernel, weight_phys[0..], weight_port_bytes, acts_phys, act_total, result_phys, result_bytes, @intCast(q1_blocks), @intCast(num_rb), @intCast(group));
+                    seg.setup_ns += lapNs(io, &last);
+                    try programWaits(self.dma_w[0..], &self.dma_a, &self.kernel);
+                    seg.wait_ns += lapNs(io, &last);
                 }
-                try self.dma_a.startReadFromDdr(acts_phys, act_total);
-                self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group));
-                seg.setup_ns += lapNs(io, &last);
-                try self.kernel.waitDone();
-                for (&self.dma_w) |*dma| try dma.waitReadDone();
-                try self.dma_a.waitReadDone();
-                try self.dma_w[0].waitWriteDone();
-                seg.wait_ns += lapNs(io, &last);
 
                 accumulateCounters(&counters, self.readCounters());
 
@@ -448,4 +574,81 @@ test "packActs fills the expected stream length" {
     // Last scale beat carries the final sub-block's fp16 scale in its low 16 bits.
     const last = std.mem.readInt(u64, out[out.len - 8 ..][0..8], .little);
     try std.testing.expectEqual(@as(u16, @bitCast(scales[scales.len - 1])), @as(u16, @truncate(last)));
+}
+
+test "kernel record: run + waitDone emit the config writes + done poll" {
+    var buf: [8]seq.Entry = undefined;
+    var rec = seq.Recorder.init(&buf);
+    const B: u32 = @intCast(kernel_base);
+    var k = Kernel.openRecord(B, &rec);
+    k.run(3, 5, 1);
+    try k.waitDone();
+    const e = rec.entries();
+    try std.testing.expectEqual(@as(usize, 5), e.len);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = B + regmap.offsetOf("NUM_Q1_BLOCKS"), .a = 3, .b = 0 }, e[0]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = B + regmap.offsetOf("NUM_ROWBLOCKS"), .a = 5, .b = 0 }, e[1]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = B + regmap.offsetOf("NUM_COLS"), .a = 1, .b = 0 }, e[2]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = B + regmap.offsetOf("CTRL"), .a = CTRL_START, .b = 0 }, e[3]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 1, .addr = B + regmap.offsetOf("STATUS"), .a = STATUS_DONE, .b = STATUS_DONE }, e[4]);
+}
+
+test "full matmul-op descriptor: programSetup/programWaits record the whole register stream" {
+    const P = layout.weight_ports;
+    var buf: [128]seq.Entry = undefined;
+    var rec = seq.Recorder.init(&buf);
+    var dma_w: [P]dma_mod.Dma = undefined;
+    for (&dma_w, dma_w_bases[0..]) |*d, base| d.* = dma_mod.Dma.openRecord(@intCast(base), &rec);
+    var dma_a = dma_mod.Dma.openRecord(@intCast(dma_a_base), &rec);
+    var kernel = Kernel.openRecord(@intCast(kernel_base), &rec);
+
+    var weight_phys: [P]u64 = undefined;
+    for (&weight_phys, 0..) |*w, i| w.* = 0x2_0000_0000 + @as(u64, @intCast(i)) * 0x1000;
+    try programSetup(dma_w[0..], &dma_a, &kernel, weight_phys[0..], 512, 0x4_0000_0000, 256, 0x8_0000_0000, 128, 7, 1, 1);
+    try programWaits(dma_w[0..], &dma_a, &kernel);
+
+    try std.testing.expect(!rec.overflow);
+    // setup: dma_w0 reset(2wr+2wait) + (P-1) resetMm2s(1wr+1wait) + dma_a resetMm2s(2)
+    //        + dma_w0 startWrite(4) + P*startRead(4) + dma_a startRead(4) + kernel run(4)
+    // waits: kernel done(1) + P readDone + dma_a readDone(1) + dma_w0 writeDone(1)
+    const setup = 4 + (P - 1) * 2 + 2 + 4 + P * 4 + 4 + 4;
+    const waits = 1 + P + 1 + 1;
+    try std.testing.expectEqual(@as(u32, @intCast(setup + waits)), rec.count());
+
+    // The kernel strobe (4 writes) sits just before the wait block; the first wait is kernel-done.
+    const e = rec.entries();
+    const KB: u32 = @intCast(kernel_base);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = KB + regmap.offsetOf("CTRL"), .a = CTRL_START, .b = 0 }, e[setup - 1]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 1, .addr = KB + regmap.offsetOf("STATUS"), .a = STATUS_DONE, .b = STATUS_DONE }, e[setup]);
+}
+
+test "recordRun: a multi-op run records each op's stream then one END" {
+    const P = layout.weight_ports;
+    var buf: [256]seq.Entry = undefined;
+    var rec = seq.Recorder.init(&buf);
+
+    var op0: RunOp = .{
+        .weight_phys = undefined, .weight_port_bytes = 512, .acts_phys = 0x4_0000_0000,
+        .act_total = 256, .result_phys = 0x9_0000_0000, .result_bytes = 128,
+        .num_q1_blocks = 7, .num_rowblocks = 1, .num_cols = 1,
+    };
+    for (&op0.weight_phys, 0..) |*w, i| w.* = 0x2_0000_0000 + @as(u64, @intCast(i)) * 0x1000;
+    var op1 = op0;
+    op1.acts_phys = 0x4_0000_1000; // same input acts in a real Q/K/V batch; distinct result range
+    op1.result_phys = 0x9_0000_1000;
+
+    try recordRun(&rec, &.{ op0, op1 });
+    try std.testing.expect(!rec.overflow);
+
+    const setup = 4 + (P - 1) * 2 + 2 + 4 + P * 4 + 4 + 4;
+    const waits = 1 + P + 1 + 1;
+    const per_op = setup + waits;
+    try std.testing.expectEqual(@as(u32, @intCast(2 * per_op + 1)), rec.count());
+
+    const e = rec.entries();
+    const KB: u32 = @intCast(kernel_base);
+    // each op's kernel CTRL strobe is the last write of its setup block.
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = KB + regmap.offsetOf("CTRL"), .a = CTRL_START, .b = 0 }, e[setup - 1]);
+    try std.testing.expectEqual(seq.Entry{ .tag = 0, .addr = KB + regmap.offsetOf("CTRL"), .a = CTRL_START, .b = 0 }, e[per_op + setup - 1]);
+    // run ends with END.
+    try std.testing.expectEqual(@as(u32, 2), e[e.len - 1].tag);
 }

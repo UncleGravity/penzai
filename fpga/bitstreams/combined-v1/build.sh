@@ -26,6 +26,7 @@ RTL_MATMUL="../../rtl/matmul"
 RTL_FLASH="../../rtl/flash_attn"
 RTL_FP="../../rtl/fp"
 RTL_NUMERIC="../../rtl/numeric"
+RTL_SEQ="../../rtl/seq"
 
 # Union of both RTL sets — matmul (gemm) and flash now BOTH compose the numeric/ leaf
 # library; rtl/fp is fully retired from the build (no synthesizable consumer left). This
@@ -58,6 +59,12 @@ RTL_FILES=(
   "$RTL_NUMERIC/interp.v"
   "$RTL_NUMERIC/recip.v"
   "$RTL_NUMERIC/fmt.vh"
+  # seq.v = the on-PL descriptor executor (batches the per-op PS dispatch). seq_top wraps the
+  # cosim-green seq_core + the AXI-Lite replay master + the AXI4 descriptor read master.
+  "$RTL_SEQ/seq_top.v"
+  "$RTL_SEQ/seq_core.v"
+  "$RTL_SEQ/seq_reg_master.v"
+  "$RTL_SEQ/seq_desc_reader.v"
 )
 for f in "${RTL_FILES[@]}"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for the *_regs.vh)" >&2; exit 1; }
