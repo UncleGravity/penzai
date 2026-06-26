@@ -66,6 +66,14 @@
 
             cmakeFlags = [
               "-DBUILD_SHARED_LIBS=ON"
+              # We install by copying the .so's out of build/bin (not `cmake
+              # --install`), so they keep their build-tree RPATH. Emit those
+              # self-references as $ORIGIN-relative instead of absolute
+              # /build/... paths — NixOS's fixup audit forbids /build/ refs in
+              # store outputs. All libs are co-located (build/bin -> $out/lib),
+              # so $ORIGIN resolves correctly; absolute nix-store rpaths (e.g.
+              # libstdc++) are left untouched.
+              "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
               "-DGGML_BACKEND_DL=OFF"
               "-DLLAMA_BUILD_COMMON=ON"
               "-DLLAMA_BUILD_TOOLS=OFF"
