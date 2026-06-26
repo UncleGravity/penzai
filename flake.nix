@@ -46,7 +46,13 @@
             hash = "sha256-BHv0ZFWlRJMc/2/vFNeRAVTFavvCOrHF5Wpy5pkSwEs=";
           };
 
-          llama-cpp = pkgs.stdenv.mkDerivation {
+          # Build with clang/libc++ (not the default gcc/libstdc++). The Zig
+          # host compiles host/chat.cpp with Zig's bundled libc++, so the
+          # common_chat_* C++ API (which takes std::string by ref) must be
+          # mangled/ABI-matched under libc++ (std::__1) too — otherwise the host
+          # link fails with undefined std::__1::basic_string symbols. This
+          # mirrors darwin, where the default stdenv is already clang/libc++.
+          llama-cpp = pkgs.libcxxStdenv.mkDerivation {
             pname = "penzai-llama-cpp";
             version = "pinned";
             src = llama-cpp-src;
@@ -102,6 +108,19 @@
             '';
           };
 
+          # Zig's native libc detection fails inside the Nix build sandbox and
+          # falls back to a musl ABI (wrong on glibc NixOS). For the libc++ host
+          # build that breaks two ways: libc++ takes its musl <bits/alltypes.h>
+          # mbstate_t branch (compile error), and any binary it did emit would
+          # carry a musl loader (/lib/ld-musl-*) that can't run here. Force the
+          # glibc ABI for the host target so libc++ uses glibc; autoPatchelfHook
+          # then repoints the interpreter/rpath at the Nix glibc. null on darwin
+          # (no musl/glibc split there) — keep native.
+          hostGnuTarget = {
+            "x86_64-linux" = "x86_64-linux-gnu";
+            "aarch64-linux" = "aarch64-linux-gnu";
+          }.${system} or null;
+
           zigCacheSetup = ''
             export ZIG_GLOBAL_CACHE_DIR="$TMPDIR/zig-global-cache"
             export ZIG_LOCAL_CACHE_DIR="$TMPDIR/zig-local-cache"
@@ -114,6 +133,12 @@
             , optimize
             , withLlama ? false
             }:
+            let
+              # Only the llama host build pulls in libc++ and a dynamic loader,
+              # so the glibc-ABI workaround (see hostGnuTarget) applies there —
+              # and only on Linux (hostGnuTarget is null on darwin).
+              forceGnu = withLlama && hostGnuTarget != null;
+            in
             pkgs.stdenv.mkDerivation {
               inherit pname;
               version = "0.1.0";
@@ -121,7 +146,11 @@
 
               nativeBuildInputs = [
                 pkgs.zig
-              ];
+              ] ++ pkgs.lib.optional forceGnu pkgs.autoPatchelfHook;
+
+              # autoPatchelfHook repoints the host binary's interpreter to the
+              # Nix glibc and resolves the llama .so DT_NEEDED entries.
+              buildInputs = pkgs.lib.optional forceGnu llama-cpp;
 
               dontConfigure = true;
 
@@ -130,7 +159,7 @@
                 ${zigCacheSetup}
                 zig build ${step} \
                   -Doptimize=${optimize} \
-                  ${pkgs.lib.optionalString withLlama ''
+                  ${pkgs.lib.optionalString forceGnu "-Dtarget=${hostGnuTarget} "}${pkgs.lib.optionalString withLlama ''
                     -Dllama-src=${llama-cpp-src} \
                     -Dllama-lib=${llama-cpp} \
                     -Dmodel=${tiny-gguf} \
