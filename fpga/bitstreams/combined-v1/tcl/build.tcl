@@ -4,14 +4,17 @@
 # attention on PL). They run sequentially in the graph, so their DDR feeds are kept
 # independent rather than time-shared:
 #
-#   matmul  — UNCHANGED from q1a8-w256-mc: kernel_mm fed by dma_w0..w3 + dma_a over
-#             HP0..HP3 on the faster weight clock (wclk); kernel + control on fclk.
-#   flash   — UNCHANGED from flash-v1 (v2 kernel): kernel_fa fed by dma_q/k/v/mask/o,
-#             single clock (fclk), over the coherent HPC0/HPC1 ports (free — matmul
-#             owns HP0..3). Q/K/V/mask DMA straight from the resident tensors.
+#   matmul  — kernel_mm fed by dma_w0..w3 + dma_a over HP0..HP3.
+#   flash   — kernel_fa fed by dma_q/k/v/mask/o over the coherent HPC0/HPC1 ports (free —
+#             matmul owns HP0..3). Q/K/V/mask DMA straight from the resident tensors.
+#
+#   SINGLE CLOCK (fclk): both kernels + all control + all 10 DMAs + all width/data movers.
+#   The dual-clock CDC (a second wclk domain + 6 axis_clock_converters + rst_fast) was
+#   deleted — at f=wc the two domains were the same frequency, so the CDC was pure
+#   congestion/skew tax (plan-fpga-7 Part 6). wclk in the variant string is now vestigial.
 #
 #   PS M_AXI_HPM0_FPD -> AXI-Lite -> 10 DMAs + both kernels (sc_ctrl, 12 MI, fclk)
-#   matmul mem: HP0 = dma_w0 MM2S+S2MM + dma_a; HP1/2/3 = dma_w1/2/3   (wclk)
+#   matmul mem: HP0 = dma_w0 MM2S+S2MM + dma_a; HP1/2/3 = dma_w1/2/3   (fclk)
 #   flash  mem: HPC0 = dma_q + dma_o + dma_mask; HPC1 = dma_k + dma_v  (fclk)
 #
 # Address map: matmul 0xA00x_0000, flash 0xA01x_0000 (non-colliding by design — the
@@ -125,21 +128,21 @@ create_bd_port -dir O fan_en_b
 connect_bd_net [get_bd_pins ps/emio_ttc0_wave_o] [get_bd_pins fan_ttc0_ch2/Din]
 connect_bd_net [get_bd_pins fan_ttc0_ch2/Dout]   [get_bd_ports fan_en_b]
 
-# ---- Fabric clocks ----------------------------------------------------------
-# clk_out1 = fclk (both kernels + all control + flash datapath). clk_out2 = wclk
-# (matmul weight feed only). Same VCO; AXIS clock converters handle matmul's CDC.
+# ---- Fabric clock (SINGLE domain) -------------------------------------------
+# ONE clock (fclk) drives both kernels + all control + all data movement. The dual-clock
+# CDC apparatus is gone: at f300=wc300 the two domains were the SAME frequency, so the 6
+# axis_clock_converters + second clock tree + rst_fast were pure congestion/skew tax with
+# zero functional benefit (plan-fpga-7 Part 6 §"Collapses with the single-clock phase").
+# $wclk_mhz is parsed-but-unused (variant string kept for build.sh/host compatibility).
 create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* clk_wiz
 set_property -dict [list \
     CONFIG.PRIM_IN_FREQ $ps_fclk_mhz \
     CONFIG.CLKOUT1_REQUESTED_OUT_FREQ $fclk_mhz \
     CONFIG.USE_LOCKED {true} \
     CONFIG.USE_RESET {false} \
-    CONFIG.CLKOUT2_USED {true} \
-    CONFIG.CLKOUT2_REQUESTED_OUT_FREQ $wclk_mhz \
 ] [get_bd_cells clk_wiz]
 connect_bd_net [get_bd_pins ps/pl_clk0] [get_bd_pins clk_wiz/clk_in1]
 set fclk_pin "clk_wiz/clk_out1"
-set wclk_pin "clk_wiz/clk_out2"
 
 # ---- DMA / converter helpers ------------------------------------------------
 # 128-bit mem + stream (the proven width; a 64-bit DMA silently corrupted data).
@@ -178,54 +181,48 @@ proc make_dwc {name s_bytes m_bytes} {
         CONFIG.HAS_TKEEP {1} \
     ] [get_bd_cells $name]
 }
-proc make_clk_conv {name bytes} {
-    create_bd_cell -type ip -vlnv xilinx.com:ip:axis_clock_converter:* $name
-    set_property -dict [list \
-        CONFIG.TDATA_NUM_BYTES $bytes \
-        CONFIG.HAS_TLAST {1} \
-        CONFIG.HAS_TKEEP {1} \
-    ] [get_bd_cells $name]
+# Memory-side SmartConnect: $si_list DMA mem masters -> one PS HP/HPC port. With the single
+# clock the HP (matmul-weight) and HPC (flash) feeds are structurally identical, so one helper
+# serves both (before the CDC collapse, HP was wclk and HPC fclk — they could not share this).
+proc make_mem_sc {name si_list ps_port} {
+    global fclk_pin
+    create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* $name
+    set_property -dict [list CONFIG.NUM_SI [llength $si_list] CONFIG.NUM_MI {1}] [get_bd_cells $name]
+    connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins $name/aclk]
+    connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $name/aresetn]
+    set i 0
+    foreach si $si_list {
+        connect_bd_intf_net [get_bd_intf_pins $si] [get_bd_intf_pins [format "$name/S%02d_AXI" $i]]
+        incr i
+    }
+    connect_bd_intf_net [get_bd_intf_pins $name/M00_AXI] [get_bd_intf_pins ps/$ps_port]
 }
 
-# ====================== MATMUL section (HP0..3, wclk) ========================
+# ====================== MATMUL section (HP0..3, fclk) ========================
 make_dma dma_w0 1 1
 make_dma dma_w1 1 0
 make_dma dma_w2 1 0
 make_dma dma_w3 1 0
 make_dma dma_a  1 0
-# Matmul stream DMAs are async: data movers on wclk, AXI-Lite control on fclk.
-foreach dma {dma_w0 dma_w1 dma_w2 dma_w3 dma_a} {
-    set_property CONFIG.c_prmry_is_aclk_async {1} [get_bd_cells $dma]
-}
+# Single clock: matmul stream DMAs are SYNCHRONOUS (data movers + AXI-Lite both on fclk).
+# (was: c_prmry_is_aclk_async + 6 axis_clock_converters straddling wclk->fclk — all deleted)
 make_dwc dwc_a 16 8 ;# acts    128 -> 64
 make_dwc dwc_r 8 16 ;# results  64 -> 128
 create_bd_cell -type module -reference decode_top kernel_mm ;# plan-7 fixed-point gemm (was matmul_top)
 
-# Acts: dma_a(wclk) -> 128->64(wclk) -> clk_conv -> kernel_mm(fclk).
-make_clk_conv clk_conv_a 8
+# Acts: dma_a -> 128->64 -> kernel_mm  (all fclk, no clock converter).
 connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXIS_MM2S] [get_bd_intf_pins dwc_a/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_a/M_AXIS]      [get_bd_intf_pins clk_conv_a/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_a/M_AXIS] [get_bd_intf_pins kernel_mm/S_AXIS_ACTS]
+connect_bd_intf_net [get_bd_intf_pins dwc_a/M_AXIS]      [get_bd_intf_pins kernel_mm/S_AXIS_ACTS]
 
-# Weight ports: dma_wN(wclk) -> clk_conv -> kernel_mm(fclk).
-make_clk_conv clk_conv_w0 16
-make_clk_conv clk_conv_w1 16
-make_clk_conv clk_conv_w2 16
-make_clk_conv clk_conv_w3 16
-connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w0/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_w0/M_AXIS] [get_bd_intf_pins kernel_mm/S_AXIS_W0]
-connect_bd_intf_net [get_bd_intf_pins dma_w1/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w1/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_w1/M_AXIS] [get_bd_intf_pins kernel_mm/S_AXIS_W1]
-connect_bd_intf_net [get_bd_intf_pins dma_w2/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w2/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_w2/M_AXIS] [get_bd_intf_pins kernel_mm/S_AXIS_W2]
-connect_bd_intf_net [get_bd_intf_pins dma_w3/M_AXIS_MM2S] [get_bd_intf_pins clk_conv_w3/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_w3/M_AXIS] [get_bd_intf_pins kernel_mm/S_AXIS_W3]
+# Weight ports: dma_wN -> kernel_mm  (all fclk, no clock converter).
+connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXIS_MM2S] [get_bd_intf_pins kernel_mm/S_AXIS_W0]
+connect_bd_intf_net [get_bd_intf_pins dma_w1/M_AXIS_MM2S] [get_bd_intf_pins kernel_mm/S_AXIS_W1]
+connect_bd_intf_net [get_bd_intf_pins dma_w2/M_AXIS_MM2S] [get_bd_intf_pins kernel_mm/S_AXIS_W2]
+connect_bd_intf_net [get_bd_intf_pins dma_w3/M_AXIS_MM2S] [get_bd_intf_pins kernel_mm/S_AXIS_W3]
 
-# Results: kernel_mm.M_AXIS(fclk) -> dwc_r 64->128(fclk) -> clk_conv -> dma_w0.S2MM(wclk).
-make_clk_conv clk_conv_r 16
+# Results: kernel_mm.M_AXIS -> dwc_r 64->128 -> dma_w0.S2MM  (all fclk, no clock converter).
 connect_bd_intf_net [get_bd_intf_pins kernel_mm/M_AXIS]  [get_bd_intf_pins dwc_r/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins dwc_r/M_AXIS]      [get_bd_intf_pins clk_conv_r/S_AXIS]
-connect_bd_intf_net [get_bd_intf_pins clk_conv_r/M_AXIS] [get_bd_intf_pins dma_w0/S_AXIS_S2MM]
+connect_bd_intf_net [get_bd_intf_pins dwc_r/M_AXIS]      [get_bd_intf_pins dma_w0/S_AXIS_S2MM]
 
 # ====================== FLASH section (HPC0/1, fclk) =========================
 make_dma dma_q    1 0
@@ -248,29 +245,29 @@ connect_bd_intf_net [get_bd_intf_pins dwc_mask/M_AXIS]      [get_bd_intf_pins ke
 connect_bd_intf_net [get_bd_intf_pins kernel_fa/M_AXIS_O]   [get_bd_intf_pins dwc_o/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins dwc_o/M_AXIS]         [get_bd_intf_pins dma_o/S_AXIS_S2MM]
 
-# ---- Resets -----------------------------------------------------------------
-# rst on fclk (control + both kernels + flash); rst_fast on wclk (matmul weight feed).
+# ---- Reset (SINGLE domain) --------------------------------------------------
+# One reset (rst, on fclk) for everything. (was: a second rst_fast on wclk for the matmul
+# weight feed — deleted with the CDC.)
 create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* rst
 set_property -dict [list CONFIG.C_EXT_RESET_HIGH {0}] [get_bd_cells rst]
 connect_bd_net [get_bd_pins $fclk_pin]      [get_bd_pins rst/slowest_sync_clk]
 connect_bd_net [get_bd_pins ps/pl_resetn0]  [get_bd_pins rst/ext_reset_in]
 connect_bd_net [get_bd_pins clk_wiz/locked] [get_bd_pins rst/dcm_locked]
 
-create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset:* rst_fast
-set_property -dict [list CONFIG.C_EXT_RESET_HIGH {0}] [get_bd_cells rst_fast]
-connect_bd_net [get_bd_pins $wclk_pin]      [get_bd_pins rst_fast/slowest_sync_clk]
-connect_bd_net [get_bd_pins ps/pl_resetn0]  [get_bd_pins rst_fast/ext_reset_in]
-connect_bd_net [get_bd_pins clk_wiz/locked] [get_bd_pins rst_fast/dcm_locked]
-set wrst_pin "rst_fast/peripheral_aresetn"
-
-# ---- Clock fan-out ----------------------------------------------------------
-# fclk: HPM0 control, both kernels, all AXI-Lite, matmul result upsizer, ALL flash.
+# ---- Clock fan-out (SINGLE clock) -------------------------------------------
+# fclk drives EVERYTHING: HPM0 control, all 10 DMAs (AXI-Lite + data movers), both kernels,
+# all width converters, all flash. The HP0..HP3 weight-feed movers + acts downsizer that
+# used to be on wclk are now on fclk (synchronous — no CDC).
 foreach clkpin {
     ps/maxihpm0_fpd_aclk
     ps/saxihpc0_fpd_aclk ps/saxihpc1_fpd_aclk
+    ps/saxihp0_fpd_aclk ps/saxihp1_fpd_aclk ps/saxihp2_fpd_aclk ps/saxihp3_fpd_aclk
     dma_w0/s_axi_lite_aclk dma_w1/s_axi_lite_aclk dma_w2/s_axi_lite_aclk dma_w3/s_axi_lite_aclk
     dma_a/s_axi_lite_aclk
-    dwc_r/aclk kernel_mm/s_axi_aclk
+    dma_w0/m_axi_mm2s_aclk dma_w0/m_axi_s2mm_aclk
+    dma_w1/m_axi_mm2s_aclk dma_w2/m_axi_mm2s_aclk dma_w3/m_axi_mm2s_aclk
+    dma_a/m_axi_mm2s_aclk
+    dwc_a/aclk dwc_r/aclk kernel_mm/s_axi_aclk
     dma_q/s_axi_lite_aclk dma_k/s_axi_lite_aclk dma_v/s_axi_lite_aclk
     dma_mask/s_axi_lite_aclk dma_o/s_axi_lite_aclk
     dma_q/m_axi_mm2s_aclk dma_k/m_axi_mm2s_aclk dma_v/m_axi_mm2s_aclk dma_mask/m_axi_mm2s_aclk
@@ -278,35 +275,13 @@ foreach clkpin {
     dwc_q/aclk dwc_mask/aclk dwc_o/aclk kernel_fa/s_axi_aclk
 } { connect_bd_net [get_bd_pins $fclk_pin] [get_bd_pins $clkpin] }
 
-# wclk: HP0..HP3 + matmul stream-DMA data movers + acts downsizer.
-foreach clkpin {
-    ps/saxihp0_fpd_aclk ps/saxihp1_fpd_aclk ps/saxihp2_fpd_aclk ps/saxihp3_fpd_aclk
-    dma_w0/m_axi_mm2s_aclk dma_w0/m_axi_s2mm_aclk
-    dma_w1/m_axi_mm2s_aclk dma_w2/m_axi_mm2s_aclk dma_w3/m_axi_mm2s_aclk
-    dma_a/m_axi_mm2s_aclk
-    dwc_a/aclk
-} { connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins $clkpin] }
-
-# Reset fan-out. fclk-domain resets:
+# ---- Reset fan-out (SINGLE reset) -------------------------------------------
 foreach rstpin {
     dma_w0/axi_resetn dma_w1/axi_resetn dma_w2/axi_resetn dma_w3/axi_resetn dma_a/axi_resetn
-    dwc_r/aresetn kernel_mm/s_axi_aresetn
+    dwc_a/aresetn dwc_r/aresetn kernel_mm/s_axi_aresetn
     dma_q/axi_resetn dma_k/axi_resetn dma_v/axi_resetn dma_mask/axi_resetn dma_o/axi_resetn
     dwc_q/aresetn dwc_mask/aresetn dwc_o/aresetn kernel_fa/s_axi_aresetn
 } { connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $rstpin] }
-connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins dwc_a/aresetn]
-
-# Matmul clock converters straddle wclk(slave)->fclk(master); result is fclk->wclk.
-foreach conv {clk_conv_w0 clk_conv_w1 clk_conv_w2 clk_conv_w3 clk_conv_a} {
-    connect_bd_net [get_bd_pins $wclk_pin]              [get_bd_pins $conv/s_axis_aclk]
-    connect_bd_net [get_bd_pins $wrst_pin]              [get_bd_pins $conv/s_axis_aresetn]
-    connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins $conv/m_axis_aclk]
-    connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins $conv/m_axis_aresetn]
-}
-connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins clk_conv_r/s_axis_aclk]
-connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins clk_conv_r/s_axis_aresetn]
-connect_bd_net [get_bd_pins $wclk_pin]              [get_bd_pins clk_conv_r/m_axis_aclk]
-connect_bd_net [get_bd_pins $wrst_pin]              [get_bd_pins clk_conv_r/m_axis_aresetn]
 
 # ---- Control path: PS -> 10 DMAs + 2 kernels AXI-Lite (fclk) ----------------
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_ctrl
@@ -314,56 +289,22 @@ set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {12}] [get_bd_cells sc_
 connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins sc_ctrl/aclk]
 connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_ctrl/aresetn]
 connect_bd_intf_net [get_bd_intf_pins ps/M_AXI_HPM0_FPD] [get_bd_intf_pins sc_ctrl/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 0]]  [get_bd_intf_pins dma_w0/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 1]]  [get_bd_intf_pins dma_w1/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 2]]  [get_bd_intf_pins dma_w2/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 3]]  [get_bd_intf_pins dma_w3/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 4]]  [get_bd_intf_pins dma_a/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 5]]  [get_bd_intf_pins kernel_mm/S_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 6]]  [get_bd_intf_pins dma_q/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 7]]  [get_bd_intf_pins dma_k/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 8]]  [get_bd_intf_pins dma_v/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 9]]  [get_bd_intf_pins dma_mask/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 10]] [get_bd_intf_pins dma_o/S_AXI_LITE]
-connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin 11]] [get_bd_intf_pins kernel_fa/S_AXI]
+# MI index -> AXI-Lite slave (order is the address-map's; matmul 0..5, flash 6..11).
+foreach {idx target} {
+    0 dma_w0/S_AXI_LITE   1 dma_w1/S_AXI_LITE   2 dma_w2/S_AXI_LITE   3 dma_w3/S_AXI_LITE
+    4 dma_a/S_AXI_LITE    5 kernel_mm/S_AXI
+    6 dma_q/S_AXI_LITE    7 dma_k/S_AXI_LITE    8 dma_v/S_AXI_LITE    9 dma_mask/S_AXI_LITE
+    10 dma_o/S_AXI_LITE  11 kernel_fa/S_AXI
+} { connect_bd_intf_net [get_bd_intf_pins sc_ctrl/[mi_pin $idx]] [get_bd_intf_pins $target] }
 
-# ---- Memory paths -----------------------------------------------------------
-# Matmul: HP0 = dma_w0 MM2S+S2MM + dma_a MM2S; HP1/2/3 = dma_w1/2/3 (all wclk).
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_hp0
-set_property -dict [list CONFIG.NUM_SI {3} CONFIG.NUM_MI {1}] [get_bd_cells sc_hp0]
-connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins sc_hp0/aclk]
-connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins sc_hp0/aresetn]
-connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXI_MM2S] [get_bd_intf_pins sc_hp0/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins dma_w0/M_AXI_S2MM] [get_bd_intf_pins sc_hp0/S01_AXI]
-connect_bd_intf_net [get_bd_intf_pins dma_a/M_AXI_MM2S]  [get_bd_intf_pins sc_hp0/S02_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_hp0/M00_AXI]    [get_bd_intf_pins ps/S_AXI_HP0_FPD]
-
-foreach {sc dma hp} {sc_hp1 dma_w1 S_AXI_HP1_FPD  sc_hp2 dma_w2 S_AXI_HP2_FPD  sc_hp3 dma_w3 S_AXI_HP3_FPD} {
-    create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* $sc
-    set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {1}] [get_bd_cells $sc]
-    connect_bd_net [get_bd_pins $wclk_pin] [get_bd_pins $sc/aclk]
-    connect_bd_net [get_bd_pins $wrst_pin] [get_bd_pins $sc/aresetn]
-    connect_bd_intf_net [get_bd_intf_pins $dma/M_AXI_MM2S] [get_bd_intf_pins $sc/S00_AXI]
-    connect_bd_intf_net [get_bd_intf_pins $sc/M00_AXI]     [get_bd_intf_pins ps/$hp]
-}
-
-# Flash: HPC0 = dma_q MM2S + dma_o S2MM + dma_mask MM2S; HPC1 = dma_k + dma_v (all fclk).
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_hpc0
-set_property -dict [list CONFIG.NUM_SI {3} CONFIG.NUM_MI {1}] [get_bd_cells sc_hpc0]
-connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins sc_hpc0/aclk]
-connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_hpc0/aresetn]
-connect_bd_intf_net [get_bd_intf_pins dma_q/M_AXI_MM2S]    [get_bd_intf_pins sc_hpc0/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins dma_o/M_AXI_S2MM]    [get_bd_intf_pins sc_hpc0/S01_AXI]
-connect_bd_intf_net [get_bd_intf_pins dma_mask/M_AXI_MM2S] [get_bd_intf_pins sc_hpc0/S02_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_hpc0/M00_AXI]     [get_bd_intf_pins ps/S_AXI_HPC0_FPD]
-
-create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect:* sc_hpc1
-set_property -dict [list CONFIG.NUM_SI {2} CONFIG.NUM_MI {1}] [get_bd_cells sc_hpc1]
-connect_bd_net [get_bd_pins $fclk_pin]              [get_bd_pins sc_hpc1/aclk]
-connect_bd_net [get_bd_pins rst/peripheral_aresetn] [get_bd_pins sc_hpc1/aresetn]
-connect_bd_intf_net [get_bd_intf_pins dma_k/M_AXI_MM2S] [get_bd_intf_pins sc_hpc1/S00_AXI]
-connect_bd_intf_net [get_bd_intf_pins dma_v/M_AXI_MM2S] [get_bd_intf_pins sc_hpc1/S01_AXI]
-connect_bd_intf_net [get_bd_intf_pins sc_hpc1/M00_AXI]  [get_bd_intf_pins ps/S_AXI_HPC1_FPD]
+# ---- Memory paths: each DMA mem master -> its PS HP/HPC port (all fclk) ------
+# Matmul over HP0..3, flash over HPC0/1 — same shape now, one helper. S-pin order = list order.
+make_mem_sc sc_hp0  {dma_w0/M_AXI_MM2S dma_w0/M_AXI_S2MM dma_a/M_AXI_MM2S}    S_AXI_HP0_FPD
+make_mem_sc sc_hp1  {dma_w1/M_AXI_MM2S}                                       S_AXI_HP1_FPD
+make_mem_sc sc_hp2  {dma_w2/M_AXI_MM2S}                                       S_AXI_HP2_FPD
+make_mem_sc sc_hp3  {dma_w3/M_AXI_MM2S}                                       S_AXI_HP3_FPD
+make_mem_sc sc_hpc0 {dma_q/M_AXI_MM2S dma_o/M_AXI_S2MM dma_mask/M_AXI_MM2S}   S_AXI_HPC0_FPD
+make_mem_sc sc_hpc1 {dma_k/M_AXI_MM2S dma_v/M_AXI_MM2S}                       S_AXI_HPC1_FPD
 
 # ---- Address map (generated; single source: fpga/regmap/{matmul,flash_attn}.zig) ----
 # build.sh copies the two generated maps here (renamed). Each defines its own list;
@@ -421,18 +362,49 @@ if {![catch {open_run synth_1 -name synth_1} err]} {
     puts "WARNING: could not open synth_1 for utilization report: $err"
 }
 
+# Floorplan: pblock the two kernels into separate clock-region bands (f300 congestion fix —
+# docs/plan-f300-pblock.md). Impl-only (placement); synced by build.sh when USE_PBLOCK=1.
+if {[file exists ./pblock.xdc]} {
+    set pb [file normalize ./pblock.xdc]
+    add_files -fileset constrs_1 -norecurse $pb
+    set_property USED_IN_SYNTHESIS false [get_files $pb]
+    puts "==> applied floorplan pblock ($pb)"
+} else {
+    puts "==> no pblock.xdc — building unconstrained (USE_PBLOCK=0)"
+}
+
+# f300 closure. The two structural walls are fixed in RTL/BD (the flash fp32-dot 2-DSP cascade
+# → fp_dot MUL_PIPE=1; the matmul pc_col broadcast → the single-clock collapse): that took WNS
+# −0.116 → −0.044, leaving only marginal routing-bound scatter (a DMA DataMover FIFO, a few
+# control paths). So the last 0.044 is a tool-effort finish, not RTL:
+#   - PLACE  AltSpreadLogic_high  — spreads logic (cleared the old pc_col congestion); keep.
+#   - ROUTE  Explore             — extra routing effort for the routing-bound DMA-FIFO worst path.
+#   - POST-ROUTE phys_opt AggressiveExplore — run EXPLICITLY in-memory after open_run (the run-step
+#     -to_step token for post-route phys_opt is version-inconsistent), to grab the last ~0.04ns.
+# Comment these out for a vanilla build (e.g. shipping f250). Run with USE_PBLOCK=0 (spreading is
+# the opposite of the regressive pblock).
+set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE AltSpreadLogic_high [get_runs impl_1]
+set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
+
 launch_runs impl_1 -to_step route_design -jobs 4
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation failed" }
 
 open_run impl_1
+# Explicit post-route physical optimization on the routed design (incrementally reroutes what it
+# touches, so the design stays fully routed for the timing gate + bitstream). Best-effort.
+if {[catch {phys_opt_design -directive AggressiveExplore} pe]} {
+    puts "WARNING: post-route phys_opt_design failed ($pe) — gating on the routed result as-is"
+} else {
+    puts "==> post-route phys_opt_design (AggressiveExplore) complete"
+}
 catch {report_utilization -file $outdir/${bit_name}_utilization_routed.rpt}
 report_timing_summary -max_paths 10 -routable_nets -report_unconstrained \
     -file $outdir/${bit_name}_timing_summary_routed.rpt
 set failing_paths [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 0]
 if {[llength $failing_paths] > 0} {
     set wns [get_property SLACK [lindex $failing_paths 0]]
-    error "timing failed after route_design; WNS=${wns}ns. Refusing to write an invalid bitstream."
+    error "timing failed after impl; WNS=${wns}ns. Refusing to write an invalid bitstream."
 }
 
 write_bitstream -force $outdir/$bit_name.bit

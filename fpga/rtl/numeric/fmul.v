@@ -6,12 +6,21 @@
 // (use_dsp) and runs register-to-register, as in fp32_mul_pipe (the f250 fix).
 //
 // At MANT_W=23 this is bit-identical to fp32_mul_pipe (differential cosim is the gate).
-// Latency valid_in -> valid_out: 3. Format: { sign[1], exp[8], mant[MANT_W] }.
+// Latency valid_in -> valid_out: 3 + MUL_PIPE. Format: { sign[1], exp[8], mant[MANT_W] }.
+//
+// MUL_PIPE adds extra register stage(s) on the mantissa product. At fp32 (MANT_W=23) the
+// (24×24)=48-bit product exceeds one DSP48E2 (27×18), so Vivado infers a TWO-DSP cascade;
+// at MUL_PIPE=0 both DSPs evaluate combinationally in one cycle (the f300 flash-dot wall:
+// 2.9ns of multiply+ALU+cascade-ALU). MUL_PIPE=1 gives retiming a register to push into
+// the cascade (one DSP per cycle), halving the path. Value is UNCHANGED (the extra stage
+// is pure pipelining) — the cosim is the bit-exact gate. Only the wide-multiply consumers
+// that wall f300 opt in (fp_dot); everything else stays MUL_PIPE=0 (latency 3, untouched).
 
 `default_nettype none
 
 module fmul #(
-    parameter integer MANT_W = 23                 // FMT_FP32_MANT; 7 for bf16
+    parameter integer MANT_W   = 23,              // FMT_FP32_MANT; 7 for bf16
+    parameter integer MUL_PIPE = 0                // extra mantissa-product pipeline stages
 ) (
     input  wire                clk,
     input  wire                rst_n,
@@ -56,23 +65,43 @@ module fmul #(
         end
     end
 
-    // ---- product stage (DSP) ----
-    reg              valid_s0;
-    reg              zero_s0;
-    reg              sign_s0;
-    reg signed [9:0] exp_pre_s0;
-    (* use_dsp = "yes" *) reg [PW-1:0] prod_s0;
+    // ---- product stage (DSP) + optional MUL_PIPE cascade-split registers ----
+    // index 0 = raw mantissa product; indices 1..MUL_PIPE are extra pipeline registers
+    // Vivado retimes into the multi-DSP cascade (fp32 → 2 DSPs). Metadata shifts alongside,
+    // so the normalize below is unchanged. MUL_PIPE=0 ≡ the original single product reg.
+    (* use_dsp = "yes" *) reg [PW-1:0] prod_sr  [0:MUL_PIPE];
+    reg              valid_sr [0:MUL_PIPE];
+    reg              zero_sr  [0:MUL_PIPE];
+    reg              sign_sr  [0:MUL_PIPE];
+    reg signed [9:0] exp_sr   [0:MUL_PIPE];
+    integer p;
     always @(posedge clk) begin
         if (!rst_n) begin
-            valid_s0 <= 1'b0; zero_s0 <= 1'b0; sign_s0 <= 1'b0; exp_pre_s0 <= 10'sd0; prod_s0 <= 0;
+            for (p = 0; p <= MUL_PIPE; p = p + 1) begin
+                prod_sr[p] <= 0; valid_sr[p] <= 1'b0; zero_sr[p] <= 1'b0;
+                sign_sr[p] <= 1'b0; exp_sr[p] <= 10'sd0;
+            end
         end else begin
-            valid_s0   <= valid_i;
-            zero_s0    <= zero_i;
-            sign_s0    <= sign_i;
-            exp_pre_s0 <= exp_pre_i;
-            prod_s0    <= mant_a_i * mant_b_i;
+            prod_sr[0]  <= mant_a_i * mant_b_i;
+            valid_sr[0] <= valid_i;
+            zero_sr[0]  <= zero_i;
+            sign_sr[0]  <= sign_i;
+            exp_sr[0]   <= exp_pre_i;
+            for (p = 1; p <= MUL_PIPE; p = p + 1) begin
+                prod_sr[p]  <= prod_sr[p-1];
+                valid_sr[p] <= valid_sr[p-1];
+                zero_sr[p]  <= zero_sr[p-1];
+                sign_sr[p]  <= sign_sr[p-1];
+                exp_sr[p]   <= exp_sr[p-1];
+            end
         end
     end
+    // tail of the multiply pipeline feeds the (unchanged) normalize.
+    wire [PW-1:0]     prod_s0    = prod_sr[MUL_PIPE];
+    wire              valid_s0   = valid_sr[MUL_PIPE];
+    wire              zero_s0    = zero_sr[MUL_PIPE];
+    wire              sign_s0    = sign_sr[MUL_PIPE];
+    wire signed [9:0] exp_pre_s0 = exp_sr[MUL_PIPE];
 
     // ---- normalize (combinational) ----
     wire renorm_s0 = prod_s0[PW-1];
