@@ -8,12 +8,23 @@
 nix run .#deploy-penzaid # build and upload daemon
 nix run .#serve-penzaid # run remote daemon
 
-# Terminal 2
+# Terminal 2 (choose 1 from below)
+
+## Custom CLI
 nix run .#penzai -- run \
   -m /path/to/model.gguf \
   --device tcp:kria:29092 \
   --prompt "Write one sentence about FPGAs." \
   --max-tokens 64
+
+## OR llama.cpp
+PENZAI_HOST=kria PENZAI_PORT=29092 \
+  nix run .#llama-cli-penzai -- \
+    --device penzai \
+    -ngl 999 \
+    --no-op-offload -fa on \
+    -m models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
+    -p "hello" -n 64 -no-cnv
 ```
 
 Local dev:
