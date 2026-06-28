@@ -47,10 +47,50 @@
           # mangled/ABI-matched under libc++ (std::__1) too — otherwise the host
           # link fails with undefined std::__1::basic_string symbols. This
           # mirrors darwin, where the default stdenv is already clang/libc++.
-          llama-cpp = pkgs.libcxxStdenv.mkDerivation {
+          #
+          # The two llama.cpp variants below share this stdenv, src, and the
+          # bulk of the cmake flags — they differ only in extraCmakeFlags +
+          # build/install phases. Factoring the shared flags into one list keeps
+          # the variants from silently drifting apart.
+          mkLlamaCpp =
+            { pname
+            , patches ? [ ]
+            , extraCmakeFlags
+            , buildPhase
+            , installPhase
+            }:
+            pkgs.libcxxStdenv.mkDerivation {
+              inherit pname patches buildPhase installPhase;
+              version = "pinned";
+              src = llama-cpp-src;
+
+              nativeBuildInputs = [
+                pkgs.cmake
+                pkgs.ninja
+              ];
+
+              cmakeFlags = [
+                "-DBUILD_SHARED_LIBS=ON"
+                # We install by copying the .so's out of build/bin (not `cmake
+                # --install`), so they keep their build-tree RPATH. Emit those
+                # self-references as $ORIGIN-relative instead of absolute
+                # /build/... paths — NixOS's fixup audit forbids /build/ refs in
+                # store outputs. All libs are co-located (build/bin -> $out/lib),
+                # so $ORIGIN resolves correctly; absolute nix-store rpaths (e.g.
+                # libstdc++) are left untouched.
+                "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+                "-DLLAMA_BUILD_COMMON=ON"
+                "-DLLAMA_BUILD_TESTS=OFF"
+                "-DLLAMA_BUILD_EXAMPLES=OFF"
+                "-DLLAMA_CURL=OFF"
+                "-DGGML_METAL=OFF"
+                "-DGGML_ACCELERATE=OFF"
+                "-DGGML_BLAS=OFF"
+              ] ++ extraCmakeFlags;
+            };
+
+          llama-cpp = mkLlamaCpp {
             pname = "penzai-llama-cpp";
-            version = "pinned";
-            src = llama-cpp-src;
 
             # Backend-sampling fix: stock greedy leaves data.logits non-null, so
             # build_sampling records full-vocab "sampled_logits" and llama.cpp copies
@@ -60,31 +100,10 @@
             # unaffected (the change is in a .cpp, not a header).
             patches = [ ./patches/greedy-backend-drop-logits.patch ];
 
-            nativeBuildInputs = [
-              pkgs.cmake
-              pkgs.ninja
-            ];
-
-            cmakeFlags = [
-              "-DBUILD_SHARED_LIBS=ON"
-              # We install by copying the .so's out of build/bin (not `cmake
-              # --install`), so they keep their build-tree RPATH. Emit those
-              # self-references as $ORIGIN-relative instead of absolute
-              # /build/... paths — NixOS's fixup audit forbids /build/ refs in
-              # store outputs. All libs are co-located (build/bin -> $out/lib),
-              # so $ORIGIN resolves correctly; absolute nix-store rpaths (e.g.
-              # libstdc++) are left untouched.
-              "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+            extraCmakeFlags = [
               "-DGGML_BACKEND_DL=OFF"
-              "-DLLAMA_BUILD_COMMON=ON"
               "-DLLAMA_BUILD_TOOLS=OFF"
-              "-DLLAMA_BUILD_TESTS=OFF"
-              "-DLLAMA_BUILD_EXAMPLES=OFF"
               "-DLLAMA_BUILD_SERVER=OFF"
-              "-DLLAMA_CURL=OFF"
-              "-DGGML_METAL=OFF"
-              "-DGGML_ACCELERATE=OFF"
-              "-DGGML_BLAS=OFF"
             ];
 
             buildPhase = ''
@@ -106,30 +125,14 @@
           # DL-enabled llama.cpp: GGML_BACKEND_DL=ON + tools, so stock llama-cli can
           # dlopen out-of-tree backends (libggml-penzai). No greedy-drop patch — the
           # .so path samples host-side in llama-cli, not on the backend.
-          llama-cpp-dl = pkgs.libcxxStdenv.mkDerivation {
+          llama-cpp-dl = mkLlamaCpp {
             pname = "penzai-llama-cpp-dl";
-            version = "pinned";
-            src = llama-cpp-src;
 
-            nativeBuildInputs = [
-              pkgs.cmake
-              pkgs.ninja
-            ];
-
-            cmakeFlags = [
-              "-DBUILD_SHARED_LIBS=ON"
-              "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+            extraCmakeFlags = [
               "-DGGML_BACKEND_DL=ON"
-              "-DLLAMA_BUILD_COMMON=ON"
               "-DLLAMA_BUILD_TOOLS=ON"
-              "-DLLAMA_BUILD_TESTS=OFF"
-              "-DLLAMA_BUILD_EXAMPLES=OFF"
               "-DLLAMA_BUILD_SERVER=ON"
-              "-DLLAMA_CURL=OFF"
               "-DLLAMA_TOOLS_INSTALL=OFF"
-              "-DGGML_METAL=OFF"
-              "-DGGML_ACCELERATE=OFF"
-              "-DGGML_BLAS=OFF"
             ];
 
             buildPhase = ''
@@ -385,33 +388,22 @@
           packages = rec {
             inherit llama-cpp llama-cpp-dl penzai-backend-so llama-cli-penzai;
 
-            penzai = penzai-releasefast;
-            penzai-debug = mkPenzai "debug" "Debug";
-            penzai-releasefast = mkPenzai "releasefast" "ReleaseFast";
+            penzai = mkPenzai "releasefast" "ReleaseFast";
+            penzaid = mkPenzaid "releasefast" "ReleaseFast";
 
-            penzaid = penzaid-releasefast;
-            penzaid-debug = mkPenzaid "debug" "Debug";
-            penzaid-releasefast = mkPenzaid "releasefast" "ReleaseFast";
-
-            deploy-penzaid = deploy-penzaid-releasefast;
-            deploy-penzaid-debug = mkDeploy "deploy-penzaid-debug" "Debug" penzaid-debug;
-            deploy-penzaid-releasefast = mkDeploy "deploy-penzaid-releasefast" "ReleaseFast" penzaid-releasefast;
+            deploy-penzaid = mkDeploy "deploy-penzaid" "ReleaseFast" penzaid;
             serve-penzaid = mkServe "serve-penzaid";
             hello = mkHello penzai;
 
-            default = penzai-releasefast;
+            default = penzai;
           };
 
           apps = rec {
             default = penzai;
 
-            penzai = mkApp packages.penzai-releasefast "penzai" "Run the releasefast penzai host CLI";
-            penzai-debug = mkApp packages.penzai-debug "penzai" "Run the debug penzai host CLI";
-            penzai-releasefast = mkApp packages.penzai-releasefast "penzai" "Run the releasefast penzai host CLI";
+            penzai = mkApp packages.penzai "penzai" "Run the releasefast penzai host CLI";
 
-            deploy-penzaid = mkApp packages.deploy-penzaid "deploy-penzaid-releasefast" "Deploy the releasefast KR260 penzaid daemon";
-            deploy-penzaid-debug = mkApp packages.deploy-penzaid-debug "deploy-penzaid-debug" "Deploy the debug KR260 penzaid daemon";
-            deploy-penzaid-releasefast = mkApp packages.deploy-penzaid-releasefast "deploy-penzaid-releasefast" "Deploy the releasefast KR260 penzaid daemon";
+            deploy-penzaid = mkApp packages.deploy-penzaid "deploy-penzaid" "Deploy the releasefast KR260 penzaid daemon";
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
             llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
@@ -423,7 +415,7 @@
               pname = "penzai-zig-tests";
               step = "test";
             };
-            inherit (packages) penzai-debug penzai-releasefast penzaid-debug penzaid-releasefast;
+            inherit (packages) penzai penzaid;
           };
 
           devShells.default = pkgs.mkShell {
