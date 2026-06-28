@@ -1,8 +1,9 @@
 const std = @import("std");
 const shared = @import("shared");
 const run_mod = @import("run.zig");
-const prof_model = @import("prof/model.zig");
-const prof_render = @import("prof/render.zig");
+const prof = @import("prof");
+const prof_model = prof.model;
+const prof_render = prof.render;
 
 const protocol_transport = shared.protocol_transport;
 

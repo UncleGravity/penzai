@@ -1,4 +1,6 @@
 #pragma once
+// FFI shim header — the one Zig↔llama.cpp C++ bridge. Renders a chat template for
+// a single user turn via llama.cpp's common_chat_* API. Implemented in chat.cpp.
 
 #include <stdbool.h>
 

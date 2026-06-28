@@ -47,6 +47,7 @@ pub fn build(b: *std.Build) void {
     b.installArtifact(host_exe);
     const install_penzai = b.addInstallArtifact(host_exe, .{});
     b.step("install-penzai", "Install the host penzai CLI").dependOn(&install_penzai.step);
+    addPenzaiBackendLib(b, target, optimize, host_shared, host_link, llama_config);
 
     const kr260_target = kr260Target(b);
     const device_options = createBuildOptions(b, false, enable_profiling, "");
@@ -412,6 +413,7 @@ fn addPenzai(
     });
     addHostImports(host_mod, build_options, shared, runtime, server, link);
     if (llama_config.enabled) addLlamaSupport(b, host_mod, llama_config, c_mod.?);
+    addHostExtraModules(b, host_mod, target, optimize, shared, link, llama_config);
 
     return b.addExecutable(.{
         .name = "penzai",
@@ -528,7 +530,7 @@ fn createHostLinkModule(
     server: *std.Build.Module,
 ) *std.Build.Module {
     const link = b.createModule(.{
-        .root_source_file = b.path("host/link.zig"),
+        .root_source_file = b.path("host/link/link.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -724,6 +726,7 @@ fn addHostTest(
     });
     addHostImports(mod, build_options, shared, runtime, server, link);
     if (with_llama) addLlamaSupport(b, mod, llama_config, c_mod.?);
+    addHostExtraModules(b, mod, target, optimize, shared, link, llama_config);
     const test_exe = b.addTest(.{ .root_module = mod });
     step.dependOn(&b.addRunArtifact(test_exe).step);
 }
@@ -734,12 +737,12 @@ fn createLlamaCModule(
     llama_src: []const u8,
 ) *std.Build.Module {
     const translate_c = b.addTranslateC(.{
-        .root_source_file = b.path("host/c_api.h"),
+        .root_source_file = b.path("host/llama/c_api.h"),
         .target = target,
         .optimize = .Debug,
         .link_libc = true,
     });
-    translate_c.addIncludePath(b.path("host"));
+    translate_c.addIncludePath(b.path("host/llama"));
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "include" }) });
     translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "src" }) });
@@ -759,10 +762,10 @@ fn addLlamaSupport(
 
 fn addChatShim(b: *std.Build, mod: *std.Build.Module, llama_src: []const u8) void {
     mod.addCSourceFile(.{
-        .file = b.path("host/chat.cpp"),
+        .file = b.path("host/llama/chat.cpp"),
         .flags = &.{"-std=c++17"},
     });
-    mod.addIncludePath(b.path("host"));
+    mod.addIncludePath(b.path("host/llama"));
     mod.addIncludePath(.{ .cwd_relative = llama_src });
     mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
     mod.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "common" }) });
@@ -781,4 +784,132 @@ fn linkLlama(b: *std.Build, mod: *std.Build.Module, llama_lib: []const u8) void 
     mod.linkSystemLibrary("ggml", .{});
     mod.linkSystemLibrary("ggml-base", .{});
     mod.linkSystemLibrary("ggml-cpu", .{});
+}
+
+fn createProfModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    shared: *std.Build.Module,
+    link: *std.Build.Module,
+) *std.Build.Module {
+    const prof = b.createModule(.{
+        .root_source_file = b.path("host/prof/prof.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    prof.addImport("shared", shared);
+    prof.addImport("link", link);
+    return prof;
+}
+
+/// ggml-only translate-c root (module `c_ggml`) for the llama-free backend core —
+/// the same ggml/ggml-backend headers as `c`, minus llama.h.
+fn createGgmlCModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    llama_src: []const u8,
+) *std.Build.Module {
+    const translate_c = b.addTranslateC(.{
+        .root_source_file = b.path("host/backend/c_ggml.h"),
+        .target = target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "include" }) });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "include" }) });
+    translate_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ llama_src, "ggml", "src" }) });
+    return translate_c.createModule();
+}
+
+/// The ggml backend core as its own module: its import table carries `c_ggml`, not
+/// the full llama `c`, so the llama-free invariant is enforced by the build graph
+/// rather than by convention. Re-exports Device + Census to the driver.
+fn createBackendModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    c_ggml: *std.Build.Module,
+    shared: *std.Build.Module,
+    link: *std.Build.Module,
+    prof: *std.Build.Module,
+) *std.Build.Module {
+    const backend = b.createModule(.{
+        .root_source_file = b.path("host/backend/backend.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    backend.addImport("c_ggml", c_ggml);
+    backend.addImport("shared", shared);
+    backend.addImport("link", link);
+    backend.addImport("prof", prof);
+    return backend;
+}
+
+// The host-side modules not shared with the device: `prof` (always) and, when
+// llama is enabled, the `backend` core (which privately carries `c_ggml`). One
+// `prof` instance feeds both the host module and the backend module so
+// `Device.profile` and the driver's Collector are the same type across the seam.
+fn addHostExtraModules(
+    b: *std.Build,
+    mod: *std.Build.Module,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    shared: *std.Build.Module,
+    link: *std.Build.Module,
+    llama_config: LlamaConfig,
+) void {
+    const prof = createProfModule(b, target, optimize, shared, link);
+    mod.addImport("prof", prof);
+    if (llama_config.enabled) {
+        const c_ggml = createGgmlCModule(b, target, llama_config.src);
+        const backend = createBackendModule(b, target, optimize, c_ggml, shared, link, prof);
+        mod.addImport("backend", backend);
+    }
+}
+
+/// `libggml-penzai` — the out-of-tree ggml backend. Stock llama.cpp loads it via
+/// `GGML_BACKEND_PATH` + `--device penzai`. Same backend core module as the
+/// in-process path (so it stays llama-free), rooted on the `ggml_backend_init`
+/// entry shim and linking only libggml-base.
+fn addPenzaiBackendLib(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    shared: *std.Build.Module,
+    link: *std.Build.Module,
+    llama_config: LlamaConfig,
+) void {
+    if (!llama_config.enabled) return; // needs the ggml headers + libggml-base
+
+    const c_ggml = createGgmlCModule(b, target, llama_config.src);
+    const prof = createProfModule(b, target, optimize, shared, link);
+    const backend = createBackendModule(b, target, optimize, c_ggml, shared, link, prof);
+
+    const lib_mod = b.createModule(.{
+        .root_source_file = b.path("host/backend/backend_dl.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    lib_mod.addImport("c_ggml", c_ggml);
+    lib_mod.addImport("shared", shared);
+    lib_mod.addImport("link", link);
+    lib_mod.addImport("backend", backend);
+
+    // The backend core calls into ggml (ggml_nbytes, ggml_backend_buffer_init, …),
+    // which resolve against the host process's libggml-base.so at load time; link it
+    // so the .so carries the NEEDED reference (and the dlopen smoke can satisfy it).
+    const lib_path = b.pathJoin(&.{ llama_config.lib, "lib" });
+    lib_mod.addLibraryPath(.{ .cwd_relative = lib_path });
+    lib_mod.addRPath(.{ .cwd_relative = lib_path });
+    lib_mod.linkSystemLibrary("ggml-base", .{});
+
+    const lib = b.addLibrary(.{
+        .name = "ggml-penzai",
+        .root_module = lib_mod,
+        .linkage = .dynamic,
+    });
+    const install = b.addInstallArtifact(lib, .{});
+    b.step("backend-so", "Build libggml-penzai — the out-of-tree ggml backend").dependOn(&install.step);
 }

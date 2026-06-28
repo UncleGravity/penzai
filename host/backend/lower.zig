@@ -1,5 +1,11 @@
+//! ggml graph lowering — turns each supported ggml node into a fixed-width
+//! `wire.Command` for the device. Two halves: `supportsOp` + the per-op
+//! `supportsX` shape predicates (the gate ggml queries), and the `lowerX`
+//! emitters that pack operand byte-ranges + dims. The dense shape predicates are
+//! domain knowledge, not clutter — tablify the dispatch but keep them intact
+//! (plan-host-rebuild.md §4). llama-free.
 const std = @import("std");
-const c = @import("c");
+const c = @import("c_ggml");
 const shared = @import("shared");
 
 const layout = shared.layout;
@@ -52,6 +58,8 @@ pub fn supportsOp(op: ?*const c.ggml_tensor) bool {
         supportsArgmax(tensor) or
         supportsPad(tensor);
 }
+
+// ===========================  Graph lowering — the dispatch loop  ===========================
 
 pub fn lowerGraph(
     allocator: std.mem.Allocator,
@@ -122,6 +130,10 @@ pub fn lowerGraph(
 
     return try commands.toOwnedSlice(allocator);
 }
+
+// ===========================  supports_op predicates — per-op shape gates  ===========================
+// The domain knowledge: exactly which shapes / dtypes / op_params each op
+// accepts. Ugly but load-bearing — tablify the dispatch above, never these (§4).
 
 fn supportsCopy(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_CPY) return false;
@@ -310,6 +322,8 @@ fn supportsPad(op: *const c.ggml_tensor) bool {
     if (dim(op, 1) < dim(src, 1)) return false;
     return true;
 }
+
+// ===========================  Lowering — ggml node → wire.Command  ===========================
 
 fn lowerCopy(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
     const src: *const c.ggml_tensor = node.*.src[0] orelse return error.InvalidShape;
@@ -708,6 +722,8 @@ fn lowerPad(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command 
     } };
 }
 
+// ===========================  Range / span helpers  ===========================
+
 fn range(binding: Binding, nbytes: usize) wire.TensorRange {
     return .{
         .handle = binding.range.handle,
@@ -743,6 +759,8 @@ fn stridedSpan(row_bytes: usize, ne1: u32, ne2: u32, ne3: u32, nb1: usize, nb2: 
     span = try checkedAdd(span, try checkedMul(@as(usize, @intCast(ne3 - 1)), nb3));
     return span;
 }
+
+// ===========================  Tensor geometry & op-param accessors  ===========================
 
 fn tensorElements(tensor: *const c.ggml_tensor) usize {
     const raw = c.ggml_nelements(@constCast(tensor));

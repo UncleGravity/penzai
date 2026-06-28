@@ -1,13 +1,19 @@
+//! llama.cpp driver — the one place that owns the llama lifecycle: load model,
+//! register the penzai backend (devices + n_gpu_layers=999), init context,
+//! tokenize, run the decode loop, and sample. Also `runLogitsCheck`, the
+//! CPU-vs-device numerics A/B that is the host's oracle. The residency and
+//! backend-sampling invariants here are load-bearing (plan-host-rebuild.md §2.6,
+//! §2.13): op_offload=false, sampler chain built before context init.
 const std = @import("std");
 const c = @import("c");
 const build_options = @import("build_options");
 const shared = @import("shared");
-const backend_mod = @import("backend.zig");
-const census_mod = @import("census.zig");
+const backend_mod = @import("backend");
 const link_mod = @import("link");
-const prof_collector = @import("prof/collector.zig");
-const prof_model = @import("prof/model.zig");
-const prof_render = @import("prof/render.zig");
+const prof = @import("prof");
+const prof_collector = prof.collector;
+const prof_model = prof.model;
+const prof_render = prof.render;
 
 const profiling = shared.profiling;
 
@@ -97,7 +103,7 @@ pub fn runPrompt(
     const device = backend_mod.Device.create(allocator, link) catch return error.BackendHandshakeFailed;
     defer device.destroy();
     device.profile = profile;
-    var census: census_mod.Census = .{};
+    var census: backend_mod.Census = .{};
     if (options.census) device.census = &census;
 
     const model_path = try allocator.dupeZ(u8, options.model_path);
@@ -110,7 +116,9 @@ pub fn runPrompt(
     var model_params = c.llama_model_default_params();
     model_params.n_gpu_layers = 999;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
-    var devices = [_]c.ggml_backend_dev_t{ device.ggmlDevice(), null };
+    // ggmlDevice() is a c_ggml pointer (the backend core's ggml view); the
+    // llama params want c's. ABI-identical, distinct Zig types → one @ptrCast.
+    var devices = [_]c.ggml_backend_dev_t{ @ptrCast(device.ggmlDevice()), null };
     model_params.devices = &devices;
 
     if (profile) |p| p.setPhase(.model_load);
@@ -290,7 +298,7 @@ fn collectTrace(
     var model_params = c.llama_model_default_params();
     model_params.n_gpu_layers = if (device != null) 999 else 0;
     model_params.split_mode = c.LLAMA_SPLIT_MODE_LAYER;
-    var devices = [_]c.ggml_backend_dev_t{ if (device) |d| d.ggmlDevice() else null, null };
+    var devices = [_]c.ggml_backend_dev_t{ if (device) |d| @as(c.ggml_backend_dev_t, @ptrCast(d.ggmlDevice())) else null, null };
     if (device != null) model_params.devices = &devices;
 
     const model = c.llama_model_load_from_file(model_path.ptr, model_params) orelse return error.ModelLoadFailed;

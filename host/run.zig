@@ -1,10 +1,15 @@
+//! Options→execution bridge — builds a Fake/Tcp link, wraps it in a `Client`,
+//! and drives either llama (run/logits) or the matmul/bench harness over that one
+//! interface. The fake/tcp twins and the bench fixtures split into session.zig
+//! and bench.zig in the CLI rebuild (plan-host-rebuild.md §5); until then this
+//! stays at the host root.
 const std = @import("std");
 const build_options = @import("build_options");
 const shared = @import("shared");
-const prof_model = @import("prof/model.zig");
+const prof_model = @import("prof").model;
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
-const llama_mod = if (build_options.enable_llama) @import("llama.zig") else struct {
+const llama_mod = if (build_options.enable_llama) @import("llama/llama.zig") else struct {
     pub const Error = error{};
     pub const Options = struct {};
 };

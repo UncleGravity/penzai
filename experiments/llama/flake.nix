@@ -30,11 +30,6 @@
             ];
           };
 
-          tiny-gguf = pkgs.fetchurl {
-            url = "https://huggingface.co/ggml-org/tiny-llamas/resolve/def3e2dd70df35ecbf6403ea347de4c5977220c1/stories260K.gguf";
-            hash = "sha256-BHv0ZFWlRJMc/2/vFNeRAVTFavvCOrHF5Wpy5pkSwEs=";
-          };
-
           llama-cpp = pkgs.stdenv.mkDerivation {
             pname = "penzai-e2e-llama-cpp";
             version = "pinned";
@@ -91,8 +86,7 @@
               zig build \
                 -Doptimize=ReleaseSafe \
                 -Dllama-src=${llama-cpp-src} \
-                -Dllama-lib=${llama-cpp} \
-                -Dmodel=${tiny-gguf}
+                -Dllama-lib=${llama-cpp}
               runHook postBuild
             '';
 
@@ -104,12 +98,12 @@
             '';
 
             passthru = {
-              inherit llama-cpp tiny-gguf;
+              inherit llama-cpp;
             };
           };
         in {
           packages = {
-            inherit llama-cpp tiny-gguf;
+            inherit llama-cpp;
             all = llama-experiments;
             default = llama-experiments;
             backend-e2e = llama-experiments;

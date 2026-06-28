@@ -1,5 +1,11 @@
+//! TCP transport — the real-wire byte channel under the link. `Endpoint` owns the
+//! socket, TCP_NODELAY, the persistent 64 KiB stream buffers, and the zero-copy
+//! `callInto` (readFrameInto) the logits download relies on; `TcpTransport` adapts
+//! it to the link `Transport` interface (Endpoint.Error mapped to LinkError). The
+//! host's only transport that crosses the network; the in-process fake is fake.zig.
 const std = @import("std");
 const shared = @import("shared");
+const link = @import("link.zig");
 
 const protocol_transport = shared.protocol_transport;
 
@@ -93,3 +99,52 @@ fn connectStream(io: std.Io, spec: protocol_transport.TcpSpec) !net.Stream {
     const host_name = net.HostName.init(spec.host) catch return error.InvalidAddress;
     return net.HostName.connect(host_name, io, spec.port, .{ .mode = .stream, .protocol = .tcp });
 }
+
+// ===========================  TcpTransport — Endpoint as a link Transport  ===========================
+
+/// Adapts `Endpoint` to the `Transport` interface `Link` expects: a request frame
+/// in, response bytes (or zero-copy payload) out, with `Endpoint.Error` mapped to
+/// `LinkError`. `Link(TcpTransport)` is the wire-backed link.
+pub const TcpTransport = struct {
+    const Self = @This();
+
+    endpoint: Endpoint,
+
+    pub fn connect(io: std.Io, spec: protocol_transport.TcpSpec) link.LinkError!Self {
+        const endpoint = Endpoint.connect(io, spec) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Protocol => return error.Protocol,
+            error.InvalidAddress, error.Transport => return error.Transport,
+        };
+        return .{ .endpoint = endpoint };
+    }
+
+    pub fn deinit(self: *Self) void {
+        self.endpoint.deinit();
+    }
+
+    pub fn ioHandle(self: *Self) ?std.Io {
+        return self.endpoint.io;
+    }
+
+    pub fn call(self: *Self, allocator: std.mem.Allocator, request_frame: []const u8) link.LinkError![]u8 {
+        return self.endpoint.call(allocator, request_frame) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Protocol => return error.Protocol,
+            error.InvalidAddress, error.Transport => return error.Transport,
+        };
+    }
+
+    pub fn callInto(
+        self: *Self,
+        allocator: std.mem.Allocator,
+        request_frame: []const u8,
+        payload_out: []u8,
+    ) link.LinkError!protocol_transport.FrameIntoResult {
+        return self.endpoint.callInto(allocator, request_frame, payload_out) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.Protocol => return error.Protocol,
+            error.InvalidAddress, error.Transport => return error.Transport,
+        };
+    }
+};

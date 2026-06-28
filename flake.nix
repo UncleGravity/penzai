@@ -41,11 +41,6 @@
             ];
           };
 
-          tiny-gguf = pkgs.fetchurl {
-            url = "https://huggingface.co/ggml-org/tiny-llamas/resolve/def3e2dd70df35ecbf6403ea347de4c5977220c1/stories260K.gguf";
-            hash = "sha256-BHv0ZFWlRJMc/2/vFNeRAVTFavvCOrHF5Wpy5pkSwEs=";
-          };
-
           # Build with clang/libc++ (not the default gcc/libstdc++). The Zig
           # host compiles host/chat.cpp with Zig's bundled libc++, so the
           # common_chat_* C++ API (which takes std::string by ref) must be
@@ -108,6 +103,59 @@
             '';
           };
 
+          # DL-enabled llama.cpp: GGML_BACKEND_DL=ON + tools, so stock llama-cli can
+          # dlopen out-of-tree backends (libggml-penzai). No greedy-drop patch — the
+          # .so path samples host-side in llama-cli, not on the backend.
+          llama-cpp-dl = pkgs.libcxxStdenv.mkDerivation {
+            pname = "penzai-llama-cpp-dl";
+            version = "pinned";
+            src = llama-cpp-src;
+
+            nativeBuildInputs = [
+              pkgs.cmake
+              pkgs.ninja
+            ];
+
+            cmakeFlags = [
+              "-DBUILD_SHARED_LIBS=ON"
+              "-DCMAKE_BUILD_RPATH_USE_ORIGIN=ON"
+              "-DGGML_BACKEND_DL=ON"
+              "-DLLAMA_BUILD_COMMON=ON"
+              "-DLLAMA_BUILD_TOOLS=ON"
+              "-DLLAMA_BUILD_TESTS=OFF"
+              "-DLLAMA_BUILD_EXAMPLES=OFF"
+              "-DLLAMA_BUILD_SERVER=ON"
+              "-DLLAMA_CURL=OFF"
+              "-DLLAMA_TOOLS_INSTALL=OFF"
+              "-DGGML_METAL=OFF"
+              "-DGGML_ACCELERATE=OFF"
+              "-DGGML_BLAS=OFF"
+            ];
+
+            buildPhase = ''
+              runHook preBuild
+              cmake --build .
+              runHook postBuild
+            '';
+
+            installPhase = ''
+              runHook preInstall
+              mkdir -p "$out/bin" "$out/lib" "$out/include/ggml"
+              cp bin/llama-cli "$out/bin/"
+              # The in-tree CPU backend must sit next to llama-cli for the DL loader
+              # to find it; the rest of the shared libs go to lib/.
+              if [ -e bin/libggml-cpu.so ]; then cp -P bin/libggml-cpu.so "$out/bin/"; fi
+              find bin -maxdepth 1 \( -name 'lib*.so*' -o -name 'lib*.dylib' \) \
+                ! -name 'libggml-cpu.so' -exec cp -P {} "$out/lib/" \;
+              cp -R "$src/ggml/include/." "$out/include/ggml/"
+              runHook postInstall
+            '';
+          };
+
+          dynamicLibraryPathVar =
+            if pkgs.stdenv.hostPlatform.isDarwin then "DYLD_LIBRARY_PATH" else "LD_LIBRARY_PATH";
+          soExt = if pkgs.stdenv.hostPlatform.isDarwin then "dylib" else "so";
+
           # Zig's native libc detection fails inside the Nix build sandbox and
           # falls back to a musl ABI (wrong on glibc NixOS). For the libc++ host
           # build that breaks two ways: libc++ takes its musl <bits/alltypes.h>
@@ -132,6 +180,7 @@
             , step
             , optimize
             , withLlama ? false
+            , llamaLib ? llama-cpp
             }:
             let
               # Only the llama host build pulls in libc++ and a dynamic loader,
@@ -150,7 +199,7 @@
 
               # autoPatchelfHook repoints the host binary's interpreter to the
               # Nix glibc and resolves the llama .so DT_NEEDED entries.
-              buildInputs = pkgs.lib.optional forceGnu llama-cpp;
+              buildInputs = pkgs.lib.optional forceGnu llamaLib;
 
               dontConfigure = true;
 
@@ -161,8 +210,7 @@
                   -Doptimize=${optimize} \
                   ${pkgs.lib.optionalString forceGnu "-Dtarget=${hostGnuTarget} "}${pkgs.lib.optionalString withLlama ''
                     -Dllama-src=${llama-cpp-src} \
-                    -Dllama-lib=${llama-cpp} \
-                    -Dmodel=${tiny-gguf} \
+                    -Dllama-lib=${llamaLib} \
                   ''}--prefix "$out"
                 runHook postBuild
               '';
@@ -175,7 +223,7 @@
               passthru = {
                 inherit optimize;
               } // pkgs.lib.optionalAttrs withLlama {
-                inherit llama-cpp tiny-gguf;
+                inherit llama-cpp;
               };
             };
 
@@ -221,6 +269,16 @@
             pname = "penzaid-${name}";
             step = "install-penzaid";
             inherit optimize;
+          };
+
+          # The out-of-tree backend .so, built by Zig against the DL llama's ggml-base
+          # so it shares one libggml-base with the llama-cli that dlopens it.
+          penzai-backend-so = mkZigPackage {
+            pname = "penzai-backend-so";
+            step = "backend-so";
+            optimize = "ReleaseFast";
+            withLlama = true;
+            llamaLib = llama-cpp-dl;
           };
 
           mkApp = package: program: description: {
@@ -311,10 +369,21 @@
                 say hello
               '';
             };
+
+          # Stock llama-cli wired to dlopen libggml-penzai. Talks to a penzaid at
+          # PENZAI_HOST/PENZAI_PORT (default 127.0.0.1:9000). The residency flags the
+          # in-process driver hard-codes must be passed here:
+          #   PENZAI_HOST=… llama-cli-penzai --device penzai -ngl 999 --no-op-offload -fa on -m model.gguf
+          llama-cli-penzai = pkgs.writeShellScriptBin "llama-cli-penzai" ''
+            set -e
+            export GGML_BACKEND_PATH="${penzai-backend-so}/lib/libggml-penzai.${soExt}"
+            export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
+            exec "${llama-cpp-dl}/bin/llama-cli" "$@"
+          '';
         in
         rec {
           packages = rec {
-            inherit llama-cpp tiny-gguf;
+            inherit llama-cpp llama-cpp-dl penzai-backend-so llama-cli-penzai;
 
             penzai = penzai-releasefast;
             penzai-debug = mkPenzai "debug" "Debug";
@@ -345,6 +414,7 @@
             deploy-penzaid-releasefast = mkApp packages.deploy-penzaid-releasefast "deploy-penzaid-releasefast" "Deploy the releasefast KR260 penzaid daemon";
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
+            llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
           };
 
           checks = rec {
@@ -368,7 +438,6 @@
 
             LLAMA_CPP_SRC = llama-cpp-src;
             LLAMA_CPP_LIB = llama-cpp;
-            TINY_GGUF = tiny-gguf;
           };
         };
     };

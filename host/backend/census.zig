@@ -1,5 +1,10 @@
+//! Op-surface census — the `penzai census` diagnostic. Walks every graph_compute
+//! node (the *observed* op worklist, which `supports_op` does not fully predict —
+//! plan-host-rebuild.md §2.9) and tallies op counts, support status, matmul
+//! weight dtypes, and missing bindings, then prints the unsupported-op worklist.
+//! llama-free; lives with the backend core.
 const std = @import("std");
-const c = @import("c");
+const c = @import("c_ggml");
 const lower = @import("lower.zig");
 
 const op_count: usize = @intCast(c.GGML_OP_COUNT);

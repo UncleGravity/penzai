@@ -1,7 +1,13 @@
+//! penzai ggml backend — the pinned `Device` and its four ggml vtables
+//! (reg/device/buft/backend), remote-tensor residency, and the upload-batching
+//! preload path. This is the llama-free core: it speaks only ggml, and is the
+//! future `.so` subset. The non-obvious bits here are load-bearing — see
+//! plan-host-rebuild.md §2 (pinned Device, strict supports_buft + RemoteMagic,
+//! PROT_NONE reservation, full-op-surface residency, pending_preload batching).
 const std = @import("std");
-const c = @import("c");
+const c = @import("c_ggml");
 const shared = @import("shared");
-const prof_collector = @import("prof/collector.zig");
+const prof_collector = @import("prof").collector;
 const link_mod = @import("link");
 const lower = @import("lower.zig");
 const census_mod = @import("census.zig");
@@ -9,6 +15,10 @@ const census_mod = @import("census.zig");
 const layout = shared.layout;
 const wire = shared.wire;
 const profiling = shared.profiling;
+
+/// Re-exported so the llama driver can name the census type through the backend
+/// module; census.zig is internal to this module.
+pub const Census = census_mod.Census;
 
 const RemoteMagic: u64 = 0x7065_6e7a_6169_6275; // "penzaibu"
 const MaxBindings = 8192;
@@ -32,6 +42,10 @@ pub const Counters = struct {
     lowered_commands: usize = 0,
     unsupported_graphs: usize = 0,
 };
+
+// ===========================  Device — the pinned backend handle  ===========================
+// Heap-allocated and never moved: its four ggml vtables hold cross-pointers back
+// into the struct (wired in `wire`). §2.1.
 
 pub const Device = struct {
     const Self = @This();
@@ -69,6 +83,12 @@ pub const Device = struct {
         return &self.device;
     }
 
+    /// The wired registry, for the out-of-tree `.so` entry point (`ggml_backend_init`
+    /// returns this); the in-process driver passes the device via model_params instead.
+    pub fn ggmlReg(self: *Self) c.ggml_backend_reg_t {
+        return &self.reg;
+    }
+
     fn wire(self: *Self) void {
         self.reg = .{ .api_version = c.GGML_BACKEND_API_VERSION, .iface = reg_iface, .context = self };
         self.device = .{ .iface = device_iface, .reg = &self.reg, .context = self };
@@ -76,6 +96,10 @@ pub const Device = struct {
         self.backend = .{ .guid = null, .iface = backend_iface, .device = &self.device, .context = self };
     }
 };
+
+// ===========================  Residency — reservations, buffers, bindings  ===========================
+// Reserved (PROT_NONE) address space gives ggml a stable base for tensor->data
+// arithmetic it never dereferences; the real bytes live on-device. §2.3–2.5.
 
 /// A page reservation: virtual address space with no committed pages and no
 /// access. ggml needs a stable base pointer for tensor->data arithmetic; the
@@ -222,6 +246,8 @@ fn tensorOffsetInBuffer(remote: *RemoteBuffer, tensor: *const c.ggml_tensor) ?us
     if (offset > remote.remote.nbytes or size > remote.remote.nbytes - offset) return null;
     return offset;
 }
+
+// ===========================  Buffer vtable — tensor I/O over the link  ===========================
 
 fn bufGetBase(buf: c.ggml_backend_buffer_t) callconv(.c) ?*anyopaque {
     return remoteOf(buf).reservation.base();
@@ -373,6 +399,10 @@ fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) li
     dev.counters.fill_bytes += size;
 }
 
+// ===========================  Timed link ops + preload batching  ===========================
+// The pending_preload path folds tiny per-token inputs into the run_graph request
+// so they don't each cost a round trip. Load-bearing — §2.8 / the §0 heuristic.
+
 fn timedAlloc(dev: *Device, nbytes: u64, tensor_alignment: u32) link_mod.LinkError!wire.TensorRange {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     const result = try dev.link.alloc(nbytes, tensor_alignment);
@@ -455,6 +485,8 @@ const buffer_iface = c.ggml_backend_buffer_i{
     .reset = &bufReset,
 };
 
+// ===========================  Buffer-type vtable  ===========================
+
 fn buftGetName(buft: c.ggml_backend_buffer_type_t) callconv(.c) [*c]const u8 {
     return devOf(buft.?.*.context).name;
 }
@@ -520,6 +552,8 @@ const buft_iface = c.ggml_backend_buffer_type_i{
     .is_host = &buftIsHost,
 };
 
+// ===========================  Backend vtable — graph_compute → lower → link  ===========================
+
 fn backendGetName(backend: c.ggml_backend_t) callconv(.c) [*c]const u8 {
     return devOf(backend.?.*.context).name;
 }
@@ -579,6 +613,8 @@ const backend_iface = c.ggml_backend_i{
     .event_wait = null,
     .graph_optimize = null,
 };
+
+// ===========================  Device vtable — props, supports_op, offload_op  ===========================
 
 fn devGetName(dev: c.ggml_backend_dev_t) callconv(.c) [*c]const u8 {
     return devOf(dev.?.*.context).name;
@@ -652,6 +688,8 @@ const device_iface = c.ggml_backend_device_i{
     .event_free = null,
     .event_synchronize = null,
 };
+
+// ===========================  Registry vtable  ===========================
 
 fn regGetName(reg: c.ggml_backend_reg_t) callconv(.c) [*c]const u8 {
     return devOf(reg.?.*.context).name;
