@@ -7,6 +7,8 @@
 # Terminal 1
 nix run .#deploy-penzaid # build and upload daemon
 nix run .#serve-penzaid # run remote daemon
+# OR run local daemon (for testing)
+nix run .#penzaid-native -- serve --device tcp:127.0.0.1:29097 --mem fake --heap-mib 768
 
 # Terminal 2 (choose 1 from below)
 

@@ -390,6 +390,13 @@
 
             penzai = mkPenzai "releasefast" "ReleaseFast";
             penzaid = mkPenzaid "releasefast" "ReleaseFast";
+            # Native (host-arch) penzaid for local TCP testing of the .so — `--mem fake`,
+            # no board, no cross-compile. The KR260 `penzaid` above won't run on the host.
+            penzaid-native = mkZigPackage {
+              pname = "penzaid-native";
+              step = "install-penzaid-native";
+              optimize = "ReleaseFast";
+            };
 
             deploy-penzaid = mkDeploy "deploy-penzaid" "ReleaseFast" penzaid;
             serve-penzaid = mkServe "serve-penzaid";
@@ -405,6 +412,7 @@
 
             deploy-penzaid = mkApp packages.deploy-penzaid "deploy-penzaid" "Deploy the releasefast KR260 penzaid daemon";
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
+            penzaid-native = mkApp packages.penzaid-native "penzaid-native" "Run a local native penzaid daemon";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
             llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
           };
