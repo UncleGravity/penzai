@@ -36,6 +36,8 @@ const Model = struct {
     flip_after: u32 = 0,
     flip_val: u32 = 0,
     flip_reads: u32 = 0,
+    // dead-slave mode: the register port never grants (the watchdog's trigger condition).
+    stall_reg: bool = false,
     desc_gnt_prev: bool = false,
     reg_gnt_prev: bool = false,
 
@@ -68,7 +70,9 @@ const Model = struct {
             self.desc_gnt_prev = true;
         }
         // register port
-        if (self.reg_gnt_prev) {
+        if (self.stall_reg) {
+            // dead slave: leave gnt low forever
+        } else if (self.reg_gnt_prev) {
             c.dut_set_reg_gnt(self.h, 0);
             self.reg_gnt_prev = false;
         } else if (c.dut_reg_req(self.h) != 0) {
@@ -108,6 +112,7 @@ const Model = struct {
         c.dut_set_rst_n(self.h, 1);
         self.wl_n = 0;
         self.flip_reads = 0;
+        self.stall_reg = false;
         self.desc_gnt_prev = false;
         self.reg_gnt_prev = false;
     }
@@ -211,6 +216,32 @@ pub fn main() !void {
         if (c.dut_done(m.h) == 0) return error.NoDone;
         try expectWrites(&m, &.{});
         std.debug.print("  scenario 4 (empty run): finished in {d} cyc, no writes\n", .{cyc});
+    }
+
+    // ---- Scenario 5: dead register slave (no gnt, ever) → global watchdog, not a hang ----
+    {
+        m.reset();
+        const desc = [_][4]u32{ wr(0x10, 0x55), wr(0x20, 0x66) };
+        m.entries = &desc;
+        m.stall_reg = true;
+        const cyc = m.run(2, 50_000); // cosim WATCHDOG_TIMEOUT=4096 << 50k budget
+        if (c.dut_done(m.h) == 0) {
+            std.debug.print("  FAIL: scenario 5 hung instead of watchdogging\n", .{});
+            return error.NoDone;
+        }
+        if (c.dut_err_watchdog(m.h) == 0) return error.NoWatchdog;
+        if (c.dut_err_timeout(m.h) != 0) return error.UnexpectedTimeout;
+        if (c.dut_err_index(m.h) != 0) return error.WrongErrIndex; // stuck on entry 0
+        try expectWrites(&m, &.{}); // the stuck write never granted
+        std.debug.print("  scenario 5 (dead slave): watchdog fired at entry {d} in {d} cyc\n", .{ c.dut_err_index(m.h), cyc });
+
+        // ...and the core is reusable after a reset (what seq_top's ABORT does).
+        m.reset();
+        m.entries = &desc;
+        _ = m.run(2, 2000);
+        if (c.dut_done(m.h) == 0 or c.dut_err_watchdog(m.h) != 0) return error.NotReusableAfterAbort;
+        try expectWrites(&m, &.{ .{ .addr = 0x10, .val = 0x55 }, .{ .addr = 0x20, .val = 0x66 } });
+        std.debug.print("  scenario 5b (post-abort reuse): clean replay after reset\n", .{});
     }
 
     std.debug.print("  all seq_core cosim cases passed\n\n", .{});

@@ -15,6 +15,9 @@ const ps_pad = @import("ps/pad.zig");
 const ps_softmax = @import("ps/softmax.zig");
 const pl_matmul = @import("pl/matmul.zig");
 const pl_flash = @import("pl/flash_attn.zig");
+/// seq.v bring-up gate A (penzaid seq-smoke). Exposed through this module because the pl/
+/// files and their `regmap` dep live here, not in the exe root.
+pub const seq_smoke = @import("pl/seq_smoke.zig");
 
 const wire = shared.wire;
 const profiling = shared.profiling;

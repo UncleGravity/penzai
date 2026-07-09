@@ -59,12 +59,11 @@ RTL_FILES=(
   "$RTL_NUMERIC/interp.v"
   "$RTL_NUMERIC/recip.v"
   "$RTL_NUMERIC/fmt.vh"
-  # seq.v = the on-PL descriptor executor (batches the per-op PS dispatch). seq_top wraps the
-  # cosim-green seq_core + the AXI-Lite replay master + the AXI4 descriptor read master.
+  # seq.v = the on-PL command executor (batches the per-op PS dispatch, v2.1). seq_top =
+  # control slave + command BRAM + cosim-green seq_core + the AXI-Lite replay master.
   "$RTL_SEQ/seq_top.v"
   "$RTL_SEQ/seq_core.v"
   "$RTL_SEQ/seq_reg_master.v"
-  "$RTL_SEQ/seq_desc_reader.v"
 )
 for f in "${RTL_FILES[@]}"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for the *_regs.vh)" >&2; exit 1; }

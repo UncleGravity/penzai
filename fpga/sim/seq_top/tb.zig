@@ -1,19 +1,31 @@
-//! End-to-end cosim for seq_top: control AXI-Lite slave + seq_core + the two master adapters,
-//! all wired. The tb drives S_AXI as the PS (write DESC_BASE/COUNT, strobe go, poll STATUS) and
-//! models the far-side slaves: M_AXI_DESC as a descriptor memory and M_AXI_REG as the sc_ctrl
-//! target (writelog + a status register that flips done after K reads — the WAIT case). One run
-//! of {WRITE, WRITE, WAIT, WRITE} must replay the 3 writes in order, satisfy the WAIT, and finish.
+//! End-to-end cosim for seq_top v2.1: control AXI-Lite slave + command BRAM + seq_core +
+//! seq_reg_master, all wired. The tb drives S_AXI as the PS (fill the CMD window, program
+//! RUN_START/RUN_COUNT, strobe go/abort, poll STATUS) and models M_AXI_REG's far side as the
+//! sc_ctrl target (writelog + a status register that flips done after K reads — the WAIT case).
+//!
+//! Covers the v2.1 contract:
+//!  1. two runs RESIDENT at different CMD indices, kicked separately by RUN_START — the
+//!     segmented replay the resident-program design relies on, exact write order per run
+//!  2. RUN_COUNT=0 finishes immediately
+//!  3. ABORT mid-WAIT recovers to IDLE, and the executor + BRAM are reusable right after
+//!     (reload same indices, clean replay) — the reclaim-over-SSH property v1 lacked
 
 const std = @import("std");
 const c = @cImport(@cInclude("shim.h"));
 
-const OFF_DESC_BASE_LO: u32 = 0x00;
-const OFF_DESC_BASE_HI: u32 = 0x04;
-const OFF_DESC_COUNT: u32 = 0x08;
-const OFF_CTRL: u32 = 0x0C;
-const OFF_STATUS: u32 = 0x10;
-const ST_DONE: u32 = 0x2;
-const ST_ERR: u32 = 0x4;
+// Host mirror of seq_top's control map (device/pl/seq.zig `ctrl`).
+const OFF_RUN_START: u32 = 0x00;
+const OFF_RUN_COUNT: u32 = 0x04;
+const OFF_CTRL: u32 = 0x08;
+const OFF_STATUS: u32 = 0x0C;
+const OFF_ERR_INDEX: u32 = 0x10;
+const CMD_OFF: u32 = 0x8000;
+const CTRL_GO: u32 = 1 << 0;
+const CTRL_ABORT: u32 = 1 << 1;
+const ST_BUSY: u32 = 1 << 0;
+const ST_DONE: u32 = 1 << 1;
+const ST_ERR_TIMEOUT: u32 = 1 << 2;
+const ST_ERR_WATCHDOG: u32 = 1 << 3;
 
 const Entry = [4]u32;
 fn wr(addr: u32, val: u32) Entry {
@@ -27,13 +39,7 @@ const Write = struct { addr: u32, val: u32 };
 
 const Tb = struct {
     h: *c.Dut,
-    // descriptor memory (M_AXI_DESC)
-    mem: []const Entry = &.{},
-    desc_base: u64 = 0,
-    d_addr: u64 = 0,
-    d_ar_seen: bool = false,
-    d_r_pending: bool = false,
-    // register target (M_AXI_REG)
+    // register target model (M_AXI_REG far side)
     writelog: [32]Write = undefined,
     wl_n: usize = 0,
     flip_addr: u32 = 0xFFFF_FFFF,
@@ -64,28 +70,9 @@ const Tb = struct {
         return 0;
     }
 
+    // ---- M_AXI_REG slave (sc_ctrl target: writelog + flipping status read) ----
     fn respond(self: *Tb) void {
         const h = self.h;
-        // ---- M_AXI_DESC slave (descriptor memory) ----
-        if (c.dut_desc_arvalid(h) != 0) {
-            c.dut_set_desc_arready(h, 1);
-            self.d_addr = c.dut_desc_araddr(h);
-            self.d_ar_seen = true;
-        } else c.dut_set_desc_arready(h, 0);
-        if (self.d_ar_seen and !self.d_r_pending) self.d_r_pending = true;
-        if (self.d_r_pending) {
-            const idx: usize = @intCast((self.d_addr - self.desc_base) / 16);
-            const e = self.mem[idx];
-            c.dut_set_desc_rdata(h, e[0], e[1], e[2], e[3]);
-            c.dut_set_desc_rvalid(h, 1);
-            c.dut_set_desc_rlast(h, 1);
-        } else c.dut_set_desc_rvalid(h, 0);
-        if (self.d_r_pending and c.dut_desc_rready(h) != 0) {
-            self.d_r_pending = false;
-            self.d_ar_seen = false;
-        }
-
-        // ---- M_AXI_REG slave (sc_ctrl target: writelog + flipping status read) ----
         if (c.dut_reg_awvalid(h) != 0) {
             c.dut_set_reg_awready(h, 1);
             self.aw_addr = c.dut_reg_awaddr(h);
@@ -144,7 +131,12 @@ const Tb = struct {
         c.dut_set_rst_n(self.h, 1);
     }
 
-    // ---- S_AXI master driver ----
+    fn clearLog(self: *Tb) void {
+        self.wl_n = 0;
+        self.flip_reads = 0;
+    }
+
+    // ---- S_AXI master driver (the PS) ----
     fn writeReg(self: *Tb, off: u32, val: u32) !void {
         const h = self.h;
         c.dut_set_s_awaddr(h, off);
@@ -182,53 +174,113 @@ const Tb = struct {
         c.dut_set_s_rready(h, 0);
         return val;
     }
+
+    /// Load entries into the CMD window at entry index `at` — what seq_ctrl.load does.
+    fn load(self: *Tb, at: u32, entries: []const Entry) !void {
+        for (entries, 0..) |e, i| {
+            const base = CMD_OFF + (at + @as(u32, @intCast(i))) * 16;
+            for (e, 0..) |word, lane| {
+                try self.writeReg(base + @as(u32, @intCast(lane)) * 4, word);
+            }
+        }
+    }
+
+    fn kick(self: *Tb, start: u32, count: u32) !void {
+        try self.writeReg(OFF_RUN_START, start);
+        try self.writeReg(OFF_RUN_COUNT, count);
+        try self.writeReg(OFF_CTRL, CTRL_GO);
+    }
+
+    /// Poll STATUS.done like the PS does; each read advances the sim.
+    fn waitDone(self: *Tb, max_polls: usize) !u32 {
+        var i: usize = 0;
+        while (i < max_polls) : (i += 1) {
+            const status = try self.readReg(OFF_STATUS);
+            if (status & ST_DONE != 0) return status;
+        }
+        return error.NeverDone;
+    }
 };
+
+fn expectWrites(tb: *Tb, want: []const Write) !void {
+    try std.testing.expectEqualSlices(Write, want, tb.writelog[0..tb.wl_n]);
+}
 
 pub fn main() !void {
     var tb = Tb.init();
     defer tb.deinit();
     tb.reset();
 
-    const desc = [_]Entry{
-        wr(0xA000_0010, 0x11),
-        wr(0xA000_0014, 0x22),
-        wait(0xA005_0000, 0x2, 0x2), // kernel STATUS.done
-        wr(0xA000_0018, 0x33),
-    };
-    tb.mem = &desc;
-    tb.desc_base = 0x8_0000_0000;
-    tb.flip_addr = 0xA005_0000;
-    tb.flip_after = 3; // reads 1..3 -> 0, read 4 -> 0x2
-    tb.flip_val = 0x2;
+    // ---- Scenario 1: two runs resident at different indices, kicked by RUN_START ----
+    {
+        // Run A at entry 0: two kernel-config writes. Run B at entry 8: write, WAIT, write.
+        const run_a = [_]Entry{ wr(0xA005_0010, 0x11), wr(0xA005_0014, 0x22) };
+        const run_b = [_]Entry{
+            wr(0xA000_0018, 0x33),
+            wait(0xA005_0000, 0x2, 0x2), // kernel STATUS.done
+            wr(0xA000_001C, 0x44),
+        };
+        try tb.load(0, &run_a);
+        try tb.load(8, &run_b);
 
-    // Program the run over S_AXI, then go.
-    try tb.writeReg(OFF_DESC_BASE_LO, @truncate(tb.desc_base & 0xffff_ffff));
-    try tb.writeReg(OFF_DESC_BASE_HI, @truncate(tb.desc_base >> 32));
-    try tb.writeReg(OFF_DESC_COUNT, 4);
-    try tb.writeReg(OFF_CTRL, 1);
+        tb.clearLog();
+        try tb.kick(0, 2);
+        var status = try tb.waitDone(400);
+        if (status & (ST_ERR_TIMEOUT | ST_ERR_WATCHDOG) != 0) return error.UnexpectedErr;
+        try expectWrites(&tb, &.{ .{ .addr = 0xA005_0010, .val = 0x11 }, .{ .addr = 0xA005_0014, .val = 0x22 } });
 
-    // Poll STATUS.done (each read advances the sim while the core runs autonomously).
-    var status: u32 = 0;
-    var i: usize = 0;
-    while (i < 400) : (i += 1) {
+        tb.clearLog();
+        tb.flip_addr = 0xA005_0000;
+        tb.flip_after = 3; // reads 1..3 -> 0, read 4 -> 0x2
+        tb.flip_val = 0x2;
+        try tb.kick(8, 3);
+        status = try tb.waitDone(400);
+        if (status & (ST_ERR_TIMEOUT | ST_ERR_WATCHDOG) != 0) return error.UnexpectedErr;
+        try expectWrites(&tb, &.{ .{ .addr = 0xA000_0018, .val = 0x33 }, .{ .addr = 0xA000_001C, .val = 0x44 } });
+        if (tb.flip_reads < 4) return error.WaitUnderPolled;
+        std.debug.print("  scenario 1 (two resident runs): segment replay by RUN_START, WAIT polled {d}x\n", .{tb.flip_reads});
+    }
+
+    // ---- Scenario 2: RUN_COUNT=0 finishes immediately, no writes ----
+    {
+        tb.clearLog();
+        tb.flip_addr = 0xFFFF_FFFF;
+        try tb.kick(0, 0);
+        _ = try tb.waitDone(50);
+        try expectWrites(&tb, &.{});
+        std.debug.print("  scenario 2 (empty run): immediate done\n", .{});
+    }
+
+    // ---- Scenario 3: ABORT mid-WAIT -> IDLE, then reload + clean reuse ----
+    {
+        // A WAIT that never matches: the executor loops polling (slave responsive, POLL_TIMEOUT
+        // is the silicon-scale default and never fires in this horizon).
+        const stuck = [_]Entry{ wr(0xA005_0010, 0x55), wait(0xA005_0000, 0x2, 0x2) };
+        try tb.load(0, &stuck);
+        tb.clearLog();
+        tb.flip_addr = 0xDEAD; // the polled addr always reads 0
+        try tb.kick(0, 2);
+        for (0..200) |_| tb.step(); // let it get stuck in the poll loop
+        var status = try tb.readReg(OFF_STATUS);
+        if (status & ST_BUSY == 0) return error.ExpectedBusy;
+
+        try tb.writeReg(OFF_CTRL, CTRL_ABORT);
         status = try tb.readReg(OFF_STATUS);
-        if (status & ST_DONE != 0) break;
-    } else return error.NeverDone;
+        if (status & (ST_BUSY | ST_DONE) != 0) {
+            std.debug.print("  FAIL: post-abort STATUS=0x{x}, want idle\n", .{status});
+            return error.AbortDidNotIdle;
+        }
 
-    if (status & ST_ERR != 0) {
-        std.debug.print("  FAIL: err_timeout set\n", .{});
-        return error.Timeout;
+        // Reload the same indices with a clean run and go again — executor + BRAM reusable.
+        const clean = [_]Entry{ wr(0xA005_0020, 0x66), wr(0xA005_0024, 0x77) };
+        try tb.load(0, &clean);
+        tb.clearLog();
+        try tb.kick(0, 2);
+        status = try tb.waitDone(400);
+        if (status & (ST_ERR_TIMEOUT | ST_ERR_WATCHDOG) != 0) return error.UnexpectedErr;
+        try expectWrites(&tb, &.{ .{ .addr = 0xA005_0020, .val = 0x66 }, .{ .addr = 0xA005_0024, .val = 0x77 } });
+        std.debug.print("  scenario 3 (abort mid-WAIT): recovered to idle, clean reuse after reload\n", .{});
     }
-    const want = [_]Write{
-        .{ .addr = 0xA000_0010, .val = 0x11 },
-        .{ .addr = 0xA000_0014, .val = 0x22 },
-        .{ .addr = 0xA000_0018, .val = 0x33 },
-    };
-    try std.testing.expectEqualSlices(Write, &want, tb.writelog[0..tb.wl_n]);
-    if (tb.flip_reads < 4) {
-        std.debug.print("  FAIL: WAIT polled {d}x, expected >=4\n", .{tb.flip_reads});
-        return error.WaitUnderPolled;
-    }
-    std.debug.print("  end-to-end: 3 writes replayed in order via M_AXI_REG, WAIT polled {d}x, STATUS.done\n", .{tb.flip_reads});
+
     std.debug.print("  all seq_top cosim cases passed\n\n", .{});
 }

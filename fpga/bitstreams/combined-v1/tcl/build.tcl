@@ -245,11 +245,11 @@ connect_bd_intf_net [get_bd_intf_pins dwc_mask/M_AXIS]      [get_bd_intf_pins ke
 connect_bd_intf_net [get_bd_intf_pins kernel_fa/M_AXIS_O]   [get_bd_intf_pins dwc_o/S_AXIS]
 connect_bd_intf_net [get_bd_intf_pins dwc_o/M_AXIS]         [get_bd_intf_pins dma_o/S_AXIS_S2MM]
 
-# ====================== SEQ.V descriptor executor ===========================
-# seq_top batches the per-op PS->PL register dance: the PS writes a {WRITE|WAIT} descriptor list
-# to DRAM and kicks seq.v once; seq.v replays it into sc_ctrl (M_AXI_REG, a 2nd sc_ctrl master),
-# fetching the list over HPC0 (M_AXI_DESC, coherent — the PS's cached writes are visible w/o flush).
-# Its control slave (S_AXI) is a 13th sc_ctrl target the PS pokes once/run. (docs/plan-seq-impl.md)
+# ====================== SEQ.V command executor (v2.1) =======================
+# seq_top batches the per-op PS->PL register dance: the PS loads a {WRITE|WAIT} command stream
+# into seq_top's OWN BRAM through its control slave (S_AXI, a 13th sc_ctrl target), kicks it once,
+# and seq.v replays the stream into sc_ctrl (M_AXI_REG, a 2nd sc_ctrl master). No DRAM, no fetch
+# master, no cache coherency — v1's brick class is unrepresentable. (docs/plan-seq-impl-v2.md)
 create_bd_cell -type module -reference seq_top seq_top
 
 # ---- Reset (SINGLE domain) --------------------------------------------------
@@ -317,7 +317,7 @@ make_mem_sc sc_hp0  {dma_w0/M_AXI_MM2S dma_w0/M_AXI_S2MM dma_a/M_AXI_MM2S}    S_
 make_mem_sc sc_hp1  {dma_w1/M_AXI_MM2S}                                       S_AXI_HP1_FPD
 make_mem_sc sc_hp2  {dma_w2/M_AXI_MM2S}                                       S_AXI_HP2_FPD
 make_mem_sc sc_hp3  {dma_w3/M_AXI_MM2S}                                       S_AXI_HP3_FPD
-make_mem_sc sc_hpc0 {dma_q/M_AXI_MM2S dma_o/M_AXI_S2MM dma_mask/M_AXI_MM2S seq_top/M_AXI_DESC} S_AXI_HPC0_FPD
+make_mem_sc sc_hpc0 {dma_q/M_AXI_MM2S dma_o/M_AXI_S2MM dma_mask/M_AXI_MM2S} S_AXI_HPC0_FPD
 make_mem_sc sc_hpc1 {dma_k/M_AXI_MM2S dma_v/M_AXI_MM2S}                       S_AXI_HPC1_FPD
 
 # ---- Address map (generated; single source: fpga/regmap/{matmul,flash_attn}.zig) ----
@@ -333,15 +333,31 @@ foreach {addr_list kcell} [list $matmul_address_map kernel_mm $flash_address_map
             [first_addr_seg [list "$cell/$intf/Reg" "$cell/$intf/*"]]
     }
 }
-# seq_top control slave: a fixed base the host SeqCtrl matches (device/pl/seq.zig seq.base). Above
-# the matmul (0xA00x) / flash (0xA01x) windows. seq_top's M_AXI_REG (a 2nd sc_ctrl master) reaches
-# the DMAs/kernels at their assigned addresses; M_AXI_DESC reaches PS DDR via HPC0 — both handled by
-# the bare assign_bd_address below (it maps every still-unassigned master).
+# seq_top control slave: a fixed base the host SeqCtrl matches (device/pl/seq.zig ctrl.base).
+# Above the matmul (0xA00x) / flash (0xA01x) windows. 64K covers the register block + the CMD
+# window at +0x8000 (2048 entries).
 assign_bd_address -offset 0xA0200000 -range 64K \
     [first_addr_seg [list "seq_top/S_AXI/Reg" "seq_top/S_AXI/*"]]
 
-# Route the DMA mem masters (and seq_top's M_AXI_REG -> sc_ctrl, M_AXI_DESC -> DDR) to their targets.
+# Route the DMA mem masters and seq_top's M_AXI_REG -> sc_ctrl targets.
 assign_bd_address
+
+# Pin the replay master's view: the host builds command streams from the PS address map, so
+# seq_top/M_AXI_REG MUST see every sc_ctrl target at the same offset the PS does. Fail the
+# build on any divergence rather than ship a bitstream that replays onto wrong registers.
+foreach {addr_list kcell} [list $matmul_address_map kernel_mm $flash_address_map kernel_fa] {
+    foreach entry $addr_list {
+        lassign $entry cell intf offset
+        if {$cell eq "kernel"} { set cell $kcell }
+        set segs [get_bd_addr_segs -of_objects [get_bd_addr_spaces seq_top/M_AXI_REG] \
+            -filter "NAME =~ *${cell}*"]
+        if {[llength $segs] != 1} { error "seq M_AXI_REG: want 1 addr seg for $cell, got: $segs" }
+        set got [format 0x%08X [get_property OFFSET [lindex $segs 0]]]
+        set want [format 0x%08X $offset]
+        if {$got ne $want} { error "seq M_AXI_REG sees $cell at $got, PS map says $want" }
+    }
+}
+puts "==> seq_top/M_AXI_REG address view matches the PS map (12 targets)"
 
 validate_bd_design
 set kernel_clk_hz [clock_hz $fclk_pin $fclk_mhz]

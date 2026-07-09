@@ -163,7 +163,7 @@ const numeric_diff_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/fp_recip.v",
 };
 
-// seq_core (the seq.v descriptor executor) — pure control logic, no software ref.
+// seq_core (the seq.v command executor) — pure control logic, no software ref.
 const seq_rtl = [_][]const u8{
     "fpga/rtl/seq/seq_core.v",
 };
@@ -171,16 +171,12 @@ const seq_rtl = [_][]const u8{
 const seq_reg_master_rtl = [_][]const u8{
     "fpga/rtl/seq/seq_reg_master.v",
 };
-// seq_desc_reader: the AXI4 read-master descriptor-fetch adapter.
-const seq_desc_reader_rtl = [_][]const u8{
-    "fpga/rtl/seq/seq_desc_reader.v",
-};
-// seq_top: the BD-ready executor — control AXI-Lite slave + seq_core + both master adapters.
+// seq_top: the BD-ready executor — control AXI-Lite slave + command BRAM + seq_core +
+// seq_reg_master (v2.1: no DRAM descriptor fetch).
 const seq_top_rtl = [_][]const u8{
     "fpga/rtl/seq/seq_top.v",
     "fpga/rtl/seq/seq_core.v",
     "fpga/rtl/seq/seq_reg_master.v",
-    "fpga/rtl/seq/seq_desc_reader.v",
 };
 
 // numeric/fma (fixed-point DSP-MAC) oracle cosim vs matmul_ref.windowedRow.
@@ -267,10 +263,9 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
-    addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core descriptor executor (write-replay/WAIT/END/timeout)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
+    addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
-    addCosim(b, target, optimize, "test-rtl-seq-desc-reader", "Verilator cosim: seq_desc_reader (req/gnt -> AXI4 read master)", "seq_desc_reader", "fpga/sim/seq_desc_reader", &seq_desc_reader_rtl, .seq);
-    addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + core + both masters)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
+    addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.

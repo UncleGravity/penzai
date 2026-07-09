@@ -1,6 +1,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const device_tcp = @import("transport/tcp.zig");
+const seq_smoke = @import("runtime").seq_smoke;
 
 const protocol_transport = shared.protocol_transport;
 
@@ -10,7 +11,7 @@ const CliError = error{
     InvalidNumber,
     MissingValue,
     UnsupportedDevice,
-} || protocol_transport.ParseError || device_tcp.ServeError || std.process.Args.Iterator.InitError || std.Io.Writer.Error;
+} || protocol_transport.ParseError || device_tcp.ServeError || std.process.Args.Iterator.InitError || std.Io.Writer.Error || seq_smoke.Error;
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -42,6 +43,11 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
 
     if (std.mem.eql(u8, command, "help") or std.mem.eql(u8, command, "--help") or std.mem.eql(u8, command, "-h")) {
         try writeUsage(stdout);
+        return;
+    }
+
+    if (std.mem.eql(u8, command, "seq-smoke")) {
+        try seq_smoke.run(stdout);
         return;
     }
 
@@ -110,8 +116,9 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  penzaid serve --device tcp:HOST:PORT [--mem fake|xrt] [--heap-mib N] [--max-requests N]
         \\
         \\commands:
-        \\  serve    run the board/device runtime over TCP
-        \\  help     show this help
+        \\  serve      run the board/device runtime over TCP
+        \\  seq-smoke  seq.v bring-up gate A: no-DMA replay/timeout/abort test (penzaid must be stopped)
+        \\  help       show this help
         \\
     );
 }

@@ -27,6 +27,7 @@ void dut_set_reg_rdata(Dut *d, uint32_t v);
 int dut_busy(Dut *d);
 int dut_done(Dut *d);
 int dut_err_timeout(Dut *d);
+int dut_err_watchdog(Dut *d);
 uint32_t dut_err_index(Dut *d);
 // descriptor-port request outputs
 int dut_desc_req(Dut *d);

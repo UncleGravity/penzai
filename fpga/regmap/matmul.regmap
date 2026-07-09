@@ -7,7 +7,7 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x00000009   v9 = fixed-window gemm (104b acc, no EMIN register)
+0x04      VERSION         ro      0x0000000A   v10 = v9 + seq_top command executor on sc_ctrl (gates PENZAI_SEQ)
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128

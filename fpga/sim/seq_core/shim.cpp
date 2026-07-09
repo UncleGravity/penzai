@@ -40,6 +40,7 @@ void dut_set_reg_rdata(Dut *d, uint32_t v) { d->t->reg_rdata = v; }
 int dut_busy(Dut *d) { return d->t->busy; }
 int dut_done(Dut *d) { return d->t->done; }
 int dut_err_timeout(Dut *d) { return d->t->err_timeout; }
+int dut_err_watchdog(Dut *d) { return d->t->err_watchdog; }
 uint32_t dut_err_index(Dut *d) { return d->t->err_index; }
 int dut_desc_req(Dut *d) { return d->t->desc_req; }
 uint32_t dut_desc_idx(Dut *d) { return d->t->desc_idx; }
