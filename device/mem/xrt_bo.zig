@@ -1,6 +1,7 @@
 const std = @import("std");
 const shared = @import("shared");
 const xrt = @import("../xrt.zig");
+const regions_mod = @import("regions.zig");
 
 const wire = shared.wire;
 
@@ -21,13 +22,9 @@ pub const InitError = error{
     XrtBOSyncFailed,
 };
 
-const Record = struct {
-    handle: u64,
-    offset: u64,
-    nbytes: u64,
-    alive: bool,
-};
-
+/// Board heap: a single contiguous XRT buffer object mapped into the daemon and
+/// physically addressable by the PL.  Offset bookkeeping is delegated to
+/// `Regions`; this type owns the BO, the CPU mapping, and the cache syncs.
 pub const Heap = struct {
     const Self = @This();
 
@@ -37,9 +34,7 @@ pub const Heap = struct {
     bo: xrt.BufferHandle,
     data: []u8,
     phys_base: u64,
-    records: std.ArrayList(Record),
-    cursor: u64,
-    next_handle: u64,
+    regions: regions_mod.Regions,
 
     pub fn init(allocator: std.mem.Allocator, size: usize) InitError!Self {
         var x = xrt.Xrt.open() catch |err| switch (err) {
@@ -61,6 +56,8 @@ pub const Heap = struct {
         @memset(data, 0);
         if (x.boSync(bo, xrt.sync_to_device, size, 0) != 0) return error.XrtBOSyncFailed;
 
+        const regions = regions_mod.Regions.init(allocator, size) catch return error.XrtBOAllocFailed;
+
         return .{
             .allocator = allocator,
             .x = x,
@@ -68,14 +65,12 @@ pub const Heap = struct {
             .bo = bo,
             .data = data,
             .phys_base = x.boAddress(bo),
-            .records = .empty,
-            .cursor = 0,
-            .next_handle = 1,
+            .regions = regions,
         };
     }
 
     pub fn deinit(self: *Self) void {
-        self.records.deinit(self.allocator);
+        self.regions.deinit();
         _ = self.x.boFree(self.bo);
         _ = self.x.deviceClose(self.dev);
         self.x.close();
@@ -83,87 +78,53 @@ pub const Heap = struct {
     }
 
     pub fn allocate(self: *Self, nbytes: u64, alignment: u32) HeapError!wire.TensorRange {
-        if (alignment == 0 or !std.math.isPowerOfTwo(alignment)) return error.InvalidAlignment;
-        const aligned = alignForward(self.cursor, alignment);
-        if (aligned > self.data.len or nbytes > self.data.len - aligned) return error.OutOfMemory;
-
-        const handle = self.next_handle;
-        self.next_handle += 1;
-        self.records.append(self.allocator, .{
-            .handle = handle,
-            .offset = aligned,
-            .nbytes = nbytes,
-            .alive = true,
-        }) catch return error.OutOfMemory;
-        self.cursor = aligned + nbytes;
-        return .{ .handle = handle, .offset = 0, .nbytes = nbytes };
+        const a = try self.regions.allocate(nbytes, alignment);
+        return .{ .handle = a.handle, .offset = 0, .nbytes = nbytes };
     }
 
     pub fn free(self: *Self, handle: u64) HeapError!void {
-        const rec = try self.findRecord(handle);
-        rec.alive = false;
+        return self.regions.free(handle);
     }
 
     pub fn read(self: *Self, range: wire.TensorRange) HeapError![]const u8 {
-        const abs = try self.absolute(range);
-        return self.data[abs..][0..try checkedUsize(range.nbytes)];
+        return self.bytes(range);
     }
 
     pub fn write(self: *Self, range: wire.TensorRange, src: []const u8) HeapError!void {
         if (src.len != try checkedUsize(range.nbytes)) return error.OutOfBounds;
-        const abs = try self.absolute(range);
-        @memcpy(self.data[abs..][0..src.len], src);
+        @memcpy((try self.bytes(range))[0..src.len], src);
         try self.syncToDevice(range);
     }
 
     pub fn fill(self: *Self, range: wire.TensorRange, value: u8) HeapError!void {
-        const abs = try self.absolute(range);
-        @memset(self.data[abs..][0..try checkedUsize(range.nbytes)], value);
+        @memset(try self.bytes(range), value);
         try self.syncToDevice(range);
     }
 
     pub fn bytes(self: *Self, range: wire.TensorRange) HeapError![]u8 {
-        const abs = try self.absolute(range);
-        return self.data[abs..][0..try checkedUsize(range.nbytes)];
+        const abs = try self.regions.absolute(range.handle, range.offset, range.nbytes);
+        return self.data[@intCast(abs)..][0..try checkedUsize(range.nbytes)];
     }
 
     pub fn deviceAddress(self: *Self, range: wire.TensorRange) HeapError!u64 {
-        const abs = try self.absolute(range);
-        return self.phys_base + @as(u64, @intCast(abs));
+        const abs = try self.regions.absolute(range.handle, range.offset, range.nbytes);
+        return self.phys_base + abs;
     }
 
     pub fn syncToDevice(self: *Self, range: wire.TensorRange) HeapError!void {
-        const abs = try self.absolute(range);
+        const abs = try self.regions.absolute(range.handle, range.offset, range.nbytes);
         const len = try checkedUsize(range.nbytes);
-        if (self.x.boSync(self.bo, xrt.sync_to_device, len, abs) != 0) return error.BackendFailure;
+        if (self.x.boSync(self.bo, xrt.sync_to_device, len, @intCast(abs)) != 0) return error.BackendFailure;
     }
 
     pub fn syncFromDevice(self: *Self, range: wire.TensorRange) HeapError!void {
-        const abs = try self.absolute(range);
+        const abs = try self.regions.absolute(range.handle, range.offset, range.nbytes);
         const len = try checkedUsize(range.nbytes);
-        if (self.x.boSync(self.bo, xrt.sync_from_device, len, abs) != 0) return error.BackendFailure;
-    }
-
-    fn absolute(self: *Self, range: wire.TensorRange) HeapError!usize {
-        const rec = try self.findRecord(range.handle);
-        if (range.offset > rec.nbytes or range.nbytes > rec.nbytes - range.offset) return error.OutOfBounds;
-        return @intCast(rec.offset + range.offset);
-    }
-
-    fn findRecord(self: *Self, handle: u64) HeapError!*Record {
-        for (self.records.items) |*rec| {
-            if (rec.handle == handle and rec.alive) return rec;
-        }
-        return error.UnknownHandle;
+        if (self.x.boSync(self.bo, xrt.sync_from_device, len, @intCast(abs)) != 0) return error.BackendFailure;
     }
 };
 
 fn checkedUsize(value: u64) HeapError!usize {
     if (value > std.math.maxInt(usize)) return error.OutOfBounds;
     return @intCast(value);
-}
-
-fn alignForward(value: u64, alignment: u32) u64 {
-    const mask = @as(u64, alignment) - 1;
-    return (value + mask) & ~mask;
 }

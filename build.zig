@@ -589,6 +589,7 @@ fn addTests(
     addSupportTest(b, test_step, "fpga/sim/support/matmul_ref.zig", target, optimize);
 
     addDeviceTest(b, test_step, "device/profile.zig", target, optimize, build_options, shared);
+    addDeviceTest(b, test_step, "device/mem/regions.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/mem/heap.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/runtime.zig", target, optimize, build_options, shared);
     addDeviceTest(b, test_step, "device/ps/activations.zig", target, optimize, build_options, shared);

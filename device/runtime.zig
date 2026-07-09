@@ -31,7 +31,14 @@ pub const RuntimeError = error{
     BackendFailure,
 };
 
+const xrt_bo = @import("mem/xrt_bo.zig");
+
+/// The fake heap runtime (`--mem fake`, off-board tests) and the XRT/board heap
+/// runtime (`--mem xrt`). Both heap backends live behind this module so their
+/// shared `mem/regions.zig` bookkeeping belongs to exactly one module; the tcp
+/// transport picks between these two aliases instead of importing the heaps.
 pub const Runtime = RuntimeFor(heap_mod.Heap);
+pub const XrtRuntime = RuntimeFor(xrt_bo.Heap);
 
 pub fn RuntimeFor(comptime Heap: type) type {
     return struct {

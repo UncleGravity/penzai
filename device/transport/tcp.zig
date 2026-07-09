@@ -2,7 +2,6 @@ const std = @import("std");
 const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const server_mod = @import("server");
-const xrt_bo = @import("../mem/xrt_bo.zig");
 
 const protocol_transport = shared.protocol_transport;
 
@@ -45,7 +44,7 @@ pub fn serve(io: std.Io, allocator: std.mem.Allocator, spec: protocol_transport.
 
     switch (options.memory) {
         .fake => try serveWithRuntime(runtime_mod.Runtime, io, allocator, &listener, heap_size, options),
-        .xrt => try serveWithRuntime(runtime_mod.RuntimeFor(xrt_bo.Heap), io, allocator, &listener, heap_size, options),
+        .xrt => try serveWithRuntime(runtime_mod.XrtRuntime, io, allocator, &listener, heap_size, options),
     }
 }
 
