@@ -1,3 +1,0 @@
-== OOC synth FULL gemm_kernel (FE_LAT=4 input-reg fix) @ 3.333ns ==
-RESULT top=gemm_kernel_ooc dsp=288 lut=0 carry8=637 ff=16177 wns_ns=0.149 fmax_mhz=314.1 (period=3.333ns)
-== gemm_kernel OOC2 DONE ==

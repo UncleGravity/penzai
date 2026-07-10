@@ -1,3 +1,0 @@
-== OOC synth gemm_emit (readout normalize: 72b LZD + barrel shift) @ 3.333ns ==
-RESULT top=gemm_emit_ooc dsp=0 lut=0 carry8=14 ff=114 wns_ns=-1.709 fmax_mhz=198.3 (period=3.333ns)
-== gemm_emit OOC DONE ==

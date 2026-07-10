@@ -1,4 +1,0 @@
-== re-sync (pipelined gemm.v) ==
-== OOC synth pipelined gemm_rowblock @ 3.333ns (f300) ==
-RESULT top=gemm_rb_ooc dsp=288 lut=0 carry8=608 ff=8054 wns_ns=0.826 fmax_mhz=398.9 (period=3.333ns)
-== gemm OOC2 DONE ==

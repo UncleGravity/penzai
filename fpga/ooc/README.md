@@ -86,3 +86,6 @@ Then add it to the sync + `ooc.bat` invocation above with the files it instantia
   line (counts via `get_cells` filters; WNS via `get_timing_paths`).
 - `ooc.bat` — VM-side shim: sources Vivado settings, runs `vivado -mode batch -source ooc_synth.tcl
   -tclargs %*`.
+- `check_acc_fanout.tcl` — structural regression check for the lane-local GEMM accumulator
+  clock-enable topology. Run from an initialized Vivado shell with
+  `vivado -mode batch -source check_acc_fanout.tcl -tclargs <rtl-dir> <report-dir>`.

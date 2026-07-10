@@ -11,3 +11,7 @@ result-*
 
 # verilator output
 obj_dir/
+
+# FPGA generated build and analysis artifacts
+fpga/bitstreams/**/out/
+fpga/ooc/out/

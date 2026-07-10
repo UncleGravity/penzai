@@ -1,4 +1,0 @@
-== OOC gemm_kernel at MAX_SUB_INDEX=256 (deployed acts_mem depth) @ 3.333ns + @ 4.0ns ==
--- f300 (3.333ns) --
-RESULT top=gemm_kernel_ooc dsp=288 lut=0 carry8=641 ff=16433 wns_ns=0.149 fmax_mhz=314.1 (period=3.333ns)
-== DONE ==
