@@ -21,6 +21,17 @@ pub const packed_per_port_q1_block: usize = (1 + q8_subblocks) * weight_port_bea
 pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 320
 pub const acts_per_q1_block: usize = q8_subblocks * (q8_block + beat_bytes);
 
+// Activation-BRAM capacity of the gemm kernel. The kernel stores acts indexed by
+// sub-block and addresses that index with clog2(max_sub_index) bits, of which the
+// top clog2(max_sub_index/q8_subblocks) select the Q1 block — so K is hard-capped at
+// max_q1_blocks * q1_block. A matmul with a larger K aliases in the acts BRAM and
+// returns garbage, so callers must decline it (→ software matmul). 512 puts the cap at
+// K=16384, the exact limit of the 104-bit accumulator window (matmul_ref.zig). MUST
+// match decode_top.v MAX_SUB_INDEX — bump both together, and only with a rebuilt
+// bitstream deployed, or the host claims more K than the board delivers.
+pub const max_sub_index: usize = 512;
+pub const max_q1_blocks: usize = max_sub_index / q8_subblocks; // 128 → K <= 16384
+
 comptime {
     if (rows_per_block % weight_ports != 0) @compileError("Q1A8 rows must split evenly across ports");
     if (rows_per_port != 4) @compileError("Q1A8 v8 expects 4 rows per weight port");
@@ -65,6 +76,15 @@ pub fn outputF32Bytes(rows: usize, cols: usize) LayoutError!usize {
     return rows * cols * @sizeOf(f32);
 }
 
+/// Byte offset of block (port, rb, q1) in the resident weight buffer. The kernel
+/// streams weights rowblock-major (per port: rowblock outer, q1-block inner), so
+/// the pack and the accessors share this one formula.
+pub fn weightBlockOffset(rows: usize, k: usize, port: usize, rb: usize, q1: usize) usize {
+    const q1_blocks = k / q1_block; // caller validates k
+    const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
+    return port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+}
+
 pub fn packWeightsFromLogical(
     rows: usize,
     k: usize,
@@ -79,24 +99,23 @@ pub fn packWeightsFromLogical(
     if (out.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
 
     @memset(out, 0);
-    var cursor: usize = 0;
     for (0..weight_ports) |port| {
         for (0..rowblocksFor(rows)) |rb| {
             const row_start = rb * rows_per_block + port * rows_per_port;
             const row_count = if (row_start < rows) @min(rows_per_port, rows - row_start) else 0;
             for (0..q1_blocks) |q1| {
+                const base = weightBlockOffset(rows, k, port, rb, q1);
                 for (0..row_count) |lane| {
                     const scale_bits: u16 = @bitCast(weight_scales[(row_start + lane) * q1_blocks + q1]);
-                    std.mem.writeInt(u16, out[cursor + lane * 4 ..][0..2], scale_bits, .little);
+                    std.mem.writeInt(u16, out[base + lane * 4 ..][0..2], scale_bits, .little);
                 }
-                cursor += weight_port_beat_bytes;
                 for (0..q8_subblocks) |sub| {
+                    const sub_base = base + (1 + sub) * weight_port_beat_bytes;
                     for (0..row_count) |lane| {
                         const bits = weight_bits[(row_start + lane) * q1_blocks + q1];
                         const part: u32 = @truncate(bits >> @intCast(sub * q8_block));
-                        std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], part, .little);
+                        std.mem.writeInt(u32, out[sub_base + lane * 4 ..][0..4], part, .little);
                     }
-                    cursor += weight_port_beat_bytes;
                 }
             }
         }
@@ -114,27 +133,26 @@ pub fn packWeightsFromGgmlQ1_0(
     if (out.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
 
     @memset(out, 0);
-    var cursor: usize = 0;
     const source_row_bytes = q1_blocks * q1_block_bytes;
     for (0..weight_ports) |port| {
         for (0..rowblocksFor(rows)) |rb| {
             const row_start = rb * rows_per_block + port * rows_per_port;
             const row_count = if (row_start < rows) @min(rows_per_port, rows - row_start) else 0;
             for (0..q1_blocks) |q1| {
+                const base = weightBlockOffset(rows, k, port, rb, q1);
                 for (0..row_count) |lane| {
                     const source_offset = (row_start + lane) * source_row_bytes + q1 * q1_block_bytes;
                     const scale = std.mem.readInt(u16, q1_0_weights[source_offset..][0..2], .little);
-                    std.mem.writeInt(u16, out[cursor + lane * 4 ..][0..2], scale, .little);
+                    std.mem.writeInt(u16, out[base + lane * 4 ..][0..2], scale, .little);
                 }
-                cursor += weight_port_beat_bytes;
                 for (0..q8_subblocks) |sub| {
+                    const sub_base = base + (1 + sub) * weight_port_beat_bytes;
                     for (0..row_count) |lane| {
                         const source_offset = (row_start + lane) * source_row_bytes +
                             q1 * q1_block_bytes + @sizeOf(f16) + sub * (q8_block / 8);
                         const bits = std.mem.readInt(u32, q1_0_weights[source_offset..][0..4], .little);
-                        std.mem.writeInt(u32, out[cursor + lane * 4 ..][0..4], bits, .little);
+                        std.mem.writeInt(u32, out[sub_base + lane * 4 ..][0..4], bits, .little);
                     }
-                    cursor += weight_port_beat_bytes;
                 }
             }
         }
@@ -142,26 +160,24 @@ pub fn packWeightsFromGgmlQ1_0(
 }
 
 pub fn packedWeightScale(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize) LayoutError!f16 {
-    const q1_blocks = try blocksPerRow(k);
+    _ = try blocksPerRow(k);
     if (weights.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
     const port = lane / rows_per_port;
     const port_lane = lane % rows_per_port;
-    const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
-    const block_base = port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+    const block_base = weightBlockOffset(rows, k, port, rb, q1);
     return @bitCast(std.mem.readInt(u16, weights[block_base + port_lane * 4 ..][0..2], .little));
 }
 
 pub fn packedWeightBits(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, sub: usize) LayoutError!u32 {
-    const q1_blocks = try blocksPerRow(k);
+    _ = try blocksPerRow(k);
     if (weights.len != try packedWeightBytes(rows, k)) return error.InvalidLength;
     const rb = row / rows_per_block;
     const lane = row % rows_per_block;
     const port = lane / rows_per_port;
     const port_lane = lane % rows_per_port;
-    const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
-    const block_base = port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+    const block_base = weightBlockOffset(rows, k, port, rb, q1);
     const sub_base = block_base + weight_port_beat_bytes + sub * weight_port_beat_bytes;
     return std.mem.readInt(u32, weights[sub_base + port_lane * 4 ..][0..4], .little);
 }
@@ -307,6 +323,40 @@ test "pack ggml q1_0 bytes matches logical packer" {
     try packWeightsFromLogical(rows, k, &bits, &scales, &from_logical);
     try packWeightsFromGgmlQ1_0(rows, k, &raw, &from_raw);
     try std.testing.expectEqualSlices(u8, &from_logical, &from_raw);
+}
+
+test "wide-K pack round-trips through the accessors" {
+    // k spanning many q1-blocks with a partial tail rowblock: packer and accessor
+    // agree block-for-block via the shared weightBlockOffset.
+    const rows = rows_per_block + 3;
+    const q1_blocks = 40;
+    const k = q1_block * q1_blocks;
+    const logical_len = rows * q1_blocks;
+    const packed_len = comptime packedWeightBytes(rows, k) catch unreachable;
+    const A = std.testing.allocator;
+    const bits = try A.alloc(u128, logical_len);
+    defer A.free(bits);
+    const scales = try A.alloc(f16, logical_len);
+    defer A.free(scales);
+    for (0..rows) |row| {
+        for (0..q1_blocks) |q1| {
+            bits[row * q1_blocks + q1] = (@as(u128, row + 1) << 64) | (@as(u128, q1 + 1) << 8) | 0x5A;
+            scales[row * q1_blocks + q1] = @floatCast(0.0625 * @as(f32, @floatFromInt((row + 1) * (q1 + 2))));
+        }
+    }
+    const packed_buf = try A.alloc(u8, packed_len);
+    defer A.free(packed_buf);
+    try packWeightsFromLogical(rows, k, bits, scales, packed_buf);
+
+    for (0..rows) |row| {
+        for (0..q1_blocks) |q1| {
+            try std.testing.expectEqual(scales[row * q1_blocks + q1], try packedWeightScale(packed_buf, rows, k, row, q1));
+            for (0..q8_subblocks) |sub| {
+                const want: u32 = @truncate(bits[row * q1_blocks + q1] >> @intCast(sub * q8_block));
+                try std.testing.expectEqual(want, try packedWeightBits(packed_buf, rows, k, row, q1, sub));
+            }
+        }
+    }
 }
 
 test "quantize exact scale when amax is 127" {

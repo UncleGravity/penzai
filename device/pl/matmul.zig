@@ -316,6 +316,10 @@ pub fn Backend(comptime Heap: type) type {
             if (rows == 0 or cols == 0 or k == 0 or k % layout.q1_block != 0) return null;
 
             const q1_blocks = k / layout.q1_block;
+            // The kernel accumulates all of K in one exact 104-bit-window pass; its acts
+            // BRAM holds at most layout.max_q1_blocks blocks. A larger K would alias in the
+            // BRAM, so decline it → the runtime runs the software matmul.
+            if (q1_blocks > layout.max_q1_blocks) return null;
             const num_rb = layout.rowblocksFor(rows);
             const weight_port_bytes = num_rb * q1_blocks * layout.packed_per_port_q1_block;
             const weight_bytes = weight_port_bytes * layout.weight_ports;

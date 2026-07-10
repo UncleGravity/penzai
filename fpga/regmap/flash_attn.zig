@@ -56,13 +56,13 @@ pub const addr = struct {
     pub const kernel: i64 = 0xA015_0000; // kernel AXI-Lite
 };
 
-/// Build/layout caps of the deployed bitstream the host must match. `lanes` is the
-/// kernel's MAC width (also the LANES register reset); `head_dim_max` is the
-/// compile-time HEAD_DIM_MAX the RTL is built with. Host staging reservations are
-/// sized when the flash tenant lands (step ⑤).
+/// Build/layout caps of the deployed bitstream the device driver must match. The
+/// kernel version gates changes to these compile-time capacities.
 pub const caps = struct {
     pub const lanes: u32 = 8;
     pub const head_dim_max: u32 = 128;
+    pub const max_heads: usize = 32;
+    pub const max_head_kv: usize = 8;
     // The only host staging the v2 tenant reserves: the DMA sink for the kernel's
     // packed 8-wide O emit (dense n_tokens·n_heads·head_dim_v f32). Q/K/V/mask are
     // DMA'd straight from the resident tensors in their native layout — there is no
@@ -158,7 +158,7 @@ test "regmap parses known offsets and resets" {
     try std.testing.expect(table.len >= 20);
     try std.testing.expectEqual(@as(u32, 0x00), offsetOf("ID"));
     try std.testing.expectEqual(@as(u32, 0xF1A54A00), resetOf("ID"));
-    try std.testing.expectEqual(@as(u32, 2), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 3), resetOf("VERSION"));
     try std.testing.expectEqual(@as(u32, 0x08), offsetOf("CTRL"));
     try std.testing.expectEqual(@as(u32, 0x1C), offsetOf("N_HEAD_KV"));
     try std.testing.expectEqual(@as(u32, 0x20), offsetOf("HEAD_RATIO"));

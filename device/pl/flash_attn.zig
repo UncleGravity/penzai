@@ -27,10 +27,10 @@ const caps = flash_regmap.caps;
 const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Oldest kernel VERSION the driver accepts. v2 is the kv-major kernel (GQA-in-HW,
-/// pipelined dot, packed O); a v1 bitstream uses the head-major replicated feed and is
-/// incompatible with this tenant, so it must fall back to PS rather than corrupt output.
-const min_version: u32 = 2;
+/// Oldest kernel VERSION the driver accepts. v3 retains the kv-major v2 datapath and
+/// raises its query-head capacity to 32. Older bitstreams must fall back to PS rather
+/// than let the driver submit shapes that alias their smaller on-chip pools.
+const min_version: u32 = 3;
 const expected_id: u32 = flash_regmap.resetOf("ID");
 const expected_lanes: u32 = flash_regmap.resetOf("LANES");
 
@@ -231,6 +231,7 @@ pub fn Backend(comptime Heap: type) type {
             if (!attn.has_mask) return null; // the mask gives kv_hi and feeds the kernel's skip
             if (!s.beatAligned()) return null;
             if (s.head_dim_q > caps.head_dim_max or s.head_dim_v > caps.head_dim_max) return null;
+            if (s.n_heads > caps.max_heads or s.n_head_kv > caps.max_head_kv) return null;
             if (!s.directDmaCapable()) {
                 // One-shot bring-up diagnostic: if a decode op falls back to PS, this
                 // says which stride assumption missed (no `flash seg` line ⇒ PS path).

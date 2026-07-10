@@ -97,13 +97,25 @@ if [[ "${USE_PBLOCK:-1}" == "1" ]]; then
 fi
 
 echo "== Vivado build variant=$VARIANT on $VM =="
+set +e
 ssh "$VM" "cd $VM_DIR && build.bat $VARIANT"
+build_status=$?
+set -e
 
-echo "== fetch outputs -> ./out =="
+echo "== fetch reports -> ./out =="
 mkdir -p out
+# Vivado writes these before build.tcl's timing gate. Always retrieve them, including
+# failed builds; otherwise the information needed to diagnose a near miss is stranded
+# on the VM because `set -e` exits before this block.
+scp "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT"_*.rpt out/ 2>/dev/null || true
+
+if (( build_status != 0 )); then
+  echo "ERROR: Vivado build failed (status $build_status); reports, if produced, are in ./out" >&2
+  exit "$build_status"
+fi
+
+echo "== fetch bitstream -> ./out =="
 scp "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT.bit.bin" \
     "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT.bit" out/
-# Fetch the resource/timing reports too (the combined-fit answer).
-scp "$VM:$VM_DIR/out/$BIT_PREFIX-$VARIANT"_*.rpt out/ 2>/dev/null || true
 ls -la "out/$BIT_PREFIX-$VARIANT.bit.bin"
 echo "Done. Deploy with: ./deploy.sh $VARIANT"

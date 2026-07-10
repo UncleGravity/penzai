@@ -26,7 +26,7 @@
 
 module flash_kernel #(
     parameter integer HEAD_DIM_MAX = 128,
-    parameter integer MAX_HEADS    = 16,
+    parameter integer MAX_HEADS    = 32,
     parameter integer MAX_HEAD_KV  = 8,
     parameter integer LANES        = 8
 ) (
@@ -63,8 +63,9 @@ module flash_kernel #(
     localparam integer MAXB  = HEAD_DIM_MAX / LANES;         // 16 max Q/K/V beats per head
     localparam integer LSH   = $clog2(LANES);                // 3
     localparam integer LMAXB = $clog2(MAXB);                 // 4 (beat occupies the low bits)
-    localparam integer AW    = $clog2(MAX_HEADS * MAXB);     // acc/q_buf addr width (8)
+    localparam integer AW    = $clog2(MAX_HEADS * MAXB);     // acc/q_buf addr width (9)
     localparam integer KW    = $clog2(MAX_HEAD_KV * MAXB);   // k_buf/v_buf addr width (7)
+    localparam integer HW    = $clog2(MAX_HEADS);            // head-index width for the per-head pools
     localparam [31:0]  NEG_INF = 32'hFF800000;
     localparam [15:0]  F16_NEG_INF = 16'hFC00;
 
@@ -170,20 +171,20 @@ module flash_kernel #(
     // ---- online softmax step (per head) ----
     wire soft_v; wire [31:0] soft_m, soft_l, soft_p, soft_corr; wire soft_grew;
     flash_softmax u_soft (.clk(clk), .rst_n(rst_n), .valid_in(soft_fire),
-        .m_in(mpool[head_i[3:0]]), .l_in(lpool[head_i[3:0]]), .score(score_q), .valid_out(soft_v),
+        .m_in(mpool[head_i[HW-1:0]]), .l_in(lpool[head_i[HW-1:0]]), .score(score_q), .valid_out(soft_v),
         .m_out(soft_m), .l_out(soft_l), .p(soft_p), .corr(soft_corr), .grew(soft_grew));
 
     // ---- reciprocal of the denominator (per head, at finalize) ----
     wire rec_v; wire [31:0] rec_out;
     recip u_recip (.clk(clk), .rst_n(rst_n), .valid_in(rec_fire),
-        .l(lpool[head_i[3:0]]), .valid_out(rec_v), .y(rec_out));
+        .l(lpool[head_i[HW-1:0]]), .valid_out(rec_v), .y(rec_out));
 
     // ---- shared 8-wide axpy: acc*corr + p·V (accumulate) OR acc*inv_l (emit) ----
     // acc and V are now synchronous-read BRAMs (acc_rd / v_rd arrive one cycle after the
     // address is presented), so the matching control strobes are delayed one cycle to
     // realign with the data. ax_axpy_q selects v_rd (accumulate) vs zero (emit).
-    wire [31:0]  ax_s1 = emit_fire ? inv_l_q : cpool[head_i[3:0]];
-    wire [31:0]  ax_p  = emit_fire ? 32'd0   : ppool[head_i[3:0]];
+    wire [31:0]  ax_s1 = emit_fire ? inv_l_q : cpool[head_i[HW-1:0]];
+    wire [31:0]  ax_p  = emit_fire ? 32'd0   : ppool[head_i[HW-1:0]];
     wire ax_fire = axpy_fire | emit_fire;
     reg        ax_fire_q, ax_axpy_q;
     reg [31:0] ax_s1_q, ax_p_q;
@@ -264,7 +265,7 @@ module flash_kernel #(
 
                 // ---- init the per-head pool for this token (acc=0, m=-inf, l=0) ----
                 S_TINIT: begin
-                    if (ld_b == 16'd0) begin mpool[ld_a[3:0]] <= NEG_INF; lpool[ld_a[3:0]] <= 32'd0; end
+                    if (ld_b == 16'd0) begin mpool[ld_a[HW-1:0]] <= NEG_INF; lpool[ld_a[HW-1:0]] <= 32'd0; end
                     if (ld_b + 16'd1 == vbeats) begin
                         ld_b <= 0;
                         if (ld_a + 16'd1 == n_heads) begin kv_i <= 0; state <= S_MASK; end
@@ -308,8 +309,8 @@ module flash_kernel #(
 
                 S_SOFTF: state <= S_SOFTW;
                 S_SOFTW: if (soft_v) begin
-                    mpool[head_i[3:0]] <= soft_m; lpool[head_i[3:0]] <= soft_l;
-                    ppool[head_i[3:0]] <= soft_p; cpool[head_i[3:0]] <= soft_corr;
+                    mpool[head_i[HW-1:0]] <= soft_m; lpool[head_i[HW-1:0]] <= soft_l;
+                    ppool[head_i[HW-1:0]] <= soft_p; cpool[head_i[HW-1:0]] <= soft_corr;
                     if (last_head) begin ld_a <= 0; ld_b <= 0; state <= S_VLOAD; end
                     else begin
                         head_i <= head_i + 16'd1;

@@ -254,6 +254,35 @@ module gemm_rowblock #(
     end
     wire [CW-1:0] wcol = col_pipe[COL_LAT-1];
 
+    // Build the accumulator write enable before the existing control pipeline, then carry
+    // it alongside col_pipe. The last stage is duplicated per lane below. This avoids a
+    // timing path from a replicated col_pipe bit through a 3,105-load combinational decode.
+    wire [COLS_MAX-1:0] acc_write_onehot;
+    genvar wc;
+    generate
+        for (wc = 0; wc < COLS_MAX; wc = wc + 1) begin : gen_acc_write_decode
+            assign acc_write_onehot[wc] = (valid_in || clear) &&
+                                           (col_idx == wc[CW-1:0]);
+        end
+    endgenerate
+
+    // Seven shared stages plus the lane-local leaf register form the same COL_LAT=8 delay
+    // as col_pipe and valid_out/clear_out. Reset only this small control pipeline; accS/accC
+    // remain unreset and are initialized by their explicit first-contribution clear.
+    reg [COLS_MAX-1:0] acc_write_pipe [0:COL_LAT-2];
+    integer awp;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            for (awp = 0; awp < COL_LAT-1; awp = awp + 1)
+                acc_write_pipe[awp] <= {COLS_MAX{1'b0}};
+        end else begin
+            acc_write_pipe[0] <= acc_write_onehot;
+            for (awp = 1; awp < COL_LAT-1; awp = awp + 1)
+                acc_write_pipe[awp] <= acc_write_pipe[awp-1];
+        end
+    end
+    wire [COLS_MAX-1:0] acc_write_preleaf = acc_write_pipe[COL_LAT-2];
+
     genvar r, g, cc;
     generate
         for (r = 0; r < ROWS; r = r + 1) begin : gen_lane
@@ -306,6 +335,22 @@ module gemm_rowblock #(
                 .valid_out(vout), .clear_out(clr_out), .shifted(shifted)
             );
 
+            // Intentionally duplicate the final registered control per lane and CSA bank.
+            // Each leaf bit directly drives ACC_W=104 clock enables. KEEP prevents synthesis
+            // from merging these equivalent registers back into a device-spanning control net;
+            // unlike DONT_TOUCH, it still permits placement-aware physical optimization.
+            (* keep = "true" *) reg [COLS_MAX-1:0] accS_write_enable;
+            (* keep = "true" *) reg [COLS_MAX-1:0] accC_write_enable;
+            always @(posedge clk) begin
+                if (!rst_n) begin
+                    accS_write_enable <= {COLS_MAX{1'b0}};
+                    accC_write_enable <= {COLS_MAX{1'b0}};
+                end else begin
+                    accS_write_enable <= acc_write_preleaf;
+                    accC_write_enable <= acc_write_preleaf;
+                end
+            end
+
             // COLS_MAX-wide accumulator bank, in CARRY-SAVE form: the value of column cc is the
             // redundant pair accS[cc] + accC[cc]. Each contribution folds in with a 3:2 CSA
             // (sum = a^b^c, carry = majority(a,b,c)<<1) — ONE logic level, NO carry chain — so
@@ -322,15 +367,16 @@ module gemm_rowblock #(
             wire signed [ACC_W-1:0] csaC = ((baseS & baseC) | (baseS & shifted) | (baseC & shifted)) <<< 1;
             wire signed [ACC_W-1:0] nextS = vout ? csaS : baseS; // clear-only (clr_out & !vout): hold 0
             wire signed [ACC_W-1:0] nextC = vout ? csaC : baseC;
+            // Do not reset the accumulator data bank. The first contribution to every active
+            // column arrives with clr_out asserted, which selects zero above before writing the
+            // new CSA pair. Resetting these otherwise-invalid data registers created a 26,624-FF
+            // branch on the design-wide reset net and consumed ordinary data-routing resources.
             for (cc = 0; cc < COLS_MAX; cc = cc + 1) begin : gen_acc
                 always @(posedge clk) begin
-                    if (!rst_n) begin
-                        accS[cc] <= {ACC_W{1'b0}};
-                        accC[cc] <= {ACC_W{1'b0}};
-                    end else if ((vout || clr_out) && (wcol == cc[CW-1:0])) begin
+                    if (accS_write_enable[cc])
                         accS[cc] <= nextS;
+                    if (accC_write_enable[cc])
                         accC[cc] <= nextC;
-                    end
                 end
             end
             // resolve the redundant pair for readout, PIPELINED: register the read_col-muxed pair

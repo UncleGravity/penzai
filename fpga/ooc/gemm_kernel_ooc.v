@@ -37,7 +37,7 @@ module gemm_kernel_ooc #(
     wire        m_valid, m_last, w_ready, a_ready, busy, done;
     wire [7:0]  m_keep;
     wire [3:0]  dbg;
-    gemm_kernel #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .MAX_SUB_INDEX(256)) u ( // 256 = deployed (decode_top)
+    gemm_kernel #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .MAX_SUB_INDEX(512)) u ( // 512 = deployed (decode_top)
         .clk(clk), .rst_n(rst_n), .start_kernel(start_kernel),
         .num_q1_blocks(num_q1_blocks), .num_rowblocks(num_rowblocks), .num_cols(num_cols),
         .emin(emin), .kernel_done(done), .busy(busy),

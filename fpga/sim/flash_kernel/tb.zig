@@ -256,8 +256,11 @@ pub fn main() !void {
     try runCfg(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .masked_kv = 2 }, &dut, 0xF1A54EE7);
     try runCfg(.{ .hdq = 24, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 3, .ntok = 2, .scale = 0.125, .masked_kv = -1 }, &dut, 0xBEEF01);
     try runCfg(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .masked_kv = 0 }, &dut, 0xC0FFEE);
-    // Bonsai decode shape: head_dim 128 (qbeats=16, full adder tree, no zero-pad),
-    // 16 query heads over 8 kv-heads (GQA r2, full pool), real 1/sqrt(128) scale.
+    // Decode shape: head_dim 128 (qbeats=16, full adder tree, no zero-pad),
+    // 16 query heads over 8 kv-heads (GQA r2, half the pool), real 1/sqrt(128) scale.
     try runCfg(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4 }, &dut, 0xD00D);
+    // 32 query heads over 8 kv-heads (GQA r4): exercises the full MAX_HEADS pool and the
+    // head-index bits above [3:0] — the aliasing the [3:0] pool index used to cause.
+    try runCfg(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4 }, &dut, 0x32EAD5);
     std.debug.print("  all flash_kernel cosim configs passed\n\n", .{});
 }

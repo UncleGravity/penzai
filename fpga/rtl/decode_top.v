@@ -167,8 +167,10 @@ module decode_top #(
     assign s_axis_w3_tready = weight_tready && s_axis_w0_tvalid && s_axis_w1_tvalid && s_axis_w2_tvalid;
 
     // COLS_MAX comes from the generated header (caps.cols_max), the same source the host's
-    // mc_cols_max reads — never a literal. MAX_SUB_INDEX=256 matches the deployed matmul_top.
-    gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(256)) u_kernel (
+    // mc_cols_max reads — never a literal. MAX_SUB_INDEX=512 sizes the acts BRAM for K up to
+    // 512/q8_subblocks = 128 q1-blocks = 16384, the exact limit of the 104-bit accumulator
+    // window. Must match the host's layout.max_sub_index.
+    gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(512)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
         .start_kernel(start_strobe),
@@ -188,7 +190,8 @@ module decode_top #(
         .m_axis_tvalid(m_axis_tvalid),
         .m_axis_tready(m_axis_tready),
         .m_axis_tlast(m_axis_tlast),
-        .m_axis_tkeep(m_axis_tkeep)
+        .m_axis_tkeep(m_axis_tkeep),
+        .dbg_state()
     );
 
     always @(posedge clk) begin

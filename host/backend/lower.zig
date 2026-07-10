@@ -161,6 +161,9 @@ fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
     if (dim(weights, 0) != dim(acts, 0)) return false;
     if (dim(op, 0) != dim(weights, 1) or dim(op, 1) != dim(acts, 1)) return false;
     if (@mod(@as(usize, @intCast(dim(weights, 0))), layout.q1_block) != 0) return false;
+    // K past the kernel's acts-BRAM capacity would alias (see layout.max_q1_blocks),
+    // so decline here and let it fall back to the CPU backend.
+    if (@divTrunc(@as(usize, @intCast(dim(weights, 0))), layout.q1_block) > layout.max_q1_blocks) return false;
     for (2..4) |axis| {
         if (dimAt(weights, axis) != 1 or dimAt(acts, axis) != 1 or dimAt(op, axis) != 1) return false;
     }
