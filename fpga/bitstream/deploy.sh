@@ -7,7 +7,7 @@
 # "pl: q1a8 kernel ready" and "pl: flash kernel ready".
 #
 #   ./deploy.sh                       # uses VARIANT from config.env
-#   ./deploy.sh w512-p4-f200-wc300
+#   ./deploy.sh w512-p4-f300
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -18,7 +18,7 @@ set -a; source config.env; set +a
 : "${BOARD:?config.env must set BOARD (e.g. ubuntu@kria)}"
 : "${BOARD_TMP:?config.env must set BOARD_TMP (e.g. /tmp/penzai-combined)}"
 APP="${APP:-penzai-combined-v1}"
-VARIANT="${1:-${VARIANT:-w512-p4-f200-wc300}}"
+VARIANT="${1:-${VARIANT:-w512-p4-f300}}"
 BIT_PREFIX="penzai-combined-v1"
 case "$BOARD_TMP" in /tmp/*) ;; *) echo "ERROR: BOARD_TMP must be under /tmp" >&2; exit 1 ;; esac
 

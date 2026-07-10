@@ -9,10 +9,10 @@ rather than time-shared — each keeps exactly the topology it was tuned/validat
 
 | | kernel | clock | DMAs | PS ports |
 |---|---|---|---|---|
-| **GEMM** | `kernel_mm` (`decode_top`) | `wclk` feed / `fclk` ctrl | dma_w0–3 + dma_a | **HP0–3** (GP2–5) |
+| **GEMM** | `kernel_mm` (`decode_top`) | `fclk` | dma_w0–3 + dma_a | **HP0–3** (GP2–5) |
 | **flash** (kv-major v3) | `kernel_fa` (`flash_top`) | `fclk` | dma_q/k/v/mask/o | **HPC0–1** (GP0–1, coherent) |
 
-Both kernels run on the **shared `fclk`**; `wclk` is the matmul weight-feed clock only.
+Both kernels and all data movement run on the single **`fclk`** domain.
 Flash gets the otherwise-free coherent HPC ports (matmul owns all four HP ports for its
 512-bit weight bandwidth). Address maps don't collide by design — matmul `0xA00x_0000`,
 flash `0xA01x_0000` (the flash regmap was allocated in `0xA01x` for exactly this).
@@ -20,8 +20,8 @@ flash `0xA01x_0000` (the flash regmap was allocated in `0xA01x` for exactly this
 ## Build & deploy
 ```sh
 cp config.env.example config.env       # edit VM / BOARD (or reuse the committed one)
-(cd ../../.. && zig build regmap)       # refresh generated contracts under fpga/regmap/
-./build.sh                              # variant w512-p4-f200-wc300 (start here — f200 is flash-validated)
+(cd ../.. && zig build regmap)          # refresh generated contracts under fpga/regmap/
+./build.sh                              # default variant: w512-p4-f300
 ./deploy.sh
 # serve the daemon telling it BOTH ops are on PL:
 (cd ../../.. && nix run .#deploy-penzaid)
@@ -45,8 +45,8 @@ The routed build remains the gate:
   before producing an invalid artifact.
 
 If it doesn't fit or close at `f200`:
-- **Timing** — drop `f` (e.g. `w512-p4-f150-wc300`); flash closes ≥ f200 but the combined
-  routing is denser, so a lower `f` may be needed first. `wc` can also come down.
+- **Timing** — drop `f` (e.g. `w512-p4-f250`) if a future change causes the combined
+  design to miss timing.
 - **Resources** — the levers are matmul width (a narrower array) or sharing flash's fp
   units; bring the utilization report back and we'll pick.
 

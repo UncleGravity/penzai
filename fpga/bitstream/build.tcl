@@ -10,8 +10,8 @@
 #
 #   SINGLE CLOCK (fclk): both kernels + all control + all 10 DMAs + all width/data movers.
 #   The dual-clock CDC (a second wclk domain + 6 axis_clock_converters + rst_fast) was
-#   deleted — at f=wc the two domains were the same frequency, so the CDC was pure
-#   congestion/skew tax (plan-fpga-7 Part 6). wclk in the variant string is now vestigial.
+#   deleted because the two domains ran at the same frequency, making the CDC pure
+#   congestion/skew tax (plan-fpga-7 Part 6).
 #
 #   PS M_AXI_HPM0_FPD -> AXI-Lite -> 10 DMAs + both kernels (sc_ctrl, 12 MI, fclk)
 #   matmul mem: HP0 = dma_w0 MM2S+S2MM + dma_a; HP1/2/3 = dma_w1/2/3   (fclk)
@@ -22,13 +22,11 @@
 # (`zig build regmap`); this script sources both and remaps their "kernel" cell to
 # kernel_mm / kernel_fa.
 
-set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f200-wc300"}]
+set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f300"}]
 
-# variant = w512-p4-f<MHz>-wc<MHz>. fclk drives BOTH kernels + all control; wclk is the
-# matmul weight-feed clock (HP0..HP3 + their DMAs). flash runs entirely on fclk, so the
-# shared fclk must be one the flash kernel closes at (validated f200; matmul closes higher).
-if {![regexp {^w512-p4-f([0-9]+)-wc([0-9]+)$} $variant -> fclk_mhz wclk_mhz]} {
-    error "unknown variant '$variant'; expected w512-p4-f<MHz>-wc<MHz>, e.g. w512-p4-f200-wc300"
+# variant = w512-p4-f<MHz>. fclk drives both kernels, all control, and all data movement.
+if {![regexp {^w512-p4-f([0-9]+)$} $variant -> fclk_mhz]} {
+    error "unknown variant '$variant'; expected w512-p4-f<MHz>, e.g. w512-p4-f300"
 }
 
 set bit_prefix penzai-combined-v1
@@ -130,10 +128,9 @@ connect_bd_net [get_bd_pins fan_ttc0_ch2/Dout]   [get_bd_ports fan_en_b]
 
 # ---- Fabric clock (SINGLE domain) -------------------------------------------
 # ONE clock (fclk) drives both kernels + all control + all data movement. The dual-clock
-# CDC apparatus is gone: at f300=wc300 the two domains were the SAME frequency, so the 6
+# CDC apparatus is gone: both domains ran at 300 MHz, so the 6
 # axis_clock_converters + second clock tree + rst_fast were pure congestion/skew tax with
 # zero functional benefit (plan-fpga-7 Part 6 §"Collapses with the single-clock phase").
-# $wclk_mhz is parsed-but-unused (variant string kept for build.sh/host compatibility).
 create_bd_cell -type ip -vlnv xilinx.com:ip:clk_wiz:* clk_wiz
 set_property -dict [list \
     CONFIG.PRIM_IN_FREQ $ps_fclk_mhz \

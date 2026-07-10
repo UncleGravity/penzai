@@ -20,7 +20,7 @@ how fast is this path in isolation?" without paying for place-and-route.
 
 ```bash
 cd fpga/ooc
-source ../bitstreams/combined-v1/config.env        # sets $VM (the Windows Vivado VM)
+source ../bitstream/config.env                     # sets $VM (the Windows Vivado VM)
 VM_OOC=penzai-ooc                                   # the OOC working dir on the VM
 
 # 1. sync the RTL the probe needs (the harness + every module it instantiates)
@@ -45,7 +45,7 @@ re-sync only the files you changed.
 
 ```bash
 cd fpga/ooc
-source ../bitstreams/combined-v1/config.env
+source ../bitstream/config.env
 scp ../rtl/gemm.v ../rtl/numeric/fma.v ../rtl/gemm_kernel.v gemm_rb_ooc.v gemm_emit_ooc.v "$VM:penzai-ooc/"
 
 # the throughput accumulate path (the f250/f300 matmul limiter to watch)

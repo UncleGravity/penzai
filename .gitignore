@@ -13,5 +13,8 @@ result-*
 obj_dir/
 
 # FPGA generated build and analysis artifacts
-fpga/bitstreams/**/out/
+fpga/bitstream/analysis/
+fpga/bitstream/out/*
+!fpga/bitstream/out/*.bit
+!fpga/bitstream/out/*.bit.bin
 fpga/ooc/out/
