@@ -1,15 +1,12 @@
 // decode_top - AXI-Lite top for the fixed-point gemm kernel (plan-fpga-7.md §gemm.v / decode_top).
 //
-// The plan-7 replacement for matmul_top: same AXI-Lite contract, same four-port weight zip
-// and 64-bit acts/result streams, same counter bank — only the datapath changes (gemm_kernel:
-// fixed-point accumulate + pipelined fp32 emit, instead of matmul_kernel's fp32 reducer/pool).
+// Owns the deployed AXI-Lite contract, four-port weight zip, 64-bit acts/result streams,
+// counter bank, and the fixed-point gemm_kernel datapath.
 // The fixed-point window floor is a baked-in constant (EMIN_FLOOR — the f16-format floor, not a
 // per-model knob: a contribution exponent is e_ws+e_as ∈ [-48,+10] for ANY f16 model, and the
 // 104-bit accumulator covers that whole range exactly). So there is NO EMIN register and NO
-// calibration: the wire layout AND the host driver are byte-identical to matmul_top.
+// calibration; the wire layout and host driver share the generated regmap contract.
 //
-// Lives alongside matmul_top until the atomic swap (the new tree is guarded-subtracted in).
-
 `default_nettype none
 
 module decode_top #(

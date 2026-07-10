@@ -3,9 +3,10 @@
 //! it to its destination so the Verilog decode, the Vivado address assignment, and the
 //! Zig MMIO driver all share one source (fpga/regmap/{matmul,flash_attn}.zig).
 //!
-//!   regmap-emit matmul vh   -> fpga/rtl/matmul/matmul_regs.vh       (register header)
-//!   regmap-emit matmul tcl  -> .../tcl/address_map.tcl              (Vivado address map)
-//!   regmap-emit flash  vh   -> fpga/rtl/flash_attn/flash_regs.vh    (register header)
+//!   regmap-emit matmul vh   -> fpga/regmap/matmul_regs.vh           (register header)
+//!   regmap-emit matmul tcl  -> fpga/regmap/matmul_address_map.tcl   (Vivado address map)
+//!   regmap-emit flash  vh   -> fpga/regmap/flash_regs.vh            (register header)
+//!   regmap-emit flash  tcl  -> fpga/regmap/flash_address_map.tcl    (Vivado address map)
 
 const std = @import("std");
 const matmul = @import("matmul.zig");

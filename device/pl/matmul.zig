@@ -37,7 +37,7 @@ const kernel_base: i64 = regmap.addr.kernel; // kernel AXI-Lite
 const acts_staging_cap: usize = regmap.caps.acts_staging_bytes; // COLS_MAX columns of acts
 const result_staging_cap: usize = regmap.caps.result_staging_bytes; // num_rb * COLS_MAX * result_bytes_per_rb
 
-// Columns multiplied per kernel run. Matches matmul_kernel COLS_MAX in the loaded
+// Columns multiplied per kernel run. Matches gemm_kernel COLS_MAX in the loaded
 // bitstream (both derive from caps.cols_max). Prefill (cols>1) is tiled into
 // groups of this many.
 const mc_cols_max: usize = regmap.caps.cols_max;

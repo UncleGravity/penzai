@@ -1,8 +1,7 @@
 // numeric/interp - linear interpolation between two fp32 LUT endpoints + an aligned
-// META bus. Port of fp_interp onto the numeric leaves (fadd/fmul/cvt_i2f) with delay
-// depths derived from numeric/fmt.vh instead of hand-counted literals. Shared by
-// exp/recip. Bit-identical to fp_interp (the new leaves ≡ the rtl/fp leaves), gated
-// transitively by the exp/recip differential cosims.
+// META bus. Composes fadd/fmul/cvt_i2f with delay depths derived from numeric/fmt.vh
+// instead of hand-counted literals. Shared by exp/recip; migration was gated
+// transitively through their differential cosims.
 //
 //   frac = lo + (t/256)·(hi - lo)
 

@@ -1,5 +1,4 @@
-/* C ABI over the Verilated decode_top model. Same AXI-Lite + four-port weight BFM as the
- * matmul_top shim (decode_top is the matmul_top re-extraction with the gemm kernel + EMIN). */
+/* C ABI over the Verilated decode_top model. */
 #pragma once
 #include <stdint.h>
 #ifdef __cplusplus

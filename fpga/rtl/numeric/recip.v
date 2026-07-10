@@ -1,6 +1,6 @@
 // numeric/recip - hardware reciprocal for the softmax denominator: y ~= 1/l for l >= 1.
-// Port of fp_recip onto numeric/interp (its only fp-leaf dependency). Bit-identical to
-// fp_recip (gated by the differential cosim).
+// Composes numeric/interp; migration was gated bit-identical against the former
+// standalone reciprocal leaf.
 //
 //   1/sig = lut+lerp(mantissa) ; y = ldexp(1/sig, -(exp-127)).
 

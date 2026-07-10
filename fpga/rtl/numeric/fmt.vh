@@ -15,14 +15,7 @@ localparam integer FMT_FP32_MANT = 23;
 localparam integer FMT_BF16_MANT = 7; // phase-3 element-wise path; here so the menu is single-sourced
 
 // ---- leaf pipeline latency (valid_in -> valid_out), the contract on each fp seam.
-//      These mirror the leaf register structure; the matmul cosim is the guard that they
+//      These mirror the leaf register structure; the pipeline cosims guard that they
 //      stay in sync (a wrong value mis-times the derived pipes below and fails results). ----
-localparam integer FP32_MUL_LATENCY = 3; // fp32_mul_pipe: in-reg + product-reg + out-reg
-localparam integer FP32_ADD_LATENCY = 4; // fp32_add_pipe: 4 registered stages
-
-// ---- derived cross-module latencies. A parent can't read a child module's localparam,
-//      so the shared contract lives here rather than being re-counted at each call site
-//      (matmul_rowblock used to hard-copy the reducer's 10 and the add's 5). ----
-localparam integer MATMUL_REDUCER_STAGES   = 4;                                       // reducer's own registered stages (s0..s3)
-localparam integer MATMUL_REDUCER_LATENCY  = MATMUL_REDUCER_STAGES + 2*FP32_MUL_LATENCY; // + two serial fp32 muls
-localparam integer MATMUL_ROWBLOCK_ADD_LAT = FP32_ADD_LATENCY + 1;                    // caller registers valid before the add
+localparam integer FP32_MUL_LATENCY = 3; // fmul: in-reg + product-reg + out-reg
+localparam integer FP32_ADD_LATENCY = 4; // fadd: 4 registered stages

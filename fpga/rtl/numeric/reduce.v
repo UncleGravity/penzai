@@ -2,10 +2,9 @@
 //
 //   sum = Σ_{i<N} in[i]   over log2(N) levels of fadd, NO recurrence.
 //
-// Parameterized N (power of 2) and MANT_W; composes numeric/fadd. The pairing order
-// matches fp_addtree exactly — (0,1)(2,3)…, then pairs of those — so at MANT_W=23,N=16
-// it is bit-identical to fp_addtree (fp add is non-associative, so order is the
-// contract). Latency = log2(N) · FADD_LATENCY. Unused lanes are the caller's job to
+// Parameterized N (power of 2) and MANT_W; composes numeric/fadd. The pairing order is
+// fixed as (0,1)(2,3)…, then pairs of those (fp add is non-associative, so order is part
+// of the contract). Latency = log2(N) · FADD_LATENCY. Unused lanes are the caller's job to
 // zero-pad (fp `+0` is exact). MODE is `tree` for now (iterative/dsp_cascade later,
 // behind the same param — plan-fpga-7.md numeric/reduce).
 

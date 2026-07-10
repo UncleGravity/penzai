@@ -76,43 +76,20 @@ pub fn build(b: *std.Build) void {
     addRtlSteps(b, target, optimize);
 }
 
-// RTL file sets (paths relative to the repo root, where `zig build` runs). The
-// matmul op lives in rtl/matmul/; the reusable fp32 cells in rtl/fp/ (a leaf
-// library shared with future ops). One module per file, file named after the module.
-const fp_rtl = [_][]const u8{
-    "fpga/rtl/fp/fp32_add_pipe.v", "fpga/rtl/fp/fp32_mul_pipe.v",
-    "fpga/rtl/fp/fp16_to_fp32.v",  "fpga/rtl/fp/int_to_fp32.v",
-};
-const matmul_rtl = [_][]const u8{
-    "fpga/rtl/matmul/matmul_kernel.v",  "fpga/rtl/matmul/matmul_rowblock.v",
-    "fpga/rtl/matmul/matmul_reducer.v",
-} ++ fp_rtl;
-const matmul_top_rtl = [_][]const u8{
-    "fpga/rtl/matmul/matmul_top.v",
-} ++ matmul_rtl;
-
-const matmul_rtl_args = "fpga/rtl/matmul/matmul_top.v fpga/rtl/matmul/matmul_kernel.v fpga/rtl/matmul/matmul_rowblock.v fpga/rtl/matmul/matmul_reducer.v fpga/rtl/fp/fp32_add_pipe.v fpga/rtl/fp/fp32_mul_pipe.v fpga/rtl/fp/fp16_to_fp32.v fpga/rtl/fp/int_to_fp32.v";
-
-// Flash-attention fp leaves (rebuild 1D-4): exp + reciprocal LUT units and their
-// shared interpolation, on the rtl/fp leaf library. The cosim harness top wraps
-// both leaves so one Verilator model exercises them against flash_ref.
+// Flash-attention numeric leaves. The cosim-only harness wraps exp, reciprocal,
+// and dot so one Verilator model checks them directly against flash_ref.
 const flash_fp_rtl = [_][]const u8{
-    "fpga/rtl/flash_attn/flash_fp_top.v",
-    "fpga/rtl/flash_attn/fp_exp.v",
-    "fpga/rtl/flash_attn/fp_recip.v",
+    "fpga/sim/flash_fp/flash_fp_top.v",
     "fpga/rtl/flash_attn/fp_dot.v",
-    "fpga/rtl/flash_attn/fp_interp.v",
-    // fp_dot composes numeric leaves now (reduce→fadd); fp_exp/fp_recip/fp_interp stay old cells.
+    "fpga/rtl/numeric/exp.v",
+    "fpga/rtl/numeric/recip.v",
+    "fpga/rtl/numeric/interp.v",
     "fpga/rtl/numeric/cvt.v",
     "fpga/rtl/numeric/fmul.v",
     "fpga/rtl/numeric/fadd.v",
     "fpga/rtl/numeric/reduce.v",
-    "fpga/rtl/fp/fp32_add_pipe.v",
-    "fpga/rtl/fp/fp32_mul_pipe.v",
-    "fpga/rtl/fp/fp16_to_fp32.v",
-    "fpga/rtl/fp/int_to_fp32.v",
 };
-// The online-softmax transform on the exp leaf (+ its interp/fp deps).
+// The online-softmax transform on the exp leaf and its numeric dependencies.
 const flash_softmax_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_softmax.v",
     "fpga/rtl/numeric/exp.v",
@@ -121,7 +98,7 @@ const flash_softmax_rtl = [_][]const u8{
     "fpga/rtl/numeric/fmul.v",
     "fpga/rtl/numeric/cvt.v",
 };
-// The full kernel composing fp_dot + flash_softmax + fp_recip.
+// The full kernel composing fp_dot + flash_softmax + numeric recip.
 const flash_kernel_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_kernel.v",
     "fpga/rtl/flash_attn/fp_dot.v",
@@ -141,28 +118,6 @@ const flash_top_rtl = [_][]const u8{
     "fpga/rtl/flash_attn/flash_top.v",
 } ++ flash_kernel_rtl;
 
-// numeric/ leaf library differential harness: each new leaf beside the proven rtl/fp
-// leaf it replaces. Grows as leaves land (fmul/cvt/reduce next).
-const numeric_diff_rtl = [_][]const u8{
-    "fpga/rtl/numeric/numeric_diff_top.v",
-    "fpga/rtl/numeric/fadd.v",
-    "fpga/rtl/numeric/fmul.v",
-    "fpga/rtl/numeric/cvt.v",
-    "fpga/rtl/numeric/reduce.v",
-    "fpga/rtl/numeric/interp.v",
-    "fpga/rtl/numeric/exp.v",
-    "fpga/rtl/numeric/recip.v",
-    // old leaves the new ones are gated against (flash_luts.vh resolves via incdir)
-    "fpga/rtl/fp/fp32_add_pipe.v",
-    "fpga/rtl/fp/fp32_mul_pipe.v",
-    "fpga/rtl/fp/fp16_to_fp32.v",
-    "fpga/rtl/fp/int_to_fp32.v",
-    "fpga/rtl/flash_attn/fp_addtree.v",
-    "fpga/rtl/flash_attn/fp_interp.v",
-    "fpga/rtl/flash_attn/fp_exp.v",
-    "fpga/rtl/flash_attn/fp_recip.v",
-};
-
 // seq_core (the seq.v command executor) — pure control logic, no software ref.
 const seq_rtl = [_][]const u8{
     "fpga/rtl/seq/seq_core.v",
@@ -181,14 +136,14 @@ const seq_top_rtl = [_][]const u8{
 
 // numeric/fma (fixed-point DSP-MAC) oracle cosim vs matmul_ref.windowedRow.
 const numeric_fma_rtl = [_][]const u8{
-    "fpga/rtl/numeric/fma_top.v",
+    "fpga/sim/numeric_fma/fma_top.v",
     "fpga/rtl/numeric/fma.v",
 };
 
 // gemm decode datapath: the front-end (f16 decompose + Σ±a reduce) + ROWS fma lanes,
 // gated bit-exact vs matmul_ref.windowedRow (exact-in-window). Composes the proven fma.
 const numeric_gemm_rtl = [_][]const u8{
-    "fpga/rtl/gemm_top.v",
+    "fpga/sim/gemm/gemm_top.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
@@ -201,15 +156,17 @@ const gemm_kernel_rtl = [_][]const u8{
     "fpga/rtl/numeric/fma.v",
 };
 
-// decode_top: the deployable AXI-Lite top (matmul_top re-extracted with gemm_kernel + the
-// EMIN config register). Includes the generated matmul_regs.vh. Gated bit-exact vs
-// windowedFixedOutput through the four-port weight zip + AXI-Lite config (incl. EMIN).
+// decode_top: the deployable AXI-Lite top around gemm_kernel. Includes the generated
+// matmul_regs.vh and is gated bit-exact vs windowedFixedOutput through the four-port
+// weight zip and AXI-Lite configuration.
 const decode_top_rtl = [_][]const u8{
     "fpga/rtl/decode_top.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
+
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
@@ -227,39 +184,35 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     const run_vh = b.addRunArtifact(emit);
     run_vh.addArgs(&.{ "matmul", "vh" });
-    update.addCopyFileToSource(run_vh.captureStdOut(.{}), "fpga/rtl/matmul/matmul_regs.vh");
+    update.addCopyFileToSource(run_vh.captureStdOut(.{}), "fpga/regmap/matmul_regs.vh");
 
     const run_tcl = b.addRunArtifact(emit);
     run_tcl.addArgs(&.{ "matmul", "tcl" });
-    update.addCopyFileToSource(run_tcl.captureStdOut(.{}), "fpga/bitstreams/q1a8-w256-mc/tcl/address_map.tcl");
+    update.addCopyFileToSource(run_tcl.captureStdOut(.{}), "fpga/regmap/matmul_address_map.tcl");
 
     const run_flash_vh = b.addRunArtifact(emit);
     run_flash_vh.addArgs(&.{ "flash", "vh" });
-    update.addCopyFileToSource(run_flash_vh.captureStdOut(.{}), "fpga/rtl/flash_attn/flash_regs.vh");
+    update.addCopyFileToSource(run_flash_vh.captureStdOut(.{}), "fpga/regmap/flash_regs.vh");
 
     const run_flash_tcl = b.addRunArtifact(emit);
     run_flash_tcl.addArgs(&.{ "flash", "tcl" });
-    update.addCopyFileToSource(run_flash_tcl.captureStdOut(.{}), "fpga/bitstreams/flash-v1/tcl/address_map.tcl");
+    update.addCopyFileToSource(run_flash_tcl.captureStdOut(.{}), "fpga/regmap/flash_address_map.tcl");
 
     b.step("regmap", "Generate matmul/flash register headers + address maps").dependOn(&update.step);
 
-    // Verilator lint of the deployable matmul RTL, including matmul_top + the
-    // counter bank + the generated header. This is the structural gate for the
-    // gateware that the cosim (which drives the core) does not exercise.
+    // Verilator lint of the deployable fixed-point GEMM top and its generated
+    // register contract.
     const lint = b.addSystemCommand(&.{
-        "sh",                                                                                                                                                 "-c",
-        "verilator --lint-only -Wall -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING +incdir+fpga/rtl/matmul +incdir+fpga/rtl/numeric --top-module matmul_top " ++ matmul_rtl_args,
+        "sh",                                                                                                                                                                                                                 "-c",
+        "verilator --lint-only -Wall -Wno-DECLFILENAME -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM -Wno-PINMISSING -Wno-PINCONNECTEMPTY +incdir+fpga/regmap +incdir+fpga/rtl/numeric --top-module decode_top " ++ decode_top_rtl_args,
     });
-    b.step("lint-rtl", "Verilator lint the matmul RTL").dependOn(&lint.step);
+    b.step("lint-rtl", "Verilator lint the deployable GEMM RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl-matmul", "Verilator cosim: matmul kernel vs matmul_ref", "matmul_kernel", "fpga/sim/matmul_kernel", &matmul_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-matmul-top", "Verilator cosim: matmul AXI-Lite top (four-port zip) vs matmul_ref", "matmul_top", "fpga/sim/matmul_top", &matmul_top_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-numeric", "Verilator cosim: numeric/ leaves differential vs rtl/fp", "numeric_diff_top", "fpga/sim/numeric_diff", &numeric_diff_rtl, .numeric);
     addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
     addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
     addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite gemm top, four-port zip + EMIN) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: flash fp_exp/fp_recip/fp_dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
+    addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite GEMM top + four-port zip) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
+    addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: numeric exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
@@ -269,8 +222,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
-// `numeric` is differential (new leaf vs the proven rtl/fp leaf) — no software ref.
-const CosimKind = enum { matmul, flash, numeric, seq };
+const CosimKind = enum { matmul, flash, seq };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -315,11 +267,8 @@ fn addCosim(
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "--Mdir", gen });
     switch (kind) {
-        // matmul reducer/rowblock `include "fmt.vh" from numeric/ (the format+latency contract).
-        .matmul => vcmd.addArgs(&.{ "+incdir+fpga/rtl/matmul", "+incdir+fpga/rtl/numeric" }),
-        .flash => vcmd.addArgs(&.{ "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
-        // numeric exp/recip `include flash_luts.vh (still in flash_attn/ pre-swap).
-        .numeric => vcmd.addArgs(&.{ "+incdir+fpga/rtl/numeric", "+incdir+fpga/rtl/flash_attn" }),
+        .matmul => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/numeric" }),
+        .flash => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
         .seq => {}, // seq_core has no includes
     }
     vcmd.addArgs(rtl);
@@ -331,7 +280,7 @@ fn addCosim(
         .link_libc = true,
     });
     switch (kind) {
-        .numeric, .seq => {}, // no software ref imports (seq_core is pure control logic)
+        .seq => {}, // pure control logic, no software reference imports
         .matmul => attachCosimSupport(b, tb_mod, target, optimize),
         .flash => {
             tb_mod.addImport("flash_ref", b.createModule(.{

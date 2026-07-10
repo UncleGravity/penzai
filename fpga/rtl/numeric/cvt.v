@@ -3,8 +3,8 @@
 // Combinational, truncating. Conversions (cvt_f16_f32, cvt_i2f, + the bf16 narrow/widen):
 //   cvt_f16_f32 : f16 -> fp32 widen (attention K/V/mask)         ≡ fp16_to_fp32
 //   cvt_i2f     : signed int(WIDTH) -> fp32 (interp t, etc.)     ≡ int_to_fp32
-// Both gated bit-identical to their rtl/fp predecessors (differential cosim,
-// exhaustive over the input domain). The new fixed->fp emit path lives with the
+// Migration was gated bit-identical against the former converters, exhaustively over
+// the input domain. The fixed->fp emit path lives with the
 // gemm datapath (oracle-gated vs windowedFixedOutput), not here.
 
 `default_nettype none

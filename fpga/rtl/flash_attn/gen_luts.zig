@@ -1,11 +1,11 @@
 //! Generator for the flash-attention LUT header (`flash_luts.vh`). Emits the two
-//! softmax tables to stdout as packed Verilog localparams; the build/regmap step
-//! captures it to `fpga/rtl/flash_attn/flash_luts.vh` (a checked-in generated
-//! artifact, like `matmul_regs.vh`). Single source: the same closed formulas the
+//! softmax tables to stdout as packed Verilog localparams. Its output is checked in as
+//! `fpga/rtl/flash_attn/flash_luts.vh` (a generated
+//! artifact, like `fpga/regmap/matmul_regs.vh`). Single source: the same closed formulas the
 //! `flash_ref` model uses —
 //!
-//!   FLASH_EXP_LUT[k]   = 2^(−k/2^B)      for the fp_exp 2^(−af) table, af∈[0,1)
-//!   FLASH_RECIP_LUT[k] = 1/(1 + k/2^B)   for the fp_recip 1/sig table, sig∈[1,2)
+//!   FLASH_EXP_LUT[k]   = 2^(−k/2^B)      for numeric/exp, af∈[0,1)
+//!   FLASH_RECIP_LUT[k] = 1/(1 + k/2^B)   for numeric/recip, sig∈[1,2)
 //!
 //! Entry k occupies bits [k*32 +: 32]; the leaf reads table[idx*32 +: 32] and
 //! table[(idx+1)*32 +: 32] for the two interpolation endpoints (k = 0 … 2^B).
@@ -41,7 +41,7 @@ pub fn main(init: std.process.Init) !void {
     var buf: [96 * 1024]u8 = undefined;
     var cursor: usize = 0;
     // No `ifndef include guard: these are module-scoped localparams and each
-    // including module (fp_exp, fp_recip) needs its own textual copy. A guard would
+    // including module (exp, recip) needs its own textual copy. A guard would
     // let only the first include define them (global `define), starving the rest.
     cursor += (try std.fmt.bufPrint(buf[cursor..], "// Generated from fpga/rtl/flash_attn/gen_luts.zig — do not edit.\n", .{})).len;
     cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam integer FLASH_LUT_BITS = {d};\n", .{B})).len;

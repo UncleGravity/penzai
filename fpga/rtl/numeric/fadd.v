@@ -5,8 +5,8 @@
 // fp32's full 8-bit exponent ... cuts the mantissa." Truncating (no rounding), same
 // semantics as the rtl/fp leaf it replaces.
 //
-// At MANT_W=23 this is bit-identical to fp32_add_pipe and preserves its pipeline depth
-// (the differential cosim, test-rtl-numeric, is the gate). Format on the wire:
+// At MANT_W=23 this preserves the retired fp32_add_pipe semantics and pipeline depth;
+// migration was gated by an exhaustive differential cosim. Format on the wire:
 //   { sign[1], exp[8], mant[MANT_W] }   width = MANT_W + 9.
 
 `default_nettype none

@@ -9,7 +9,7 @@
 #   ./build.sh w512-p4-f200-wc300    # explicit; f = shared kernel clock (both ops), wc = matmul weight clock
 #
 # Regenerate the generated inputs first if the regmaps changed:
-#   (cd ../../.. && zig build regmap)   # writes matmul_regs.vh, flash_regs.vh, both address_map.tcl
+#   (cd ../../.. && zig build regmap)   # writes fpga/regmap/{matmul,flash} contract files
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -22,30 +22,26 @@ set -a; source config.env; set +a
 VARIANT="${1:-${VARIANT:-w512-p4-f200-wc300}}"
 BIT_PREFIX="penzai-combined-v1"
 RTL_ROOT="../../rtl"
-RTL_MATMUL="../../rtl/matmul"
 RTL_FLASH="../../rtl/flash_attn"
-RTL_FP="../../rtl/fp"
 RTL_NUMERIC="../../rtl/numeric"
 RTL_SEQ="../../rtl/seq"
+REGMAP_ROOT="../../regmap"
 
-# Union of both RTL sets — matmul (gemm) and flash now BOTH compose the numeric/ leaf
-# library; rtl/fp is fully retired from the build (no synthesizable consumer left). This
-# set is exactly decode_top's + flash_top's cosim deps (build.zig), so it's proven to elaborate.
+# Union of both RTL sets. GEMM and flash compose the shared numeric/ leaves; generated
+# register contracts come from regmap/. This matches the deployable cosim dependencies.
 RTL_FILES=(
-  # matmul = the plan-7 fixed-point gemm path (decode_top replaces matmul_top; the legacy
-  # matmul_{top,kernel,rowblock,reducer}.v stay on disk for the cosims but are not built).
+  # Plan-7 fixed-point GEMM path.
   "$RTL_ROOT/decode_top.v"
   "$RTL_ROOT/gemm_kernel.v"
   "$RTL_ROOT/gemm.v"
-  "$RTL_MATMUL/matmul_regs.vh"
-  # flash = the migrated kernel; fp_dot/fp_axpy8/flash_softmax are numeric compositions now
-  # (the old fp_addtree/fp_exp/fp_recip/fp_interp are dead — reduce/exp/recip replace them).
+  "$REGMAP_ROOT/matmul_regs.vh"
+  # Migrated flash kernel; these pipeline compositions use numeric/ leaves.
   "$RTL_FLASH/flash_top.v"
   "$RTL_FLASH/flash_kernel.v"
   "$RTL_FLASH/fp_dot.v"
   "$RTL_FLASH/fp_axpy8.v"
   "$RTL_FLASH/flash_softmax.v"
-  "$RTL_FLASH/flash_regs.vh"
+  "$REGMAP_ROOT/flash_regs.vh"
   "$RTL_FLASH/flash_luts.vh"
   # numeric/ leaf library: fma (matmul) + the float leaves shared by flash. cvt carries the
   # f16/f32/bf16 conversions (incl. the bf16 p·V seam); reduce composes fadd; exp/recip
@@ -69,17 +65,17 @@ for f in "${RTL_FILES[@]}"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap' for the *_regs.vh)" >&2; exit 1; }
 done
 
-# Both generated address maps (build.tcl sources them, renamed). One source: the regmaps.
-MATMUL_ADDR="../q1a8-w256-mc/tcl/address_map.tcl"
-FLASH_ADDR="../flash-v1/tcl/address_map.tcl"
+# Both generated address maps (build.tcl sources renamed copies). One source: regmap/.
+MATMUL_ADDR="$REGMAP_ROOT/matmul_address_map.tcl"
+FLASH_ADDR="$REGMAP_ROOT/flash_address_map.tcl"
 for f in "$MATMUL_ADDR" "$FLASH_ADDR"; do
   [[ -f "$f" ]] || { echo "ERROR: missing $f (run 'zig build regmap')" >&2; exit 1; }
 done
 
 echo "== sync FPGA inputs -> $VM:$VM_DIR =="
 ssh "$VM" "if not exist $VM_DIR mkdir $VM_DIR" || true
-# Clean rtl/ before sync so a changed RTL_FILES list (matmul_* -> gemm) leaves no stale
-# modules for build.tcl's `glob ./rtl/*.v` to pick up (e.g. a dead matmul_top.v).
+# Clean rtl/ before sync so a changed RTL_FILES list leaves no stale modules for
+# build.tcl's `glob ./rtl/*.v` to pick up.
 ssh "$VM" "if exist $VM_DIR\\rtl rmdir /s /q $VM_DIR\\rtl" || true
 ssh "$VM" "mkdir $VM_DIR\\rtl" || true
 scp tcl/build.tcl build.bat "$VM:$VM_DIR/"

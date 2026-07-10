@@ -85,7 +85,7 @@ pub fn weightBytesWide(num_rowblocks: usize, q1_blocks: usize) usize {
     return num_rowblocks * q1_blocks * (1 + layout.Q8_SUBBLOCKS) * WIDE_BEAT_BYTES;
 }
 
-/// Pack weights for matmul_kernel: per q1block per rowblock, one scale beat
+/// Pack weights for gemm_kernel: per q1block per rowblock, one scale beat
 /// then 4 wbit beats. Every row lane owns a 32-bit slot; scale beats store the
 /// fp16 scale in the low half of that slot, matching the v7 two-port combiner.
 pub fn packWeightsWide(

@@ -1,6 +1,6 @@
 # flash_attn kernel AXI-Lite register map — single source of truth.
 # Consumed by the Zig MMIO driver (device/pl, the flash tenant) and the RTL via the
-# generated Verilog header (fpga/regmap/flash_attn.zig emits flash_regs.vh). Do not
+# generated Verilog header (fpga/regmap/flash_regs.vh). Do not
 # hand-edit the generated header or duplicate these constants; change them here.
 #
 # Mirrors the matmul regmap shape (ID/VERSION/CTRL/STATUS/CYCLES/CLK_HZ + a counter

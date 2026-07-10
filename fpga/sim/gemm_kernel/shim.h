@@ -1,5 +1,4 @@
-/* C ABI over the Verilated gemm_kernel model. Mirrors the matmul_kernel shim plus the
- * global `emin` calibration register. */
+/* C ABI over the Verilated gemm_kernel model. */
 #pragma once
 #include <stdint.h>
 #ifdef __cplusplus

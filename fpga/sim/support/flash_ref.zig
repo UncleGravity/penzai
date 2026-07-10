@@ -13,7 +13,7 @@
 //! the *real* KV extent. That PS kernel is the shipping, tested oracle; the PL
 //! kernel and this ref both implement the same schedule, differing only in that
 //! exp/recip are the hardware approximations modeled below. Internal datapath is
-//! fp32 throughout (matches rtl/fp/ and the PS path; the bf16-accumulator area
+//! fp32 throughout (matches numeric/ at FP32 precision and the PS path; the bf16-accumulator area
 //! lever was considered and rejected to avoid reopening numerics).
 
 const std = @import("std");
@@ -31,7 +31,7 @@ pub const recip_lut_bits: u5 = 8;
 //
 // Softmax feeds exp only values ≤ 0 (p = exp(score−m), m ≥ score; corr = exp(Δm),
 // Δm ≤ 0), so output ∈ (0,1] and the integer exponent part is ≤ 0 — a right-shift /
-// underflow-to-0, never overflow. HW recipe (all from existing rtl/fp/ cells + one
+// underflow-to-0, never overflow. HW recipe (composed from numeric/ cells + one
 // table + one lerp):
 //
 //   y = x · log2e          one fp32 multiply              (y ≤ 0)

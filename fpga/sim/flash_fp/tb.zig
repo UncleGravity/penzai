@@ -1,5 +1,5 @@
-//! Micro-cosim for the flash fp leaves: drives fp_exp and fp_recip (wrapped in
-//! flash_fp_top) over input sweeps and checks each RTL result against the validated
+//! Micro-cosim for the migrated numeric leaves: drives exp and recip (wrapped in
+//! flash_fp_top with fp_dot) and checks each RTL result against the validated
 //! `flash_ref` software model (softmaxExp / recip, B=8). The pipes are fixed-latency
 //! and in-order, so the k-th valid_out is the k-th input — collect in order.
 //!
@@ -167,11 +167,11 @@ pub fn main() !void {
         .{ ec, rc, dc, N },
     );
     std.debug.print(
-        "    fp_exp   : max_rel={e:.3} (@x={d:.3})  max_abs={e:.3}\n",
+        "    exp      : max_rel={e:.3} (@x={d:.3})  max_abs={e:.3}\n",
         .{ exp_rel, worst_exp_x, exp_abs },
     );
     std.debug.print(
-        "    fp_recip : max_rel={e:.3} (@l={d:.3})  max_abs={e:.3}\n",
+        "    recip    : max_rel={e:.3} (@l={d:.3})  max_abs={e:.3}\n",
         .{ rec_rel, worst_rec_l, rec_abs },
     );
     std.debug.print(

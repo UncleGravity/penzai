@@ -1,4 +1,4 @@
-// flash_kernel - flash attention, kv-major (v2).
+// flash_kernel - flash attention, kv-major (v3).
 //
 // Consumes the KV cache in its NATIVE layout — kv-position-major, n_head_kv heads,
 // NOT GQA-replicated — so the device DMAs Q/K/V/mask straight from the resident
@@ -6,7 +6,7 @@
 // here: one kv-head's K/V fans out to its `head_ratio` query heads. All n_heads carry
 // an independent online-softmax state (m,l,acc) at once, so streaming kv-major updates
 // every head per kv. The dot is pipelined (stream head_dim/8 beats through fp_dot into
-// a 16-deep buffer, sum with fp_addtree — no per-beat recurrence), replacing v1's
+// a 16-deep buffer, sum with numeric/reduce — no per-beat recurrence), replacing v1's
 // ~320-cyc/kv sequential dot. O is emitted 8-wide packed.
 //
 //   load Q[token] (all heads, resident); init pool m=-inf,l=0,acc=0
@@ -148,7 +148,7 @@ module flash_kernel #(
     fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire_q),
         .q(q_rd), .k(k_rd), .valid_out(dot_v), .sum(dot_beat));
 
-    // ---- fp_addtree: sum the per-beat partials (zero-padded, latency 16) ----
+    // ---- reduction tree: sum the per-beat partials (zero-padded, latency 16) ----
     wire [511:0] tree_in;
     genvar g;
     generate

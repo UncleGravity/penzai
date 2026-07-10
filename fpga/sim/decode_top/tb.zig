@@ -2,7 +2,7 @@
 //! Drives the four 128-bit resident weight streams + acts, writes the config registers, and
 //! checks the result stream BIT-EXACT against matmul_ref.windowedFixedOutput (the fixed window
 //! decode_top bakes in — no EMIN register). Proves the four-port zip feeds gemm_kernel in the
-//! right order. (The AXI/zip BFM mirrors test-rtl-matmul-top.)
+//! right order through the AXI/zip BFM.
 
 const std = @import("std");
 const layout = @import("layout");

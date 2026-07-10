@@ -1,7 +1,7 @@
 // gemm_kernel - the fixed-point matmul kernel FSM (plan-fpga-7.md §gemm.v, increment 3).
 //
-// Re-extracted from matmul_kernel: same AXIS weight/act feed, BRAM-backed activation
-// storage, and COLS_MAX column sweep (one weight beat held across `num_cols` columns —
+// Owns the AXIS weight/act feed, BRAM-backed activation storage, and COLS_MAX column
+// sweep (one weight beat held across `num_cols` columns —
 // the prefill weight-reuse axis). What it DROPS is the recurrence-hiding machinery the
 // fp32 accumulate needed: no ACCUM_DEPTH pool, no issue_gap, no single_col round-robin, no
 // done_pipe. The fixed-point accumulate is single-cycle, so sub-blocks issue back-to-back
@@ -10,9 +10,8 @@
 // Datapath = gemm_rowblock (the COLS_MAX-banked fixed-point MAC) + gemm_emit (the per-output
 // fixed→fp32 normalize, PIPELINED — fails f300 combinationally). The emit pipeline is filled
 // in a PRECOMPUTE phase (free-running, no backpressure) into a result buffer, which ST_EMIT
-// then streams 2 fp32/beat with AXIS backpressure (matmul_kernel's proven readout). `emin` is
-// one global calibration register, set once at init (NOT per call). Output stream layout is
-// identical to matmul_kernel: per rowblock, per column, ROWS/2 beats of 2 fp32 (lane-major).
+// then streams 2 fp32/beat with AXIS backpressure. `emin` is stable for a run. Output
+// stream layout is per rowblock, per column, ROWS/2 beats of 2 fp32 (lane-major).
 //
 // Gated vs matmul_ref.windowedFixedOutput (C=1 decode and C>1 prefill) — bit-exact, since
 // the oracle emits via the truncating emitTrunc that models gemm_emit.

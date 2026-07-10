@@ -11,9 +11,8 @@
 //
 // LANES = 8 (a 128-bit K beat / 256-bit Q beat). Latency valid_in→valid_out:
 // (FP32_MUL_LATENCY+1) + log2(LANES)·FP32_ADD_LATENCY = 4 + 12 = 16 — the dot's fmul runs
-// MUL_PIPE=1 (the fp32 2-DSP multiply split for f300). VALUE-identical to the rtl/fp
-// version (the extra stage is pure pipelining): the numeric leaves ≡ the fp32_*_pipe leaves
-// and reduce(N=8) ≡ the hand-rolled add tree (same (0,1)(2,3)… order — the cosim is the gate).
+// MUL_PIPE=1 (the fp32 2-DSP multiply split for f300). The extra stage is pure
+// pipelining; reduce(N=8) retains the established (0,1)(2,3)… pairing order.
 
 `default_nettype none
 

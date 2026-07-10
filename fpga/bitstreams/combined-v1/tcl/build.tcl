@@ -74,13 +74,13 @@ if {[catch {set_property board_part $board [current_project]} err]} {
 }
 set_property target_language Verilog [current_project]
 
-# Both RTL sets live under ./rtl (build.sh syncs matmul/* + flash_attn/* + fp/* once).
+# Both RTL sets and their generated headers are flattened under ./rtl by build.sh.
 set rtl_files [glob -nocomplain [file normalize ./rtl/*.v]]
 if {[llength $rtl_files] == 0} { error "missing RTL files under ./rtl" }
 add_files -norecurse $rtl_files
-# Verilog headers: matmul_top includes matmul_regs.vh; flash_top includes flash_regs.vh;
-# fp_exp/fp_recip include flash_luts.vh; matmul reducer/rowblock include fmt.vh (the
-# numeric format+latency contract). All must be added as headers + on the include path.
+# Verilog headers: decode_top and flash_top include their generated register contracts;
+# numeric exp/recip include flash_luts.vh; numeric leaves include fmt.vh. All must be
+# added as headers and placed on the include path.
 foreach vh {matmul_regs.vh flash_regs.vh flash_luts.vh fmt.vh} {
     set f [file normalize ./rtl/$vh]
     if {![file exists $f]} { error "missing ./rtl/$vh (run 'zig build regmap' for the *_regs.vh)" }

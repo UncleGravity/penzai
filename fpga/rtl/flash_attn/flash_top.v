@@ -2,7 +2,7 @@
 //
 // The host writes the shape config (HEAD_DIM_Q/V, N_HEADS, N_KV, N_TOKENS, SCALE)
 // then strobes CTRL.start. Q/K/V/mask stream in from DMA, O streams out to DMA. A
-// per-run counter bank records Q/K/V/O beats + K/V/O stalls. Mirrors matmul_top; the
+// per-run counter bank records Q/K/V/O beats + K/V/O stalls. As with decode_top, the
 // register decode comes from the generated flash_regs.vh so RTL and the Zig driver
 // never drift.
 

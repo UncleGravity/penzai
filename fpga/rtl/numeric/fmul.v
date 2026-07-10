@@ -2,10 +2,10 @@
 //
 // fp32 (MANT_W=23) and bf16 (MANT_W=7) are the SAME module, different param; the
 // exponent stays 8-bit (fp32 range) for both. Truncating, same semantics as the
-// rtl/fp leaf it replaces. The (MANT_W+1)² mantissa product is forced into a DSP
-// (use_dsp) and runs register-to-register, as in fp32_mul_pipe (the f250 fix).
+// retired fp32 leaf. The (MANT_W+1)² mantissa product is forced into a DSP
+// (use_dsp) and runs register-to-register.
 //
-// At MANT_W=23 this is bit-identical to fp32_mul_pipe (differential cosim is the gate).
+// At MANT_W=23 migration was gated bit-identical against the former fp32 multiplier.
 // Latency valid_in -> valid_out: 3 + MUL_PIPE. Format: { sign[1], exp[8], mant[MANT_W] }.
 //
 // MUL_PIPE adds extra register stage(s) on the mantissa product. At fp32 (MANT_W=23) the

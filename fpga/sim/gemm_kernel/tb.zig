@@ -4,7 +4,7 @@
 //! matmul_ref.windowedFixedOutput — exact, not ε, because the oracle emits via the truncating
 //! emitTrunc that models gemm_emit. C=1 is decode (one accumulator/row); C>1 is prefill (one
 //! weight stream MAC'd against COLS_MAX columns — the bank + column sweep). Reuses pack.zig,
-//! the same wire contract matmul_kernel uses.
+//! the deployed GEMM wire contract.
 
 const std = @import("std");
 const layout = @import("layout");

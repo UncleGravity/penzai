@@ -1,6 +1,6 @@
 # matmul kernel AXI-Lite register map — single source of truth.
 # Consumed by the Zig MMIO driver (device/pl, P4) and the RTL via the generated
-# Verilog header (fpga/regmap/matmul.zig emits matmul_regs.vh). Do not hand-edit the
+# Verilog header (generated at fpga/regmap/matmul_regs.vh). Do not hand-edit the
 # generated header or duplicate these constants; change them here.
 #
 # Format: offset  name  access  reset  description... (one register per line)

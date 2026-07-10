@@ -1,6 +1,6 @@
 // numeric/exp - hardware exp for softmax: y ~= exp(x) for x <= 0, output in (0,1].
-// Port of fp_exp onto numeric leaves (fmul + numeric/interp), guard delay derived from
-// fmt.vh. Bit-identical to fp_exp (gated by the differential cosim).
+// Composes fmul + numeric/interp with guard delay derived from fmt.vh. Migration was
+// gated bit-identical against the former standalone exp leaf.
 //
 //   a = |x|·log2e ; ai=floor(a), af=a-ai ; 2^-af = lut+lerp(af) ; y = ldexp(2^-af, -ai)
 //   guards: x >= 0 -> 1.0 ; x <= -87 -> 0.

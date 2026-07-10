@@ -66,7 +66,7 @@ pub const addr = struct {
 /// device and gateware agree on it); the staging sizes are host DMA-buffer
 /// reservations sized to one COLS_MAX group.
 pub const caps = struct {
-    /// Activation columns multiplied per kernel run (matmul_kernel COLS_MAX).
+    /// Activation columns multiplied per kernel run (gemm_kernel COLS_MAX).
     pub const cols_max: u32 = 8;
     /// Activation staging reservation: COLS_MAX columns of packed acts.
     pub const acts_staging_bytes: usize = 256 * 1024;
@@ -133,7 +133,7 @@ pub fn emitVerilog(buf: []u8) std.fmt.BufPrintError![]const u8 {
         if (reg.access != .ro) continue;
         cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam [31:0] MATMUL_RST_{s} = 32'h{X:0>8};\n", .{ reg.name, reg.reset })).len;
     }
-    // Build caps the RTL needs (not registers). matmul_top drives the kernel's
+    // Build caps the RTL needs (not registers). decode_top drives the kernel's
     // COLS_MAX from this so the deployed column count and the host's caps.cols_max
     // share one source.
     cursor += (try std.fmt.bufPrint(buf[cursor..], "localparam integer MATMUL_COLS_MAX = {d};\n", .{caps.cols_max})).len;
@@ -179,7 +179,7 @@ test "emitVerilog contains offsets and ro reset values" {
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_ID = 32'hB05A2000;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_CTRL") == null);
-    // COLS_MAX flows to the RTL so matmul_top can drive the kernel from it.
+    // COLS_MAX flows to the RTL so decode_top can drive the kernel from it.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_COLS_MAX = 8;") != null);
 }
 
