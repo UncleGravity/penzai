@@ -15,6 +15,8 @@ const protocol_transport = shared.protocol_transport;
 const wire = shared.wire;
 const profiling = shared.profiling;
 
+const max_transfer_payload: usize = @intCast(framing.max_payload_len);
+
 pub const LinkError = error{
     OutOfMemory,
     Protocol,
@@ -254,7 +256,34 @@ pub fn Link(comptime Transport: type) type {
             return opTimingFrom(response.meta);
         }
 
+        /// Upload one logical tensor range, splitting it across wire frames when
+        /// it is larger than the protocol payload limit.
         pub fn upload(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
+            return self.uploadChunked(range, bytes, max_transfer_payload);
+        }
+
+        fn uploadChunked(
+            self: *Self,
+            range: wire.TensorRange,
+            bytes: []const u8,
+            chunk_limit: usize,
+        ) LinkError!OpTiming {
+            if (!validTransfer(range, bytes.len) or !validChunkLimit(chunk_limit)) return error.Protocol;
+            if (bytes.len == 0) return self.uploadOne(range, bytes);
+
+            var total: OpTiming = .{};
+            var offset: usize = 0;
+            while (offset < bytes.len) {
+                const chunk_len = @min(chunk_limit, bytes.len - offset);
+                const chunk_range = try transferChunkRange(range, offset, chunk_len);
+                const timing = try self.uploadOne(chunk_range, bytes[offset..][0..chunk_len]);
+                total.device_service_ns = total.device_service_ns +| timing.device_service_ns;
+                offset += chunk_len;
+            }
+            return total;
+        }
+
+        fn uploadOne(self: *Self, range: wire.TensorRange, bytes: []const u8) LinkError!OpTiming {
             var meta: [64]u8 = undefined;
             const id = self.nextId();
             const meta_len = wire.encodeUpload(&meta, id, range) catch return error.Protocol;
@@ -274,10 +303,36 @@ pub fn Link(comptime Transport: type) type {
             return opTimingFrom(response.meta);
         }
 
-        /// Download routes through `transport.callInto` so the wire transport can
-        /// read the payload straight into `out` (zero-copy, §3 #1); the in-process
-        /// fake copies. Either way the meta is validated and the length checked.
+        /// Download one logical tensor range, splitting it across wire frames when
+        /// it is larger than the protocol payload limit.
         pub fn download(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
+            return self.downloadChunked(range, out, max_transfer_payload);
+        }
+
+        fn downloadChunked(
+            self: *Self,
+            range: wire.TensorRange,
+            out: []u8,
+            chunk_limit: usize,
+        ) LinkError!OpTiming {
+            if (!validTransfer(range, out.len) or !validChunkLimit(chunk_limit)) return error.Protocol;
+            if (out.len == 0) return self.downloadOne(range, out);
+
+            var total: OpTiming = .{};
+            var offset: usize = 0;
+            while (offset < out.len) {
+                const chunk_len = @min(chunk_limit, out.len - offset);
+                const chunk_range = try transferChunkRange(range, offset, chunk_len);
+                const timing = try self.downloadOne(chunk_range, out[offset..][0..chunk_len]);
+                total.device_service_ns = total.device_service_ns +| timing.device_service_ns;
+                offset += chunk_len;
+            }
+            return total;
+        }
+
+        /// Each download chunk routes through `transport.callInto` so the wire
+        /// transport reads the payload straight into its final destination.
+        fn downloadOne(self: *Self, range: wire.TensorRange, out: []u8) LinkError!OpTiming {
             var meta: [64]u8 = undefined;
             const id = self.nextId();
             const meta_len = wire.encodeDownload(&meta, id, range) catch return error.Protocol;
@@ -399,6 +454,27 @@ fn buildRunGraphPayload(allocator: std.mem.Allocator, preload_bytes: []const u8,
     return payload;
 }
 
+fn validTransfer(range: wire.TensorRange, len: usize) bool {
+    const len_u64 = std.math.cast(u64, len) orelse return false;
+    if (range.nbytes != len_u64) return false;
+    _ = std.math.add(u64, range.offset, range.nbytes) catch return false;
+    return true;
+}
+
+fn validChunkLimit(chunk_limit: usize) bool {
+    return chunk_limit != 0 and chunk_limit <= max_transfer_payload;
+}
+
+fn transferChunkRange(range: wire.TensorRange, offset: usize, len: usize) LinkError!wire.TensorRange {
+    const offset_u64 = std.math.cast(u64, offset) orelse return error.Protocol;
+    const len_u64 = std.math.cast(u64, len) orelse return error.Protocol;
+    return .{
+        .handle = range.handle,
+        .offset = std.math.add(u64, range.offset, offset_u64) catch return error.Protocol,
+        .nbytes = len_u64,
+    };
+}
+
 const Response = struct {
     frame: []u8,
     meta: wire.ResponseMeta,
@@ -414,3 +490,132 @@ const Response = struct {
         if (self.meta.status != .ok) return error.RemoteFailed;
     }
 };
+
+test "chunked upload and download preserve ranges, bytes, and timing" {
+    const TestTransport = struct {
+        const timing: wire.ResponseMeta = .{
+            .request_id = 0,
+            .status = .ok,
+            .device_service_ns = 3,
+            .device_encode_ns = 4,
+        };
+
+        ranges: [10]wire.TensorRange = undefined,
+        range_count: usize = 0,
+        uploaded: [16]u8 = undefined,
+        uploaded_len: usize = 0,
+
+        pub fn ioHandle(_: *@This()) ?std.Io {
+            return null;
+        }
+
+        pub fn call(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            request_frame: []const u8,
+        ) LinkError![]u8 {
+            const frame = framing.decode(request_frame) catch return error.Protocol;
+            const request = wire.decodeRequest(frame.metadata, frame.payload) catch return error.Protocol;
+            const upload = switch (request) {
+                .upload => |value| value,
+                else => return error.Protocol,
+            };
+            try self.record(upload.range);
+            if (self.uploaded.len - self.uploaded_len < upload.bytes.len) return error.Protocol;
+            @memcpy(self.uploaded[self.uploaded_len..][0..upload.bytes.len], upload.bytes);
+            self.uploaded_len += upload.bytes.len;
+            return encodeTestResponse(allocator, upload.request_id);
+        }
+
+        pub fn callInto(
+            self: *@This(),
+            allocator: std.mem.Allocator,
+            request_frame: []const u8,
+            payload_out: []u8,
+        ) LinkError!protocol_transport.FrameIntoResult {
+            const frame = framing.decode(request_frame) catch return error.Protocol;
+            const request = wire.decodeRequest(frame.metadata, frame.payload) catch return error.Protocol;
+            const download = switch (request) {
+                .download => |value| value,
+                else => return error.Protocol,
+            };
+            try self.record(download.range);
+            if (!validTransfer(download.range, payload_out.len)) return error.Protocol;
+            for (payload_out, 0..) |*byte, i| {
+                byte.* = @truncate(download.range.offset + @as(u64, @intCast(i)));
+            }
+
+            const metadata = try allocator.alloc(u8, wire.response_meta_len);
+            errdefer allocator.free(metadata);
+            var response_meta = timing;
+            response_meta.request_id = download.request_id;
+            _ = wire.encodeResponseMeta(metadata, response_meta) catch return error.Protocol;
+            return .{
+                .metadata = metadata,
+                .payload_len = payload_out.len,
+                .payload_copied = true,
+            };
+        }
+
+        fn record(self: *@This(), range: wire.TensorRange) LinkError!void {
+            if (self.range_count == self.ranges.len) return error.Protocol;
+            self.ranges[self.range_count] = range;
+            self.range_count += 1;
+        }
+
+        fn encodeTestResponse(allocator: std.mem.Allocator, request_id: u64) LinkError![]u8 {
+            var response_meta = timing;
+            response_meta.request_id = request_id;
+            var metadata: [wire.response_meta_len]u8 = undefined;
+            const metadata_len = wire.encodeResponseMeta(&metadata, response_meta) catch return error.Protocol;
+            const frame_len = framing.encodedLen(metadata_len, 0) catch return error.Protocol;
+            const frame = try allocator.alloc(u8, frame_len);
+            errdefer allocator.free(frame);
+            _ = framing.encode(metadata[0..metadata_len], "", frame) catch return error.Protocol;
+            return frame;
+        }
+    };
+
+    const transport: TestTransport = .{};
+    var link = Link(TestTransport).from(std.testing.allocator, transport);
+
+    const range: wire.TensorRange = .{ .handle = 9, .offset = 10, .nbytes = 7 };
+    const upload_timing = try link.uploadChunked(range, "abcdefg", 3);
+    try std.testing.expectEqual(@as(u64, 21), upload_timing.device_service_ns);
+    try std.testing.expectEqualSlices(u8, "abcdefg", link.transport.uploaded[0..link.transport.uploaded_len]);
+    try expectRange(.{ .handle = 9, .offset = 10, .nbytes = 3 }, link.transport.ranges[0]);
+    try expectRange(.{ .handle = 9, .offset = 13, .nbytes = 3 }, link.transport.ranges[1]);
+    try expectRange(.{ .handle = 9, .offset = 16, .nbytes = 1 }, link.transport.ranges[2]);
+
+    var downloaded: [7]u8 = undefined;
+    const download_timing = try link.downloadChunked(range, &downloaded, 3);
+    try std.testing.expectEqual(@as(u64, 21), download_timing.device_service_ns);
+    try std.testing.expectEqualSlices(u8, &.{ 10, 11, 12, 13, 14, 15, 16 }, &downloaded);
+    try expectRange(.{ .handle = 9, .offset = 10, .nbytes = 3 }, link.transport.ranges[3]);
+    try expectRange(.{ .handle = 9, .offset = 13, .nbytes = 3 }, link.transport.ranges[4]);
+    try expectRange(.{ .handle = 9, .offset = 16, .nbytes = 1 }, link.transport.ranges[5]);
+
+    const empty_range: wire.TensorRange = .{ .handle = 9, .offset = 17, .nbytes = 0 };
+    const empty_upload_timing = try link.uploadChunked(empty_range, "", 3);
+    try std.testing.expectEqual(@as(u64, 7), empty_upload_timing.device_service_ns);
+    var empty_download: [0]u8 = .{};
+    const empty_download_timing = try link.downloadChunked(empty_range, &empty_download, 3);
+    try std.testing.expectEqual(@as(u64, 7), empty_download_timing.device_service_ns);
+    try expectRange(empty_range, link.transport.ranges[6]);
+    try expectRange(empty_range, link.transport.ranges[7]);
+
+    const calls_before_mismatch = link.transport.range_count;
+    const wrong_range: wire.TensorRange = .{ .handle = 9, .offset = 10, .nbytes = 6 };
+    try std.testing.expectError(error.Protocol, link.uploadChunked(wrong_range, "abcdefg", 3));
+    try std.testing.expectError(error.Protocol, link.downloadChunked(wrong_range, &downloaded, 3));
+    try std.testing.expectError(error.Protocol, link.uploadChunked(range, "abcdefg", 0));
+    const overflowing_range: wire.TensorRange = .{ .handle = 9, .offset = std.math.maxInt(u64), .nbytes = 1 };
+    try std.testing.expectError(error.Protocol, link.uploadChunked(overflowing_range, "x", 3));
+    try std.testing.expectEqual(calls_before_mismatch, link.transport.range_count);
+}
+
+fn expectRange(expected: wire.TensorRange, actual: wire.TensorRange) !void {
+    try std.testing.expectEqual(expected.handle, actual.handle);
+    try std.testing.expectEqual(expected.offset, actual.offset);
+    try std.testing.expectEqual(expected.nbytes, actual.nbytes);
+}

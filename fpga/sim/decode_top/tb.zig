@@ -251,5 +251,8 @@ pub fn main() !void {
     try runCase(a, 1, 2, 1, 0x4101, "decode, 1 rb");
     try runCase(a, 2, 3, 3, 0x4102, "multi-rb prefill C=3");
     try runCase(a, 1, 4, 8, 0x4103, "prefill C=8 full bank");
+    try runCase(a, 1, 76, 1, 0x4104, "decode, K=9728 (4B down, 76 blk)");
+    try runCase(a, 1, 96, 1, 0x4105, "decode, K=12288 (8B down, 96 blk)");
+    try runCase(a, 3, 96, 4, 0x4106, "prefill, K=12288 96 blk, multi-rb C=4");
     std.debug.print("all decode_top cosim cases passed (decode_top === windowedFixedOutput, bit-exact)\n", .{});
 }
