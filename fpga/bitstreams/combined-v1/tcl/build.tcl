@@ -399,27 +399,11 @@ if {![catch {open_run synth_1 -name synth_1} err]} {
     puts "WARNING: could not open synth_1 for utilization report: $err"
 }
 
-# Floorplan: pblock the two kernels into separate clock-region bands (f300 congestion fix —
-# docs/plan-f300-pblock.md). Impl-only (placement); synced by build.sh when USE_PBLOCK=1.
-if {[file exists ./pblock.xdc]} {
-    set pb [file normalize ./pblock.xdc]
-    add_files -fileset constrs_1 -norecurse $pb
-    set_property USED_IN_SYNTHESIS false [get_files $pb]
-    puts "==> applied floorplan pblock ($pb)"
-} else {
-    puts "==> no pblock.xdc — building unconstrained (USE_PBLOCK=0)"
-}
-
-# f300 closure. The two structural walls are fixed in RTL/BD (the flash fp32-dot 2-DSP cascade
-# → fp_dot MUL_PIPE=1; the matmul pc_col broadcast → the single-clock collapse): that took WNS
-# −0.116 → −0.044, leaving only marginal routing-bound scatter (a DMA DataMover FIFO, a few
-# control paths). So the last 0.044 is a tool-effort finish, not RTL:
+# f300 implementation effort for the remaining routing-sensitive paths:
 #   - PLACE  AltSpreadLogic_high  — spreads logic (cleared the old pc_col congestion); keep.
 #   - ROUTE  Explore             — extra routing effort for the routing-bound DMA-FIFO worst path.
 #   - POST-ROUTE phys_opt AggressiveExplore — run EXPLICITLY in-memory after open_run (the run-step
 #     -to_step token for post-route phys_opt is version-inconsistent), to grab the last ~0.04ns.
-# Comment these out for a vanilla build (e.g. shipping f250). Run with USE_PBLOCK=0 (spreading is
-# the opposite of the regressive pblock).
 set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE AltSpreadLogic_high [get_runs impl_1]
 set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
 

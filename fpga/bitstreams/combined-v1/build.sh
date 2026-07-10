@@ -83,15 +83,6 @@ scp "$MATMUL_ADDR" "$VM:$VM_DIR/matmul_address_map.tcl"
 scp "$FLASH_ADDR"  "$VM:$VM_DIR/flash_address_map.tcl"
 scp "${RTL_FILES[@]}" "$VM:$VM_DIR/rtl/"
 
-# Floorplan pblock (f300 congestion fix — docs/plan-f300-pblock.md). On by default; build.tcl
-# applies it impl-only when present. USE_PBLOCK=0 removes any stale copy to A/B an unconstrained
-# build. Removed first so the choice is never stale.
-ssh "$VM" "if exist $VM_DIR\\pblock.xdc del $VM_DIR\\pblock.xdc" || true
-if [[ "${USE_PBLOCK:-1}" == "1" ]]; then
-  scp pblock.xdc "$VM:$VM_DIR/"
-  echo "   + pblock.xdc synced (floorplan; rebuild with USE_PBLOCK=0 to compare unconstrained)"
-fi
-
 echo "== Vivado build variant=$VARIANT on $VM =="
 set +e
 ssh "$VM" "cd $VM_DIR && build.bat $VARIANT"
