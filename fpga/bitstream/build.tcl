@@ -22,11 +22,18 @@
 # (`zig build regmap`); this script sources both and remaps their "kernel" cell to
 # kernel_mm / kernel_fa.
 
-set variant [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f300"}]
+set_param general.maxThreads 8
+puts "==> Vivado general.maxThreads=[get_param general.maxThreads]"
+
+set variant    [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f300"}]
+set build_mode [expr {$argc >= 2 ? [lindex $argv 1] : "clean"}]
 
 # variant = w512-p4-f<MHz>. fclk drives both kernels, all control, and all data movement.
 if {![regexp {^w512-p4-f([0-9]+)$} $variant -> fclk_mhz]} {
     error "unknown variant '$variant'; expected w512-p4-f<MHz>, e.g. w512-p4-f300"
+}
+if {$build_mode ni {clean incremental}} {
+    error "unknown build mode '$build_mode'; expected clean or incremental"
 }
 
 set bit_prefix penzai-combined-v1
@@ -36,10 +43,32 @@ set bd         design_1
 set part       xck26-sfvc784-2LV-c
 set board      xilinx.com:kr260_som:part0:1.1
 set outdir     [file normalize ./out]
+set cache_root [file normalize ./cache]
+set ip_cache   [file join $cache_root ip]
+set checkpoint_dir [file join $cache_root checkpoints]
+set reference_dcp [file join $checkpoint_dir ${bit_name}-routed.dcp]
 set ps_fclk_mhz 99.999001
 
 file delete -force $outdir [file normalize ./$proj]
-file mkdir $outdir
+file mkdir $outdir $ip_cache $checkpoint_dir
+
+set build_started [clock milliseconds]
+set phase_times {}
+proc record_phase {name started_ms} {
+    global phase_times outdir bit_name build_started
+    set elapsed_s [expr {([clock milliseconds] - $started_ms) / 1000.0}]
+    lappend phase_times [list $name $elapsed_s]
+    set report [file join $outdir ${bit_name}_build_times.rpt]
+    set fh [open $report w]
+    puts $fh "phase seconds"
+    foreach phase $phase_times {
+        puts $fh [format "%-28s %.1f" [lindex $phase 0] [lindex $phase 1]]
+    }
+    puts $fh [format "%-28s %.1f" total_so_far \
+        [expr {([clock milliseconds] - $build_started) / 1000.0}]]
+    close $fh
+    puts [format "==> phase %-22s %.1fs" $name $elapsed_s]
+}
 
 proc assert_config {cell_name prop expected} {
     set cell [get_bd_cells $cell_name]
@@ -67,6 +96,11 @@ proc clock_hz {pin fallback_mhz} {
 }
 
 create_project $proj [file normalize ./$proj] -part $part -force
+# The project is intentionally rebuilt from its Tcl source, but generated AMD IP and a
+# timing-clean routed checkpoint persist outside the project directory across builds.
+config_ip_cache -use_cache_location $ip_cache
+puts "==> persistent IP cache: $ip_cache"
+puts "==> build mode: $build_mode"
 if {[catch {set_property board_part $board [current_project]} err]} {
     puts "WARNING: could not set board_part '$board': $err"
 }
@@ -382,9 +416,12 @@ puts $fh {set_property DRIVE 4 [get_ports fan_en_b]}
 close $fh
 add_files -fileset constrs_1 -norecurse $fan_xdc
 
+record_phase project_generation $build_started
+set phase_started [clock milliseconds]
 launch_runs synth_1 -jobs 4
 wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} { error "synthesis failed" }
+record_phase synthesis $phase_started
 
 # Post-synth resource utilization (the combined-fit question) — logged before the long
 # impl so an over-map is visible early. Best-effort: never let it abort the build.
@@ -404,27 +441,66 @@ if {![catch {open_run synth_1 -name synth_1} err]} {
 set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE AltSpreadLogic_high [get_runs impl_1]
 set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
 
+set incremental_active 0
+if {$build_mode eq "incremental"} {
+    if {[file exists $reference_dcp]} {
+        set_property INCREMENTAL_CHECKPOINT $reference_dcp [get_runs impl_1]
+        set incremental_active 1
+        puts "==> incremental reference: $reference_dcp"
+    } else {
+        puts "WARNING: no reference checkpoint at $reference_dcp; running a clean implementation"
+    }
+}
+
+set phase_started [clock milliseconds]
 launch_runs impl_1 -to_step route_design -jobs 4
 wait_on_run impl_1
 if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation failed" }
+record_phase implementation_through_route $phase_started
 
 open_run impl_1
-# Explicit post-route physical optimization on the routed design (incrementally reroutes what it
-# touches, so the design stays fully routed for the timing gate + bitstream). Best-effort.
-if {[catch {phys_opt_design -directive AggressiveExplore} pe]} {
-    puts "WARNING: post-route phys_opt_design failed ($pe) — gating on the routed result as-is"
+# AggressiveExplore is expensive and only useful when the routed design misses timing.
+# When needed it incrementally reroutes touched nets, leaving the design routed.
+set routed_failing [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 0]
+if {[llength $routed_failing] == 0} {
+    puts "==> routed design is timing-clean; skipping post-route phys_opt_design"
 } else {
-    puts "==> post-route phys_opt_design (AggressiveExplore) complete"
+    set routed_wns [get_property SLACK [lindex $routed_failing 0]]
+    puts "==> routed WNS=${routed_wns}ns; running post-route AggressiveExplore"
+    set phase_started [clock milliseconds]
+    if {[catch {phys_opt_design -directive AggressiveExplore} pe]} {
+        puts "WARNING: post-route phys_opt_design failed ($pe) — gating on the routed result as-is"
+    } else {
+        puts "==> post-route phys_opt_design (AggressiveExplore) complete"
+    }
+    record_phase post_route_phys_opt $phase_started
 }
+if {$incremental_active} {
+    if {[catch {
+        report_incremental_reuse -file $outdir/${bit_name}_incremental_reuse.rpt
+    } reuse_err]} {
+        puts "WARNING: incremental reuse report failed: $reuse_err"
+    }
+}
+set phase_started [clock milliseconds]
 catch {report_utilization -file $outdir/${bit_name}_utilization_routed.rpt}
 report_timing_summary -max_paths 10 -routable_nets -report_unconstrained \
     -file $outdir/${bit_name}_timing_summary_routed.rpt
+record_phase routed_reports $phase_started
 set failing_paths [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 0]
 if {[llength $failing_paths] > 0} {
     set wns [get_property SLACK [lindex $failing_paths 0]]
     error "timing failed after impl; WNS=${wns}ns. Refusing to write an invalid bitstream."
 }
 
+set phase_started [clock milliseconds]
 write_bitstream -force $outdir/$bit_name.bit
-catch {write_hw_platform -fixed -force -file $outdir/$bit_name.xsa}
+record_phase bitstream_generation $phase_started
+
+# Only timing-clean, successfully generated designs become future references. Keeping
+# this outside the disposable project directory makes reuse explicit and variant-scoped.
+set phase_started [clock milliseconds]
+write_checkpoint -force $reference_dcp
+record_phase checkpoint_save $phase_started
 puts "==> Built timing-clean bitstream: $outdir/$bit_name.bit"
+puts "==> Incremental reference updated: $reference_dcp"

@@ -5,8 +5,10 @@
 # Vivado, and fetches the .bit/.bit.bin to ./out. Run after
 # `cp config.env.example config.env`.
 #
-#   ./build.sh                       # uses VARIANT from config.env
-#   ./build.sh w512-p4-f250          # explicit shared kernel clock
+#   ./build.sh                              # clean build; uses VARIANT from config.env
+#   ./build.sh w512-p4-f250                 # clean build at an explicit clock
+#   ./build.sh --incremental                # reuse the last timing-clean checkpoint
+#   ./build.sh w512-p4-f250 --incremental   # explicit clock + checkpoint reuse
 #
 # Regenerate the generated inputs first if the regmaps changed:
 #   (cd ../.. && zig build regmap)   # writes fpga/regmap/{matmul,flash} contract files
@@ -19,7 +21,24 @@ set -a; source config.env; set +a
 
 : "${VM:?config.env must set VM (Windows Vivado host)}"
 : "${VM_DIR:?config.env must set VM_DIR (build dir on the VM)}"
-VARIANT="${1:-${VARIANT:-w512-p4-f300}}"
+VARIANT="${VARIANT:-w512-p4-f300}"
+INCREMENTAL="${INCREMENTAL:-0}"
+for arg in "$@"; do
+  case "$arg" in
+    --incremental) INCREMENTAL=1 ;;
+    w512-p4-f[0-9]*) VARIANT="$arg" ;;
+    *) echo "ERROR: unknown argument '$arg'" >&2; exit 1 ;;
+  esac
+done
+[[ "$VARIANT" =~ ^w512-p4-f[0-9]+$ ]] || {
+  echo "ERROR: invalid variant '$VARIANT'; expected w512-p4-f<MHz>" >&2
+  exit 1
+}
+case "$INCREMENTAL" in
+  0) BUILD_MODE=clean ;;
+  1) BUILD_MODE=incremental ;;
+  *) echo "ERROR: INCREMENTAL must be 0 or 1" >&2; exit 1 ;;
+esac
 BIT_PREFIX="penzai-combined-v1"
 RTL_ROOT="../rtl"
 REGMAP_ROOT="../regmap"
@@ -65,9 +84,9 @@ scp "$MATMUL_ADDR" "$VM:$VM_DIR/matmul_address_map.tcl"
 scp "$FLASH_ADDR"  "$VM:$VM_DIR/flash_address_map.tcl"
 scp "${RTL_FILES[@]}" "$VM:$VM_DIR/rtl/"
 
-echo "== Vivado build variant=$VARIANT on $VM =="
+echo "== Vivado build variant=$VARIANT mode=$BUILD_MODE on $VM =="
 set +e
-ssh "$VM" "cd $VM_DIR && build.bat $VARIANT"
+ssh "$VM" "cd $VM_DIR && build.bat $VARIANT $BUILD_MODE"
 build_status=$?
 set -e
 

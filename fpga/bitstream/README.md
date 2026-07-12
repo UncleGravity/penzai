@@ -22,6 +22,7 @@ flash `0xA01x_0000` (the flash regmap was allocated in `0xA01x` for exactly this
 cp config.env.example config.env       # edit VM / BOARD (or reuse the committed one)
 (cd ../.. && zig build regmap)          # refresh generated contracts under fpga/regmap/
 ./build.sh                              # default variant: w512-p4-f300
+./build.sh --incremental                # development build; reuse last clean route
 ./deploy.sh
 # serve the daemon telling it BOTH ops are on PL:
 (cd ../../.. && nix run .#deploy-penzaid)
@@ -43,6 +44,12 @@ The routed build remains the gate:
   report says what's over before you wait for place-and-route.
 - It then runs impl and **refuses to write a bitstream unless timing closes** (WNS ≥ 0),
   before producing an invalid artifact.
+
+Builds use all eight Vivado worker threads and a persistent VM-side `cache/` for generated
+AMD IP. Every timing-clean build refreshes a routed checkpoint for its variant.
+`--incremental` uses that checkpoint to accelerate localized RTL changes; a missing
+checkpoint falls back to clean implementation. Use the default clean mode for signoff.
+Per-phase elapsed times are fetched as `out/<bit>_build_times.rpt`.
 
 If it doesn't fit or close at `f200`:
 - **Timing** — drop `f` (e.g. `w512-p4-f250`) if a future change causes the combined

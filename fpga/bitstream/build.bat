@@ -1,10 +1,16 @@
 @echo off
 REM build.bat - run on the Windows VM (Vivado). Invoked by build.sh over ssh, or
-REM directly:  build.bat w512-p4-f300
+REM directly:  build.bat w512-p4-f300 clean
 REM Produces out\penzai-combined-v1-<variant>.bit(.bin)
 
 set "VARIANT=%~1"
 if "%VARIANT%"=="" set "VARIANT=w512-p4-f300"
+set "BUILD_MODE=%~2"
+if "%BUILD_MODE%"=="" set "BUILD_MODE=clean"
+if not "%BUILD_MODE%"=="clean" if not "%BUILD_MODE%"=="incremental" (
+  echo ERROR: build mode must be clean or incremental
+  exit /b 1
+)
 
 set "VIVADO_SETTINGS=C:\AMDDesignTools\2025.2.1\Vivado\settings64.bat"
 set "BIT_PREFIX=penzai-combined-v1"
@@ -19,8 +25,8 @@ if not exist "%VIVADO_SETTINGS%" (
 )
 call "%VIVADO_SETTINGS%"
 
-echo == [1/2] Vivado: synth/impl/bitstream variant=%VARIANT% ==
-call vivado -mode batch -source build.tcl -tclargs %VARIANT%
+echo == [1/2] Vivado: synth/impl/bitstream variant=%VARIANT% mode=%BUILD_MODE% ==
+call vivado -mode batch -source build.tcl -tclargs %VARIANT% %BUILD_MODE%
 if errorlevel 1 ( echo Vivado build failed & exit /b 1 )
 
 echo == [2/2] bootgen: %BIT_NAME%.bit -^> %BIT_NAME%.bit.bin ==
