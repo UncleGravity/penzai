@@ -145,6 +145,7 @@
               runHook preInstall
               mkdir -p "$out/bin" "$out/lib" "$out/include/ggml"
               cp bin/llama-cli "$out/bin/"
+              cp bin/llama-server "$out/bin/"
               # The in-tree CPU backend must sit next to llama-cli for the DL loader
               # to find it; the rest of the shared libs go to lib/.
               if [ -e bin/libggml-cpu.so ]; then cp -P bin/libggml-cpu.so "$out/bin/"; fi
@@ -383,10 +384,22 @@
             export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
             exec "${llama-cpp-dl}/bin/llama-cli" "$@"
           '';
+
+          # Stock llama-server wired to dlopen libggml-penzai — the OpenAI-compatible
+          # HTTP server sibling of llama-cli-penzai. Same residency flags apply; add
+          # --host/--port for the listener, e.g.:
+          #   PENZAI_HOST=kria llama-server-penzai --device penzai -ngl 999 \
+          #     --no-op-offload -fa on -m model.gguf --host 0.0.0.0 --port 8080
+          llama-server-penzai = pkgs.writeShellScriptBin "llama-server-penzai" ''
+            set -e
+            export GGML_BACKEND_PATH="${penzai-backend-so}/lib/libggml-penzai.${soExt}"
+            export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
+            exec "${llama-cpp-dl}/bin/llama-server" "$@"
+          '';
         in
         rec {
           packages = rec {
-            inherit llama-cpp llama-cpp-dl penzai-backend-so llama-cli-penzai;
+            inherit llama-cpp llama-cpp-dl penzai-backend-so llama-cli-penzai llama-server-penzai;
 
             penzai = mkPenzai "releasefast" "ReleaseFast";
             penzaid = mkPenzaid "releasefast" "ReleaseFast";
@@ -415,6 +428,7 @@
             penzaid-native = mkApp packages.penzaid-native "penzaid-native" "Run a local native penzaid daemon";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
             llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
+            llama-server-penzai = mkApp packages.llama-server-penzai "llama-server-penzai" "Stock llama-server (HTTP) with the out-of-tree penzai backend";
           };
 
           checks = rec {
