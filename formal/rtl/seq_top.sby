@@ -1,0 +1,29 @@
+[tasks]
+prove
+bmc
+cover
+
+[options]
+prove: mode prove
+prove: depth 60
+prove: aigsmt boolector
+bmc: mode bmc
+bmc: depth 30
+cover: mode cover
+cover: depth 60
+
+[engines]
+prove: abc pdr
+bmc: smtbmc boolector
+cover: smtbmc boolector
+
+[script]
+read -formal -DFORMAL seq_core.v seq_reg_master.v seq_top.v seq_top_formal.sv
+prep -top seq_top_formal
+
+[files]
+fpga/rtl/seq/seq_core.v
+fpga/rtl/seq/seq_reg_master.v
+fpga/rtl/seq/seq_top.v
+formal/rtl/seq_top_properties.vh
+formal/rtl/seq_top_formal.sv

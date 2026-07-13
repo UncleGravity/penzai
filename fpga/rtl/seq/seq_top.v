@@ -206,18 +206,24 @@ module seq_top #(
     wire [REG_ADDR_W-1:0] reg_addr;
     wire [31:0]           reg_wdata_core, reg_rdata_core;
 
-    // BRAM sync read at run_start + desc_idx; gnt two cycles after req (read, then present).
+    // Snapshot the segment base with an accepted run. Software may prepare the next run's
+    // control registers while this one is active without redirecting in-flight fetches.
+    reg [COUNT_W-1:0] active_start;
+
+    // BRAM sync read at active_start + desc_idx; gnt two cycles after req (read, then present).
     // Same one-pulse-per-req `armed` handshake as seq_reg_master (req held until gnt, dropped
     // a cycle later).
     wire [CMD_DEPTH_LOG2-1:0] rd_idx =
-        run_start[CMD_DEPTH_LOG2-1:0] + desc_idx[CMD_DEPTH_LOG2-1:0];
+        active_start[CMD_DEPTH_LOG2-1:0] + desc_idx[CMD_DEPTH_LOG2-1:0];
     reg        rd_armed, rd_pending, desc_gnt_q;
     reg [31:0] dq0, dq1, dq2, dq3;
     always @(posedge clk) begin
         if (!core_rst_n) begin
+            active_start <= {COUNT_W{1'b0}};
             rd_armed <= 1'b1; rd_pending <= 1'b0; desc_gnt_q <= 1'b0;
             dq0 <= 32'd0; dq1 <= 32'd0; dq2 <= 32'd0; dq3 <= 32'd0;
         end else begin
+            if (go_strobe && !busy) active_start <= run_start;
             desc_gnt_q <= rd_pending;   // data registered last cycle, grant it now
             rd_pending <= 1'b0;
             if (!desc_req) rd_armed <= 1'b1;
@@ -254,6 +260,10 @@ module seq_top #(
         .m_araddr(reg_araddr), .m_arvalid(reg_arvalid), .m_arready(reg_arready),
         .m_rdata(reg_rdata), .m_rresp(reg_rresp), .m_rvalid(reg_rvalid), .m_rready(reg_rready)
     );
+
+`ifdef FORMAL
+`include "seq_top_properties.vh"
+`endif
 
     wire _unused = &{1'b0, s_wstrb, desc_idx};
 endmodule

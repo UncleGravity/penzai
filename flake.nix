@@ -235,6 +235,7 @@
             { pname
             , step
             , optimize ? "Debug"
+            , extraNativeBuildInputs ? [ ]
             }:
             pkgs.stdenv.mkDerivation {
               inherit pname;
@@ -243,7 +244,7 @@
 
               nativeBuildInputs = [
                 pkgs.zig
-              ];
+              ] ++ extraNativeBuildInputs;
 
               dontConfigure = true;
 
@@ -437,6 +438,15 @@
               pname = "penzai-zig-tests";
               step = "test";
             };
+            formal-control = mkZigCheck {
+              pname = "penzai-formal-control";
+              step = "formal";
+              extraNativeBuildInputs = [
+                pkgs.yosys
+                pkgs.sby
+                pkgs.boolector
+              ];
+            };
             inherit (packages) penzai penzaid;
           };
 
@@ -445,6 +455,9 @@
               pkgs.zig
               pkgs.zls
               pkgs.verilator
+              pkgs.yosys
+              pkgs.sby
+              pkgs.boolector
               pkgs.cmake
               pkgs.ninja
               pkgs.openssh

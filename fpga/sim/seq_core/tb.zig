@@ -244,5 +244,22 @@ pub fn main() !void {
         std.debug.print("  scenario 5b (post-abort reuse): clean replay after reset\n", .{});
     }
 
+    // ---- Scenario 6: desc_count is sampled with go, not observed live mid-run ----
+    {
+        m.reset();
+        const desc = [_][4]u32{ wr(0x30, 0x88), wr(0x34, 0x99) };
+        m.entries = &desc;
+        c.dut_set_desc_count(m.h, 2);
+        c.dut_set_go(m.h, 1);
+        m.step();
+        c.dut_set_go(m.h, 0);
+        c.dut_set_desc_count(m.h, 1); // must not shorten the already-started run
+        var cyc: usize = 0;
+        while (c.dut_done(m.h) == 0 and cyc < 2000) : (cyc += 1) m.step();
+        if (c.dut_done(m.h) == 0) return error.NoDone;
+        try expectWrites(&m, &.{ .{ .addr = 0x30, .val = 0x88 }, .{ .addr = 0x34, .val = 0x99 } });
+        std.debug.print("  scenario 6 (count snapshot): mid-run desc_count rewrite ignored\n", .{});
+    }
+
     std.debug.print("  all seq_core cosim cases passed\n\n", .{});
 }

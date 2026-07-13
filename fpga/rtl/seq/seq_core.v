@@ -71,6 +71,9 @@ module seq_core #(
 
     reg [2:0]            state;
     reg [COUNT_W-1:0]    idx;
+    // Snapshot the PS-facing count with `go`. RUN_COUNT remains writable in seq_top while busy;
+    // observing it live in S_ADV can lengthen/shorten an in-flight run.
+    reg [COUNT_W-1:0]    run_count;
     reg [1:0]            e_tag;
     reg [ADDR_W-1:0]     e_addr;
     reg [31:0]           e_a, e_b;
@@ -94,7 +97,8 @@ module seq_core #(
         if (!rst_n) begin
             state <= S_IDLE; busy <= 1'b0; done <= 1'b0; err_timeout <= 1'b0; err_watchdog <= 1'b0;
             err_index <= {COUNT_W{1'b0}};
-            idx <= {COUNT_W{1'b0}}; poll_cnt <= 32'd0; wd_cnt <= 32'd0;
+            idx <= {COUNT_W{1'b0}}; run_count <= {COUNT_W{1'b0}};
+            poll_cnt <= 32'd0; wd_cnt <= 32'd0;
             desc_req <= 1'b0; desc_idx <= {COUNT_W{1'b0}};
             reg_req <= 1'b0; reg_we <= 1'b0; reg_addr <= {ADDR_W{1'b0}}; reg_wdata <= 32'd0;
             e_tag <= 2'd0; e_addr <= {ADDR_W{1'b0}}; e_a <= 32'd0; e_b <= 32'd0;
@@ -110,7 +114,7 @@ module seq_core #(
                 S_IDLE: begin
                     if (go) begin
                         busy <= 1'b1; done <= 1'b0; err_timeout <= 1'b0; err_watchdog <= 1'b0;
-                        idx <= {COUNT_W{1'b0}};
+                        idx <= {COUNT_W{1'b0}}; run_count <= desc_count;
                         if (desc_count == {COUNT_W{1'b0}}) begin
                             state <= S_FIN;                       // empty run
                         end else begin
@@ -168,7 +172,7 @@ module seq_core #(
                 end
 
                 S_ADV: begin
-                    if (idx + {{(COUNT_W-1){1'b0}}, 1'b1} == desc_count) begin
+                    if (idx + {{(COUNT_W-1){1'b0}}, 1'b1} == run_count) begin
                         state <= S_FIN;
                     end else begin
                         idx <= idx + {{(COUNT_W-1){1'b0}}, 1'b1};

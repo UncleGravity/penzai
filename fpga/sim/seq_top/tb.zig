@@ -9,6 +9,7 @@
 //!  2. RUN_COUNT=0 finishes immediately
 //!  3. ABORT mid-WAIT recovers to IDLE, and the executor + BRAM are reusable right after
 //!     (reload same indices, clean replay) — the reclaim-over-SSH property v1 lacked
+//!  4. rewriting RUN_START while busy does not redirect the active command segment
 
 const std = @import("std");
 const c = @cImport(@cInclude("shim.h"));
@@ -280,6 +281,35 @@ pub fn main() !void {
         if (status & (ST_ERR_TIMEOUT | ST_ERR_WATCHDOG) != 0) return error.UnexpectedErr;
         try expectWrites(&tb, &.{ .{ .addr = 0xA005_0020, .val = 0x66 }, .{ .addr = 0xA005_0024, .val = 0x77 } });
         std.debug.print("  scenario 3 (abort mid-WAIT): recovered to idle, clean reuse after reload\n", .{});
+    }
+
+    // ---- Scenario 4: RUN_START is a snapshot for the active run ----
+    {
+        const original = [_]Entry{
+            wait(0xA005_0000, 0x2, 0x2),
+            wr(0xA005_0030, 0x88),
+        };
+        const redirected = [_]Entry{wr(0xDEAD_0000, 0xBAD0)};
+        try tb.load(0, &original);
+        try tb.load(9, &redirected);
+
+        tb.clearLog();
+        tb.flip_addr = 0xA005_0000;
+        tb.flip_after = std.math.maxInt(u32);
+        tb.flip_val = 0x2;
+        try tb.kick(0, 2);
+        for (0..200) |_| {
+            tb.step();
+            if (tb.flip_reads != 0) break;
+        }
+        if (tb.flip_reads == 0) return error.WaitNotStarted;
+
+        try tb.writeReg(OFF_RUN_START, 8);
+        tb.flip_after = tb.flip_reads;
+        const status = try tb.waitDone(400);
+        if (status & (ST_ERR_TIMEOUT | ST_ERR_WATCHDOG) != 0) return error.UnexpectedErr;
+        try expectWrites(&tb, &.{.{ .addr = 0xA005_0030, .val = 0x88 }});
+        std.debug.print("  scenario 4 (start snapshot): mid-run RUN_START rewrite ignored\n", .{});
     }
 
     std.debug.print("  all seq_top cosim cases passed\n\n", .{});

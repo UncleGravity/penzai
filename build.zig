@@ -74,6 +74,53 @@ pub fn build(b: *std.Build) void {
 
     addTests(b, target, optimize, host_options, host_shared, host_runtime, host_server, host_link, llama_config, host_c);
     addRtlSteps(b, target, optimize);
+    addFormalSteps(b);
+}
+
+fn addFormalSteps(b: *std.Build) void {
+    const seq_reg_master_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/seq_reg_master",
+        "formal/rtl/seq_reg_master.sby",
+    });
+    const seq_reg_master_step = b.step(
+        "formal-seq-reg-master",
+        "Prove seq_reg_master AXI-Lite safety properties and cover read/write traces",
+    );
+    seq_reg_master_step.dependOn(&seq_reg_master_run.step);
+
+    const seq_core_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/seq_core",
+        "formal/rtl/seq_core.sby",
+    });
+    const seq_core_step = b.step(
+        "formal-seq-core",
+        "Prove seq_core ordering, bounds, handshake, and error properties",
+    );
+    seq_core_step.dependOn(&seq_core_run.step);
+
+    const seq_top_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/seq_top",
+        "formal/rtl/seq_top.sby",
+    });
+    const seq_top_step = b.step(
+        "formal-seq-top",
+        "Prove seq_top control, BRAM addressing, and abort properties",
+    );
+    seq_top_step.dependOn(&seq_top_run.step);
+
+    const formal = b.step("formal", "Run formal verification pilots");
+    formal.dependOn(seq_reg_master_step);
+    formal.dependOn(seq_core_step);
+    formal.dependOn(seq_top_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps exp, reciprocal,
