@@ -192,6 +192,7 @@ fn getRowsBytes(op: wire.GetRows) u64 {
     const src_row_bytes: u64 = switch (op.src_type) {
         .f32 => mul(op.row_width, @sizeOf(f32)),
         .q1_0 => q1GetRowsSourceBytes(op.row_width),
+        .q2_0 => ternaryGetRowsSourceBytes(op.row_width),
     };
     return mul(rows, src_row_bytes +| index_bytes +| dst_row_bytes);
 }
@@ -201,6 +202,12 @@ fn q1GetRowsSourceBytes(row_width: u32) u64 {
     const blocks = (@as(u64, row_width) + layout.q1_block - 1) / layout.q1_block;
     const bytes_per_block = layout.beat_bytes * (1 + layout.q8_subblocks);
     return mul(blocks, bytes_per_block);
+}
+
+fn ternaryGetRowsSourceBytes(row_width: u32) u64 {
+    if (row_width == 0) return 0;
+    const blocks = (@as(u64, row_width) + layout.q1_block - 1) / layout.q1_block;
+    return mul(blocks, layout.ternary_block_bytes);
 }
 
 fn mul(a: u64, b: u64) u64 {
@@ -259,4 +266,9 @@ test "profile byte estimates for row ops count touched rows, not backing spans" 
     } };
     const q1_source_bytes = 2 * layout.beat_bytes * (1 + layout.q8_subblocks);
     try std.testing.expectEqual(@as(u64, 6 * (q1_source_bytes + 4 + 256 * 4)), commandBytes(get_rows));
+
+    var ternary_rows = get_rows;
+    ternary_rows.get_rows.src_type = .q2_0;
+    const ternary_source_bytes = 2 * layout.ternary_block_bytes;
+    try std.testing.expectEqual(@as(u64, 6 * (ternary_source_bytes + 4 + 256 * 4)), commandBytes(ternary_rows));
 }

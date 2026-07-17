@@ -18,8 +18,12 @@ pub const Problem = struct {
     /// Weight sign bits, row-major: weight_bits[row * q1_blocks + blk] is a
     /// Q1_BLOCK-wide bitmask; bit i set => +1, clear => -1.
     weight_bits: []const u128,
+    /// Optional ternary nonzero mask. Null preserves binary +/-1 behavior.
+    weight_nonzero: ?[]const u128 = null,
     /// fp16 weight scale per (row, Q1 block), same indexing as weight_bits.
     weight_scales: []const f16,
+    /// Optional scale for weights 64..127 of each block. Null reuses weight_scales.
+    weight_scales_hi: ?[]const f16 = null,
 
     /// int8 activation quants, length q1_blocks * Q1_BLOCK.
     act_quants: []const i8,
@@ -29,19 +33,29 @@ pub const Problem = struct {
     pub fn subblockCount(self: Problem) usize {
         return self.rows * self.q1_blocks * layout.Q8_SUBBLOCKS;
     }
+
+    pub fn weightScale(self: Problem, row: usize, blk: usize, sub: usize) f16 {
+        const index = row * self.q1_blocks + blk;
+        if (sub >= 2) {
+            if (self.weight_scales_hi) |hi| return hi[index];
+        }
+        return self.weight_scales[index];
+    }
 };
 
 /// Integer sub-sum for one (row, Q1 block, Q8 sub-block): Σ ±act over the
 /// sub-block. Exact; this is the bit-exact gate against the fabric.
 pub fn subSum(p: Problem, row: usize, blk: usize, sub: usize) i32 {
     const bits = p.weight_bits[row * p.q1_blocks + blk];
+    const nonzero = if (p.weight_nonzero) |masks| masks[row * p.q1_blocks + blk] else std.math.maxInt(u128);
     var sum: i32 = 0;
     var i: usize = 0;
     while (i < layout.Q8_BLOCK) : (i += 1) {
         const bit_index = sub * layout.Q8_BLOCK + i;
         const act: i32 = p.act_quants[blk * layout.Q1_BLOCK + bit_index];
         const set = (bits >> @intCast(bit_index)) & 1 == 1;
-        sum += if (set) act else -act;
+        if ((nonzero >> @intCast(bit_index)) & 1 == 1)
+            sum += if (set) act else -act;
     }
     return sum;
 }
@@ -73,9 +87,9 @@ pub fn scaledOutput(p: Problem, out: []f32) void {
         var acc: f32 = 0;
         var blk: usize = 0;
         while (blk < p.q1_blocks) : (blk += 1) {
-            const ws: f32 = @floatCast(p.weight_scales[row * p.q1_blocks + blk]);
             var sub: usize = 0;
             while (sub < layout.Q8_SUBBLOCKS) : (sub += 1) {
+                const ws: f32 = @floatCast(p.weightScale(row, blk, sub));
                 const as_: f32 = @floatCast(p.act_scales[blk * layout.Q8_SUBBLOCKS + sub]);
                 if (ws == 0 or as_ == 0) continue;
                 const ss: f32 = @floatFromInt(subSum(p, row, blk, sub));
@@ -135,8 +149,8 @@ fn exactRow(p: Problem, row: usize) RowExact {
     var emin: i32 = std.math.maxInt(i32);
     var any = false;
     for (0..p.q1_blocks) |blk| {
-        const ws = p.weight_scales[row * p.q1_blocks + blk];
         for (0..layout.Q8_SUBBLOCKS) |sub| {
+            const ws = p.weightScale(row, blk, sub);
             const as_ = p.act_scales[blk * layout.Q8_SUBBLOCKS + sub];
             if (contribMant(ws, as_, subSum(p, row, blk, sub)) == 0) continue;
             emin = @min(emin, contribExp(ws, as_));
@@ -146,8 +160,8 @@ fn exactRow(p: Problem, row: usize) RowExact {
     if (!any) return .{ .acc = 0, .emin = 0, .nonzero = false };
     var acc: i128 = 0;
     for (0..p.q1_blocks) |blk| {
-        const ws = p.weight_scales[row * p.q1_blocks + blk];
         for (0..layout.Q8_SUBBLOCKS) |sub| {
+            const ws = p.weightScale(row, blk, sub);
             const as_ = p.act_scales[blk * layout.Q8_SUBBLOCKS + sub];
             const m = contribMant(ws, as_, subSum(p, row, blk, sub));
             if (m == 0) continue;
@@ -206,8 +220,8 @@ pub fn calibrateWindow(problems: []const Problem) Window {
         for (0..p.rows) |row| {
             var terms: usize = 0;
             for (0..p.q1_blocks) |blk| {
-                const ws = p.weight_scales[row * p.q1_blocks + blk];
                 for (0..layout.Q8_SUBBLOCKS) |sub| {
+                    const ws = p.weightScale(row, blk, sub);
                     const as_ = p.act_scales[blk * layout.Q8_SUBBLOCKS + sub];
                     if (contribMant(ws, as_, subSum(p, row, blk, sub)) == 0) continue;
                     const e = contribExp(ws, as_);
@@ -238,8 +252,8 @@ pub fn windowedRow(p: Problem, row: usize, w: Window) RowWindowed {
     var acc: i128 = 0;
     var sats: usize = 0;
     for (0..p.q1_blocks) |blk| {
-        const ws = p.weight_scales[row * p.q1_blocks + blk];
         for (0..layout.Q8_SUBBLOCKS) |sub| {
+            const ws = p.weightScale(row, blk, sub);
             const as_ = p.act_scales[blk * layout.Q8_SUBBLOCKS + sub];
             const m = contribMant(ws, as_, subSum(p, row, blk, sub));
             if (m == 0) continue;

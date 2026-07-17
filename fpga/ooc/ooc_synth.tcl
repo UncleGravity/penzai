@@ -27,14 +27,24 @@ create_clock -name clk -period $period [get_ports clk]
 set_false_path -from [all_inputs]
 set_false_path -to   [all_outputs]
 
-report_utilization      -file ${outpfx}_util.rpt
+set util_report [report_utilization -return_string]
+set util_fh [open ${outpfx}_util.rpt w]
+puts -nonewline $util_fh $util_report
+close $util_fh
 report_timing_summary   -max_paths 5 -file ${outpfx}_timing.rpt
 
 # ---- machine-readable one-liner to stdout ----
-set luts   [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == LUT}]]
-set carry8 [llength [get_cells -hier -quiet -filter {REF_NAME == CARRY8}]]
-set dsps   [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == DSP || REF_NAME =~ DSP*}]]
-set ffs    [llength [get_cells -hier -quiet -filter {PRIMITIVE_GROUP == REGISTER || PRIMITIVE_SUBGROUP == SDR || REF_NAME =~ FD*}]]
+proc utilization_used {report label} {
+    set pattern [format {\|[[:space:]]*%s[[:space:]]*\|[[:space:]]*([0-9]+)[[:space:]]*\|} $label]
+    if {![regexp -- $pattern $report -> used]} {
+        error "could not find utilization row '$label'"
+    }
+    return $used
+}
+set luts   [utilization_used $util_report {CLB LUTs\*}]
+set carry8 [utilization_used $util_report {CARRY8}]
+set dsps   [utilization_used $util_report {DSPs}]
+set ffs    [utilization_used $util_report {Register as Flip Flop}]
 
 set wns "n/a"
 set fmax "n/a"

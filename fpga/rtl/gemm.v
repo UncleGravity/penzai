@@ -166,6 +166,7 @@ module gemm_rowblock #(
     input  wire [CW-1:0]           col_idx,      // accumulator column this issue targets
     input  wire signed [EXP_W-1:0] emin,         // calibration window floor
     input  wire [ROWS*32-1:0]      weight_bits_flat,    // per row: 32 sign bits (this sub-block)
+    input  wire [ROWS*32-1:0]      weight_nonzero_flat, // per row: ternary enables; binary all ones
     input  wire [ROWS*16-1:0]      weight_scales_flat,  // per row: f16 weight scale
     input  wire [255:0]            acts_packed,         // 32 int8 activations (shared)
     input  wire [15:0]             act_scale,           // f16 activation scale (shared)
@@ -199,6 +200,7 @@ module gemm_rowblock #(
     // One quad's Σ±a over 4 int8 (combinational; 8 quads tile the 32-wide sub-block).
     function automatic signed [S_W-1:0] quad_sum;
         input [3:0]  wb;
+        input [3:0]  nz;
         input [31:0] a4;
         integer e;
         reg signed [S_W-1:0] s, a;
@@ -206,7 +208,7 @@ module gemm_rowblock #(
             s = {S_W{1'b0}};
             for (e = 0; e < 4; e = e + 1) begin
                 a = {{(S_W-8){a4[e*8+7]}}, a4[e*8 +: 8]}; // sext int8 -> S_W
-                s = s + (wb[e] ? a : -a);
+                if (nz[e]) s = s + (wb[e] ? a : -a);
             end
             quad_sum = s;
         end
@@ -223,9 +225,11 @@ module gemm_rowblock #(
     // activations and weight sign-bits so the BRAM read and the Σ±a tree don't share a cycle.
     reg [255:0]       acts_r;
     reg [ROWS*32-1:0] wb_r;
+    reg [ROWS*32-1:0] nz_r;
     always @(posedge clk) begin
         acts_r <= acts_packed;
         wb_r   <= weight_bits_flat;
+        nz_r   <= weight_nonzero_flat;
     end
 
     // shared control + as_sig delay lines (FE_LAT deep). The scale decode runs on the RAW
@@ -309,7 +313,7 @@ module gemm_rowblock #(
             // then 8 quad partials (comb) -> ps1 ; 8->4 -> l1_2 ; 4->1 -> s_sum_3 (3 inner).
             wire signed [S_W-1:0] ps_c [0:7];
             for (g = 0; g < 8; g = g + 1) begin : gen_quad
-                assign ps_c[g] = quad_sum(wb_r[r*32 + g*4 +: 4],
+                assign ps_c[g] = quad_sum(wb_r[r*32 + g*4 +: 4], nz_r[r*32 + g*4 +: 4],
                                           acts_r[g*32 +: 32]);
             end
             reg signed [S_W-1:0] ps1 [0:7];

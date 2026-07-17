@@ -65,8 +65,26 @@ pub fn getRowsF32Bytes(command: wire.GetRows, src: []const u8, indices: []const 
                         // src_nb* describes ggml's raw tensor strides and is not used here.
                         try dequantizePackedQ1Row(src, dst[dst_offset..][0..row_bytes], src_rows, row_width, row);
                     },
+                    .q2_0 => {
+                        if (d11 != 0 or d12 != 0) return error.InvalidShape;
+                        try dequantizePackedTernaryRow(src, dst[dst_offset..][0..row_bytes], src_rows, row_width, row);
+                    },
                 }
             }
+        }
+    }
+}
+
+fn dequantizePackedTernaryRow(src: []const u8, dst: []u8, rows: usize, k: usize, row: usize) RowsError!void {
+    const q1_blocks = layout.blocksPerRow(k) catch return error.InvalidShape;
+    if (src.len != (layout.packedTernaryWeightBytes(rows, k) catch return error.InvalidShape)) return error.OutOfBounds;
+    if (dst.len != try checkedMul(k, @sizeOf(f32))) return error.InvalidShape;
+
+    for (0..q1_blocks) |q1| {
+        for (0..layout.q1_block) |i| {
+            const scale: f32 = @floatCast(layout.packedTernaryWeightScale(src, rows, k, row, q1, i / layout.q2_source_block) catch return error.OutOfBounds);
+            const trit = layout.packedTernaryWeight(src, rows, k, row, q1, i) catch return error.OutOfBounds;
+            writeF32(dst, q1 * layout.q1_block + i, @as(f32, @floatFromInt(trit)) * scale);
         }
     }
 }
@@ -363,6 +381,51 @@ test "get_rows dequantizes resident q1_0 packed rows" {
     }, &src, &indices, &dst);
 
     try expectApprox(2.0, readF32(&dst, 0), 0.0);
+    try expectApprox(2.0, readF32(&dst, k - 1), 0.0);
+}
+
+test "get_rows dequantizes both independently scaled ternary halves" {
+    const rows = 2;
+    const k = layout.q1_block;
+    const raw_len = rows * 2 * layout.q2_source_block_bytes;
+    const packed_len = comptime layout.packedTernaryWeightBytes(rows, k) catch unreachable;
+    var raw = [_]u8{0xaa} ** raw_len; // four code-2 (+1) weights per byte
+    for (0..rows) |row| {
+        const row_base = row * 2 * layout.q2_source_block_bytes;
+        std.mem.writeInt(u16, raw[row_base..][0..2], @bitCast(@as(f16, 1)), .little);
+        std.mem.writeInt(u16, raw[row_base + layout.q2_source_block_bytes ..][0..2], @bitCast(@as(f16, 2)), .little);
+    }
+    var src: [packed_len]u8 = undefined;
+    try layout.packWeightsFromGgmlQ2_0(rows, k, &raw, &src);
+
+    var indices: [@sizeOf(i32)]u8 = undefined;
+    writeI32(&indices, 0, 1);
+    var dst: [k * @sizeOf(f32)]u8 = undefined;
+    @memset(&dst, 0);
+
+    try getRowsF32Bytes(.{
+        .src = .{ .handle = 1, .offset = 0, .nbytes = src.len },
+        .indices = .{ .handle = 2, .offset = 0, .nbytes = indices.len },
+        .dst = .{ .handle = 3, .offset = 0, .nbytes = dst.len },
+        .src_type = .q2_0,
+        .row_width = k,
+        .src_rows = rows,
+        .ne10 = 1,
+        .ne11 = 1,
+        .ne12 = 1,
+        .src_nb1 = layout.q2_source_block_bytes,
+        .src_nb2 = 2 * layout.q2_source_block_bytes,
+        .src_nb3 = raw_len,
+        .indices_nb1 = @sizeOf(i32),
+        .indices_nb2 = @sizeOf(i32),
+        .dst_nb1 = dst.len,
+        .dst_nb2 = dst.len,
+        .dst_nb3 = dst.len,
+    }, &src, &indices, &dst);
+
+    try expectApprox(1.0, readF32(&dst, 0), 0.0);
+    try expectApprox(1.0, readF32(&dst, layout.q2_source_block - 1), 0.0);
+    try expectApprox(2.0, readF32(&dst, layout.q2_source_block), 0.0);
     try expectApprox(2.0, readF32(&dst, k - 1), 0.0);
 }
 

@@ -1,4 +1,4 @@
-# build.tcl - KR260 COMBINED bitstream: matmul (q1a8 v8 four-port) + flash (kv-major v2).
+# build.tcl - KR260 COMBINED bitstream: dual-format matmul (v11 four-port) + flash (kv-major v2).
 #
 # Both PL ops in one design so a single bitstream serves decode end-to-end (matmul +
 # attention on PL). They run sequentially in the graph, so their DDR feeds are kept

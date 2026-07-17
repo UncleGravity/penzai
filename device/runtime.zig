@@ -226,7 +226,10 @@ pub fn RuntimeFor(comptime Heap: type) type {
             const dst = self.heap.bytes(mm.dst) catch return; // holds the PL result
             const scratch = self.allocator.alloc(u8, dst.len) catch return;
             defer self.allocator.free(scratch);
-            ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, scratch, mm.rows, mm.cols, mm.k) catch return;
+            switch (mm.weight_fmt) {
+                .w1a8 => ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, scratch, mm.rows, mm.cols, mm.k) catch return,
+                .w158a8 => ps_matmul_q1a8.runW158A8(self.allocator, weights, acts, scratch, mm.rows, mm.cols, mm.k) catch return,
+            }
             var max_abs: f32 = 0;
             var max_rel: f32 = 0;
             var nbad: usize = 0;
@@ -243,14 +246,11 @@ pub fn RuntimeFor(comptime Heap: type) type {
             if (nbad > 0) std.debug.print("pl verify rows={d} k={d}: {d}/{d} mismatch (max_abs={d:.4} max_rel={d:.4})\n", .{ mm.rows, mm.k, nbad, n, max_abs, max_rel });
         }
 
-        /// Debug cross-check (PENZAI_PL_VERIFY=1): run the PS flash oracle into
-        /// scratch and compare against the PL result already in `dst`. The PL
-        /// kernel uses LUT-based exp/recip and a different fp reduction order, so
-        /// the tolerance is tighter than matmul's (rel > 0.01 vs 0.02): the
-        /// silicon run showed byte-identical output, so the real max_rel is well
-        /// under 1%, and a tighter gate catches numerical regressions from the
-        /// upcoming pipelined kernel rewrite. Logs mismatches; never changes
-        /// results.
+        /// Debug cross-check (PENZAI_PL_VERIFY=1): run the full-f32 PS flash
+        /// oracle into scratch and compare against the approximate PL result in
+        /// `dst`. The PL deliberately uses BF16 for p*V plus LUT-based exp/recip,
+        /// so this is a normalized numerical smoke test, not a bit-faithful gate.
+        /// RTL cosim against flash_ref remains the structural correctness gate.
         fn verifyFlash(self: *Self, attn: wire.FlashAttnF32) void {
             const q = self.heap.read(attn.q) catch return;
             const k = self.heap.read(attn.k) catch return;
@@ -281,19 +281,19 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .dst_nb2 = attn.dst_nb2,
             }) catch return;
             var max_abs: f32 = 0;
-            var max_rel: f32 = 0;
+            var max_norm: f32 = 0;
             var nbad: usize = 0;
             const n = dst.len / @sizeOf(f32);
             for (0..n) |i| {
                 const a: f32 = @bitCast(std.mem.readInt(u32, dst[i * 4 ..][0..4], .little));
                 const b: f32 = @bitCast(std.mem.readInt(u32, scratch[i * 4 ..][0..4], .little));
                 const d = @abs(a - b);
-                const rel = d / @max(@abs(b), 1e-6);
+                const norm = d / @max(@abs(b), 1.0);
                 max_abs = @max(max_abs, d);
-                max_rel = @max(max_rel, rel);
-                if (rel > 0.01 and d > 1e-3) nbad += 1;
+                max_norm = @max(max_norm, norm);
+                if (norm > 0.02) nbad += 1;
             }
-            if (nbad > 0) std.debug.print("pl verify flash hdq={d} nkv={d} ntok={d}: {d}/{d} mismatch (max_abs={d:.4} max_rel={d:.4})\n", .{ attn.head_dim_q, attn.n_kv, attn.n_tokens, nbad, n, max_abs, max_rel });
+            if (nbad > 0) std.debug.print("pl verify flash hdq={d} nkv={d} ntok={d}: {d}/{d} approximation outlier (max_abs={d:.4} max_norm={d:.4})\n", .{ attn.head_dim_q, attn.n_kv, attn.n_tokens, nbad, n, max_abs, max_norm });
         }
 
         fn plVerifyEnabled() bool {
@@ -349,7 +349,10 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     const weights = self.heap.read(matmul.weights) catch |err| return mapHeapError(err);
                     const acts = self.heap.read(matmul.acts) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(matmul.dst) catch |err| return mapHeapError(err);
-                    ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, dst, matmul.rows, matmul.cols, matmul.k) catch |err| switch (err) {
+                    (switch (matmul.weight_fmt) {
+                        .w1a8 => ps_matmul_q1a8.runQ1A8(self.allocator, weights, acts, dst, matmul.rows, matmul.cols, matmul.k),
+                        .w158a8 => ps_matmul_q1a8.runW158A8(self.allocator, weights, acts, dst, matmul.rows, matmul.cols, matmul.k),
+                    }) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.InvalidRequest,
                     };

@@ -68,6 +68,7 @@ pub const version_with_counters: u32 = 5;
 /// seq window on an older bitstream is an unmapped sc_ctrl access (a bus fault), so the driver
 /// refuses rather than trusts the env var.
 pub const version_with_seq: u32 = 10;
+pub const version_with_ternary: u32 = 11;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -113,10 +114,11 @@ pub const Kernel = struct {
     }
 
     /// Set dims then strobe start. done_latched clears on the strobe.
-    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32) void {
+    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32, weight_fmt: wire.WeightFormat) void {
         self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
         self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
         self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
+        self.win.wr(regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(weight_fmt));
         self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
     }
 
@@ -165,7 +167,7 @@ pub const seq_dma_bases: [layout.weight_ports + 1]u32 = blk: {
 
 /// Entries one column-group programs: dma_w0 reset (4) + 4x MM2S-only resets (8) + S2MM arm (4)
 /// + 5x MM2S start (20) + kernel config/start (4) + kernel done + 5x MM2S idle + S2MM idle (7).
-pub const seq_entries_per_op: usize = 47;
+pub const seq_entries_per_op: usize = 48;
 
 /// Push one column-group's register program onto `b` — identical in order and value to the
 /// MMIO pokes in tryMatmul step 2 (pinned by the golden test below). seq.v replays it with no
@@ -181,6 +183,7 @@ pub fn buildOp(
     q1_blocks: u32,
     num_rb: u32,
     group: u32,
+    weight_fmt: wire.WeightFormat,
 ) void {
     const kb: u32 = @intCast(kernel_base);
     dma_mod.record.reset(b, seq_dma_bases[0]);
@@ -194,6 +197,7 @@ pub fn buildOp(
     b.write(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), q1_blocks);
     b.write(kb + regmap.offsetOf("NUM_ROWBLOCKS"), num_rb);
     b.write(kb + regmap.offsetOf("NUM_COLS"), group);
+    b.write(kb + regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(weight_fmt));
     b.write(kb + regmap.offsetOf("CTRL"), CTRL_START);
     b.wait(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE);
     for (seq_dma_bases[0..layout.weight_ports]) |base| dma_mod.record.waitReadDone(b, base);
@@ -309,7 +313,7 @@ pub fn Backend(comptime Heap: type) type {
         /// success, null to defer to the PS kernel. Errors are hardware/heap
         /// failures the runtime should surface, not silent fallbacks.
         pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8, io: ?std.Io) Error!?profile.PlCounters {
-            if (mm.weight_fmt != .w1a8) return null;
+            if (mm.weight_fmt == .w158a8 and self.kernel.version < version_with_ternary) return null;
             const rows: usize = mm.rows;
             const cols: usize = mm.cols;
             const k: usize = mm.k;
@@ -321,7 +325,11 @@ pub fn Backend(comptime Heap: type) type {
             // BRAM, so decline it → the runtime runs the software matmul.
             if (q1_blocks > layout.max_q1_blocks) return null;
             const num_rb = layout.rowblocksFor(rows);
-            const weight_port_bytes = num_rb * q1_blocks * layout.packed_per_port_q1_block;
+            const bytes_per_port_block = switch (mm.weight_fmt) {
+                .w1a8 => layout.packed_per_port_q1_block,
+                .w158a8 => layout.ternary_packed_per_port_block,
+            };
+            const weight_port_bytes = num_rb * q1_blocks * bytes_per_port_block;
             const weight_bytes = weight_port_bytes * layout.weight_ports;
             const act_stream_bytes = q1_blocks * layout.acts_per_q1_block; // per column
             const dst_bytes = rows * cols * @sizeOf(f32);
@@ -381,7 +389,7 @@ pub fn Backend(comptime Heap: type) type {
                 // same register program: seq.v replays it in fabric, or the PS pokes it.
                 if (self.seq_ctrl) |*sc| {
                     var b = seq.Builder.init(&self.seq_entries);
-                    buildOp(&b, weight_phys, weight_port_bytes, acts_phys, act_total, result_phys, result_bytes, @intCast(q1_blocks), @intCast(num_rb), @intCast(group));
+                    buildOp(&b, weight_phys, weight_port_bytes, acts_phys, act_total, result_phys, result_bytes, @intCast(q1_blocks), @intCast(num_rb), @intCast(group), mm.weight_fmt);
                     std.debug.assert(!b.overflow);
                     // The gate that keeps a bad stream from ever reaching a DMA: every
                     // transfer must land inside this op's own buffers.
@@ -412,7 +420,7 @@ pub fn Backend(comptime Heap: type) type {
                         try dma.startReadFromDdr(weight_phys[port], weight_port_bytes);
                     }
                     try self.dma_a.startReadFromDdr(acts_phys, act_total);
-                    self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group));
+                    self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group), mm.weight_fmt);
                     seg.setup_ns += lapNs(io, &last);
                     try self.kernel.waitDone();
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
@@ -561,7 +569,7 @@ test "buildOp: exact per-col-group register program (bit-parity with the MMIO pa
     var buf: [seq_entries_per_op]seq.Entry = undefined;
     var b = seq.Builder.init(&buf);
     const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0100, 0x8_0000_0200, 0x8_0000_0300 };
-    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1);
+    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, .w1a8);
     try std.testing.expect(!b.overflow);
     try std.testing.expectEqual(@as(u32, seq_entries_per_op), b.count());
 
@@ -586,31 +594,24 @@ test "buildOp: exact per-col-group register program (bit-parity with the MMIO pa
     const kb: u32 = 0xA005_0000;
     const want = [_]E{
         // dma_w0.reset() (both channels), then MM2S-only resets: w1..w3 + acts
-        W.wr(w0 + 0x00, RESET), W.wr(w0 + 0x30, RESET), W.wt(w0 + 0x00, RESET, 0), W.wt(w0 + 0x30, RESET, 0),
-        W.wr(w1 + 0x00, RESET), W.wt(w1 + 0x00, RESET, 0),
-        W.wr(w2 + 0x00, RESET), W.wt(w2 + 0x00, RESET, 0),
-        W.wr(w3 + 0x00, RESET), W.wt(w3 + 0x00, RESET, 0),
-        W.wr(da + 0x00, RESET), W.wt(da + 0x00, RESET, 0),
+        W.wr(w0 + 0x00, RESET),                         W.wr(w0 + 0x30, RESET),                                         W.wt(w0 + 0x00, RESET, 0),                 W.wt(w0 + 0x30, RESET, 0),
+        W.wr(w1 + 0x00, RESET),                         W.wt(w1 + 0x00, RESET, 0),                                      W.wr(w2 + 0x00, RESET),                    W.wt(w2 + 0x00, RESET, 0),
+        W.wr(w3 + 0x00, RESET),                         W.wt(w3 + 0x00, RESET, 0),                                      W.wr(da + 0x00, RESET),                    W.wt(da + 0x00, RESET, 0),
         // arm the result S2MM FIRST
-        W.wr(w0 + 0x30, RS), W.wr(w0 + 0x48, 0x2000_0000), W.wr(w0 + 0x4C, 0x8), W.wr(w0 + 0x58, 0x40),
+        W.wr(w0 + 0x30, RS),                            W.wr(w0 + 0x48, 0x2000_0000),                                   W.wr(w0 + 0x4C, 0x8),                      W.wr(w0 + 0x58, 0x40),
         // weight MM2S x4
-        W.wr(w0 + 0x00, RS), W.wr(w0 + 0x18, 0x0000_0000), W.wr(w0 + 0x1C, 0x8), W.wr(w0 + 0x28, 0x100),
-        W.wr(w1 + 0x00, RS), W.wr(w1 + 0x18, 0x0000_0100), W.wr(w1 + 0x1C, 0x8), W.wr(w1 + 0x28, 0x100),
-        W.wr(w2 + 0x00, RS), W.wr(w2 + 0x18, 0x0000_0200), W.wr(w2 + 0x1C, 0x8), W.wr(w2 + 0x28, 0x100),
-        W.wr(w3 + 0x00, RS), W.wr(w3 + 0x18, 0x0000_0300), W.wr(w3 + 0x1C, 0x8), W.wr(w3 + 0x28, 0x100),
+        W.wr(w0 + 0x00, RS),                            W.wr(w0 + 0x18, 0x0000_0000),                                   W.wr(w0 + 0x1C, 0x8),                      W.wr(w0 + 0x28, 0x100),
+        W.wr(w1 + 0x00, RS),                            W.wr(w1 + 0x18, 0x0000_0100),                                   W.wr(w1 + 0x1C, 0x8),                      W.wr(w1 + 0x28, 0x100),
+        W.wr(w2 + 0x00, RS),                            W.wr(w2 + 0x18, 0x0000_0200),                                   W.wr(w2 + 0x1C, 0x8),                      W.wr(w2 + 0x28, 0x100),
+        W.wr(w3 + 0x00, RS),                            W.wr(w3 + 0x18, 0x0000_0300),                                   W.wr(w3 + 0x1C, 0x8),                      W.wr(w3 + 0x28, 0x100),
         // acts MM2S
-        W.wr(da + 0x00, RS), W.wr(da + 0x18, 0x1000_0000), W.wr(da + 0x1C, 0x8), W.wr(da + 0x28, 0x200),
+        W.wr(da + 0x00, RS),                            W.wr(da + 0x18, 0x1000_0000),                                   W.wr(da + 0x1C, 0x8),                      W.wr(da + 0x28, 0x200),
         // kernel config + start
-        W.wr(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), 7),
-        W.wr(kb + regmap.offsetOf("NUM_ROWBLOCKS"), 2),
-        W.wr(kb + regmap.offsetOf("NUM_COLS"), 1),
+        W.wr(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), 7), W.wr(kb + regmap.offsetOf("NUM_ROWBLOCKS"), 2),                 W.wr(kb + regmap.offsetOf("NUM_COLS"), 1), W.wr(kb + regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(wire.WeightFormat.w1a8)),
         W.wr(kb + regmap.offsetOf("CTRL"), CTRL_START),
         // waits: kernel done, then every mover idle (read x5, write x1)
-        W.wt(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE),
-        W.wt(w0 + 0x04, IDLE, IDLE), W.wt(w1 + 0x04, IDLE, IDLE),
-        W.wt(w2 + 0x04, IDLE, IDLE), W.wt(w3 + 0x04, IDLE, IDLE),
-        W.wt(da + 0x04, IDLE, IDLE),
-        W.wt(w0 + 0x34, IDLE, IDLE),
+        W.wt(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE), W.wt(w0 + 0x04, IDLE, IDLE),               W.wt(w1 + 0x04, IDLE, IDLE),
+        W.wt(w2 + 0x04, IDLE, IDLE),                    W.wt(w3 + 0x04, IDLE, IDLE),                                    W.wt(da + 0x04, IDLE, IDLE),               W.wt(w0 + 0x34, IDLE, IDLE),
     };
     try std.testing.expectEqualSlices(E, &want, b.entries());
 }
@@ -619,10 +620,27 @@ test "buildOp stream passes validation against its own ranges, fails without the
     var buf: [seq_entries_per_op]seq.Entry = undefined;
     var b = seq.Builder.init(&buf);
     const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0100, 0x8_0000_0200, 0x8_0000_0300 };
-    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1);
+    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, .w1a8);
     const weights = seq.Range{ .lo = 0x8_0000_0000, .hi = 0x8_0000_0400 };
     const acts = seq.Range{ .lo = 0x8_1000_0000, .hi = 0x8_1000_0200 };
     const result = seq.Range{ .lo = 0x8_2000_0000, .hi = 0x8_2000_0040 };
     try seq.validate(b.entries(), &seq_dma_bases, &.{ weights, acts, result });
     try std.testing.expectError(error.S2mmOutOfRange, seq.validate(b.entries(), &seq_dma_bases, &.{ weights, acts }));
+}
+
+test "buildOp programs ternary weight format" {
+    var buf: [seq_entries_per_op]seq.Entry = undefined;
+    var b = seq.Builder.init(&buf);
+    const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0080, 0x8_0000_0100, 0x8_0000_0180 };
+    buildOp(&b, wp, 0x80, 0x8_1000_0000, 0xa0, 0x8_2000_0000, 0x40, 1, 1, 1, .w158a8);
+
+    const weight_fmt_addr: u32 = 0xA005_0000 + regmap.offsetOf("WEIGHT_FMT");
+    var found = false;
+    for (b.entries()) |entry| {
+        if (entry.tag == 0 and entry.addr == weight_fmt_addr) {
+            try std.testing.expectEqual(@as(u32, @intFromEnum(wire.WeightFormat.w158a8)), entry.a);
+            found = true;
+        }
+    }
+    try std.testing.expect(found);
 }

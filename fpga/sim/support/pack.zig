@@ -121,6 +121,58 @@ pub fn packWeightsWide(
     }
 }
 
+pub fn ternaryWeightBytesWide(num_rowblocks: usize, q1_blocks: usize) usize {
+    return num_rowblocks * q1_blocks * layout.ternary_beats_per_port_block * WIDE_BEAT_BYTES;
+}
+
+/// Pack the resident four-port ternary layout into the combined 512-bit stream
+/// observed by gemm_kernel after decode_top's lockstep zipper.
+pub fn packTernaryWeightsWide(
+    rows: usize,
+    q1_blocks: usize,
+    weight_sign: []const u128,
+    weight_nonzero: []const u128,
+    weight_scales_lo: []const f16,
+    weight_scales_hi: []const f16,
+    out: []u8,
+) void {
+    const num_rb = rows / layout.ROWS;
+    std.debug.assert(out.len == ternaryWeightBytesWide(num_rb, q1_blocks));
+    var off: usize = 0;
+    for (0..num_rb) |rb| {
+        for (0..q1_blocks) |blk| {
+            var ports: [4][layout.ternary_packed_per_port_block]u8 = [_][layout.ternary_packed_per_port_block]u8{[_]u8{0} ** layout.ternary_packed_per_port_block} ** 4;
+            for (0..4) |port| {
+                for (0..4) |lane| {
+                    const row = rb * layout.ROWS + port * 4 + lane;
+                    std.mem.writeInt(u16, ports[port][lane * 4 ..][0..2], @bitCast(weight_scales_lo[row * q1_blocks + blk]), .little);
+                    std.mem.writeInt(u16, ports[port][lane * 4 + 2 ..][0..2], @bitCast(weight_scales_hi[row * q1_blocks + blk]), .little);
+                    for (0..layout.Q8_SUBBLOCKS) |sub| {
+                        for (0..2) |code_beat| {
+                            var encoded: u32 = 0;
+                            for (0..16) |i| {
+                                const weight_index = sub * layout.Q8_BLOCK + code_beat * 16 + i;
+                                const nz = (weight_nonzero[row * q1_blocks + blk] >> @intCast(weight_index)) & 1 != 0;
+                                const pos = (weight_sign[row * q1_blocks + blk] >> @intCast(weight_index)) & 1 != 0;
+                                const code: u32 = if (!nz) 1 else if (pos) 2 else 0;
+                                encoded |= code << @intCast(i * 2);
+                            }
+                            const beat_base = (1 + sub * 2 + code_beat) * 16;
+                            std.mem.writeInt(u32, ports[port][beat_base + lane * 4 ..][0..4], encoded, .little);
+                        }
+                    }
+                }
+            }
+            for (0..layout.ternary_beats_per_port_block) |beat| {
+                for (0..4) |port| {
+                    @memcpy(out[off..][0..16], ports[port][beat * 16 ..][0..16]);
+                    off += 16;
+                }
+            }
+        }
+    }
+}
+
 /// Inverse of packWeights, for the roundtrip gate.
 pub fn unpackWeights(
     rows: usize,

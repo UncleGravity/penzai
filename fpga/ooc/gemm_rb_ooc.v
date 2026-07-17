@@ -48,7 +48,7 @@ module gemm_rb_ooc #(
     gemm_rowblock #(.ROWS(16), .COLS_MAX(COLS_MAX)) u_rb (
         .clk(clk), .rst_n(rst_n), .clear(clear_q), .valid_in(valid_q),
         .col_idx(col_q), .emin(emin_q),
-        .weight_bits_flat(wb_q), .weight_scales_flat(ws_q),
+        .weight_bits_flat(wb_q), .weight_nonzero_flat({16*32{1'b1}}), .weight_scales_flat(ws_q),
         .acts_packed(acts_q), .act_scale(as_q),
         .read_col(rdcol_q), .acc_flat(acc_w)
     );

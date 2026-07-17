@@ -117,10 +117,38 @@ fn addFormalSteps(b: *std.Build) void {
     );
     seq_top_step.dependOn(&seq_top_run.step);
 
+    const gemm_kernel_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/gemm_kernel",
+        "formal/rtl/gemm_kernel.sby",
+    });
+    const gemm_kernel_step = b.step(
+        "formal-gemm-kernel",
+        "Prove GEMM run configuration, bounds, and AXIS control properties",
+    );
+    gemm_kernel_step.dependOn(&gemm_kernel_run.step);
+
+    const gemm_ternary_selector_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/gemm_ternary_selector",
+        "formal/rtl/gemm_ternary_select.sby",
+    });
+    const gemm_ternary_selector_step = b.step(
+        "formal-gemm-ternary-selector",
+        "Exhaustively prove the Q2_0 two-bit ternary selector",
+    );
+    gemm_ternary_selector_step.dependOn(&gemm_ternary_selector_run.step);
+
     const formal = b.step("formal", "Run formal verification pilots");
     formal.dependOn(seq_reg_master_step);
     formal.dependOn(seq_core_step);
     formal.dependOn(seq_top_step);
+    formal.dependOn(gemm_kernel_step);
+    formal.dependOn(gemm_ternary_selector_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps exp, reciprocal,
@@ -199,6 +227,7 @@ const numeric_gemm_rtl = [_][]const u8{
 // gemm_emit), gated bit-exact vs matmul_ref.windowedFixedOutput (C=1 decode + C>1 prefill).
 const gemm_kernel_rtl = [_][]const u8{
     "fpga/rtl/gemm_kernel.v",
+    "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
@@ -209,11 +238,12 @@ const gemm_kernel_rtl = [_][]const u8{
 const decode_top_rtl = [_][]const u8{
     "fpga/rtl/decode_top.v",
     "fpga/rtl/gemm_kernel.v",
+    "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the

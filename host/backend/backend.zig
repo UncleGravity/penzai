@@ -209,7 +209,19 @@ fn effectiveAllocSize(tensor: *const c.ggml_tensor) usize {
         const k: usize = @intCast(dim(tensor, 0));
         return layout.packedWeightBytes(rows, k) catch tensorNbytes(tensor);
     }
+    if (isRepackableQ2_0(tensor)) {
+        const rows: usize = @intCast(dim(tensor, 1));
+        const k: usize = @intCast(dim(tensor, 0));
+        return layout.packedTernaryWeightBytes(rows, k) catch tensorNbytes(tensor);
+    }
     return tensorNbytes(tensor);
+}
+
+fn isRepackableQ2_0(tensor: *const c.ggml_tensor) bool {
+    return tensor.*.type == c.GGML_TYPE_Q2_0 and
+        dim(tensor, 0) > 0 and dim(tensor, 1) > 0 and
+        dim(tensor, 2) == 1 and dim(tensor, 3) == 1 and
+        @mod(@as(usize, @intCast(dim(tensor, 0))), layout.q1_block) == 0;
 }
 
 fn isRepackableQ1_0(tensor: *const c.ggml_tensor) bool {
@@ -223,6 +235,10 @@ fn isRepackableQ1_0(tensor: *const c.ggml_tensor) bool {
 
 fn shouldRepackQ1_0(tensor: *const c.ggml_tensor, offset: usize, size: usize) bool {
     return isRepackableQ1_0(tensor) and offset == 0 and size == tensorNbytes(tensor);
+}
+
+fn shouldRepackQ2_0(tensor: *const c.ggml_tensor, offset: usize, size: usize) bool {
+    return isRepackableQ2_0(tensor) and offset == 0 and size == tensorNbytes(tensor);
 }
 
 fn rangeValid(binding: RemoteBinding, offset: usize, size: usize) bool {
@@ -307,7 +323,6 @@ fn bufSetTensor(
     const remote = remoteOf(buf);
     const t = tensor orelse return;
     const binding = findBindingIn(remote, t) orelse return;
-    if (!rangeValid(binding, offset, size)) return;
     const src: [*]const u8 = @ptrCast(data orelse return);
 
     if (shouldRepackQ1_0(t, offset, size)) {
@@ -322,6 +337,22 @@ fn bufSetTensor(
         recordUploadTensor(remote.dev, t, packed_weights.len);
         return;
     }
+
+    if (shouldRepackQ2_0(t, offset, size)) {
+        const rows: usize = @intCast(dim(t, 1));
+        const k: usize = @intCast(dim(t, 0));
+        const packed_len = layout.packedTernaryWeightBytes(rows, k) catch return;
+        if (binding.range.nbytes != packed_len) return;
+        const packed_weights = remote.dev.allocator.alloc(u8, packed_len) catch return;
+        defer remote.dev.allocator.free(packed_weights);
+        layout.packWeightsFromGgmlQ2_0(rows, k, src[0..size], packed_weights) catch return;
+        timedUpload(remote.dev, binding.range, packed_weights) catch return;
+        remote.dev.counters.upload_bytes += packed_weights.len;
+        recordUploadTensor(remote.dev, t, packed_weights.len);
+        return;
+    }
+
+    if (!rangeValid(binding, offset, size)) return;
 
     const dst_range: wire.TensorRange = .{
         .handle = binding.range.handle,

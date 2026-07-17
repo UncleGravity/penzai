@@ -75,6 +75,7 @@ pub const IndexType = enum(u32) {
 pub const GetRowsSrcType = enum(u32) {
     f32 = 1,
     q1_0 = 2,
+    q2_0 = 3,
 };
 
 pub const BinaryF32Mode = enum(u32) {
@@ -89,7 +90,7 @@ pub const RopeMode = enum(u32) {
 
 /// Weight encoding for a matmul. Tags the command so the device picks the
 /// decoder/kernel path and the host keys per-format profiling. `w1a8` is the
-/// only implemented format; `w158a8` (ternary) is reserved (plan-long §10).
+/// Runtime weight format selected by each matmul command.
 pub const WeightFormat = enum(u32) {
     w1a8 = 1,
     w158a8 = 2,
@@ -361,8 +362,8 @@ pub const GetRows = struct {
     ne10: u32,
     ne11: u32,
     ne12: u32,
-    /// Used as byte strides for .f32 sources. For .q1_0, src is resident
-    /// q1a8-packed data and the device derives row addresses from q1a8 layout.
+    /// Used as byte strides for .f32 sources. Quantized sources use their
+    /// format-specific resident matmul layout instead of the raw ggml strides.
     src_nb1: u64,
     src_nb2: u64,
     src_nb3: u64,

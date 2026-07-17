@@ -31,6 +31,7 @@ module gemm_kernel #(
     input  wire [15:0]           num_q1_blocks,
     input  wire [15:0]           num_rowblocks,
     input  wire [15:0]           num_cols,
+    input  wire [1:0]            weight_fmt,
     input  wire signed [7:0]     emin,            // global window floor (calibration, set once)
     output reg                   kernel_done,
     output wire                  busy,
@@ -62,6 +63,9 @@ module gemm_kernel #(
     localparam [3:0] ST_PRECOMPUTE  = 4'd6;
     localparam [3:0] ST_EMIT        = 4'd7;
     localparam [3:0] ST_FINISH      = 4'd8;
+    localparam [3:0] ST_TLOAD       = 4'd9;
+    localparam [3:0] ST_TCODE0      = 4'd10;
+    localparam [3:0] ST_TCODE1      = 4'd11;
 
     // gemm_rowblock latency input→acc = FE_LAT(4) + fma(5) = 9. Wait this (plus the issue
     // register + margin) after the last issue before reading acc; the cosim drain gates it.
@@ -81,6 +85,11 @@ module gemm_kernel #(
 
     reg [3:0]  state;
     reg        busy_q;
+    reg [15:0] run_num_q1_blocks;
+    reg [15:0] run_num_rowblocks;
+    reg [15:0] run_num_cols;
+    reg signed [7:0] run_emin;
+    reg [1:0] run_weight_fmt;
     reg [15:0] rowblock_remaining;
     reg [13:0] q1_idx;
     reg [1:0]  sub;
@@ -97,6 +106,7 @@ module gemm_kernel #(
 
     reg [ROWS*16-1:0]  weight_scales_q;
     wire [ROWS*16-1:0] weight_scales_from_slots;
+    wire [ROWS*16-1:0] tern_scales_hi_from_slots;
 
     // Acts BRAM: COLS_MAX columns, each MAX_SUB_INDEX subblock entries.
     localparam integer ACT_DEPTH = MAX_SUB_INDEX * COLS_MAX;
@@ -113,8 +123,17 @@ module gemm_kernel #(
     reg                 issue_clear_q;
     reg [CW-1:0]        issue_col_q;
     reg [ROWS*32-1:0]   issue_weight_bits_q;
+    reg [ROWS*32-1:0]   issue_weight_nonzero_q;
+    reg [ROWS*16-1:0]   issue_weight_scales_q;
     reg [255:0]         issue_acts_packed_q;
     reg [15:0]          issue_act_scale_q;
+
+    // Ternary blocks stream as one dual-scale beat, then two issue-ordered
+    // two-bit code beats per 32-weight sub-block.
+    reg [ROWS*32-1:0] tern_code_first_q;
+    reg [ROWS*32-1:0] tern_code_second_q;
+    reg [ROWS*16-1:0] tern_scales_lo;
+    reg [ROWS*16-1:0] tern_scales_hi;
 
     // Acts load scratch.
     reg [255:0] acts_load_accum;
@@ -128,26 +147,47 @@ module gemm_kernel #(
     wire [ROWS*ACC_W-1:0] rowblock_acc;
 
     wire [15:0] q1_idx_wide = {2'b00, q1_idx};
-    wire last_q1   = (q1_idx_wide == num_q1_blocks - 16'd1);
-    wire last_col  = (col == num_cols - 16'd1);
+    wire last_q1   = (q1_idx_wide == run_num_q1_blocks - 16'd1);
+    wire last_col  = (col == run_num_cols - 16'd1);
     wire is_first_sub = (q1_idx == 14'd0) && (sub == 2'd0); // first sub-block of the rowblock
 
     assign busy = busy_q;
     assign dbg_state = state;
-    // Consume the scale beat in WSCALE; consume each wbit beat on the last column.
+    // Binary weights hold each issue beat across the column sweep. Ternary
+    // weights are captured as two code beats before that sweep.
     assign s_axis_tready =
-        busy_q && ((state == ST_WSCALE) || ((state == ST_WISSUE) && last_col));
+        busy_q && (((run_weight_fmt == 2'd2) &&
+                   ((state == ST_TLOAD) || (state == ST_TCODE0) || (state == ST_TCODE1))) ||
+                   ((run_weight_fmt == 2'd1) &&
+                    ((state == ST_WSCALE) || ((state == ST_WISSUE) && last_col))));
     assign s_axis_acts_tready =
         busy_q && ((state == ST_LOAD_ACTS) || (state == ST_LOAD_ASCALE));
 
     wire acts_beat_accept = s_axis_acts_tvalid && s_axis_acts_tready;
     wire start_pulse      = start_kernel && !busy_q;
+    wire weight_issue_valid = (run_weight_fmt == 2'd2) ? 1'b1 : s_axis_tvalid;
+
+    wire [ROWS*32-1:0] tern_decoded_sign;
+    wire [ROWS*32-1:0] tern_decoded_nonzero;
+    genvar tern_row;
+    generate
+        for (tern_row = 0; tern_row < ROWS; tern_row = tern_row + 1) begin : gen_tern_sub
+            gemm_ternary_select32 u_ternary_select (
+                .codes({tern_code_second_q[tern_row*32 +: 32],
+                        tern_code_first_q[tern_row*32 +: 32]}),
+                .sign(tern_decoded_sign[tern_row*32 +: 32]),
+                .nonzero(tern_decoded_nonzero[tern_row*32 +: 32])
+            );
+        end
+    endgenerate
 
     genvar scale_lane;
     generate
         for (scale_lane = 0; scale_lane < ROWS; scale_lane = scale_lane + 1) begin : gen_scale_slots
             assign weight_scales_from_slots[scale_lane*16 +: 16] =
                 s_axis_tdata[scale_lane*32 +: 16];
+            assign tern_scales_hi_from_slots[scale_lane*16 +: 16] =
+                s_axis_tdata[scale_lane*32 + 16 +: 16];
         end
     endgenerate
 
@@ -157,9 +197,10 @@ module gemm_kernel #(
         .clear(issue_clear_q),
         .valid_in(issue_valid_q),
         .col_idx(issue_col_q),
-        .emin(emin),
+        .emin(run_emin),
         .weight_bits_flat(issue_weight_bits_q),
-        .weight_scales_flat(weight_scales_q),
+        .weight_nonzero_flat(issue_weight_nonzero_q),
+        .weight_scales_flat(issue_weight_scales_q),
         .acts_packed(issue_acts_packed_q),
         .act_scale(issue_act_scale_q),
         .read_col(pc_col[CW-1:0]),
@@ -174,7 +215,7 @@ module gemm_kernel #(
     // acc[*][pc_col]) + the beat select + valid; R2 registers the beat-muxed lane pair + valid;
     // then gemm_emit. Off the throughput path (one-time fill), so +2 cycles are free; gemm_emit's
     // valid_in→valid_out and the wr_idx collection preserve order regardless of the latency.
-    wire pc_presenting = (state == ST_PRECOMPUTE) && (pc_col < num_cols);
+    wire pc_presenting = (state == ST_PRECOMPUTE) && (pc_col < run_num_cols);
 
     reg [ROWS*ACC_W-1:0] rb_acc_q;    // R1: read_col-muxed bank (gemm_rowblock acc[*][pc_col])
     reg [EBW-1:0]        pc_beat_d, pc_beat_q;
@@ -199,16 +240,16 @@ module gemm_kernel #(
     wire [31:0] emit_f32_lo, emit_f32_hi;
     gemm_emit #(.ACC_W(ACC_W), .EXP_W(8)) u_emit_lo (
         .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q2),
-        .acc($signed(acc_pair_q[ACC_W-1:0])), .emin(emin),
+        .acc($signed(acc_pair_q[ACC_W-1:0])), .emin(run_emin),
         .valid_out(emit_vo), .f32(emit_f32_lo)
     );
     gemm_emit #(.ACC_W(ACC_W), .EXP_W(8)) u_emit_hi (
         .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q2),
-        .acc($signed(acc_pair_q[2*ACC_W-1:ACC_W])), .emin(emin),
+        .acc($signed(acc_pair_q[2*ACC_W-1:ACC_W])), .emin(run_emin),
         .valid_out(emit_vo_hi), .f32(emit_f32_hi)   // same timing as emit_vo
     );
 
-    wire [15:0] n_total = num_cols * EMIT_BEATS[15:0];
+    wire [15:0] n_total = run_num_cols * EMIT_BEATS[15:0];
 
     // EMIT: stream the buffer 2 fp32/beat, lane-major, with AXIS backpressure. The buffer
     // index is {col, beat} since EMIT_BEATS = 2^EBW (matches the precompute walk order).
@@ -216,13 +257,18 @@ module gemm_kernel #(
     assign m_axis_tdata  = result_buf[rd_idx];
     assign m_axis_tvalid = (state == ST_EMIT);
     assign m_axis_tlast  = (state == ST_EMIT) && (emit_beat == EMIT_LAST[EBW-1:0]) &&
-                           (emit_col == num_cols - 16'd1) && (rowblock_remaining == 16'd1);
+                           (emit_col == run_num_cols - 16'd1) && (rowblock_remaining == 16'd1);
     assign m_axis_tkeep  = 8'hFF;
 
     always @(posedge clk) begin
         if (!rst_n) begin
             state               <= ST_IDLE;
             busy_q              <= 1'b0;
+            run_num_q1_blocks   <= 16'd0;
+            run_num_rowblocks   <= 16'd0;
+            run_num_cols        <= 16'd0;
+            run_emin            <= 8'sd0;
+            run_weight_fmt      <= 2'd1;
             rowblock_remaining  <= 16'd0;
             q1_idx              <= 14'd0;
             sub                 <= 2'd0;
@@ -238,6 +284,8 @@ module gemm_kernel #(
             issue_clear_q       <= 1'b0;
             issue_col_q         <= {CW{1'b0}};
             issue_weight_bits_q <= {ROWS*32{1'b0}};
+            issue_weight_nonzero_q <= {ROWS*32{1'b0}};
+            issue_weight_scales_q <= {ROWS*16{1'b0}};
             issue_acts_packed_q <= 256'd0;
             issue_act_scale_q   <= 16'd0;
             kernel_done         <= 1'b0;
@@ -246,6 +294,10 @@ module gemm_kernel #(
             acts_load_q1        <= 14'd0;
             acts_load_sub       <= 2'd0;
             acts_load_col       <= 16'd0;
+            tern_code_first_q   <= {ROWS*32{1'b0}};
+            tern_code_second_q  <= {ROWS*32{1'b0}};
+            tern_scales_lo      <= {ROWS*16{1'b0}};
+            tern_scales_hi      <= {ROWS*16{1'b0}};
         end else begin
             issue_valid_q <= 1'b0;
             issue_clear_q <= 1'b0;
@@ -261,6 +313,11 @@ module gemm_kernel #(
 
             if (start_pulse) begin
                 busy_q         <= 1'b1;
+                run_num_q1_blocks <= num_q1_blocks;
+                run_num_rowblocks <= num_rowblocks;
+                run_num_cols      <= num_cols;
+                run_emin          <= emin;
+                run_weight_fmt    <= weight_fmt;
                 acts_load_beat <= 3'd0;
                 acts_load_q1   <= 14'd0;
                 acts_load_sub  <= 2'd0;
@@ -293,15 +350,15 @@ module gemm_kernel #(
                             acts_load_beat <= 3'd0;
                             if (acts_load_sub == 2'd3) begin
                                 acts_load_sub <= 2'd0;
-                                if ({2'b00, acts_load_q1} + 16'd1 == num_q1_blocks) begin
+                                if ({2'b00, acts_load_q1} + 16'd1 == run_num_q1_blocks) begin
                                     acts_load_q1 <= 14'd0;
-                                    if (acts_load_col + 16'd1 == num_cols) begin
+                                    if (acts_load_col + 16'd1 == run_num_cols) begin
                                         // All columns loaded - begin matmul.
-                                        rowblock_remaining <= num_rowblocks;
+                                        rowblock_remaining <= run_num_rowblocks;
                                         q1_idx             <= 14'd0;
                                         sub                <= 2'd0;
                                         col                <= 16'd0;
-                                        state              <= ST_WSCALE;
+                                        state              <= (run_weight_fmt == 2'd2) ? ST_TLOAD : ST_WSCALE;
                                     end else begin
                                         acts_load_col <= acts_load_col + 16'd1;
                                         state         <= ST_LOAD_ACTS;
@@ -326,14 +383,42 @@ module gemm_kernel #(
                         end
                     end
 
+                    ST_TLOAD: begin
+                        if (s_axis_tvalid) begin
+                            tern_scales_lo <= weight_scales_from_slots;
+                            tern_scales_hi <= tern_scales_hi_from_slots;
+                            sub            <= 2'd0;
+                            col            <= 16'd0;
+                            state          <= ST_TCODE0;
+                        end
+                    end
+
+                    ST_TCODE0: begin
+                        if (s_axis_tvalid) begin
+                            tern_code_first_q <= s_axis_tdata;
+                            state             <= ST_TCODE1;
+                        end
+                    end
+
+                    ST_TCODE1: begin
+                        if (s_axis_tvalid) begin
+                            tern_code_second_q <= s_axis_tdata;
+                            col                <= 16'd0;
+                            state              <= ST_WISSUE;
+                        end
+                    end
+
                     // Hold each wbit beat across the column sweep; advance only on the last
                     // column (s_axis_tready pulses there). Single-cycle accumulate → no gap.
                     ST_WISSUE: begin
-                        if (s_axis_tvalid) begin
+                        if (weight_issue_valid) begin
                             issue_valid_q       <= 1'b1;
                             issue_clear_q       <= is_first_sub;
                             issue_col_q         <= col[CW-1:0];
-                            issue_weight_bits_q <= s_axis_tdata;
+                            issue_weight_bits_q <= (run_weight_fmt == 2'd2) ? tern_decoded_sign : s_axis_tdata;
+                            issue_weight_nonzero_q <= (run_weight_fmt == 2'd2) ? tern_decoded_nonzero : {ROWS*32{1'b1}};
+                            issue_weight_scales_q <= (run_weight_fmt == 2'd2) ?
+                                ((sub < 2) ? tern_scales_lo : tern_scales_hi) : weight_scales_q;
                             issue_acts_packed_q <= acts_packed_w;
                             issue_act_scale_q   <= act_scale_w;
                             if (last_col) begin
@@ -345,12 +430,12 @@ module gemm_kernel #(
                                         state    <= ST_WAIT_DONE;
                                     end else begin
                                         q1_idx <= q1_idx + 14'd1;
-                                        state  <= ST_WSCALE;
+                                        state  <= (run_weight_fmt == 2'd2) ? ST_TLOAD : ST_WSCALE;
                                     end
                                 end else begin
-                                    // next sub-block: read the next wbit beat — STAY in
-                                    // WISSUE (the scale beat is read once per q1-block).
                                     sub <= sub + 2'd1;
+                                    if (run_weight_fmt == 2'd2)
+                                        state <= ST_TCODE0;
                                 end
                             end else begin
                                 col <= col + 16'd1;
@@ -374,7 +459,7 @@ module gemm_kernel #(
                     // Walk every (col, beat) through the emit pipeline into result_buf; the
                     // wr_idx collector (above) fills it on valid_out. Done once all N written.
                     ST_PRECOMPUTE: begin
-                        if (pc_col < num_cols) begin
+                        if (pc_col < run_num_cols) begin
                             if (pc_beat == EMIT_LAST[EBW-1:0]) begin
                                 pc_beat <= {EBW{1'b0}};
                                 pc_col  <= pc_col + 16'd1;
@@ -393,7 +478,7 @@ module gemm_kernel #(
                         if (m_axis_tready) begin
                             if (emit_beat == EMIT_LAST[EBW-1:0]) begin
                                 emit_beat <= {EBW{1'b0}};
-                                if (emit_col + 16'd1 == num_cols) begin
+                                if (emit_col + 16'd1 == run_num_cols) begin
                                     if (rowblock_remaining == 16'd1) begin
                                         state <= ST_FINISH;
                                     end else begin
@@ -401,7 +486,7 @@ module gemm_kernel #(
                                         q1_idx             <= 14'd0;
                                         sub                <= 2'd0;
                                         col                <= 16'd0;
-                                        state              <= ST_WSCALE;
+                                        state              <= (run_weight_fmt == 2'd2) ? ST_TLOAD : ST_WSCALE;
                                     end
                                 end else begin
                                     emit_col <= emit_col + 16'd1;
@@ -426,5 +511,9 @@ module gemm_kernel #(
             end
         end
     end
+
+`ifdef FORMAL
+`include "gemm_kernel_properties.vh"
+`endif
 
 endmodule

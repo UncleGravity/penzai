@@ -7,7 +7,7 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x0000000A   v10 = v9 + seq_top command executor on sc_ctrl (gates PENZAI_SEQ)
+0x04      VERSION         ro      0x0000000B   v11 = dual-format binary/ternary GEMM
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
@@ -34,6 +34,7 @@
 # A zero value means the bitstream did not self-describe its clock.
 0x3C      CLK_HZ          ro      0x00000000   fabric clock (Hz); set by bitstream build
 0x40      WEIGHT_PORTS    ro      0x00000004   synchronized AXIS weight ports
+0x44      WEIGHT_FMT      rw      0x00000001   1 = binary w1a8, 2 = ternary w158a8
 #
 # (v8 had a writable EMIN window-floor register at 0x44. v9 bakes the window floor in as a
 # constant of the f16 format — decode_top.EMIN_FLOOR — so there is no EMIN register and no

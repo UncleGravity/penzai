@@ -137,6 +137,7 @@ module decode_top #(
     reg [15:0] num_q1_blocks_q;
     reg [15:0] num_rowblocks_q;
     reg [15:0] num_cols_q;
+    reg [1:0]  weight_fmt_q;
     reg        start_strobe;
 
     // Fixed-point window floor: a constant of the f16 format (min contribution exponent
@@ -174,6 +175,7 @@ module decode_top #(
         .num_q1_blocks(num_q1_blocks_q),
         .num_rowblocks(num_rowblocks_q),
         .num_cols(num_cols_q),
+        .weight_fmt(weight_fmt_q),
         .emin(EMIN_FLOOR),
         .kernel_done(kernel_done),
         .busy(kernel_busy),
@@ -238,6 +240,7 @@ module decode_top #(
             num_q1_blocks_q <= 16'd0;
             num_rowblocks_q <= 16'd0;
             num_cols_q      <= 16'd0;
+            weight_fmt_q    <= 2'd1;
             start_strobe    <= 1'b0;
         end else begin
             start_strobe <= 1'b0;
@@ -267,6 +270,9 @@ module decode_top #(
                         if (s_axi_wstrb[0]) num_cols_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_cols_q[15:8] <= s_axi_wdata[15:8];
                     end
+                    MATMUL_OFF_WEIGHT_FMT[7:0]: begin
+                        if (s_axi_wstrb[0]) weight_fmt_q <= s_axi_wdata[1:0];
+                    end
                     default: ;
                 endcase
             end
@@ -294,6 +300,7 @@ module decode_top #(
                     MATMUL_OFF_NUM_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, num_q1_blocks_q};
                     MATMUL_OFF_NUM_ROWBLOCKS[7:0]: rdata_q <= {16'd0, num_rowblocks_q};
                     MATMUL_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
+                    MATMUL_OFF_WEIGHT_FMT[7:0]:    rdata_q <= {30'd0, weight_fmt_q};
                     MATMUL_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
                     MATMUL_OFF_ROWS[7:0]:          rdata_q <= MATMUL_RST_ROWS;
                     MATMUL_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;

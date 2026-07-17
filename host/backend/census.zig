@@ -21,6 +21,7 @@ pub const Census = struct {
     missing_src_bindings: u64 = 0,
     missing_dst_bindings: u64 = 0,
     matmul_q1_0: u64 = 0,
+    matmul_q2_0: u64 = 0,
     matmul_f16: u64 = 0,
     matmul_f32: u64 = 0,
     matmul_other: u64 = 0,
@@ -47,8 +48,8 @@ pub const Census = struct {
             .{ self.missing_src_bindings, self.missing_dst_bindings },
         );
         try writer.print(
-            "matmul_weight_dtype q1_0={d} f16={d} f32={d} other={d}\n\n",
-            .{ self.matmul_q1_0, self.matmul_f16, self.matmul_f32, self.matmul_other },
+            "matmul_weight_dtype q1_0={d} q2_0={d} f16={d} f32={d} other={d}\n\n",
+            .{ self.matmul_q1_0, self.matmul_q2_0, self.matmul_f16, self.matmul_f32, self.matmul_other },
         );
 
         try writer.print("ops:\n", .{});
@@ -103,6 +104,8 @@ pub const Census = struct {
             };
             if (weights.*.type == c.GGML_TYPE_Q1_0) {
                 self.matmul_q1_0 += 1;
+            } else if (weights.*.type == c.GGML_TYPE_Q2_0) {
+                self.matmul_q2_0 += 1;
             } else if (weights.*.type == c.GGML_TYPE_F16) {
                 self.matmul_f16 += 1;
             } else if (weights.*.type == c.GGML_TYPE_F32) {

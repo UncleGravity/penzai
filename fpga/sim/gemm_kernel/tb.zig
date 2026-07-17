@@ -32,7 +32,7 @@ const Dut = struct {
     }
 };
 
-fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, emin: i32, w_bytes: []const u8, a_bytes: []const u8) ![]u8 {
+fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, emin: i32, weight_fmt: u2, w_bytes: []const u8, a_bytes: []const u8) ![]u8 {
     const num_rb = rows / ROWS;
     var dut = Dut.init();
     defer dut.deinit();
@@ -55,6 +55,7 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
     c.dut_set_num_rb(dut.h, @intCast(num_rb));
     c.dut_set_num_cols(dut.h, @intCast(num_cols));
     c.dut_set_emin(dut.h, @intCast(emin));
+    c.dut_set_weight_fmt(dut.h, weight_fmt);
 
     var wi: usize = 0;
     var ai: usize = 0;
@@ -94,25 +95,52 @@ fn runKernel(a: std.mem.Allocator, rows: usize, blocks: usize, num_cols: usize, 
     return res;
 }
 
-fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, seed: u64, note: []const u8) !void {
+fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, ternary: bool, seed: u64, note: []const u8) !void {
     const rows = num_rb * ROWS;
     const bits = try a.alloc(u128, rows * blocks);
     defer a.free(bits);
     const wscales = try a.alloc(f16, rows * blocks);
     defer a.free(wscales);
+    const wscales_hi = try a.alloc(f16, rows * blocks);
+    defer a.free(wscales_hi);
+    const nonzero = try a.alloc(u128, rows * blocks);
+    defer a.free(nonzero);
 
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
-    for (bits) |*b| b.* = (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64);
+    if (ternary) {
+        for (bits, nonzero) |*signs, *nz| {
+            signs.* = 0;
+            nz.* = 0;
+            for (0..layout.Q1_BLOCK) |i| {
+                const digit = rnd.intRangeLessThan(u2, 0, 3);
+                if (digit != 1) nz.* |= @as(u128, 1) << @intCast(i);
+                if (digit == 2) signs.* |= @as(u128, 1) << @intCast(i);
+            }
+        }
+    } else {
+        for (bits, nonzero) |*b, *nz| {
+            b.* = (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64);
+            nz.* = std.math.maxInt(u128);
+        }
+    }
     // narrow-band positive normal f16 weight scales (a realistic calibrated window).
     for (wscales) |*s| {
         const e: u16 = rnd.intRangeAtMost(u16, 13, 17);
         s.* = @bitCast((e << 10) | rnd.intRangeLessThan(u16, 0, 1024));
     }
+    for (wscales_hi) |*s| {
+        const e: u16 = rnd.intRangeAtMost(u16, 13, 17);
+        s.* = @bitCast((e << 10) | rnd.intRangeLessThan(u16, 0, 1024));
+    }
 
-    const w_bytes = try a.alloc(u8, pack.weightBytesWide(num_rb, blocks));
+    const w_len = if (ternary) pack.ternaryWeightBytesWide(num_rb, blocks) else pack.weightBytesWide(num_rb, blocks);
+    const w_bytes = try a.alloc(u8, w_len);
     defer a.free(w_bytes);
-    pack.packWeightsWide(rows, blocks, bits, wscales, w_bytes);
+    if (ternary)
+        pack.packTernaryWeightsWide(rows, blocks, bits, nonzero, wscales, wscales_hi, w_bytes)
+    else
+        pack.packWeightsWide(rows, blocks, bits, wscales, w_bytes);
 
     // num_cols activation columns, packed back to back; one Problem per column (shared weights).
     const a_bytes = try a.alloc(u8, num_cols * pack.actBytes(blocks));
@@ -140,7 +168,9 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
         .rows = rows,
         .q1_blocks = blocks,
         .weight_bits = bits,
+        .weight_nonzero = if (ternary) nonzero else null,
         .weight_scales = wscales,
+        .weight_scales_hi = if (ternary) wscales_hi else null,
         .act_quants = aquants[col * aq_per ..][0..aq_per],
         .act_scales = ascales[col * as_per ..][0..as_per],
     };
@@ -155,7 +185,7 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
         sats += s;
     }
 
-    const res = try runKernel(a, rows, blocks, num_cols, w.emin, w_bytes, a_bytes);
+    const res = try runKernel(a, rows, blocks, num_cols, w.emin, if (ternary) 2 else 1, w_bytes, a_bytes);
     defer a.free(res);
 
     var mism: usize = 0;
@@ -194,7 +224,7 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
-    const Case = struct { num_rb: usize, blocks: usize, cols: usize, note: []const u8 = "" };
+    const Case = struct { num_rb: usize, blocks: usize, cols: usize, ternary: bool = false, note: []const u8 = "" };
     const cases = [_]Case{
         .{ .num_rb = 1, .blocks = 1, .cols = 1, .note = "decode, 1 rb" },
         .{ .num_rb = 1, .blocks = 2, .cols = 4, .note = "prefill C=4" },
@@ -202,7 +232,8 @@ pub fn main() !void {
         .{ .num_rb = 2, .blocks = 4, .cols = 8, .note = "prefill C=8 (full bank)" },
         .{ .num_rb = 8, .blocks = 16, .cols = 1, .note = "decode, attn-ish" },
         .{ .num_rb = 4, .blocks = 8, .cols = 8, .note = "prefill, larger" },
+        .{ .num_rb = 1, .blocks = 2, .cols = 3, .ternary = true, .note = "ternary decode + prefill" },
     };
-    for (cases, 0..) |cs, i| try runCase(a, cs.num_rb, cs.blocks, cs.cols, 0x3000 + i, cs.note);
+    for (cases, 0..) |cs, i| try runCase(a, cs.num_rb, cs.blocks, cs.cols, cs.ternary, 0x3000 + i, cs.note);
     std.debug.print("all gemm_kernel cosim cases passed (gemm_kernel === windowedFixedOutput, bit-exact)\n", .{});
 }

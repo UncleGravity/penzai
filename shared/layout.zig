@@ -5,6 +5,9 @@ pub const weight_ports: usize = 4;
 pub const rows_per_port: usize = rows_per_block / weight_ports;
 pub const q1_block: usize = 128;
 pub const q1_block_bytes: usize = 18; // ggml Q1_0 block size (2 B scale + 16 B bits)
+pub const q2_source_block: usize = 64;
+pub const q2_source_block_bytes: usize = 18; // upstream Q2_0: f16 scale + 16 B 2-bit codes
+pub const ternary_block_bytes: usize = 36; // two f16 scales + 32 B of two-bit codes per row
 pub const q8_block: usize = 32;
 pub const q8_subblocks: usize = q1_block / q8_block;
 pub const beat_bytes: usize = 8; // activation AXIS beat (64-bit)
@@ -19,6 +22,9 @@ pub const weight_beat_bytes: usize = rows_per_block * 4; // ROWS * 32 bits = 512
 pub const weight_port_beat_bytes: usize = rows_per_port * 4; // 4 lanes * 32 bits = 128
 pub const packed_per_port_q1_block: usize = (1 + q8_subblocks) * weight_port_beat_bytes;
 pub const packed_per_q1_block: usize = (1 + q8_subblocks) * weight_beat_bytes; // = 320
+pub const ternary_beats_per_port_block: usize = 1 + 2 * q8_subblocks; // scale beat + two code beats/sub-block
+pub const ternary_packed_per_port_block: usize = ternary_beats_per_port_block * weight_port_beat_bytes; // 144
+pub const ternary_packed_per_block: usize = weight_ports * ternary_packed_per_port_block; // 576
 pub const acts_per_q1_block: usize = q8_subblocks * (q8_block + beat_bytes);
 
 // Activation-BRAM capacity of the gemm kernel. The kernel stores acts indexed by
@@ -38,6 +44,8 @@ comptime {
     if (weight_port_beat_bytes != 16) @compileError("Q1A8 port beat size drifted");
     if (packed_per_port_q1_block != 80) @compileError("Q1A8 port block size drifted");
     if (packed_per_q1_block != 320) @compileError("Q1A8 packed block size drifted");
+    if (ternary_packed_per_port_block != 144) @compileError("W158A8 port block size drifted");
+    if (ternary_beats_per_port_block != 9) @compileError("W158A8 must use nine port beats");
     if (acts_per_q1_block != 160) @compileError("Q1A8 acts block size drifted");
 }
 
@@ -45,6 +53,7 @@ pub const LayoutError = error{
     InvalidRows,
     InvalidK,
     InvalidLength,
+    ReservedTernaryCode,
 };
 
 pub fn rowblocksFor(rows: usize) usize {
@@ -66,6 +75,16 @@ pub fn packedWeightPortBytes(rows: usize, k: usize) LayoutError!usize {
     return rowblocksFor(rows) * try blocksPerRow(k) * packed_per_port_q1_block;
 }
 
+pub fn packedTernaryWeightBytes(rows: usize, k: usize) LayoutError!usize {
+    if (rows == 0) return error.InvalidRows;
+    return rowblocksFor(rows) * try blocksPerRow(k) * ternary_packed_per_block;
+}
+
+pub fn packedTernaryWeightPortBytes(rows: usize, k: usize) LayoutError!usize {
+    if (rows == 0) return error.InvalidRows;
+    return rowblocksFor(rows) * try blocksPerRow(k) * ternary_packed_per_port_block;
+}
+
 pub fn actsF32Bytes(cols: usize, k: usize) LayoutError!usize {
     _ = try blocksPerRow(k);
     return cols * k * @sizeOf(f32);
@@ -83,6 +102,115 @@ pub fn weightBlockOffset(rows: usize, k: usize, port: usize, rb: usize, q1: usiz
     const q1_blocks = k / q1_block; // caller validates k
     const port_stride = rowblocksFor(rows) * q1_blocks * packed_per_port_q1_block;
     return port * port_stride + (rb * q1_blocks + q1) * packed_per_port_q1_block;
+}
+
+pub fn ternaryWeightBlockOffset(rows: usize, k: usize, port: usize, rb: usize, q1: usize) usize {
+    const q1_blocks = k / q1_block;
+    const port_stride = rowblocksFor(rows) * q1_blocks * ternary_packed_per_port_block;
+    return port * port_stride + (rb * q1_blocks + q1) * ternary_packed_per_port_block;
+}
+
+/// Repack upstream group-64 Q2_0 into the PL's issue-ordered two-bit layout.
+/// Each port block is one dual-scale beat followed by two code beats for each
+/// 32-weight sub-block, so the RTL consumes it without full-block buffering.
+pub fn packWeightsFromGgmlQ2_0(
+    rows: usize,
+    k: usize,
+    q2_0_weights: []const u8,
+    out: []u8,
+) LayoutError!void {
+    const q1_blocks = try blocksPerRow(k);
+    const source_blocks_per_row = k / q2_source_block;
+    if (q2_0_weights.len != rows * source_blocks_per_row * q2_source_block_bytes) return error.InvalidLength;
+    if (out.len != try packedTernaryWeightBytes(rows, k)) return error.InvalidLength;
+
+    @memset(out, 0);
+    const source_row_bytes = source_blocks_per_row * q2_source_block_bytes;
+    for (0..weight_ports) |port| {
+        for (0..rowblocksFor(rows)) |rb| {
+            const row_start = rb * rows_per_block + port * rows_per_port;
+            const row_count = if (row_start < rows) @min(rows_per_port, rows - row_start) else 0;
+            for (0..q1_blocks) |q1| {
+                const block_base = ternaryWeightBlockOffset(rows, k, port, rb, q1);
+                for (0..row_count) |lane| {
+                    const row = row_start + lane;
+                    const src0 = row * source_row_bytes + (q1 * 2) * q2_source_block_bytes;
+                    const src1 = src0 + q2_source_block_bytes;
+                    for (0..2) |half| {
+                        const source_base = if (half == 0) src0 else src1;
+                        const scale = std.mem.readInt(u16, q2_0_weights[source_base..][0..2], .little);
+                        std.mem.writeInt(u16, out[block_base + lane * 4 + half * 2 ..][0..2], scale, .little);
+                        for (0..q2_source_block) |i| {
+                            const byte = q2_0_weights[source_base + 2 + i / 4];
+                            const code: u8 = (byte >> @intCast((i % 4) * 2)) & 3;
+                            if (code == 3) return error.ReservedTernaryCode;
+                        }
+                    }
+                    for (0..q8_subblocks) |sub| {
+                        const source_base = if (sub < 2) src0 else src1;
+                        const source_sub = sub % 2;
+                        for (0..2) |code_beat| {
+                            const dst = block_base + (1 + sub * 2 + code_beat) * weight_port_beat_bytes + lane * 4;
+                            const src = source_base + 2 + source_sub * 8 + code_beat * 4;
+                            @memcpy(out[dst..][0..4], q2_0_weights[src..][0..4]);
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn packedTernaryWeightScale(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, half: usize) LayoutError!f16 {
+    _ = try blocksPerRow(k);
+    if (half >= 2) return error.InvalidLength;
+    if (weights.len != try packedTernaryWeightBytes(rows, k)) return error.InvalidLength;
+    const rb = row / rows_per_block;
+    const lane = row % rows_per_block;
+    const port = lane / rows_per_port;
+    const port_lane = lane % rows_per_port;
+    const base = ternaryWeightBlockOffset(rows, k, port, rb, q1);
+    return @bitCast(std.mem.readInt(u16, weights[base + port_lane * 4 + half * 2 ..][0..2], .little));
+}
+
+pub fn packedTernaryWeight(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, index: usize) LayoutError!i2 {
+    _ = try blocksPerRow(k);
+    if (index >= q1_block) return error.InvalidLength;
+    if (weights.len != try packedTernaryWeightBytes(rows, k)) return error.InvalidLength;
+    const rb = row / rows_per_block;
+    const lane = row % rows_per_block;
+    const port = lane / rows_per_port;
+    const port_lane = lane % rows_per_port;
+    const base = ternaryWeightBlockOffset(rows, k, port, rb, q1);
+    const sub = index / q8_block;
+    const local = index % q8_block;
+    const code_beat = local / 16;
+    const in_beat = local % 16;
+    const byte_offset = base + (1 + sub * 2 + code_beat) * weight_port_beat_bytes + port_lane * 4 + in_beat / 4;
+    const code = (weights[byte_offset] >> @intCast((in_beat % 4) * 2)) & 3;
+    if (code == 3) return error.ReservedTernaryCode;
+    return @intCast(@as(i8, @intCast(code)) - 1);
+}
+
+/// Return the 32 two-bit ternary codes for one Q8 sub-block. This is the
+/// bulk-read counterpart of packedWeightBits and keeps resident-layout address
+/// arithmetic out of reference-matmul inner loops.
+pub fn packedTernaryWeightCodes(weights: []const u8, rows: usize, k: usize, row: usize, q1: usize, sub: usize) LayoutError!u64 {
+    const q1_blocks = try blocksPerRow(k);
+    if (row >= rows or q1 >= q1_blocks or sub >= q8_subblocks) return error.InvalidLength;
+    if (weights.len != try packedTernaryWeightBytes(rows, k)) return error.InvalidLength;
+    const rb = row / rows_per_block;
+    const lane = row % rows_per_block;
+    const port = lane / rows_per_port;
+    const port_lane = lane % rows_per_port;
+    const base = ternaryWeightBlockOffset(rows, k, port, rb, q1);
+    const low_offset = base + (1 + sub * 2) * weight_port_beat_bytes + port_lane * 4;
+    const high_offset = low_offset + weight_port_beat_bytes;
+    const low = std.mem.readInt(u32, weights[low_offset..][0..4], .little);
+    const high = std.mem.readInt(u32, weights[high_offset..][0..4], .little);
+    const codes = @as(u64, low) | (@as(u64, high) << 32);
+    if ((codes & (codes >> 1) & 0x5555_5555_5555_5555) != 0) return error.ReservedTernaryCode;
+    return codes;
 }
 
 pub fn packWeightsFromLogical(
@@ -323,6 +451,76 @@ test "pack ggml q1_0 bytes matches logical packer" {
     try packWeightsFromLogical(rows, k, &bits, &scales, &from_logical);
     try packWeightsFromGgmlQ1_0(rows, k, &raw, &from_raw);
     try std.testing.expectEqualSlices(u8, &from_logical, &from_raw);
+}
+
+test "pack upstream q2_0 pairs into issue-ordered two-bit blocks" {
+    const rows = rows_per_block + 1;
+    const k = q1_block * 2;
+    const source_blocks = k / q2_source_block;
+    const raw_len = rows * source_blocks * q2_source_block_bytes;
+    const packed_len = comptime packedTernaryWeightBytes(rows, k) catch unreachable;
+    var raw: [raw_len]u8 = [_]u8{0} ** raw_len;
+
+    for (0..rows) |row| {
+        for (0..source_blocks) |block| {
+            const off = (row * source_blocks + block) * q2_source_block_bytes;
+            const scale: f16 = @floatCast(@as(f32, @floatFromInt(row + block / 2 + 1)) * 0.125);
+            std.mem.writeInt(u16, raw[off..][0..2], @bitCast(scale), .little);
+            for (0..q2_source_block) |i| {
+                const code: u8 = @intCast((row * 7 + block * 11 + i) % 3);
+                raw[off + 2 + i / 4] |= code << @intCast((i % 4) * 2);
+            }
+        }
+    }
+
+    var resident: [packed_len]u8 = undefined;
+    try packWeightsFromGgmlQ2_0(rows, k, &raw, &resident);
+    for (0..rows) |row| {
+        for (0..k / q1_block) |q1| {
+            for (0..2) |half| {
+                const raw_scale = std.mem.readInt(u16, raw[(row * source_blocks + q1 * 2 + half) * q2_source_block_bytes ..][0..2], .little);
+                try std.testing.expectEqual(@as(f16, @bitCast(raw_scale)), try packedTernaryWeightScale(&resident, rows, k, row, q1, half));
+            }
+            for (0..q1_block) |i| {
+                const source_block = q1 * 2 + i / q2_source_block;
+                const local = i % q2_source_block;
+                const off = (row * source_blocks + source_block) * q2_source_block_bytes;
+                const code = (raw[off + 2 + local / 4] >> @intCast((local % 4) * 2)) & 3;
+                const expected: i2 = @intCast(@as(i8, @intCast(code)) - 1);
+                try std.testing.expectEqual(expected, try packedTernaryWeight(&resident, rows, k, row, q1, i));
+            }
+            for (0..q8_subblocks) |sub| {
+                const codes = try packedTernaryWeightCodes(&resident, rows, k, row, q1, sub);
+                for (0..q8_block) |i| {
+                    const source_index = sub * q8_block + i;
+                    const source_block = q1 * 2 + source_index / q2_source_block;
+                    const local = source_index % q2_source_block;
+                    const off = (row * source_blocks + source_block) * q2_source_block_bytes;
+                    const expected = (raw[off + 2 + local / 4] >> @intCast((local % 4) * 2)) & 3;
+                    try std.testing.expectEqual(expected, @as(u8, @truncate(codes >> @intCast(i * 2))) & 3);
+                }
+            }
+        }
+    }
+}
+
+test "q2_0 repack rejects reserved codes and preserves unequal scale pairs" {
+    const rows = 1;
+    const k = q1_block;
+    const raw_len = 2 * q2_source_block_bytes;
+    const packed_len = comptime packedTernaryWeightBytes(rows, k) catch unreachable;
+    var raw: [raw_len]u8 = [_]u8{0x55} ** raw_len; // code 1 (zero)
+    var resident: [packed_len]u8 = undefined;
+
+    std.mem.writeInt(u16, raw[0..2], @bitCast(@as(f16, 0.5)), .little);
+    std.mem.writeInt(u16, raw[q2_source_block_bytes..][0..2], @bitCast(@as(f16, 0.25)), .little);
+    raw[2] = (raw[2] & 0xfc) | 3;
+    try std.testing.expectError(error.ReservedTernaryCode, packWeightsFromGgmlQ2_0(rows, k, &raw, &resident));
+
+    raw[2] = (raw[2] & 0xfc) | 1;
+    try packWeightsFromGgmlQ2_0(rows, k, &raw, &resident);
+    try std.testing.expectEqual(@as(f16, 0.5), try packedTernaryWeightScale(&resident, rows, k, 0, 0, 0));
+    try std.testing.expectEqual(@as(f16, 0.25), try packedTernaryWeightScale(&resident, rows, k, 0, 0, 1));
 }
 
 test "wide-K pack round-trips through the accessors" {

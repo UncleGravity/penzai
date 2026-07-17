@@ -58,8 +58,10 @@ If it doesn't fit or close at `f200`:
   units; bring the utilization report back and we'll pick.
 
 ## Validate on silicon
-1. **Correctness:** `PENZAI_PL_OPS=all PENZAI_PL_VERIFY=1 nix run .#serve-penzaid`, then a
-   run — expect **no** `pl verify` mismatch lines for either op.
+1. **Runtime correctness test:** `PENZAI_PL_OPS=all PENZAI_PL_VERIFY=1 nix run .#serve-penzaid`,
+   then a run. Expect no matmul mismatch or flash approximation-outlier lines. Flash
+   uses a 2% normalized comparison against the higher-precision PS implementation;
+   the bit-faithful structural gate is `zig build test-rtl-flash-kernel`.
 2. **Perf:** `--prof` over `tcp:` — now **both** `matmul_q1a8` and `flash_attn_f32` show PL
    numbers (`MAC/cyc`, real `flash_ms_tok ~13`), the scoreboard `variant` shows a real
    clock (not `f0`), and decode should land ~132 ms/tok. This is the first run where the

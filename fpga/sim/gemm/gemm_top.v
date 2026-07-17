@@ -50,6 +50,7 @@ module gemm_top #(
         .clk(clk), .rst_n(rst_n), .clear(clear), .valid_in(valid_in),
         .col_idx(col_idx), .emin(emin),
         .weight_bits_flat(weight_bits_flat),
+        .weight_nonzero_flat({ROWS*32{1'b1}}),
         .weight_scales_flat(weight_scales_flat),
         .acts_packed(acts_packed),
         .act_scale(act_scale),

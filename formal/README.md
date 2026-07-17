@@ -64,3 +64,26 @@ register directly for BRAM addressing. Rewriting it while busy redirected later
 descriptor fetches into a different resident command segment. `seq_top` now
 snapshots the start index with the accepted `go`; both the formal invariant and
 an end-to-end Verilator regression preserve that behavior.
+
+## `gemm_kernel`
+
+`formal/rtl/gemm_kernel_formal.sv` drives arbitrary configuration changes and
+AXIS backpressure around a reduced GEMM instance. ABC PDR proves that an
+accepted run uses snapshotted dimensions, format, and exponent floor; internal
+indices remain in range; output data is stable while stalled; and terminal
+`TLAST` accounting agrees with the accepted shape. BMC provides bounded
+diagnostics, while cover reaches binary and ternary control paths.
+
+The first trace found that writable dimensions remained live after start.
+`gemm_kernel` now snapshots the complete run configuration.
+
+## `gemm_ternary_select32`
+
+`formal/rtl/gemm_ternary_select_formal.sv` exhaustively proves the combinational
+two-bit selector for all 32 lanes. Codes `0`, `1`, and `2` map to minus, zero,
+and plus controls respectively; reserved code `3` has `nonzero=0` and is
+therefore safely disabled. Cover points pin uniform words for all four codes.
+
+The software packer independently rejects source code `3`; the leaf proof
+establishes that every accepted upstream code maps to the same selector values
+as the software oracle.

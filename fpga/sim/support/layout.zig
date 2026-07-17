@@ -11,6 +11,10 @@ pub const Q1_BLOCK: usize = shared.q1_block; // weights per Q1 block (per row)
 pub const Q8_BLOCK: usize = shared.q8_block; // activations per Q8 sub-block
 pub const Q8_SUBBLOCKS: usize = shared.q8_subblocks; // = 4
 pub const BEAT_BYTES: usize = shared.beat_bytes; // 64-bit AXIS data width
+pub const q2_source_block: usize = shared.q2_source_block;
+pub const ternary_block_bytes: usize = shared.ternary_block_bytes;
+pub const ternary_packed_per_port_block: usize = shared.ternary_packed_per_port_block;
+pub const ternary_beats_per_port_block: usize = shared.ternary_beats_per_port_block;
 
 // AXIS weight stream beats, per Q1 block per rowblock.
 pub const SCALE_BEATS: usize = (ROWS + 3) / 4; // 4 fp16 scales per beat

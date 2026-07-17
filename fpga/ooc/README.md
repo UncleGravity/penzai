@@ -1,7 +1,7 @@
 # fpga/ooc — out-of-context synthesis probe (the fast timing/area loop)
 
-**What it is:** `synth_design -mode out_of_context` on **one module** on the Vivado VM
-(~1–2 min), giving **real DSP / LUT / CARRY8 / FF counts and a synth-level Fmax** — the
+**What it is:** `synth_design -mode out_of_context` on **one module** on the Vivado VM,
+giving **real DSP / LUT / CARRY8 / FF counts and a synth-level Fmax** — the
 middle rung between Verilator cosim (correctness, seconds, no Vivado) and the full ~30-min
 bitstream build (routed timing + congestion). Use it to answer "did this map onto DSP/CARRY8?
 how fast is this path in isolation?" without paying for place-and-route.
@@ -13,6 +13,10 @@ how fast is this path in isolation?" without paying for place-and-route.
 > isolation but the **combined f250 build failed at −0.370ns**. So: OOC is a *resource + isolated-Fmax*
 > probe. For a go/no-go on a clock, you still need the routed combined build and must **read its
 > worst path** (`…_timing_summary_routed.rpt`, grep `Slack`).
+
+Small leaves usually finish in 1–2 minutes. The full GEMM kernel takes a few
+minutes because Vivado also optimizes the wide accumulator bank and complete
+dual-format control path.
 
 ---
 
@@ -46,18 +50,19 @@ re-sync only the files you changed.
 ```bash
 cd fpga/ooc
 source ../bitstream/config.env
-scp ../rtl/gemm.v ../rtl/numeric/fma.v ../rtl/gemm_kernel.v gemm_rb_ooc.v gemm_emit_ooc.v "$VM:penzai-ooc/"
+scp ../rtl/gemm.v ../rtl/numeric/fma.v ../rtl/gemm_ternary_select.v ../rtl/gemm_kernel.v gemm_rb_ooc.v gemm_emit_ooc.v "$VM:penzai-ooc/"
 
 # the throughput accumulate path (the f250/f300 matmul limiter to watch)
 ssh "$VM" "cd penzai-ooc && ooc.bat gemm_rb_ooc     3.333 gemmrb   gemm.v fma.v gemm_rb_ooc.v"
 # the per-output fixed→fp32 emit (LZD + barrel shift)
 ssh "$VM" "cd penzai-ooc && ooc.bat gemm_emit_ooc   3.333 gemmemit gemm.v gemm_emit_ooc.v"
 # the full kernel (FSM + banked rowblock + pipelined emit + result buffer)
-ssh "$VM" "cd penzai-ooc && ooc.bat gemm_kernel_ooc 3.333 gemmk    gemm.v fma.v gemm_kernel.v gemm_kernel_ooc.v"
+ssh "$VM" "cd penzai-ooc && ooc.bat gemm_kernel_ooc 3.333 gemmk    gemm.v fma.v gemm_ternary_select.v gemm_kernel.v gemm_kernel_ooc.v"
 ```
 
-Reference numbers (xck26 @ 3.333ns, current carry-save matmul): `gemm_rb_ooc` 398.9 / `gemm_emit_ooc`
-386.8 / `gemm_kernel_ooc` 375.8 MHz — all clear f300 in isolation (but see the caveat).
+Reference numbers (xck26 @ 3.333ns, current carry-save matmul): `gemm_rb_ooc` 398.9 MHz,
+`gemm_emit_ooc` 386.8 MHz, and the issue-ordered dual-format `gemm_kernel_ooc` 368.5 MHz
+(`+0.619 ns`, 38,439 LUTs, 42,796 FFs, 32 DSPs). All clear f300 in isolation, but see the caveat.
 
 ## Writing a new probe
 

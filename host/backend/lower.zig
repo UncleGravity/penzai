@@ -155,7 +155,7 @@ fn supportsMatmulQ1A8(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_MUL_MAT or op.*.type != c.GGML_TYPE_F32) return false;
     const weights: *const c.ggml_tensor = op.*.src[0] orelse return false;
     const acts: *const c.ggml_tensor = op.*.src[1] orelse return false;
-    if (weights.*.type != c.GGML_TYPE_Q1_0 or acts.*.type != c.GGML_TYPE_F32) return false;
+    if ((weights.*.type != c.GGML_TYPE_Q1_0 and weights.*.type != c.GGML_TYPE_Q2_0) or acts.*.type != c.GGML_TYPE_F32) return false;
     if (!c.ggml_is_contiguous(weights) or !c.ggml_is_contiguous(acts) or !c.ggml_is_contiguous(op)) return false;
     if (dim(weights, 0) <= 0 or dim(weights, 1) <= 0 or dim(acts, 1) <= 0) return false;
     if (dim(weights, 0) != dim(acts, 0)) return false;
@@ -288,13 +288,14 @@ fn supportsGetRows(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_GET_ROWS) return false;
     const src0: *const c.ggml_tensor = op.*.src[0] orelse return false;
     const src1: *const c.ggml_tensor = op.*.src[1] orelse return false;
-    if ((src0.*.type != c.GGML_TYPE_F32 and src0.*.type != c.GGML_TYPE_Q1_0) or src1.*.type != c.GGML_TYPE_I32 or op.*.type != c.GGML_TYPE_F32) return false;
+    if ((src0.*.type != c.GGML_TYPE_F32 and src0.*.type != c.GGML_TYPE_Q1_0 and src0.*.type != c.GGML_TYPE_Q2_0) or src1.*.type != c.GGML_TYPE_I32 or op.*.type != c.GGML_TYPE_F32) return false;
     if (dim(src0, 0) <= 0 or dim(src0, 1) <= 0 or dim(src0, 2) <= 0 or dim(src0, 3) <= 0) return false;
     if (dim(src1, 0) <= 0 or dim(src1, 1) <= 0 or dim(src1, 2) <= 0 or dim(src1, 3) != 1) return false;
     if (src0.*.type == c.GGML_TYPE_F32 and src0.*.nb[0] != @sizeOf(f32)) return false;
     if (src0.*.type == c.GGML_TYPE_Q1_0 and (src0.*.nb[0] != layout.q1_block_bytes or @mod(@as(usize, @intCast(dim(src0, 0))), layout.q1_block) != 0)) return false;
+    if (src0.*.type == c.GGML_TYPE_Q2_0 and (src0.*.nb[0] != layout.q2_source_block_bytes or @mod(@as(usize, @intCast(dim(src0, 0))), layout.q1_block) != 0)) return false;
     if (src1.*.nb[0] != @sizeOf(i32) or op.*.nb[0] != @sizeOf(f32)) return false;
-    if (src0.*.type == c.GGML_TYPE_Q1_0 and (dim(src0, 2) != 1 or dim(src0, 3) != 1)) return false;
+    if ((src0.*.type == c.GGML_TYPE_Q1_0 or src0.*.type == c.GGML_TYPE_Q2_0) and (dim(src0, 2) != 1 or dim(src0, 3) != 1)) return false;
     if (dim(src0, 2) != dim(src1, 1) or dim(src0, 3) != dim(src1, 2)) return false;
     if (dim(op, 0) != dim(src0, 0) or dim(op, 1) != dim(src1, 0) or dim(op, 2) != dim(src1, 1) or dim(op, 3) != dim(src1, 2)) return false;
     return true;
@@ -361,7 +362,11 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
     const acts_binding = lookup.find(acts) orelse return error.MissingBinding;
     const dst_binding = lookup.find(node) orelse return error.MissingBinding;
 
-    const weights_bytes = layout.packedWeightBytes(rows, k) catch return error.InvalidShape;
+    const weight_fmt: wire.WeightFormat = if (weights.*.type == c.GGML_TYPE_Q2_0) .w158a8 else .w1a8;
+    const weights_bytes = switch (weight_fmt) {
+        .w1a8 => layout.packedWeightBytes(rows, k),
+        .w158a8 => layout.packedTernaryWeightBytes(rows, k),
+    } catch return error.InvalidShape;
     const acts_bytes = layout.actsF32Bytes(cols, k) catch return error.InvalidShape;
     const dst_bytes = layout.outputF32Bytes(rows, cols) catch return error.InvalidShape;
 
@@ -372,6 +377,7 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
         .rows = rows,
         .cols = cols,
         .k = k,
+        .weight_fmt = weight_fmt,
     } };
 }
 
@@ -585,7 +591,12 @@ fn lowerGetRows(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Comm
     const ne10 = try u32Dim(dim(src1, 0));
     const ne11 = try u32Dim(dim(src1, 1));
     const ne12 = try u32Dim(dim(src1, 2));
-    const src_type: wire.GetRowsSrcType = if (src0.*.type == c.GGML_TYPE_Q1_0) .q1_0 else .f32;
+    const src_type: wire.GetRowsSrcType = if (src0.*.type == c.GGML_TYPE_Q1_0)
+        .q1_0
+    else if (src0.*.type == c.GGML_TYPE_Q2_0)
+        .q2_0
+    else
+        .f32;
 
     const src_span = switch (src_type) {
         .f32 => try stridedSpan(
@@ -598,6 +609,7 @@ fn lowerGetRows(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Comm
             src0.*.nb[3],
         ),
         .q1_0 => layout.packedWeightBytes(src_rows, row_width) catch return error.InvalidShape,
+        .q2_0 => layout.packedTernaryWeightBytes(src_rows, row_width) catch return error.InvalidShape,
     };
     const indices_span = try stridedSpan(
         try checkedMul(@as(usize, @intCast(ne10)), @sizeOf(i32)),

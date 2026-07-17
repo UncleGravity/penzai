@@ -6,7 +6,10 @@
     flake-parts.url = "github:hercules-ci/flake-parts";
     zig-flake.url = "github:mitchellh/zig-overlay";
     llama-cpp-src = {
-      url = "github:ggml-org/llama.cpp/a95a11e5b834057e684712963f90bbb730f4745c";
+      # First upstream CPU release of Q2_0 (GGUF type 42, group 64).
+      # url = "github:ggml-org/llama.cpp/bec4772f6a2527d371557b5d2032641e5ff7619c";
+      # Latest upstream CPU release of Q2_0 (GGUF type 42, group 64).
+      url = "github:ggml-org/llama.cpp/e8f19cc0ad70a243c8012bf17b4be601abfc8ea2";
       flake = false;
     };
 

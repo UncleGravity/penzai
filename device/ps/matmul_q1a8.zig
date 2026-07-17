@@ -74,6 +74,65 @@ pub fn runQ1A8(
     }
 }
 
+pub fn runW158A8(
+    allocator: std.mem.Allocator,
+    packed_weights: []const u8,
+    acts_f32: []const u8,
+    dst_f32: []u8,
+    rows: u32,
+    cols: u32,
+    k: u32,
+) MatmulError!void {
+    const rows_usize: usize = @intCast(rows);
+    const cols_usize: usize = @intCast(cols);
+    const k_usize: usize = @intCast(k);
+    if (rows_usize == 0 or cols_usize == 0) return error.InvalidShape;
+    const q1_blocks = layout.blocksPerRow(k_usize) catch return error.InvalidShape;
+    if (packed_weights.len != (layout.packedTernaryWeightBytes(rows_usize, k_usize) catch return error.InvalidShape)) return error.InvalidLength;
+    if (acts_f32.len != (layout.actsF32Bytes(cols_usize, k_usize) catch return error.InvalidShape)) return error.InvalidLength;
+    if (dst_f32.len != (layout.outputF32Bytes(rows_usize, cols_usize) catch return error.InvalidShape)) return error.InvalidLength;
+
+    const q8_blocks = q1_blocks * layout.q8_subblocks;
+    const column = try allocator.alloc(f32, k_usize);
+    defer allocator.free(column);
+    const quants = try allocator.alloc(i8, k_usize);
+    defer allocator.free(quants);
+    const act_scales = try allocator.alloc(f32, q8_blocks);
+    defer allocator.free(act_scales);
+
+    for (0..cols_usize) |col| {
+        for (0..k_usize) |i| column[i] = readF32(acts_f32, (col * k_usize + i) * @sizeOf(f32));
+        layout.quantizeQ8_0F32Scales(column, quants, act_scales) catch return error.InvalidShape;
+
+        for (0..rows_usize) |row| {
+            var acc: f32 = 0;
+            for (0..q1_blocks) |q1| {
+                for (0..layout.q8_subblocks) |sub| {
+                    const wscale: f32 = @floatCast(layout.packedTernaryWeightScale(packed_weights, rows_usize, k_usize, row, q1, sub / 2) catch return error.InvalidShape);
+                    if (wscale == 0) continue;
+                    const ascale = act_scales[q1 * layout.q8_subblocks + sub];
+                    if (ascale == 0) continue;
+                    const base = q1 * layout.q1_block + sub * layout.q8_block;
+                    const codes = layout.packedTernaryWeightCodes(packed_weights, rows_usize, k_usize, row, q1, sub) catch return error.InvalidShape;
+                    var sum: i32 = 0;
+                    for (0..layout.q8_block) |i| {
+                        const code: u2 = @truncate(codes >> @intCast(i * 2));
+                        const act: i32 = quants[base + i];
+                        sum += switch (code) {
+                            0 => -act,
+                            1 => 0,
+                            2 => act,
+                            3 => unreachable, // rejected by packedTernaryWeightCodes
+                        };
+                    }
+                    acc = @mulAdd(f32, @as(f32, @floatFromInt(sum)), wscale * ascale, acc);
+                }
+            }
+            writeF32(dst_f32, (col * rows_usize + row) * @sizeOf(f32), acc);
+        }
+    }
+}
+
 fn readF32(bytes: []const u8, offset: usize) f32 {
     return @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little));
 }
@@ -168,4 +227,31 @@ test "rowblock tail and multiple columns match logical reference" {
             try std.testing.expectApproxEqAbs(expected, got, 0.001);
         }
     }
+}
+
+test "ternary resident oracle applies minus zero plus selectors" {
+    const rows = layout.rows_per_block;
+    const k = layout.q1_block;
+    const raw_blocks_per_row = k / layout.q2_source_block;
+    const raw_len = rows * raw_blocks_per_row * layout.q2_source_block_bytes;
+    const packed_len = comptime layout.packedTernaryWeightBytes(rows, k) catch unreachable;
+    var raw: [raw_len]u8 = [_]u8{0} ** raw_len;
+    for (0..rows) |row| {
+        for (0..raw_blocks_per_row) |block| {
+            const off = (row * raw_blocks_per_row + block) * layout.q2_source_block_bytes;
+            std.mem.writeInt(u16, raw[off..][0..2], @bitCast(@as(f16, 1)), .little);
+            for (0..layout.q2_source_block) |i| {
+                const code: u8 = @intCast((block * layout.q2_source_block + i) % 3);
+                raw[off + 2 + i / 4] |= code << @intCast((i % 4) * 2);
+            }
+        }
+    }
+    var weights: [packed_len]u8 = undefined;
+    try layout.packWeightsFromGgmlQ2_0(rows, k, &raw, &weights);
+
+    var acts: [k * @sizeOf(f32)]u8 = undefined;
+    for (0..k) |i| writeF32(&acts, i * @sizeOf(f32), 127);
+    var dst: [rows * @sizeOf(f32)]u8 = undefined;
+    try runW158A8(std.testing.allocator, &weights, &acts, &dst, rows, 1, k);
+    for (0..rows) |row| try std.testing.expectEqual(@as(f32, -127), readF32(&dst, row * @sizeOf(f32)));
 }
