@@ -19,4 +19,4 @@ prep -top seq_reg_master_formal
 
 [files]
 fpga/rtl/seq/seq_reg_master.v
-formal/rtl/seq_reg_master_formal.sv
+fpga/formal/seq_reg_master_formal.sv

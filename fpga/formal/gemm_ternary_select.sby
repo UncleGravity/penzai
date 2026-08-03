@@ -18,4 +18,4 @@ prep -top gemm_ternary_select_formal
 
 [files]
 fpga/rtl/gemm_ternary_select.v
-formal/rtl/gemm_ternary_select_formal.sv
+fpga/formal/gemm_ternary_select_formal.sv

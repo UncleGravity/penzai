@@ -55,9 +55,32 @@
           # bulk of the cmake flags — they differ only in extraCmakeFlags +
           # build/install phases. Factoring the shared flags into one list keeps
           # the variants from silently drifting apart.
+          llama-ui = pkgs.stdenvNoCC.mkDerivation {
+            pname = "penzai-llama-ui";
+            version = "pinned";
+            src = "${llama-cpp-src}/tools/ui";
+
+            nativeBuildInputs = [
+              pkgs.nodejs
+              pkgs.importNpmLock.linkNodeModulesHook
+            ];
+
+            npmDeps = pkgs.importNpmLock.buildNodeModules {
+              npmRoot = "${llama-cpp-src}/tools/ui";
+              inherit (pkgs) nodejs;
+            };
+
+            installPhase = ''
+              runHook preInstall
+              LLAMA_UI_OUT_DIR="$out" npm run build --offline
+              runHook postInstall
+            '';
+          };
+
           mkLlamaCpp =
             { pname
             , patches ? [ ]
+            , withUi ? false
             , extraCmakeFlags
             , buildPhase
             , installPhase
@@ -90,6 +113,11 @@
                 "-DGGML_ACCELERATE=OFF"
                 "-DGGML_BLAS=OFF"
               ] ++ extraCmakeFlags;
+
+              postPatch = pkgs.lib.optionalString withUi ''
+                cp -R "${llama-ui}" tools/ui/dist
+                chmod -R u+w tools/ui/dist
+              '';
             };
 
           llama-cpp = mkLlamaCpp {
@@ -130,6 +158,7 @@
           # .so path samples host-side in llama-cli, not on the backend.
           llama-cpp-dl = mkLlamaCpp {
             pname = "penzai-llama-cpp-dl";
+            withUi = true;
 
             extraCmakeFlags = [
               "-DGGML_BACKEND_DL=ON"

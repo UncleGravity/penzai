@@ -69,7 +69,17 @@ foreach net $ce_nets {
 }
 close $table
 
+set failures {}
+if {[llength $leaf_regs] == 0} { lappend failures "no accumulator enable leaf registers matched" }
+if {[llength $ce_pins] == 0} { lappend failures "no accumulator CE pins matched" }
+if {[llength $ce_nets] == 0} {
+    lappend failures "no accumulator CE nets matched"
+    set min_loads 0
+}
+set status [expr {[llength $failures] ? "FAIL" : "PASS"}]
+
 set summary [open [file join $output_dir accumulator_ce_locality_summary.txt] w]
+puts $summary "status=$status"
 puts $summary "leaf_enable_registers=[llength $leaf_regs]"
 puts $summary "accumulator_registers_with_ce=[llength $ce_pins]"
 puts $summary "accumulator_ce_nets=[llength $ce_nets]"
@@ -79,6 +89,8 @@ puts $summary "accumulator_ce_loads_max=$max_loads"
 puts $summary "max_load_lanes_per_ce_net=$max_load_lanes"
 puts $summary "cross_lane_loads=$cross_lane_loads"
 puts $summary "cross_bank_loads=$cross_bank_loads"
+if {[llength $failures]} { puts $summary "failures=[join $failures {; }]" }
 close $summary
 
 puts "ROUTED_ACC_FANOUT leaf_regs=[llength $leaf_regs] ce_nets=[llength $ce_nets] loads=$min_loads..$max_loads cross_lane=$cross_lane_loads cross_bank=$cross_bank_loads"
+if {[llength $failures]} { error "GEMM accumulator check failed: [join $failures {; }]" }

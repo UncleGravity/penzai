@@ -25,5 +25,5 @@ prep -top seq_top_formal
 fpga/rtl/seq/seq_core.v
 fpga/rtl/seq/seq_reg_master.v
 fpga/rtl/seq/seq_top.v
-formal/rtl/seq_top_properties.vh
-formal/rtl/seq_top_formal.sv
+fpga/formal/seq_top_properties.vh
+fpga/formal/seq_top_formal.sv

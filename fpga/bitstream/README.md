@@ -39,17 +39,39 @@ only matmul would. (The runtime already supports `all`; no daemon code change.)
 Cosim cannot establish whether GEMM and flash fit and close timing together on the XCK26.
 The routed build remains the gate:
 
-- `build.tcl` writes **`out/<bit>_utilization_synth.rpt`** right after synthesis (before
-  the long impl) — **check DSP / LUT / BRAM there first.** If synthesis over-maps, that
-  report says what's over before you wait for place-and-route.
-- It then runs impl and **refuses to write a bitstream unless timing closes** (WNS ≥ 0),
-  before producing an invalid artifact.
+- `build.tcl` writes `utilization_synth.rpt` immediately after synthesis, before the
+  long implementation phase.
+- It refuses to write a bitstream unless setup and hold timing close, the design is
+  fully routed, and `check_timing` finds no clockless or unconstrained internal endpoints.
+- It records methodology findings, utilization, near-critical path counts, phase times,
+  source identity, and build configuration in the run bundle.
 
 Builds use all eight Vivado worker threads and a persistent VM-side `cache/` for generated
 AMD IP. Every timing-clean build refreshes a routed checkpoint for its variant.
 `--incremental` uses that checkpoint to accelerate localized RTL changes; a missing
 checkpoint falls back to clean implementation. Use the default clean mode for signoff.
-Per-phase elapsed times are fetched as `out/<bit>_build_times.rpt`.
+
+Each invocation writes an immutable ignored bundle under `out/runs/<run-id>/`:
+
+```text
+summary.txt             concise whole-run pass/fail result
+vivado_summary.txt      routed gates and key metrics
+manifest.tsv            Git/source/Vivado/part/directive identity
+source_files.tsv        ordered path and SHA-256 input manifest
+metrics.tsv             timing, constraints, utilization, and phase durations
+*_routed.rpt            detailed reports for diagnosis
+<bit>.bit(.bin)         artifacts produced by this exact run
+driver_status.tsv       host-side Vivado/bootgen exit status
+```
+
+On success, only the `.bit` and `.bit.bin` are promoted to the stable paths directly
+under `out/`, preserving the existing deploy interface. `out/latest` points to the full
+bundle. Failed and partial runs remain inspectable but cannot replace a deployable image.
+
+Use `../tools/analyze.sh summary` to reapply the production metrics and gates to the
+retained routed checkpoint, or `../tools/analyze.sh deep` for detailed congestion, path,
+fanout, QoR, and clock reports. These tools inspect a checkpoint; they do not replace a
+clean routed build for release signoff.
 
 If it doesn't fit or close at `f200`:
 - **Timing** — drop `f` (e.g. `w512-p4-f250`) if a future change causes the combined

@@ -83,7 +83,7 @@ fn addFormalSteps(b: *std.Build) void {
         "-f",
         "--prefix",
         ".zig-cache/sby/seq_reg_master",
-        "formal/rtl/seq_reg_master.sby",
+        "fpga/formal/seq_reg_master.sby",
     });
     const seq_reg_master_step = b.step(
         "formal-seq-reg-master",
@@ -96,7 +96,7 @@ fn addFormalSteps(b: *std.Build) void {
         "-f",
         "--prefix",
         ".zig-cache/sby/seq_core",
-        "formal/rtl/seq_core.sby",
+        "fpga/formal/seq_core.sby",
     });
     const seq_core_step = b.step(
         "formal-seq-core",
@@ -109,7 +109,7 @@ fn addFormalSteps(b: *std.Build) void {
         "-f",
         "--prefix",
         ".zig-cache/sby/seq_top",
-        "formal/rtl/seq_top.sby",
+        "fpga/formal/seq_top.sby",
     });
     const seq_top_step = b.step(
         "formal-seq-top",
@@ -122,7 +122,7 @@ fn addFormalSteps(b: *std.Build) void {
         "-f",
         "--prefix",
         ".zig-cache/sby/gemm_kernel",
-        "formal/rtl/gemm_kernel.sby",
+        "fpga/formal/gemm_kernel.sby",
     });
     const gemm_kernel_step = b.step(
         "formal-gemm-kernel",
@@ -135,7 +135,7 @@ fn addFormalSteps(b: *std.Build) void {
         "-f",
         "--prefix",
         ".zig-cache/sby/gemm_ternary_selector",
-        "formal/rtl/gemm_ternary_select.sby",
+        "fpga/formal/gemm_ternary_select.sby",
     });
     const gemm_ternary_selector_step = b.step(
         "formal-gemm-ternary-selector",

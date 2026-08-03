@@ -23,4 +23,4 @@ prep -top seq_core_formal
 
 [files]
 fpga/rtl/seq/seq_core.v
-formal/rtl/seq_core_formal.sv
+fpga/formal/seq_core_formal.sv

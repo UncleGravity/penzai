@@ -24,7 +24,7 @@ end a run early.
 
 **Regression coverage:**
 
-- `formal/rtl/seq_core_formal.sv` permits arbitrary changes to `desc_count`
+- `fpga/formal/seq_core_formal.sv` permits arbitrary changes to `desc_count`
   while busy and proves descriptor bounds against the accepted count.
 - Scenario 6 in `fpga/sim/seq_core/tb.zig` changes the count from two to one
   during execution and verifies that both original writes still occur.
@@ -50,7 +50,7 @@ without changing the active run.
 
 **Regression coverage:**
 
-- `formal/rtl/seq_top_properties.vh` proves that every descriptor request uses
+- `fpga/formal/seq_top_properties.vh` proves that every descriptor request uses
   the start index captured for the active run.
 - The `seq_top` cover task demonstrates that rewriting `RUN_START` while busy
   is reachable through the control AXI-Lite interface.
@@ -86,7 +86,7 @@ new value rather than the accepted run.
 accepted start. Loop termination, addressing, output sizing, and arithmetic
 use those snapshots until completion.
 
-**Regression coverage:** `formal/rtl/gemm_kernel_formal.sv` permits arbitrary
+**Regression coverage:** `fpga/formal/gemm_kernel_formal.sv` permits arbitrary
 live input mutation and proves the captured configuration, address bounds,
 beat bounds, output backpressure stability, and final `TLAST` accounting.
 

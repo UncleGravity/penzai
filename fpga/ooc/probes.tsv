@@ -1,0 +1,6 @@
+name	top	period_ns	sources
+gemm-rb	gemm_rb_ooc	3.333	../rtl/gemm.v ../rtl/numeric/fma.v gemm_rb_ooc.v
+gemm-emit	gemm_emit_ooc	3.333	../rtl/gemm.v gemm_emit_ooc.v
+gemm-kernel	gemm_kernel_ooc	3.333	../rtl/gemm.v ../rtl/numeric/fma.v ../rtl/gemm_ternary_select.v ../rtl/gemm_kernel.v gemm_kernel_ooc.v
+reduce	reduce_ooc	3.333	../rtl/numeric/fadd.v ../rtl/numeric/reduce.v reduce_ooc.v
+axpy	axpy_ooc	3.333	../rtl/numeric/fmt.vh ../rtl/numeric/cvt.v ../rtl/numeric/fmul.v ../rtl/numeric/fadd.v ../rtl/flash_attn/fp_axpy8.v axpy_ooc.v

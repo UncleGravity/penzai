@@ -22,8 +22,8 @@ read -formal -DFORMAL gemm_datapath_stubs.v gemm_ternary_select.v gemm_kernel.v 
 prep -top gemm_kernel_formal
 
 [files]
-formal/rtl/gemm_datapath_stubs.v
+fpga/formal/gemm_datapath_stubs.v
 fpga/rtl/gemm_ternary_select.v
 fpga/rtl/gemm_kernel.v
-formal/rtl/gemm_kernel_properties.vh
-formal/rtl/gemm_kernel_formal.sv
+fpga/formal/gemm_kernel_properties.vh
+fpga/formal/gemm_kernel_formal.sv

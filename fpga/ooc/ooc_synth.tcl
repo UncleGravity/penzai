@@ -9,7 +9,12 @@
 # (the accumulate recurrence / barrel shift / DSP path) -- fair across tops with
 # different port shapes and not polluted by unconstrained I/O.
 
+set_param general.maxThreads 8
 set part xck26-sfvc784-2LV-c
+
+if {$argc < 4} {
+    error "usage: ooc_synth.tcl <top> <period_ns> <out_prefix> <rtl...>"
+}
 
 set top     [lindex $argv 0]
 set period  [lindex $argv 1]
@@ -19,7 +24,9 @@ set rtls    [lrange $argv 3 end]
 puts "==> OOC synth: top=$top period=${period}ns part=$part"
 puts "==> rtl: $rtls"
 
-foreach f $rtls { read_verilog $f }
+foreach f $rtls {
+    if {[file extension $f] ne ".vh"} { read_verilog $f }
+}
 
 synth_design -mode out_of_context -part $part -top $top
 
@@ -41,7 +48,7 @@ proc utilization_used {report label} {
     }
     return $used
 }
-set luts   [utilization_used $util_report {CLB LUTs\*}]
+set luts   [utilization_used $util_report {CLB LUTs\*?}]
 set carry8 [utilization_used $util_report {CARRY8}]
 set dsps   [utilization_used $util_report {DSPs}]
 set ffs    [utilization_used $util_report {Register as Flip Flop}]
@@ -58,3 +65,22 @@ if {[llength $paths] > 0} {
 }
 
 puts "RESULT top=$top dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs wns_ns=$wns fmax_mhz=$fmax (period=${period}ns)"
+
+set metrics [open ${outpfx}_metrics.tsv w]
+puts $metrics "key\tvalue"
+foreach {key value} [list \
+        top $top period_ns $period part $part vivado_version [version -short] \
+        dsp $dsps lut $luts carry8 $carry8 ff $ffs wns_ns $wns fmax_mhz $fmax] {
+    puts $metrics "$key\t$value"
+}
+close $metrics
+
+set summary [open ${outpfx}_summary.txt w]
+set status [expr {$wns ne "n/a" && $wns >= 0.0 ? "PASS" : "FAIL"}]
+puts $summary "OOC $status top=$top period_ns=$period wns_ns=$wns fmax_mhz=$fmax"
+puts $summary "dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs"
+close $summary
+
+if {$status ne "PASS"} {
+    error "OOC timing gate failed: top=$top period=${period}ns wns=${wns}ns"
+}

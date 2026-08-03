@@ -27,6 +27,10 @@ puts "==> Vivado general.maxThreads=[get_param general.maxThreads]"
 
 set variant    [expr {$argc >= 1 ? [lindex $argv 0] : "w512-p4-f300"}]
 set build_mode [expr {$argc >= 2 ? [lindex $argv 1] : "clean"}]
+set run_id     [expr {$argc >= 3 ? [lindex $argv 2] : "manual-$variant"}]
+set git_commit [expr {$argc >= 4 ? [lindex $argv 3] : "unknown"}]
+set git_dirty  [expr {$argc >= 5 ? [lindex $argv 4] : "unknown"}]
+set source_hash [expr {$argc >= 6 ? [lindex $argv 5] : "unknown"}]
 
 # variant = w512-p4-f<MHz>. fclk drives both kernels, all control, and all data movement.
 if {![regexp {^w512-p4-f([0-9]+)$} $variant -> fclk_mhz]} {
@@ -35,6 +39,9 @@ if {![regexp {^w512-p4-f([0-9]+)$} $variant -> fclk_mhz]} {
 if {$build_mode ni {clean incremental}} {
     error "unknown build mode '$build_mode'; expected clean or incremental"
 }
+if {![regexp {^[A-Za-z0-9._-]+$} $run_id]} {
+    error "invalid run ID '$run_id'"
+}
 
 set bit_prefix penzai-combined-v1
 set bit_name   "$bit_prefix-$variant"
@@ -42,7 +49,8 @@ set proj       "combined_[string map {- _} $variant]"
 set bd         design_1
 set part       xck26-sfvc784-2LV-c
 set board      xilinx.com:kr260_som:part0:1.1
-set outdir     [file normalize ./out]
+set run_root   [file normalize ./out/runs]
+set outdir     [file join $run_root $run_id]
 set cache_root [file normalize ./cache]
 set ip_cache   [file join $cache_root ip]
 set checkpoint_dir [file join $cache_root checkpoints]
@@ -52,13 +60,32 @@ set ps_fclk_mhz 99.999001
 file delete -force $outdir [file normalize ./$proj]
 file mkdir $outdir $ip_cache $checkpoint_dir
 
+source [file normalize ./metrics.tcl]
+::penzai_analysis::init $outdir [dict create \
+    run_id $run_id \
+    variant $variant \
+    build_mode $build_mode \
+    requested_fclk_mhz $fclk_mhz \
+    git_commit $git_commit \
+    git_dirty $git_dirty \
+    source_sha256 $source_hash \
+    vivado_version [version -short] \
+    part $part \
+    board $board \
+    max_threads [get_param general.maxThreads] \
+    place_directive AltSpreadLogic_high \
+    route_directive Explore]
+
 set build_started [clock milliseconds]
 set phase_times {}
 proc record_phase {name started_ms} {
-    global phase_times outdir bit_name build_started
+    global phase_times outdir build_started
     set elapsed_s [expr {([clock milliseconds] - $started_ms) / 1000.0}]
     lappend phase_times [list $name $elapsed_s]
-    set report [file join $outdir ${bit_name}_build_times.rpt]
+    ::penzai_analysis::metric_set build_seconds.$name [format "%.1f" $elapsed_s]
+    ::penzai_analysis::metric_set build_seconds.total_so_far \
+        [format "%.1f" [expr {([clock milliseconds] - $build_started) / 1000.0}]]
+    set report [file join $outdir build_times.rpt]
     set fh [open $report w]
     puts $fh "phase seconds"
     foreach phase $phase_times {
@@ -101,6 +128,7 @@ create_project $proj [file normalize ./$proj] -part $part -force
 config_ip_cache -use_cache_location $ip_cache
 puts "==> persistent IP cache: $ip_cache"
 puts "==> build mode: $build_mode"
+puts "==> run ID: $run_id"
 if {[catch {set_property board_part $board [current_project]} err]} {
     puts "WARNING: could not set board_part '$board': $err"
 }
@@ -423,11 +451,12 @@ wait_on_run synth_1
 if {[get_property PROGRESS [get_runs synth_1]] != "100%"} { error "synthesis failed" }
 record_phase synthesis $phase_started
 
-# Post-synth resource utilization (the combined-fit question) — logged before the long
-# impl so an over-map is visible early. Best-effort: never let it abort the build.
+# Post-synth resource utilization is both a human report and machine-readable run metric.
 if {![catch {open_run synth_1 -name synth_1} err]} {
-    catch {report_utilization -file $outdir/${bit_name}_utilization_synth.rpt}
-    puts "==> wrote $outdir/${bit_name}_utilization_synth.rpt (check DSP/LUT/BRAM fit)"
+    set synth_util [report_utilization -return_string]
+    ::penzai_analysis::write_text [file join $outdir utilization_synth.rpt] $synth_util
+    ::penzai_analysis::collect_utilization synth $synth_util
+    puts "==> wrote $outdir/utilization_synth.rpt (check DSP/LUT/BRAM fit)"
     catch {close_design}
 } else {
     puts "WARNING: could not open synth_1 for utilization report: $err"
@@ -451,6 +480,8 @@ if {$build_mode eq "incremental"} {
         puts "WARNING: no reference checkpoint at $reference_dcp; running a clean implementation"
     }
 }
+::penzai_analysis::manifest_set incremental_active $incremental_active
+::penzai_analysis::manifest_set reference_checkpoint $reference_dcp
 
 set phase_started [clock milliseconds]
 launch_runs impl_1 -to_step route_design -jobs 4
@@ -477,21 +508,14 @@ if {[llength $routed_failing] == 0} {
 }
 if {$incremental_active} {
     if {[catch {
-        report_incremental_reuse -file $outdir/${bit_name}_incremental_reuse.rpt
+        report_incremental_reuse -file $outdir/incremental_reuse.rpt
     } reuse_err]} {
         puts "WARNING: incremental reuse report failed: $reuse_err"
     }
 }
 set phase_started [clock milliseconds]
-catch {report_utilization -file $outdir/${bit_name}_utilization_routed.rpt}
-report_timing_summary -max_paths 10 -routable_nets -report_unconstrained \
-    -file $outdir/${bit_name}_timing_summary_routed.rpt
+::penzai_analysis::collect_routed 1
 record_phase routed_reports $phase_started
-set failing_paths [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 0]
-if {[llength $failing_paths] > 0} {
-    set wns [get_property SLACK [lindex $failing_paths 0]]
-    error "timing failed after impl; WNS=${wns}ns. Refusing to write an invalid bitstream."
-}
 
 set phase_started [clock milliseconds]
 write_bitstream -force $outdir/$bit_name.bit
@@ -502,5 +526,7 @@ record_phase bitstream_generation $phase_started
 set phase_started [clock milliseconds]
 write_checkpoint -force $reference_dcp
 record_phase checkpoint_save $phase_started
+::penzai_analysis::finalize vivado_pass
 puts "==> Built timing-clean bitstream: $outdir/$bit_name.bit"
 puts "==> Incremental reference updated: $reference_dcp"
+puts "RUN_OUTPUT $outdir"
