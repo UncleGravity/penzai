@@ -407,6 +407,15 @@
               '';
             };
 
+          mkP0Benchmark = penzaiPackage:
+            pkgs.writeShellApplication {
+              name = "p0-benchmark";
+              runtimeInputs = [ pkgs.python3 pkgs.git ];
+              text = ''
+                exec python3 ${./tools/p0-benchmark.py} --penzai "${penzaiPackage}/bin/penzai" "$@"
+              '';
+            };
+
           # Stock llama-cli wired to dlopen libggml-penzai. Talks to a penzaid at
           # PENZAI_HOST/PENZAI_PORT (default 127.0.0.1:9000). The residency flags the
           # in-process driver hard-codes must be passed here:
@@ -447,6 +456,7 @@
             deploy-penzaid = mkDeploy "deploy-penzaid" "ReleaseFast" penzaid;
             serve-penzaid = mkServe "serve-penzaid";
             hello = mkHello penzai;
+            p0-benchmark = mkP0Benchmark penzai;
 
             default = penzai;
           };
@@ -460,6 +470,7 @@
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
             penzaid-native = mkApp packages.penzaid-native "penzaid-native" "Run a local native penzaid daemon";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
+            p0-benchmark = mkApp packages.p0-benchmark "p0-benchmark" "Run the reproducible P0 Q1/Q2 benchmark matrix";
             llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
             llama-server-penzai = mkApp packages.llama-server-penzai "llama-server-penzai" "Stock llama-server (HTTP) with the out-of-tree penzai backend";
           };

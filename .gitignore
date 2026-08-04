@@ -18,3 +18,6 @@ fpga/bitstream/out/*
 !fpga/bitstream/out/*.bit
 !fpga/bitstream/out/*.bit.bin
 fpga/ooc/out/
+
+# Benchmarks
+benchmarks/p0/runs/

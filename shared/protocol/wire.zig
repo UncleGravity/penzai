@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 11;
+pub const version: u16 = 12;
 pub const response_meta_len: usize = 64;
 
 pub const RequestTag = enum(u16) {
@@ -11,6 +11,7 @@ pub const RequestTag = enum(u16) {
     download = 5,
     run_graph = 6,
     fill = 7,
+    capabilities = 8,
 };
 
 pub const OpTag = enum(u16) {
@@ -213,6 +214,7 @@ pub const Request = union(RequestTag) {
     download: TransferRequest,
     run_graph: RunGraphRequest,
     fill: FillRequest,
+    capabilities: u64,
 
     pub fn requestId(self: Request) u64 {
         return switch (self) {
@@ -223,6 +225,7 @@ pub const Request = union(RequestTag) {
             .download => |r| r.request_id,
             .run_graph => |r| r.request_id,
             .fill => |r| r.request_id,
+            .capabilities => |id| id,
         };
     }
 };
@@ -437,6 +440,10 @@ pub fn encodeHello(out: []u8, request_id: u64) EncodeError!usize {
     return encodeHeader(out, .hello, request_id);
 }
 
+pub fn encodeCapabilities(out: []u8, request_id: u64) EncodeError!usize {
+    return encodeHeader(out, .capabilities, request_id);
+}
+
 pub fn encodeAlloc(out: []u8, request_id: u64, nbytes: u64, alignment: u32) EncodeError!usize {
     const len = 28;
     if (out.len < len) return error.OutputTooSmall;
@@ -495,6 +502,10 @@ pub fn decodeRequest(metadata: []const u8, payload: []const u8) DecodeError!Requ
         .hello => blk: {
             if (cursor != metadata.len or payload.len != 0) return error.InvalidLength;
             break :blk .{ .hello = request_id };
+        },
+        .capabilities => blk: {
+            if (cursor != metadata.len or payload.len != 0) return error.InvalidLength;
+            break :blk .{ .capabilities = request_id };
         },
         .alloc => blk: {
             const nbytes = try takeU64(metadata, &cursor);
@@ -1267,6 +1278,14 @@ test "alloc request roundtrip" {
     try std.testing.expectEqual(@as(u64, 7), req.requestId());
     try std.testing.expectEqual(@as(u64, 4096), req.alloc.nbytes);
     try std.testing.expectEqual(@as(u32, 64), req.alloc.alignment);
+}
+
+test "capabilities request roundtrip" {
+    var meta: [32]u8 = undefined;
+    const n = try encodeCapabilities(&meta, 17);
+    const req = try decodeRequest(meta[0..n], "");
+    try std.testing.expectEqual(@as(u64, 17), req.requestId());
+    try std.testing.expectEqual(@as(u64, 17), req.capabilities);
 }
 
 test "fill request roundtrip" {

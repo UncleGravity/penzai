@@ -17,10 +17,13 @@ pub const Collector = struct {
     current: model.Phase = .model_load,
     // Decode throughput split (a subset of the decode phase wall): time to the
     // first generated token vs the steady-state tokens after it.
-    first_decode_ns: u64 = 0,
+    first_decode_step_ns: u64 = 0,
+    compute_ttft_ns: u64 = 0,
+    output_ttft_ns: u64 = 0,
     steady_decode_ns: u64 = 0,
     steady_decode_count: u64 = 0,
     generated_tokens: u64 = 0,
+    prompt_tokens: u64 = 0,
     // Residency diagnostic: which tensors get uploaded, in which phase.
     upload_census: model.UploadCensus = .{},
 
@@ -83,12 +86,17 @@ pub const Collector = struct {
     pub fn recordDecodeToken(self: *Collector, is_first: bool, ns: u64) void {
         self.phases[@intFromEnum(model.Phase.decode)].wall_ns += ns;
         if (is_first) {
-            self.first_decode_ns += ns;
+            self.first_decode_step_ns += ns;
         } else {
             self.steady_decode_ns += ns;
             self.steady_decode_count += 1;
         }
         self.generated_tokens += 1;
+    }
+
+    pub fn recordTtft(self: *Collector, compute_ns: u64, output_ns: u64) void {
+        self.compute_ttft_ns = compute_ns;
+        self.output_ttft_ns = output_ns;
     }
 
     /// Total wall = Σ phase walls. Nothing is excluded; every phase reconciles.

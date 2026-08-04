@@ -437,26 +437,26 @@ fn uploadFill(dev: *Device, handle: u64, offset: u64, size: usize, value: u8) li
 fn timedAlloc(dev: *Device, nbytes: u64, tensor_alignment: u32) link_mod.LinkError!wire.TensorRange {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     const result = try dev.link.alloc(nbytes, tensor_alignment);
-    if (dev.profile) |profile| profile.recordAlloc(nbytes, profile.elapsedSince(start_ns), result.timing.device_service_ns);
+    if (dev.profile) |profile| profile.recordAlloc(nbytes, profile.elapsedSince(start_ns), result.timing.device_rpc_ns);
     return result.range;
 }
 
 fn timedUpload(dev: *Device, range: wire.TensorRange, bytes: []const u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     const timing = try dev.link.upload(range, bytes);
-    if (dev.profile) |profile| profile.recordUpload(@intCast(bytes.len), profile.elapsedSince(start_ns), timing.device_service_ns);
+    if (dev.profile) |profile| profile.recordUpload(@intCast(bytes.len), profile.elapsedSince(start_ns), timing.device_rpc_ns);
 }
 
 fn timedFill(dev: *Device, range: wire.TensorRange, value: u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     const timing = try dev.link.fill(range, value);
-    if (dev.profile) |profile| profile.recordFill(range.nbytes, profile.elapsedSince(start_ns), timing.device_service_ns);
+    if (dev.profile) |profile| profile.recordFill(range.nbytes, profile.elapsedSince(start_ns), timing.device_rpc_ns);
 }
 
 fn timedDownload(dev: *Device, range: wire.TensorRange, out: []u8) link_mod.LinkError!void {
     const start_ns = if (dev.profile) |profile| profile.now() else 0;
     const timing = try dev.link.download(range, out);
-    if (dev.profile) |profile| profile.recordDownload(@intCast(out.len), profile.elapsedSince(start_ns), timing.device_service_ns);
+    if (dev.profile) |profile| profile.recordDownload(@intCast(out.len), profile.elapsedSince(start_ns), timing.device_rpc_ns);
 }
 
 /// Best-effort free (teardown / error unwind); discards the error and timing.
@@ -603,23 +603,33 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
         return c.GGML_STATUS_SUCCESS;
     }
 
-    const commands = lower.lowerGraph(dev.allocator, g, lookup) catch {
+    const commands = lower.lowerGraph(dev.allocator, g, lookup) catch |err| {
+        std.debug.print("penzai backend: graph lowering failed: {s}\n", .{@errorName(err)});
         dev.counters.unsupported_graphs += 1;
         return c.GGML_STATUS_FAILED;
     };
     defer dev.allocator.free(commands);
     if (commands.len == 0) {
-        flushPreloadsEager(dev) catch return c.GGML_STATUS_FAILED;
+        flushPreloadsEager(dev) catch |err| {
+            std.debug.print("penzai backend: preload flush failed: {s}\n", .{@errorName(err)});
+            return c.GGML_STATUS_FAILED;
+        };
         return c.GGML_STATUS_SUCCESS;
     }
 
     const preload = dev.pending_preload.items;
     if (dev.profile) |profile| {
-        var profiled = dev.link.runGraphProfilePreload(preload, commands, .aggregate) catch return c.GGML_STATUS_FAILED;
+        var profiled = dev.link.runGraphProfilePreload(preload, commands, .aggregate) catch |err| {
+            std.debug.print("penzai backend: profiled graph execution failed: {s}\n", .{@errorName(err)});
+            return c.GGML_STATUS_FAILED;
+        };
         defer profiled.deinit();
         profile.recordRunGraph(profiled);
     } else {
-        dev.link.runGraphPreload(preload, commands) catch return c.GGML_STATUS_FAILED;
+        dev.link.runGraphPreload(preload, commands) catch |err| {
+            std.debug.print("penzai backend: graph execution failed: {s}\n", .{@errorName(err)});
+            return c.GGML_STATUS_FAILED;
+        };
     }
     dev.pending_preload.clearRetainingCapacity();
     dev.counters.lowered_commands += commands.len;

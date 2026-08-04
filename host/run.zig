@@ -18,15 +18,12 @@ const layout = shared.layout;
 const protocol_transport = shared.protocol_transport;
 const profiling = shared.profiling;
 const wire = shared.wire;
+const capabilities = shared.capabilities;
 
 pub const RunError = error{
     InvalidShape,
-    OutOfMemory,
-    Protocol,
-    RemoteFailed,
-    Transport,
     LlamaDisabled,
-} || llama_mod.Error;
+} || link_mod.LinkError || llama_mod.Error;
 
 pub const RunOptions = struct {
     rows: u32 = @intCast(layout.rows_per_block),
@@ -81,6 +78,7 @@ pub const BenchProfile = prof_model.RunGraphTotals;
 pub const LlamaOptions = struct {
     model_path: []const u8 = build_options.default_model_path,
     prompt: []const u8 = "Hello",
+    prompt_tokens: ?u32 = null,
     max_tokens: u32 = 16,
     heap_mib: u32 = 768,
     census: bool = false,
@@ -90,7 +88,24 @@ pub const LlamaOptions = struct {
     profile: bool = false,
     device_label: []const u8 = "fake",
     backend_sampling: bool = false,
+    exact_tokens: bool = false,
+    n_ctx: u32 = 128,
+    n_batch: u32 = 32,
+    n_ubatch: u32 = 16,
 };
+
+pub fn fakeCapabilities(allocator: std.mem.Allocator) RunError!capabilities.Report {
+    var runtime = try runtime_mod.Runtime.init(allocator, try heapBytes(1));
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(allocator, &runtime);
+    return link.capabilities();
+}
+
+pub fn tcpCapabilities(io: std.Io, allocator: std.mem.Allocator, spec: protocol_transport.TcpSpec) RunError!capabilities.Report {
+    var link = try link_mod.TcpLink.connect(allocator, io, spec);
+    defer link.deinit();
+    return link.capabilities();
+}
 
 pub fn runFakeLlama(
     io: std.Io,
@@ -106,6 +121,7 @@ pub fn runFakeLlama(
     return llama_mod.runPrompt(io, allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
+        .prompt_tokens = options.prompt_tokens,
         .max_tokens = options.max_tokens,
         .census = options.census,
         .logits_tolerance = options.logits_tolerance,
@@ -114,6 +130,10 @@ pub fn runFakeLlama(
         .profile = options.profile,
         .device_label = options.device_label,
         .backend_sampling = options.backend_sampling,
+        .exact_tokens = options.exact_tokens,
+        .n_ctx = options.n_ctx,
+        .n_batch = options.n_batch,
+        .n_ubatch = options.n_ubatch,
     });
 }
 
@@ -131,6 +151,7 @@ pub fn runTcpLlama(
     return llama_mod.runPrompt(io, allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
+        .prompt_tokens = options.prompt_tokens,
         .max_tokens = options.max_tokens,
         .census = options.census,
         .logits_tolerance = options.logits_tolerance,
@@ -139,6 +160,10 @@ pub fn runTcpLlama(
         .profile = options.profile,
         .device_label = options.device_label,
         .backend_sampling = options.backend_sampling,
+        .exact_tokens = options.exact_tokens,
+        .n_ctx = options.n_ctx,
+        .n_batch = options.n_batch,
+        .n_ubatch = options.n_ubatch,
     });
 }
 
@@ -155,10 +180,14 @@ pub fn runFakeLogitsCheck(
     return llama_mod.runLogitsCheck(allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
+        .prompt_tokens = options.prompt_tokens,
         .max_tokens = options.max_tokens,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
+        .n_ctx = options.n_ctx,
+        .n_batch = options.n_batch,
+        .n_ubatch = options.n_ubatch,
     });
 }
 
@@ -176,10 +205,14 @@ pub fn runTcpLogitsCheck(
     return llama_mod.runLogitsCheck(allocator, writer, client, .{
         .model_path = options.model_path,
         .prompt = options.prompt,
+        .prompt_tokens = options.prompt_tokens,
         .max_tokens = options.max_tokens,
         .logits_tolerance = options.logits_tolerance,
         .chat_template = options.chat_template,
         .enable_thinking = options.enable_thinking,
+        .n_ctx = options.n_ctx,
+        .n_batch = options.n_batch,
+        .n_ubatch = options.n_ubatch,
     });
 }
 

@@ -28,11 +28,14 @@ cp config.env.example config.env       # edit VM / BOARD (or reuse the committed
 (cd ../../.. && nix run .#deploy-penzaid)
 PENZAI_PL_OPS=all nix run .#serve-penzaid
 # PL init must report BOTH:  "pl: q1a8 kernel ready"  AND  "pl: flash kernel ready"
+# Query the receipt plus live engine registers through the daemon:
+nix run .#penzai -- capabilities --device tcp:kria:29092
 ```
 
-`PENZAI_PL_OPS=all` is required — it makes the daemon probe both kernels (each present in
-this bitstream). With the default (`matmul` only) flash would stay on PS; with `flash`
-only matmul would. (The runtime already supports `all`; no daemon code change.)
+`PENZAI_PL_OPS=all` makes the daemon probe both kernels. It is a selection flag,
+not proof of what is loaded. `penzai capabilities` is authoritative: it returns the
+hash-verified deployment receipt and only advertises engines whose live ID, version,
+dimensions, and clock registers passed initialization.
 
 ## Fit and timing
 
@@ -49,7 +52,8 @@ The routed build remains the gate:
 Builds use all eight Vivado worker threads and a persistent VM-side `cache/` for generated
 AMD IP. Every timing-clean build refreshes a routed checkpoint for its variant.
 `--incremental` uses that checkpoint to accelerate localized RTL changes; a missing
-checkpoint falls back to clean implementation. Use the default clean mode for signoff.
+checkpoint falls back to clean implementation. Use the default mode for an independent
+full build.
 
 Each invocation writes an immutable ignored bundle under `out/runs/<run-id>/`:
 
@@ -68,10 +72,16 @@ On success, only the `.bit` and `.bit.bin` are promoted to the stable paths dire
 under `out/`, preserving the existing deploy interface. `out/latest` points to the full
 bundle. Failed and partial runs remain inspectable but cannot replace a deployable image.
 
+`deploy.sh` resolves one exact successful bundle (normally `out/latest`), verifies its
+bitstream against the promoted file and again after transfer, and installs
+`deployment_receipt.tsv` beside the firmware. Set `PENZAI_BITSTREAM_RUN_ID` to deploy a
+specific retained run. The daemon reads this receipt by default; it can be overridden
+with `PENZAI_BITSTREAM_RECEIPT` or `--bitstream-receipt` for test environments.
+
 Use `../tools/analyze.sh summary` to reapply the production metrics and gates to the
 retained routed checkpoint, or `../tools/analyze.sh deep` for detailed congestion, path,
-fanout, QoR, and clock reports. These tools inspect a checkpoint; they do not replace a
-clean routed build for release signoff.
+fanout, QoR, and clock reports. These tools inspect a checkpoint; they do not produce a
+new bitstream.
 
 If it doesn't fit or close at `f200`:
 - **Timing** — drop `f` (e.g. `w512-p4-f250`) if a future change causes the combined

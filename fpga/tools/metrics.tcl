@@ -1,4 +1,4 @@
-# metrics.tcl - shared Vivado build/checkpoint metrics and routed signoff gates.
+# metrics.tcl - shared Vivado build/checkpoint metrics and routed build gates.
 
 namespace eval ::penzai_analysis {
     variable output_dir ""
@@ -191,7 +191,7 @@ proc ::penzai_analysis::collect_routed {strict} {
     flush
     write_summary $status $failures
     if {$strict && [llength $failures] > 0} {
-        error "routed signoff gates failed: [join $failures {; }]"
+        error "routed build failed: [join $failures {; }]"
     }
     return [llength $failures]
 }

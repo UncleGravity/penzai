@@ -27,8 +27,14 @@ pub fn handleFrame(
         return finish(io, allocator, start_ns, errorMeta(0, .invalid_request), "");
     const request = wire.decodeRequest(frame.metadata, frame.payload) catch
         return finish(io, allocator, start_ns, errorMeta(0, .invalid_request), "");
-    var result = runtime.dispatch(request, io) catch |err|
+    const request_decode_ns = if (build_options.enable_profiling)
+        profiling.elapsed(start_ns, profiling.nowNs(io))
+    else
+        0;
+    var result = runtime.dispatchMeasured(request, io, request_decode_ns) catch |err| {
+        std.debug.print("device request {s} failed: {s}\n", .{ @tagName(std.meta.activeTag(request)), @errorName(err) });
         return finish(io, allocator, start_ns, errorMeta(request.requestId(), runtime_mod.errorCode(err)), "");
+    };
     defer result.deinit(allocator);
     return finish(io, allocator, start_ns, result.meta, result.payload);
 }

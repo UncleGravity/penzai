@@ -1,4 +1,5 @@
 const std = @import("std");
+const build_options = @import("build_options");
 const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const link_mod = @import("link");
@@ -6,6 +7,33 @@ const link_mod = @import("link");
 const layout = shared.layout;
 const wire = shared.wire;
 const profiling = shared.profiling;
+
+test "fake link returns deployment and ABI capabilities" {
+    const receipt = try shared.capabilities.Receipt.parse(
+        "key\tvalue\n" ++
+            "receipt_schema_version\t1\n" ++
+            "manifest_schema_version\t1\n" ++
+            "run_id\ttest-clean-run\n" ++
+            "variant\tw512-p4-f300\n" ++
+            "git_commit\tdeadbeef1234\n" ++
+            "git_dirty\t0\n" ++
+            "build_mode\tclean\n" ++
+            "source_sha256\t1111\n" ++
+            "manifest_sha256\t2222\n" ++
+            "bitstream_sha256\t3333\n" ++
+            "bitstream_hash_verified\t1\n",
+    );
+    var runtime = try runtime_mod.Runtime.initWithReceipt(std.testing.allocator, 1024 * 1024, receipt);
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
+
+    const report = try link.capabilities();
+    try std.testing.expectEqual(shared.capabilities.ReceiptStatus.loaded, report.receipt_status);
+    try std.testing.expectEqual(wire.version, report.wire_abi);
+    try std.testing.expectEqual(profiling.version, report.profile_abi);
+    try std.testing.expectEqualStrings("test-clean-run", report.run_id.slice());
+    try std.testing.expectEqual(@as(u32, 0), report.engine_mask);
+}
 
 test "fake link alloc upload copy download" {
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
@@ -160,6 +188,7 @@ test "fake link ps f32 command graph" {
 }
 
 test "fake link runGraphProfile reports per-op aggregates" {
+    if (!build_options.enable_profiling) return error.SkipZigTest;
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
     defer runtime.deinit();
     var link = link_mod.FakeLink.initWithIo(std.testing.allocator, &runtime, std.testing.io);
@@ -182,6 +211,10 @@ test "fake link runGraphProfile reports per-op aggregates" {
     try std.testing.expectEqual(@as(u32, 2), profiled.report.summary.command_count);
     try std.testing.expect(profiled.rpc.request_bytes > 0);
     try std.testing.expect(profiled.rpc.response_bytes > 0);
+    try std.testing.expect(profiled.rpc.round_trip_ns >= profiled.rpc.deviceRpcNs());
+    try std.testing.expect(profiled.rpc.device_service_ns >= profiled.report.summary.profile_span_ns);
+    try std.testing.expect(profiled.report.summary.profile_span_ns >= profiled.report.summary.stagesNs());
+    try std.testing.expectEqual(@as(u32, 0), profiled.report.summary.accounting_violations);
 
     const add = findAggregate(profiled.report, @intFromEnum(wire.OpTag.add_f32)) orelse return error.MissingAggregate;
     try std.testing.expectEqual(@as(u32, 1), add.count);

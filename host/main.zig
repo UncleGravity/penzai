@@ -4,6 +4,7 @@ const run_mod = @import("run.zig");
 const prof = @import("prof");
 const prof_model = prof.model;
 const prof_render = prof.render;
+const capabilities = shared.capabilities;
 
 const protocol_transport = shared.protocol_transport;
 
@@ -70,7 +71,72 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         try runBenchCommand(init, &args, stdout);
         return;
     }
+    if (std.mem.eql(u8, command, "capabilities")) {
+        try runCapabilitiesCommand(init, &args, stdout);
+        return;
+    }
     return error.InvalidCommand;
+}
+
+fn runCapabilitiesCommand(
+    init: std.process.Init,
+    args: *std.process.Args.Iterator,
+    stdout: *std.Io.Writer,
+) CliError!void {
+    var device: []const u8 = "fake";
+    while (args.next()) |arg| {
+        if (std.mem.eql(u8, arg, "--device")) {
+            device = try requireValue(args, "--device");
+        } else if (std.mem.startsWith(u8, arg, "--device=")) {
+            device = arg["--device=".len..];
+        } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            try writeUsage(stdout);
+            return;
+        } else {
+            return error.InvalidOption;
+        }
+    }
+
+    const device_spec = try protocol_transport.parseDeviceSpec(device);
+    const report = switch (device_spec) {
+        .fake => try run_mod.fakeCapabilities(init.gpa),
+        .tcp => |tcp| try run_mod.tcpCapabilities(init.io, init.gpa, tcp),
+    };
+    try writeCapabilities(stdout, device, report);
+}
+
+fn writeCapabilities(writer: *std.Io.Writer, device: []const u8, report: capabilities.Report) std.Io.Writer.Error!void {
+    try writer.print("penzai capabilities\n", .{});
+    try writer.print("device={s}\n", .{device});
+    try writer.print("capability_schema={d}\n", .{capabilities.version});
+    try writer.print("wire_abi={d}\n", .{report.wire_abi});
+    try writer.print("profile_abi={d}\n", .{report.profile_abi});
+    try writer.print("receipt_status={s}\n", .{@tagName(report.receipt_status)});
+    try writer.print("manifest_schema={d}\n", .{report.manifest_schema});
+    try writer.print("run_id={s}\n", .{report.run_id.slice()});
+    try writer.print("variant={s}\n", .{report.variant.slice()});
+    try writer.print("git_commit={s}\n", .{report.git_commit.slice()});
+    try writer.print("git_dirty={}\n", .{report.identity_flags & capabilities.IdentityFlag.git_dirty != 0});
+    try writer.print("bitstream_hash_verified={}\n", .{report.identity_flags & capabilities.IdentityFlag.bitstream_hash_verified != 0});
+    try writer.print("bitstream_sha256={s}\n", .{report.bitstream_sha256.slice()});
+    try writer.print("manifest_sha256={s}\n", .{report.manifest_sha256.slice()});
+    try writer.print("source_sha256={s}\n", .{report.source_sha256.slice()});
+    try writer.print("engine_mask=0x{X:0>8}\n", .{report.engine_mask});
+    try writer.print("format_mask=0x{X:0>8}\n", .{report.format_mask});
+    try writer.print("matmul.id=0x{X:0>8}\n", .{report.matmul.id});
+    try writer.print("matmul.version={d}\n", .{report.matmul.version});
+    try writer.print("matmul.clock_hz={d}\n", .{report.matmul.clock_hz});
+    try writer.print("matmul.rows={d}\n", .{report.matmul.dim0});
+    try writer.print("matmul.weight_ports={d}\n", .{report.matmul.dim1});
+    try writer.print("matmul.cols_max={d}\n", .{report.matmul.dim2});
+    try writer.print("matmul.k_max={d}\n", .{report.matmul.dim3});
+    try writer.print("flash.id=0x{X:0>8}\n", .{report.flash.id});
+    try writer.print("flash.version={d}\n", .{report.flash.version});
+    try writer.print("flash.clock_hz={d}\n", .{report.flash.clock_hz});
+    try writer.print("flash.lanes={d}\n", .{report.flash.dim0});
+    try writer.print("flash.head_dim_max={d}\n", .{report.flash.dim1});
+    try writer.print("flash.heads_max={d}\n", .{report.flash.dim2});
+    try writer.print("flash.kv_heads_max={d}\n", .{report.flash.dim3});
 }
 
 fn runLlamaCommand(
@@ -100,6 +166,10 @@ fn runLlamaCommand(
             options.prompt = try requireValue(args, "--prompt");
         } else if (std.mem.startsWith(u8, arg, "--prompt=")) {
             options.prompt = arg["--prompt=".len..];
+        } else if (std.mem.eql(u8, arg, "--prompt-tokens")) {
+            options.prompt_tokens = try parseU32(try requireValue(args, "--prompt-tokens"));
+        } else if (std.mem.startsWith(u8, arg, "--prompt-tokens=")) {
+            options.prompt_tokens = try parseU32(arg["--prompt-tokens=".len..]);
         } else if (std.mem.eql(u8, arg, "--max-tokens")) {
             options.max_tokens = try parseU32(try requireValue(args, "--max-tokens"));
         } else if (std.mem.startsWith(u8, arg, "--max-tokens=")) {
@@ -118,6 +188,20 @@ fn runLlamaCommand(
             options.enable_thinking = true;
         } else if (std.mem.eql(u8, arg, "--backend-sampling")) {
             options.backend_sampling = true;
+        } else if (std.mem.eql(u8, arg, "--exact-tokens")) {
+            options.exact_tokens = true;
+        } else if (std.mem.eql(u8, arg, "--context")) {
+            options.n_ctx = try parseU32(try requireValue(args, "--context"));
+        } else if (std.mem.startsWith(u8, arg, "--context=")) {
+            options.n_ctx = try parseU32(arg["--context=".len..]);
+        } else if (std.mem.eql(u8, arg, "--batch")) {
+            options.n_batch = try parseU32(try requireValue(args, "--batch"));
+        } else if (std.mem.startsWith(u8, arg, "--batch=")) {
+            options.n_batch = try parseU32(arg["--batch=".len..]);
+        } else if (std.mem.eql(u8, arg, "--ubatch")) {
+            options.n_ubatch = try parseU32(try requireValue(args, "--ubatch"));
+        } else if (std.mem.startsWith(u8, arg, "--ubatch=")) {
+            options.n_ubatch = try parseU32(arg["--ubatch=".len..]);
         } else if (std.mem.eql(u8, arg, "--prof")) {
             options.profile = true;
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
@@ -331,18 +415,21 @@ fn parseF32(value: []const u8) CliError!f32 {
 fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.Io.Writer.Error!void {
     try prof_render.writeLinkSection(writer, &profile);
     try writer.writeByte('\n');
-    try prof_render.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_total_ns);
+    try prof_render.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_execute_ns);
+    try prof_render.writeMatmulDetail(writer, "matmul", profile.usedMatmul(), profile.device_fclk_hz);
+    try prof_render.writeFlashDetail(writer, "flash", profile.usedFlash());
 }
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think] [--prof]
+        \\  penzai run -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--prompt-tokens N] [--max-tokens N] [--context N] [--batch N] [--ubatch N] [--exact-tokens] [--raw-prompt] [--think] [--prof]
         \\  penzai census -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--raw-prompt] [--think]
         \\  penzai logits -m MODEL.gguf --device fake|tcp:HOST:PORT --prompt TEXT [--max-tokens N] [--tolerance F] [--raw-prompt] [--think]
         \\  penzai matmul --device fake [--rows N] [--cols N] [--k N] [--heap-mib N]
         \\  penzai matmul --device tcp:HOST:PORT [--rows N] [--cols N] [--k N]
         \\  penzai bench op matmul-q1a8 --device fake|tcp:HOST:PORT [--rows N] [--cols N] [--k N] [--warmup N] [--iters N] [--prof]
+        \\  penzai capabilities --device fake|tcp:HOST:PORT
         \\
         \\commands:
         \\  run      generate text through llama.cpp and the penzai backend
@@ -350,6 +437,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\  logits   compare token choices and report logit drift against llama.cpp CPU
         \\  matmul   execute the Q1A8 smoke path through fake or TCP device
         \\  bench    run resident-buffer microbenchmarks
+        \\  capabilities  report daemon and loaded-bitstream identity
         \\  help     show this help
         \\
     );

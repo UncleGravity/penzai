@@ -605,6 +605,7 @@ fn addTests(
     const test_step = b.step("test", "Run host-only unit and fake full-stack tests");
 
     addSharedTest(b, test_step, "shared/root.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "shared/capabilities.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/protocol/framing.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/protocol/transport.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/protocol/wire.zig", target, optimize, shared);

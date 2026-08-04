@@ -21,6 +21,7 @@ pub const seq_smoke = @import("pl/seq_smoke.zig");
 
 const wire = shared.wire;
 const profiling = shared.profiling;
+const capabilities = shared.capabilities;
 
 pub const RuntimeError = error{
     InvalidRequest,
@@ -55,13 +56,17 @@ pub fn RuntimeFor(comptime Heap: type) type {
         pl: ?PlBackend = null,
         flash: ?FlashBackend = null,
         pl_verify: bool = false,
-        /// PL counters from the most recent matmul, consumed by the profiler.
-        pl_last: ?profile.PlCounters = null,
+        receipt: capabilities.Receipt = .{},
 
         pub fn init(allocator: std.mem.Allocator, heap_size: usize) !Self {
+            return initWithReceipt(allocator, heap_size, .{});
+        }
+
+        pub fn initWithReceipt(allocator: std.mem.Allocator, heap_size: usize, receipt: capabilities.Receipt) !Self {
             var self: Self = .{
                 .allocator = allocator,
                 .heap = try Heap.init(allocator, heap_size),
+                .receipt = receipt,
             };
             if (comptime pl_supported) {
                 self.pl_verify = plVerifyEnabled();
@@ -101,8 +106,22 @@ pub fn RuntimeFor(comptime Heap: type) type {
         }
 
         pub fn dispatch(self: *Self, request: wire.Request, io: ?std.Io) RuntimeError!DispatchResult {
+            return self.dispatchMeasured(request, io, 0);
+        }
+
+        pub fn dispatchMeasured(self: *Self, request: wire.Request, io: ?std.Io, request_decode_ns: u64) RuntimeError!DispatchResult {
             return switch (request) {
                 .hello => |request_id| .{ .meta = ok(request_id) },
+                .capabilities => |request_id| blk: {
+                    const payload = self.allocator.alloc(u8, capabilities.encoded_len) catch return error.OutOfMemory;
+                    errdefer self.allocator.free(payload);
+                    _ = capabilities.encode(self.capabilityReport(), payload) catch unreachable;
+                    break :blk .{ .meta = .{
+                        .request_id = request_id,
+                        .status = .ok,
+                        .nbytes = payload.len,
+                    }, .payload = payload, .owns_payload = true };
+                },
                 .alloc => |req| blk: {
                     const range = self.heap.allocate(req.nbytes, req.alignment) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
@@ -145,9 +164,8 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     }, .payload = bytes };
                 },
                 .run_graph => |req| blk: {
-                    try self.applyPreloads(req.preload_bytes);
                     if (build_options.enable_profiling and req.tier != .off) {
-                        const profiled = try self.runProfiled(io, req.command_bytes);
+                        const profiled = try self.runProfiled(io, req.preload_bytes, req.command_bytes, request_decode_ns);
                         break :blk .{ .meta = .{
                             .request_id = req.request_id,
                             .status = .ok,
@@ -155,12 +173,13 @@ pub fn RuntimeFor(comptime Heap: type) type {
                             .nbytes = profiled.payload.len,
                         }, .payload = profiled.payload, .owns_payload = true };
                     }
+                    try self.applyPreloads(req.preload_bytes);
                     const commands = wire.decodeCommandBuffer(self.allocator, req.command_bytes) catch |err| switch (err) {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.InvalidRequest,
                     };
                     defer self.allocator.free(commands);
-                    for (commands) |command| try self.execute(command, io);
+                    for (commands) |command| _ = try self.execute(command, null);
                     break :blk .{ .meta = .{
                         .request_id = req.request_id,
                         .status = .ok,
@@ -168,6 +187,27 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     } };
                 },
             };
+        }
+
+        fn capabilityReport(self: *const Self) capabilities.Report {
+            var report: capabilities.Report = .{
+                .wire_abi = wire.version,
+                .profile_abi = profiling.version,
+            };
+            report.applyReceipt(self.receipt);
+            if (comptime pl_supported) {
+                if (self.pl) |backend| {
+                    report.engine_mask |= capabilities.Engine.matmul;
+                    report.format_mask |= pl_matmul.formatMask(backend.kernel);
+                    report.matmul = pl_matmul.capabilityInfo(backend.kernel);
+                }
+                if (self.flash) |backend| {
+                    report.engine_mask |= capabilities.Engine.flash;
+                    report.format_mask |= pl_flash.formatMask(backend.kernel);
+                    report.flash = pl_flash.capabilityInfo(backend.kernel);
+                }
+            }
+            return report;
         }
 
         fn applyPreloads(self: *Self, preload_bytes: []const u8) RuntimeError!void {
@@ -182,8 +222,10 @@ pub fn RuntimeFor(comptime Heap: type) type {
         /// Execute a graph while timing each command and accruing a profile.
         /// Decode + execution stay here (runtime's job); the byte/span/aggregate
         /// bookkeeping and payload encoding live in `profile.Collector`.
-        fn runProfiled(self: *Self, io: ?std.Io, command_bytes: []const u8) RuntimeError!ProfiledRun {
+        fn runProfiled(self: *Self, io: ?std.Io, preload_bytes: []const u8, command_bytes: []const u8, request_decode_ns: u64) RuntimeError!ProfiledRun {
             const request_start_ns = profiling.nowNs(io);
+            try self.applyPreloads(preload_bytes);
+            const preload_done_ns = profiling.nowNs(io);
             const commands = wire.decodeCommandBuffer(self.allocator, command_bytes) catch |err| switch (err) {
                 error.OutOfMemory => return error.OutOfMemory,
                 else => return error.InvalidRequest,
@@ -192,14 +234,14 @@ pub fn RuntimeFor(comptime Heap: type) type {
             const decode_done_ns = profiling.nowNs(io);
 
             var collector: profile.Collector = .{};
+            var ctx = profile.ProfileContext{ .collector = &collector, .io = io };
 
             const execute_start_ns = profiling.nowNs(io);
             for (commands) |command| {
                 const start_ns = profiling.nowNs(io);
-                self.pl_last = null;
-                try self.execute(command, io);
+                const outcome = try self.execute(command, &ctx);
                 const end_ns = profiling.nowNs(io);
-                collector.record(command, start_ns, end_ns, self.pl_last);
+                collector.record(command, profiling.elapsed(start_ns, end_ns), outcome);
             }
             const execute_done_ns = profiling.nowNs(io);
 
@@ -207,13 +249,25 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 (if (self.pl) |b| b.kernel.clk_hz else 0)
             else
                 0;
+            const encode_start_ns = profiling.nowNs(io);
             const payload = collector.encode(self.allocator, .{
-                .device_total_ns = profiling.elapsed(request_start_ns, execute_done_ns),
-                .decode_ns = profiling.elapsed(request_start_ns, decode_done_ns),
+                .profile_span_ns = profiling.elapsed(request_start_ns, execute_done_ns),
+                .request_decode_ns = request_decode_ns,
+                .preload_ns = profiling.elapsed(request_start_ns, preload_done_ns),
+                .command_decode_ns = profiling.elapsed(preload_done_ns, decode_done_ns),
                 .execute_ns = profiling.elapsed(execute_start_ns, execute_done_ns),
+                .preload_bytes = preload_bytes.len,
+                .command_bytes = command_bytes.len,
                 .command_count = @intCast(commands.len),
                 .device_fclk_hz = fclk_hz,
             }) catch return error.OutOfMemory;
+            const encode_done_ns = profiling.nowNs(io);
+            const total_ns = request_decode_ns +| profiling.elapsed(request_start_ns, encode_done_ns);
+            const encode_ns = profiling.elapsed(encode_start_ns, encode_done_ns);
+            const children_ns = request_decode_ns +| profiling.elapsed(request_start_ns, preload_done_ns) +|
+                profiling.elapsed(preload_done_ns, decode_done_ns) +| profiling.elapsed(execute_start_ns, execute_done_ns) +| encode_ns;
+            const violations: u32 = if (children_ns > total_ns) profiling.AccountingViolation.device_stages else 0;
+            profiling.patchProfileSpan(payload, total_ns, encode_ns, violations) catch unreachable;
             return .{ .payload = payload, .command_count = commands.len };
         }
 
@@ -321,7 +375,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
             return false;
         }
 
-        fn execute(self: *Self, command: wire.Command, io: ?std.Io) RuntimeError!void {
+        fn execute(self: *Self, command: wire.Command, ctx: ?*profile.ProfileContext) RuntimeError!profile.CommandOutcome {
             switch (command) {
                 .copy => |copy| {
                     const src = self.heap.read(copy.src) catch |err| return mapHeapError(err);
@@ -335,14 +389,13 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .matmul_q1a8 => |matmul| {
                     if (comptime pl_supported) {
                         if (self.pl) |*backend| {
-                            const maybe = backend.tryMatmul(&self.heap, matmul, io) catch |err| {
+                            const maybe = backend.tryMatmul(&self.heap, matmul, ctx) catch |err| {
                                 std.debug.print("pl matmul failed: {s}\n", .{@errorName(err)});
                                 return error.BackendFailure;
                             };
-                            if (maybe) |counters| {
-                                self.pl_last = counters;
+                            if (maybe) |execution| {
                                 if (self.pl_verify) self.verifyMatmul(matmul);
-                                return;
+                                return .{ .backend = .pl, .path = execution.path, .detail = .{ .matmul = execution } };
                             }
                         }
                     }
@@ -356,6 +409,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         error.OutOfMemory => return error.OutOfMemory,
                         else => return error.InvalidRequest,
                     };
+                    return .{ .backend = .ps, .path = .software, .detail = .{ .matmul = .{ .path = .software } } };
                 },
                 .rmsnorm => |rmsnorm| {
                     const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
@@ -435,13 +489,13 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .flash_attn_f32 => |attn| {
                     if (comptime pl_supported) {
                         if (self.flash) |*backend| {
-                            const maybe = backend.tryFlashAttn(&self.heap, attn, io) catch |err| {
+                            const maybe = backend.tryFlashAttn(&self.heap, attn, ctx) catch |err| {
                                 std.debug.print("pl flash failed: {s}\n", .{@errorName(err)});
                                 return error.BackendFailure;
                             };
-                            if (maybe) |_| {
+                            if (maybe) |execution| {
                                 if (self.pl_verify) self.verifyFlash(attn);
-                                return;
+                                return .{ .backend = .pl, .path = execution.path, .detail = .{ .flash = execution } };
                             }
                         }
                     }
@@ -468,6 +522,17 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         .dst_nb1 = attn.dst_nb1,
                         .dst_nb2 = attn.dst_nb2,
                     }) catch |err| return mapKernelError(err);
+                    if (ctx == null) return .{ .backend = .ps, .path = .software };
+                    const work = flashWork(attn, mask);
+                    return .{ .backend = .ps, .path = .software, .detail = .{ .flash = .{
+                        .path = .software,
+                        .requested_n_kv = attn.n_kv,
+                        .valid_n_kv = work.valid_n_kv,
+                        .processed_n_kv = work.valid_n_kv,
+                        .requested_qkv_pairs = @as(u64, attn.n_tokens) *| @as(u64, attn.n_kv),
+                        .valid_qkv_pairs = work.valid_qkv_pairs,
+                        .processed_qkv_pairs = work.processed_qkv_pairs,
+                    } } };
                 },
                 .argmax => |argmax| {
                     const src = self.heap.read(argmax.src) catch |err| return mapHeapError(err);
@@ -480,6 +545,7 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     ps_pad.padZeroTailBytes(src, dst) catch |err| return mapKernelError(err);
                 },
             }
+            return .{};
         }
     };
 }
@@ -515,6 +581,90 @@ fn rhsRowBroadcast(mode: wire.BinaryF32Mode) bool {
         .same_shape => false,
         .rhs_row_broadcast => true,
     };
+}
+
+const FlashWork = struct {
+    valid_n_kv: u32,
+    valid_qkv_pairs: u64,
+    processed_qkv_pairs: u64,
+};
+
+fn flashWork(attn: wire.FlashAttnF32, mask: ?[]const u8) FlashWork {
+    const bytes = mask orelse return .{
+        .valid_n_kv = attn.n_kv,
+        .valid_qkv_pairs = @as(u64, attn.n_tokens) *| @as(u64, attn.n_kv),
+        .processed_qkv_pairs = @as(u64, attn.n_tokens) *| @as(u64, attn.n_kv),
+    };
+    var max_hi: u32 = 0;
+    var valid_pairs: u64 = 0;
+    var processed_pairs: u64 = 0;
+    for (0..attn.n_tokens) |token| {
+        var token_hi: u32 = 0;
+        for (0..attn.n_kv) |kv| {
+            const offset = token * attn.mask_nb1 + kv * @sizeOf(f16);
+            const bits = std.mem.readInt(u16, bytes[offset..][0..2], .little);
+            if (bits != 0xFC00) {
+                valid_pairs +|= 1;
+                token_hi = @intCast(kv + 1);
+            }
+        }
+        max_hi = @max(max_hi, token_hi);
+        processed_pairs +|= token_hi;
+    }
+    return .{
+        .valid_n_kv = max_hi,
+        .valid_qkv_pairs = valid_pairs,
+        .processed_qkv_pairs = processed_pairs,
+    };
+}
+
+test "flash work sums causal query-KV pairs" {
+    var mask: [8 * 8 * @sizeOf(f16)]u8 = undefined;
+    for (0..8) |token| {
+        for (0..8) |kv| {
+            const offset = (token * 8 + kv) * @sizeOf(f16);
+            std.mem.writeInt(u16, mask[offset..][0..2], if (kv <= token) 0 else 0xFC00, .little);
+        }
+    }
+    const range = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 1 };
+    const attn = wire.FlashAttnF32{
+        .q = range,
+        .k = range,
+        .v = range,
+        .mask = range,
+        .dst = range,
+        .has_mask = true,
+        .head_dim_q = 1,
+        .head_dim_v = 1,
+        .n_heads = 1,
+        .n_head_kv = 1,
+        .n_kv = 8,
+        .n_tokens = 8,
+        .scale = 1,
+        .q_nb1 = 1,
+        .q_nb2 = 1,
+        .k_nb1 = 1,
+        .k_nb2 = 1,
+        .v_nb1 = 1,
+        .v_nb2 = 1,
+        .mask_nb1 = 8 * @sizeOf(f16),
+        .dst_nb1 = 1,
+        .dst_nb2 = 1,
+    };
+    const work = flashWork(attn, &mask);
+    try std.testing.expectEqual(@as(u32, 8), work.valid_n_kv);
+    try std.testing.expectEqual(@as(u64, 36), work.valid_qkv_pairs);
+    try std.testing.expectEqual(@as(u64, 36), work.processed_qkv_pairs);
+
+    var non_prefix_attn = attn;
+    non_prefix_attn.n_tokens = 1;
+    non_prefix_attn.n_kv = 3;
+    non_prefix_attn.mask_nb1 = 3 * @sizeOf(f16);
+    var non_prefix_mask = [_]u16{ 0, 0xFC00, 0 };
+    const non_prefix = flashWork(non_prefix_attn, std.mem.sliceAsBytes(non_prefix_mask[0..]));
+    try std.testing.expectEqual(@as(u32, 3), non_prefix.valid_n_kv);
+    try std.testing.expectEqual(@as(u64, 2), non_prefix.valid_qkv_pairs);
+    try std.testing.expectEqual(@as(u64, 3), non_prefix.processed_qkv_pairs);
 }
 
 fn ropeMode(mode: wire.RopeMode) ps_rope.Mode {

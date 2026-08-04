@@ -5,17 +5,98 @@ const wire = shared.wire;
 const profiling = shared.profiling;
 const layout = shared.layout;
 
-/// Hardware counters read from the PL kernel after a matmul run. Cycle/stall/beat
-/// counts; all zero for a CPU matmul. The PL backend produces these and the
-/// runtime hands them to `Collector.record`.
-pub const PlCounters = struct {
+pub const ProfileContext = struct {
+    collector: *Collector,
+    io: ?std.Io,
+    timer_ns: u64 = 0,
+
+    pub fn begin(self: *ProfileContext) u64 {
+        self.timer_ns = profiling.nowNs(self.io);
+        return self.timer_ns;
+    }
+
+    pub fn lap(self: *ProfileContext, last: *u64) u64 {
+        const current_ns = profiling.nowNs(self.io);
+        const ns = profiling.elapsed(last.*, current_ns);
+        last.* = current_ns;
+        self.timer_ns = current_ns;
+        return ns;
+    }
+
+    pub fn now(self: *ProfileContext) u64 {
+        self.timer_ns = profiling.nowNs(self.io);
+        return self.timer_ns;
+    }
+};
+
+pub fn begin(ctx: ?*ProfileContext) u64 {
+    return if (ctx) |active| active.begin() else 0;
+}
+
+pub fn lap(ctx: ?*ProfileContext, last: *u64) u64 {
+    return if (ctx) |active| active.lap(last) else 0;
+}
+
+pub const MatmulExecution = struct {
+    path: profiling.ExecutionPath,
+    kernel_runs: u32 = 0,
+    wrapper_ns: u64 = 0,
+    quantize_pack_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    sync_from_ns: u64 = 0,
+    result_layout_ns: u64 = 0,
     cycles: u64 = 0,
-    w_stall: u64 = 0,
-    a_stall: u64 = 0,
-    r_stall: u64 = 0,
+    w_stall_cycles: u64 = 0,
+    a_stall_cycles: u64 = 0,
+    r_stall_cycles: u64 = 0,
     w_beats: u64 = 0,
     a_beats: u64 = 0,
     r_beats: u64 = 0,
+};
+
+pub const FlashExecution = struct {
+    path: profiling.ExecutionPath,
+    kernel_runs: u32 = 0,
+    wrapper_ns: u64 = 0,
+    prepare_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    sync_from_ns: u64 = 0,
+    result_layout_ns: u64 = 0,
+    requested_n_kv: u32 = 0,
+    valid_n_kv: u32 = 0,
+    processed_n_kv: u32 = 0,
+    requested_qkv_pairs: u64 = 0,
+    valid_qkv_pairs: u64 = 0,
+    processed_qkv_pairs: u64 = 0,
+    q_bytes: u64 = 0,
+    k_bytes: u64 = 0,
+    v_bytes: u64 = 0,
+    mask_bytes: u64 = 0,
+    o_bytes: u64 = 0,
+    cycles: u64 = 0,
+    q_beats: u64 = 0,
+    k_beats: u64 = 0,
+    k_stall_cycles: u64 = 0,
+    v_beats: u64 = 0,
+    v_stall_cycles: u64 = 0,
+    o_beats: u64 = 0,
+    o_stall_cycles: u64 = 0,
+};
+
+pub const CommandOutcome = struct {
+    backend: profiling.Backend = .ps,
+    path: profiling.ExecutionPath = .software,
+    detail: Detail = .none,
+
+    pub const Detail = union(enum) {
+        none,
+        matmul: MatmulExecution,
+        flash: FlashExecution,
+    };
 };
 
 /// Device-side per-graph profile collection. The runtime drives a Collector
@@ -25,22 +106,22 @@ pub const PlCounters = struct {
 pub const Collector = struct {
     aggregates: [profiling.max_op_tag + 1]profiling.Aggregate =
         [_]profiling.Aggregate{.{}} ** (profiling.max_op_tag + 1),
-    /// Per-(weight format) matmul rollup, indexed by the wire.WeightFormat value.
-    /// macs/total_ns are filled here; the PL counter fields stay zero until the
-    /// PL backend reports them (P2).
-    matmul_stats: [profiling.max_weight_fmt]profiling.MatmulStat =
-        [_]profiling.MatmulStat{.{}} ** profiling.max_weight_fmt,
-    /// Flash-attention shape rollup. One flash op kind, so a single accumulator
-    /// (emitted as a 0-or-1 element slice on the wire).
-    flash_stat: profiling.FlashStat = .{},
+    matmul_stats: [profiling.max_matmul_buckets]profiling.MatmulStat =
+        [_]profiling.MatmulStat{.{}} ** profiling.max_matmul_buckets,
+    flash_stats: [profiling.max_flash_buckets]profiling.FlashStat =
+        [_]profiling.FlashStat{.{}} ** profiling.max_flash_buckets,
+    matmul_count: usize = 0,
+    flash_count: usize = 0,
+    matmul_overflow: u32 = 0,
+    flash_overflow: u32 = 0,
+    accounting_violations: u32 = 0,
 
     /// Record one executed command. Timestamps are device-clock nanoseconds.
     pub fn record(
         self: *Collector,
         command: wire.Command,
-        start_ns: u64,
-        end_ns: u64,
-        pl: ?PlCounters,
+        command_ns: u64,
+        outcome: CommandOutcome,
     ) void {
         const raw_tag: u16 = @intFromEnum(commandTag(command));
         const bytes = commandBytes(command);
@@ -49,50 +130,129 @@ pub const Collector = struct {
             var aggregate = &self.aggregates[index];
             aggregate.tag = raw_tag;
             aggregate.count +|= 1;
-            aggregate.total_ns +|= profiling.elapsed(start_ns, end_ns);
+            aggregate.total_ns +|= command_ns;
             aggregate.bytes +|= bytes;
         }
         switch (command) {
             .matmul_q1a8 => |mm| {
-                const fmt: u16 = @intCast(@intFromEnum(mm.weight_fmt));
-                if (fmt < self.matmul_stats.len) {
-                    var stat = &self.matmul_stats[fmt];
-                    stat.fmt = fmt;
-                    stat.count +|= 1;
-                    const macs = mul(mul(mm.rows, mm.cols), mm.k);
-                    const ns = profiling.elapsed(start_ns, end_ns);
-                    stat.macs +|= macs;
-                    stat.total_ns +|= ns;
-                    if (pl) |c| {
-                        stat.pl_count +|= 1;
-                        stat.pl_macs +|= macs;
-                        stat.pl_ns +|= ns;
-                        stat.cycles +|= c.cycles;
-                        stat.w_stall_cycles +|= c.w_stall;
-                        stat.a_stall_cycles +|= c.a_stall;
-                        stat.r_stall_cycles +|= c.r_stall;
-                        stat.w_beats +|= c.w_beats;
-                        stat.a_beats +|= c.a_beats;
-                        stat.r_beats +|= c.r_beats;
-                    }
-                }
+                const detail = switch (outcome.detail) {
+                    .matmul => |value| value,
+                    else => MatmulExecution{ .path = outcome.path },
+                };
+                const incoming = profiling.MatmulStat{
+                    .backend = outcome.backend,
+                    .path = outcome.path,
+                    .fmt = @intCast(@intFromEnum(mm.weight_fmt)),
+                    .rows = mm.rows,
+                    .cols = mm.cols,
+                    .k = mm.k,
+                };
+                const stat = self.matmulBucket(incoming) orelse return;
+                stat.count +|= 1;
+                stat.kernel_runs +|= detail.kernel_runs;
+                stat.macs +|= mul(mul(mm.rows, mm.cols), mm.k);
+                stat.command_ns +|= command_ns;
+                stat.wrapper_ns +|= detail.wrapper_ns;
+                stat.quantize_pack_ns +|= detail.quantize_pack_ns;
+                stat.sync_to_ns +|= detail.sync_to_ns;
+                stat.setup_ns +|= detail.setup_ns;
+                stat.wait_ns +|= detail.wait_ns;
+                stat.sync_from_ns +|= detail.sync_from_ns;
+                stat.result_layout_ns +|= detail.result_layout_ns;
+                stat.cycles +|= detail.cycles;
+                stat.w_stall_cycles +|= detail.w_stall_cycles;
+                stat.a_stall_cycles +|= detail.a_stall_cycles;
+                stat.r_stall_cycles +|= detail.r_stall_cycles;
+                stat.w_beats +|= detail.w_beats;
+                stat.a_beats +|= detail.a_beats;
+                stat.r_beats +|= detail.r_beats;
+                if (detail.wrapper_ns > command_ns or detail.wrapper_ns < wrapperChildrenMatmul(detail))
+                    self.accounting_violations |= profiling.AccountingViolation.wrapper_segments;
             },
             .flash_attn_f32 => |fa| {
-                // Shape fields are constant per model (last-wins capture); only
-                // n_kv varies, so its sum/max describe the per-call distribution.
-                var s = &self.flash_stat;
+                const detail = switch (outcome.detail) {
+                    .flash => |value| value,
+                    else => FlashExecution{
+                        .path = outcome.path,
+                        .requested_n_kv = fa.n_kv,
+                        .valid_n_kv = fa.n_kv,
+                        .processed_n_kv = fa.n_kv,
+                        .requested_qkv_pairs = mul(fa.n_tokens, fa.n_kv),
+                        .valid_qkv_pairs = mul(fa.n_tokens, fa.n_kv),
+                        .processed_qkv_pairs = mul(fa.n_tokens, fa.n_kv),
+                    },
+                };
+                const incoming = profiling.FlashStat{
+                    .backend = outcome.backend,
+                    .path = outcome.path,
+                    .n_heads = sat16(fa.n_heads),
+                    .n_head_kv = sat16(fa.n_head_kv),
+                    .head_dim_q = sat16(fa.head_dim_q),
+                    .head_dim_v = sat16(fa.head_dim_v),
+                    .n_tokens = fa.n_tokens,
+                };
+                const s = self.flashBucket(incoming) orelse return;
                 s.count +|= 1;
-                s.n_heads = sat16(fa.n_heads);
-                s.n_head_kv = sat16(fa.n_head_kv);
-                s.head_dim_q = sat16(fa.head_dim_q);
-                s.head_dim_v = sat16(fa.head_dim_v);
-                s.sum_n_kv +|= fa.n_kv;
-                s.max_n_kv = @max(s.max_n_kv, fa.n_kv);
-                s.total_ns +|= profiling.elapsed(start_ns, end_ns);
-                s.bytes +|= bytes;
+                s.kernel_runs +|= detail.kernel_runs;
+                s.command_ns +|= command_ns;
+                s.wrapper_ns +|= detail.wrapper_ns;
+                s.prepare_ns +|= detail.prepare_ns;
+                s.sync_to_ns +|= detail.sync_to_ns;
+                s.setup_ns +|= detail.setup_ns;
+                s.wait_ns +|= detail.wait_ns;
+                s.sync_from_ns +|= detail.sync_from_ns;
+                s.result_layout_ns +|= detail.result_layout_ns;
+                s.requested_n_kv_sum +|= detail.requested_n_kv;
+                s.valid_n_kv_sum +|= detail.valid_n_kv;
+                s.processed_n_kv_sum +|= detail.processed_n_kv;
+                s.requested_qkv_pairs +|= detail.requested_qkv_pairs;
+                s.valid_qkv_pairs +|= detail.valid_qkv_pairs;
+                s.processed_qkv_pairs +|= detail.processed_qkv_pairs;
+                s.requested_n_kv_max = @max(s.requested_n_kv_max, detail.requested_n_kv);
+                s.valid_n_kv_max = @max(s.valid_n_kv_max, detail.valid_n_kv);
+                s.processed_n_kv_max = @max(s.processed_n_kv_max, detail.processed_n_kv);
+                s.q_bytes +|= detail.q_bytes;
+                s.k_bytes +|= detail.k_bytes;
+                s.v_bytes +|= detail.v_bytes;
+                s.mask_bytes +|= detail.mask_bytes;
+                s.o_bytes +|= detail.o_bytes;
+                s.cycles +|= detail.cycles;
+                s.q_beats +|= detail.q_beats;
+                s.k_beats +|= detail.k_beats;
+                s.k_stall_cycles +|= detail.k_stall_cycles;
+                s.v_beats +|= detail.v_beats;
+                s.v_stall_cycles +|= detail.v_stall_cycles;
+                s.o_beats +|= detail.o_beats;
+                s.o_stall_cycles +|= detail.o_stall_cycles;
+                if (detail.wrapper_ns > command_ns or detail.wrapper_ns < wrapperChildrenFlash(detail))
+                    self.accounting_violations |= profiling.AccountingViolation.wrapper_segments;
             },
             else => {},
         }
+    }
+
+    fn matmulBucket(self: *Collector, incoming: profiling.MatmulStat) ?*profiling.MatmulStat {
+        for (self.matmul_stats[0..self.matmul_count]) |*stat| if (stat.sameKey(incoming)) return stat;
+        if (self.matmul_count == self.matmul_stats.len) {
+            self.matmul_overflow +|= 1;
+            return null;
+        }
+        const stat = &self.matmul_stats[self.matmul_count];
+        stat.* = incoming;
+        self.matmul_count += 1;
+        return stat;
+    }
+
+    fn flashBucket(self: *Collector, incoming: profiling.FlashStat) ?*profiling.FlashStat {
+        for (self.flash_stats[0..self.flash_count]) |*stat| if (stat.sameKey(incoming)) return stat;
+        if (self.flash_count == self.flash_stats.len) {
+            self.flash_overflow +|= 1;
+            return null;
+        }
+        const stat = &self.flash_stats[self.flash_count];
+        stat.* = incoming;
+        self.flash_count += 1;
+        return stat;
     }
 
     /// Encode the collected report. `summary` carries the caller's timing and
@@ -109,23 +269,30 @@ pub const Collector = struct {
             used[n] = aggregate;
             n += 1;
         }
-        var used_stats: [profiling.max_weight_fmt]profiling.MatmulStat = undefined;
-        var sn: usize = 0;
-        for (self.matmul_stats) |stat| {
-            if (stat.count == 0) continue;
-            used_stats[sn] = stat;
-            sn += 1;
-        }
-        var flash_buf = [_]profiling.FlashStat{self.flash_stat};
-        const flash_used = if (self.flash_stat.count == 0) flash_buf[0..0] else flash_buf[0..1];
+        var checked = summary;
+        checked.matmul_bucket_overflow = self.matmul_overflow;
+        checked.flash_bucket_overflow = self.flash_overflow;
+        checked.accounting_violations |= self.accounting_violations;
+        var command_children: u64 = 0;
+        for (used[0..n]) |aggregate| command_children +|= aggregate.total_ns;
+        if (command_children > checked.execute_ns)
+            checked.accounting_violations |= profiling.AccountingViolation.command_children;
         return profiling.encodeAlloc(allocator, .{
-            .summary = summary,
+            .summary = checked,
             .aggregates = used[0..n],
-            .matmul_stats = used_stats[0..sn],
-            .flash_stats = flash_used,
+            .matmul_stats = self.matmul_stats[0..self.matmul_count],
+            .flash_stats = self.flash_stats[0..self.flash_count],
         });
     }
 };
+
+fn wrapperChildrenMatmul(s: MatmulExecution) u64 {
+    return s.quantize_pack_ns +| s.sync_to_ns +| s.setup_ns +| s.wait_ns +| s.sync_from_ns +| s.result_layout_ns;
+}
+
+fn wrapperChildrenFlash(s: FlashExecution) u64 {
+    return s.prepare_ns +| s.sync_to_ns +| s.setup_ns +| s.wait_ns +| s.sync_from_ns +| s.result_layout_ns;
+}
 
 pub fn commandTag(command: wire.Command) wire.OpTag {
     return switch (command) {
@@ -271,4 +438,117 @@ test "profile byte estimates for row ops count touched rows, not backing spans" 
     ternary_rows.get_rows.src_type = .q2_0;
     const ternary_source_bytes = 2 * layout.ternary_block_bytes;
     try std.testing.expectEqual(@as(u64, 6 * (ternary_source_bytes + 4 + 256 * 4)), commandBytes(ternary_rows));
+}
+
+fn testMatmulCommand(rows: u32) wire.Command {
+    const range = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 64 };
+    return .{ .matmul_q1a8 = .{
+        .weights = range,
+        .acts = range,
+        .dst = range,
+        .rows = rows,
+        .cols = 2,
+        .k = 128,
+        .weight_fmt = .w1a8,
+    } };
+}
+
+test "collector separates backend and path and validates wrapper accounting" {
+    var collector: Collector = .{};
+    const command = testMatmulCommand(16);
+    collector.record(command, 100, .{ .backend = .ps, .path = .software, .detail = .{ .matmul = .{ .path = .software } } });
+    collector.record(command, 200, .{ .backend = .pl, .path = .staged, .detail = .{ .matmul = .{
+        .path = .staged,
+        .kernel_runs = 2,
+        .wrapper_ns = 180,
+        .quantize_pack_ns = 20,
+        .sync_to_ns = 10,
+        .setup_ns = 20,
+        .wait_ns = 100,
+        .sync_from_ns = 10,
+        .result_layout_ns = 10,
+        .cycles = 50,
+        .w_beats = 40,
+    } } });
+
+    try std.testing.expectEqual(@as(usize, 2), collector.matmul_count);
+    try std.testing.expectEqual(profiling.Backend.ps, collector.matmul_stats[0].backend);
+    try std.testing.expectEqual(profiling.Backend.pl, collector.matmul_stats[1].backend);
+    try std.testing.expectEqual(profiling.ExecutionPath.staged, collector.matmul_stats[1].path);
+    try std.testing.expectEqual(@as(u32, 2), collector.matmul_stats[1].kernel_runs);
+    try std.testing.expectEqual(@as(u64, 50), collector.matmul_stats[1].cycles);
+    try std.testing.expectEqual(@as(u32, 0), collector.accounting_violations);
+
+    collector.record(command, 50, .{ .backend = .pl, .path = .direct, .detail = .{ .matmul = .{
+        .path = .direct,
+        .wrapper_ns = 40,
+        .wait_ns = 41,
+    } } });
+    try std.testing.expect(collector.accounting_violations & profiling.AccountingViolation.wrapper_segments != 0);
+}
+
+test "collector reports bounded bucket overflow" {
+    var collector: Collector = .{};
+    for (0..profiling.max_matmul_buckets + 3) |i| {
+        collector.record(testMatmulCommand(@intCast(i + 1)), 1, .{});
+    }
+    try std.testing.expectEqual(@as(usize, profiling.max_matmul_buckets), collector.matmul_count);
+    try std.testing.expectEqual(@as(u32, 3), collector.matmul_overflow);
+
+    const payload = try collector.encode(std.testing.allocator, .{ .execute_ns = profiling.max_matmul_buckets + 3 });
+    defer std.testing.allocator.free(payload);
+    var decoded = try profiling.decodeAlloc(std.testing.allocator, payload);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 3), decoded.summary.matmul_bucket_overflow);
+    try std.testing.expectEqual(@as(usize, profiling.max_matmul_buckets), decoded.matmul_stats.len);
+}
+
+test "collector preserves flash extents and multi-token query-KV work" {
+    const range = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 64 };
+    const command = wire.Command{ .flash_attn_f32 = .{
+        .q = range,
+        .k = range,
+        .v = range,
+        .mask = range,
+        .dst = range,
+        .has_mask = true,
+        .head_dim_q = 128,
+        .head_dim_v = 64,
+        .n_heads = 16,
+        .n_head_kv = 8,
+        .n_kv = 512,
+        .n_tokens = 8,
+        .scale = 1,
+        .q_nb1 = 512,
+        .q_nb2 = 512,
+        .k_nb1 = 2048,
+        .k_nb2 = 256,
+        .v_nb1 = 1024,
+        .v_nb2 = 128,
+        .mask_nb1 = 1024,
+        .dst_nb1 = 256,
+        .dst_nb2 = 4096,
+    } };
+    var collector: Collector = .{};
+    collector.record(command, 100, .{ .backend = .pl, .path = .direct, .detail = .{ .flash = .{
+        .path = .direct,
+        .wrapper_ns = 90,
+        .wait_ns = 80,
+        .requested_n_kv = 512,
+        .valid_n_kv = 8,
+        .processed_n_kv = 8,
+        .requested_qkv_pairs = 4096,
+        .valid_qkv_pairs = 36,
+        .processed_qkv_pairs = 36,
+        .cycles = 70,
+    } } });
+    const stat = collector.flash_stats[0];
+    try std.testing.expectEqual(@as(u64, 512), stat.requested_n_kv_sum);
+    try std.testing.expectEqual(@as(u32, 8), stat.n_tokens);
+    try std.testing.expectEqual(@as(u64, 8), stat.valid_n_kv_sum);
+    try std.testing.expectEqual(@as(u64, 8), stat.processed_n_kv_sum);
+    try std.testing.expectEqual(@as(u64, 4096), stat.requested_qkv_pairs);
+    try std.testing.expectEqual(@as(u64, 36), stat.valid_qkv_pairs);
+    try std.testing.expectEqual(@as(u64, 36), stat.processed_qkv_pairs);
+    try std.testing.expectEqual(profiling.Backend.pl, stat.backend);
 }

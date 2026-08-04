@@ -35,6 +35,7 @@ pub const Error = error{
 pub const Options = struct {
     model_path: []const u8 = build_options.default_model_path,
     prompt: []const u8 = "Hello",
+    prompt_tokens: ?u32 = null,
     max_tokens: u32 = 16,
     census: bool = false,
     n_ctx: u32 = 128,
@@ -51,6 +52,8 @@ pub const Options = struct {
     /// transferred back, instead of the full f32 logits vector. Requires device
     /// support for GGML_OP_ARGMAX and GGML_OP_PAD (the static-graph dummy row).
     backend_sampling: bool = false,
+    /// Benchmark-only: continue feeding sampled EOG tokens until max_tokens.
+    exact_tokens: bool = false,
 };
 
 const PreparedPrompt = struct {
@@ -171,22 +174,28 @@ pub fn runPrompt(
     const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template, options.enable_thinking);
     defer prepared.deinit();
 
-    var token_buffer = try tokenizePrompt(allocator, vocab, prepared, @intCast(options.max_tokens));
+    var token_buffer = try tokenizePrompt(allocator, vocab, prepared, @intCast(options.max_tokens), options.prompt_tokens);
     defer token_buffer.deinit();
     const tokens = token_buffer.tokens;
     var n_past = token_buffer.prompt_len;
+    const prompt_token_count = n_past;
+    if (n_past + options.max_tokens > options.n_ctx) return error.ContextInitFailed;
+    if (profile) |p| p.prompt_tokens = n_past;
 
     if (profile) |p| p.setPhase(.prefill);
-    const prefill_start = if (profile) |p| p.now() else 0;
-    try decodeTokens(ctx, tokens[0..n_past], 0, true);
-    if (profile) |p| p.addWall(.prefill, p.elapsedSince(prefill_start));
+    const prefill_start = profiling.nowNs(io);
+    try decodeTokenBatches(ctx, tokens[0..n_past], 0, options.n_batch);
+    const prefill_ns = profiling.elapsed(prefill_start, profiling.nowNs(io));
+    if (profile) |p| p.addWall(.prefill, prefill_ns);
 
     if (profile) |p| p.setPhase(.decode);
     var generated: u32 = 0;
     // Always-on decode throughput (free tok/s, no --prof needed): wall of each step,
     // split TTFT vs steady. Cheap — a clock read per token. When profiling is on the
     // Collector tracks the same split for the report.
-    var first_decode_ns: u64 = 0;
+    var first_decode_step_ns: u64 = 0;
+    var compute_ttft_ns: u64 = 0;
+    var output_ttft_ns: u64 = 0;
     var steady_decode_ns: u64 = 0;
     var steady_decode_count: u64 = 0;
     while (generated < options.max_tokens) : (generated += 1) {
@@ -194,16 +203,25 @@ pub fn runPrompt(
         // decode phase wall closes; the non-decode part lands in host residual.
         const step_start = profiling.nowNs(io);
         const token = c.llama_sampler_sample(sampler, ctx, -1);
+        const sampled_ns = profiling.nowNs(io);
         c.llama_sampler_accept(sampler, token);
-        if (c.llama_vocab_is_eog(vocab, token)) break;
+        if (!options.exact_tokens and c.llama_vocab_is_eog(vocab, token)) break;
 
         if (!options.census) try writePiece(writer, vocab, token);
+        if (generated == 0) {
+            compute_ttft_ns = profiling.elapsed(prefill_start, sampled_ns);
+            if (!options.census) {
+                try writer.flush();
+                output_ttft_ns = profiling.elapsed(prefill_start, profiling.nowNs(io));
+            }
+            if (profile) |p| p.recordTtft(compute_ttft_ns, output_ttft_ns);
+        }
         tokens[n_past] = token;
         n_past += 1;
         try decodeTokens(ctx, tokens[n_past - 1 .. n_past], n_past - 1, true);
         const step_ns = profiling.elapsed(step_start, profiling.nowNs(io));
         if (generated == 0) {
-            first_decode_ns = step_ns;
+            first_decode_step_ns = step_ns;
         } else {
             steady_decode_ns += step_ns;
             steady_decode_count += 1;
@@ -218,11 +236,31 @@ pub fn runPrompt(
         try prof_render.writeProfile(writer, p, options.model_path, options.device_label);
     } else if (generated > 0) {
         // tok/s even without --prof (the report shows the same when profiling is on).
-        try writer.print("\ndecode: {d} tok, {d:.2} tok/s (TTFT {d:.1} ms)\n", .{
+        try writer.print("\ndecode: {d} tok, {d:.2} tok/s (first step {d:.1} ms, compute TTFT {d:.1} ms, output TTFT {d:.1} ms)\n", .{
             generated,
             prof_model.perSecond(steady_decode_count, steady_decode_ns),
-            prof_model.nsToMs(first_decode_ns),
+            prof_model.nsToMs(first_decode_step_ns),
+            prof_model.nsToMs(compute_ttft_ns),
+            prof_model.nsToMs(output_ttft_ns),
         });
+        try writer.print(
+            "benchmark_result schema=1 prompt_tokens={d} generated_tokens={d}" ++
+                " prefill_wall_ns={d} first_decode_step_ns={d} compute_ttft_ns={d}" ++
+                " output_ttft_ns={d} steady_decode_ns={d} steady_decode_count={d}" ++
+                " decode_wall_ns={d} decode_device_ns=0 decode_transport_ns=0" ++
+                " decode_residual_ns=0 accounting=unprofiled\n",
+            .{
+                prompt_token_count,
+                generated,
+                prefill_ns,
+                first_decode_step_ns,
+                compute_ttft_ns,
+                output_ttft_ns,
+                steady_decode_ns,
+                steady_decode_count,
+                first_decode_step_ns + steady_decode_ns,
+            },
+        );
     }
 }
 
@@ -338,12 +376,12 @@ fn collectTrace(
     const prepared = try preparePrompt(allocator, model, options.prompt, options.chat_template, options.enable_thinking);
     defer prepared.deinit();
 
-    var token_buffer = try tokenizePrompt(allocator, vocab, prepared, max_decode_tokens);
+    var token_buffer = try tokenizePrompt(allocator, vocab, prepared, max_decode_tokens, options.prompt_tokens);
     defer token_buffer.deinit();
     const tokens = token_buffer.tokens;
     var n_past = token_buffer.prompt_len;
 
-    try decodeTokens(ctx, tokens[0..n_past], 0, true);
+    try decodeTokenBatches(ctx, tokens[0..n_past], 0, options.n_batch);
     try copyCurrentLogits(ctx, logits[0..vocab_count]);
 
     var generated_len: usize = 0;
@@ -426,6 +464,7 @@ fn tokenizePrompt(
     vocab: *const c.llama_vocab,
     prepared: PreparedPrompt,
     max_decode_tokens: usize,
+    forced_prompt_tokens: ?u32,
 ) Error!TokenBuffer {
     const needed_raw = c.llama_tokenize(
         vocab,
@@ -437,10 +476,13 @@ fn tokenizePrompt(
         prepared.parse_special,
     );
     if (needed_raw >= 0) return error.TokenizeFailed;
-    const prompt_len: usize = @intCast(-@as(i64, needed_raw));
+    const tokenized_len: usize = @intCast(-@as(i64, needed_raw));
+    if (tokenized_len == 0) return error.TokenizeFailed;
+    const prompt_len: usize = if (forced_prompt_tokens) |n| @intCast(n) else tokenized_len;
     if (prompt_len == 0) return error.TokenizeFailed;
 
-    const total_len = try checkedAdd(try checkedAdd(prompt_len, max_decode_tokens), 1);
+    const source_or_prompt_len = @max(tokenized_len, prompt_len);
+    const total_len = try checkedAdd(try checkedAdd(source_or_prompt_len, max_decode_tokens), 1);
     const tokens = try allocator.alloc(c.llama_token, total_len);
     errdefer allocator.free(tokens);
 
@@ -449,16 +491,40 @@ fn tokenizePrompt(
         prepared.bytes.ptr,
         try i32Len(prepared.bytes.len),
         tokens.ptr,
-        try i32Len(prompt_len),
+        try i32Len(tokenized_len),
         true,
         prepared.parse_special,
     );
-    if (written <= 0 or @as(usize, @intCast(written)) != prompt_len) return error.TokenizeFailed;
+    if (written <= 0 or @as(usize, @intCast(written)) != tokenized_len) return error.TokenizeFailed;
+    if (prompt_len > tokenized_len) {
+        const repeat_start: usize = if (tokenized_len > 1) 1 else 0;
+        const repeat_len = tokenized_len - repeat_start;
+        for (tokenized_len..prompt_len) |i| {
+            tokens[i] = tokens[repeat_start + (i - tokenized_len) % repeat_len];
+        }
+    }
     return .{
         .allocator = allocator,
         .tokens = tokens,
         .prompt_len = prompt_len,
     };
+}
+
+fn decodeTokenBatches(
+    ctx: *c.llama_context,
+    tokens: []c.llama_token,
+    start_pos: usize,
+    batch_tokens: u32,
+) Error!void {
+    if (batch_tokens == 0) return error.DecodeFailed;
+    var offset: usize = 0;
+    const limit: usize = @intCast(batch_tokens);
+    while (offset < tokens.len) {
+        const count = @min(limit, tokens.len - offset);
+        const end = offset + count;
+        try decodeTokens(ctx, tokens[offset..end], start_pos + offset, end == tokens.len);
+        offset = end;
+    }
 }
 
 fn decodeTokens(ctx: *c.llama_context, tokens: []c.llama_token, start_pos: usize, want_logits: bool) Error!void {
@@ -472,7 +538,16 @@ fn decodeTokens(ctx: *c.llama_context, tokens: []c.llama_token, start_pos: usize
         batch.seq_id[i][0] = 0;
         batch.logits[i] = if (want_logits and i + 1 == tokens.len) 1 else 0;
     }
-    if (c.llama_decode(ctx, batch) != 0) return error.DecodeFailed;
+    const status = c.llama_decode(ctx, batch);
+    if (status != 0) {
+        std.debug.print("llama decode failed: status={d} start_pos={d} tokens={d} logits={}\n", .{
+            status,
+            start_pos,
+            tokens.len,
+            want_logits,
+        });
+        return error.DecodeFailed;
+    }
 }
 
 fn copyCurrentLogits(ctx: *c.llama_context, dst: []f32) Error!void {

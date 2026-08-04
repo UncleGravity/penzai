@@ -1,34 +1,65 @@
 const std = @import("std");
 
-pub const version: u16 = 4;
+pub const version: u16 = 6;
 pub const max_op_tag = 64;
-/// Distinct weight formats a matmul can carry (wire.WeightFormat values are
-/// 1-based; this bounds the per-format MatmulStat table indexed by that value).
-pub const max_weight_fmt = 8;
+pub const max_matmul_buckets = 32;
+pub const max_flash_buckets = 16;
 
 const magic: u32 = 0x5046_5250; // "PRFP", little-endian on the wire.
-const header_len: usize = 52;
+const header_len: usize = 104;
 const aggregate_len: usize = 24;
-const matmul_stat_len: usize = 104;
-const flash_stat_len: usize = 40;
+const matmul_stat_len: usize = 160;
+const flash_stat_len: usize = 256;
+
+pub const AccountingViolation = struct {
+    pub const wrapper_segments: u32 = 1 << 0;
+    pub const command_children: u32 = 1 << 1;
+    pub const device_stages: u32 = 1 << 2;
+    pub const rpc_budget: u32 = 1 << 3;
+};
+
+pub const Backend = enum(u8) {
+    ps = 1,
+    pl = 2,
+};
+
+pub const ExecutionPath = enum(u8) {
+    software = 1,
+    direct = 2,
+    staged = 3,
+};
 
 pub const DecodeError = error{
     Truncated,
     BadMagic,
     UnsupportedVersion,
     InvalidLength,
+    InvalidEnum,
     OutOfMemory,
 };
 
+/// The profile payload subdivides device service time. The response metadata,
+/// not this summary, remains authoritative for the complete RPC device time.
 pub const Summary = struct {
-    device_total_ns: u64 = 0,
-    decode_ns: u64 = 0,
+    /// Covered portion of device service, from request decoding through profile
+    /// serialization. ResponseMeta.device_service_ns is the authoritative parent.
+    profile_span_ns: u64 = 0,
+    request_decode_ns: u64 = 0,
+    preload_ns: u64 = 0,
+    command_decode_ns: u64 = 0,
     execute_ns: u64 = 0,
+    profile_encode_ns: u64 = 0,
+    preload_bytes: u64 = 0,
+    command_bytes: u64 = 0,
     command_count: u32 = 0,
-    /// Fabric clock the PL kernel ran at (from its CLK_HZ register). Zero on a
-    /// PS-only run, so the host falls back to wall-time bandwidth estimates and
-    /// leaves the clock out of the variant label.
     device_fclk_hz: u32 = 0,
+    accounting_violations: u32 = 0,
+    matmul_bucket_overflow: u32 = 0,
+    flash_bucket_overflow: u32 = 0,
+
+    pub fn stagesNs(self: Summary) u64 {
+        return self.request_decode_ns +| self.preload_ns +| self.command_decode_ns +| self.execute_ns +| self.profile_encode_ns;
+    }
 };
 
 pub const Aggregate = struct {
@@ -38,21 +69,26 @@ pub const Aggregate = struct {
     bytes: u64 = 0,
 };
 
-/// Per-(matmul format) rollup. `count`/`macs`/`total_ns` cover every matmul of
-/// this format (CPU or PL). The `pl_*` fields and the cycle/stall/beat counters
-/// cover only the PL-executed subset — so MAC/cycle (`pl_macs/cycles`) and PL
-/// wall throughput (`pl_macs/pl_ns`) are not polluted by CPU-fallback matmuls
-/// that share the format bucket. All `pl_*` and counter fields stay zero for a
-/// CPU-only run. `fmt` is a wire.WeightFormat value, kept as a raw u16 so shared/
-/// stays free of the wire enum.
+/// One bounded bucket of like-shaped GEMM commands. Command time belongs to the
+/// runtime; wrapper stages and hardware counters belong to the selected PL path.
 pub const MatmulStat = struct {
+    backend: Backend = .ps,
+    path: ExecutionPath = .software,
     fmt: u16 = 0,
+    rows: u32 = 0,
+    cols: u32 = 0,
+    k: u32 = 0,
     count: u32 = 0,
+    kernel_runs: u32 = 0,
     macs: u64 = 0,
-    total_ns: u64 = 0,
-    pl_count: u32 = 0,
-    pl_macs: u64 = 0,
-    pl_ns: u64 = 0,
+    command_ns: u64 = 0,
+    wrapper_ns: u64 = 0,
+    quantize_pack_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    sync_from_ns: u64 = 0,
+    result_layout_ns: u64 = 0,
     cycles: u64 = 0,
     w_stall_cycles: u64 = 0,
     a_stall_cycles: u64 = 0,
@@ -60,25 +96,73 @@ pub const MatmulStat = struct {
     w_beats: u64 = 0,
     a_beats: u64 = 0,
     r_beats: u64 = 0,
+
+    pub fn sameKey(a: MatmulStat, b: MatmulStat) bool {
+        return a.backend == b.backend and a.path == b.path and a.fmt == b.fmt and
+            a.rows == b.rows and a.cols == b.cols and a.k == b.k;
+    }
+
+    pub fn wrapperChildrenNs(self: MatmulStat) u64 {
+        return self.quantize_pack_ns +| self.sync_to_ns +| self.setup_ns +|
+            self.wait_ns +| self.sync_from_ns +| self.result_layout_ns;
+    }
 };
 
-/// Per-phase flash-attention shape rollup. There is one flash op kind, so this
-/// is a single accumulator (the wire carries 0 or 1 of them). The shape fields
-/// (`n_heads`/`n_head_kv`/`head_dim_*`) are constant for a model, captured as-is;
-/// only `n_kv` varies per call (it grows over decode), so `sum_n_kv`/`max_n_kv`
-/// describe its distribution. The host derives avg n_kv, ns/call, ns per
-/// (head·kv) inner iteration, and effective bandwidth — enough to tell a padded
-/// `n_kv` walk apart from genuine per-iteration cost.
+/// One bounded bucket of like-shaped flash-attention commands. KV extents report
+/// loop bounds; query-KV pairs separately report padded work, finite mask entries,
+/// and the work actually walked by the selected backend.
 pub const FlashStat = struct {
-    count: u32 = 0,
+    backend: Backend = .ps,
+    path: ExecutionPath = .software,
     n_heads: u16 = 0,
     n_head_kv: u16 = 0,
     head_dim_q: u16 = 0,
     head_dim_v: u16 = 0,
-    sum_n_kv: u64 = 0,
-    max_n_kv: u32 = 0,
-    total_ns: u64 = 0,
-    bytes: u64 = 0,
+    n_tokens: u32 = 0,
+    count: u32 = 0,
+    kernel_runs: u32 = 0,
+    command_ns: u64 = 0,
+    wrapper_ns: u64 = 0,
+    prepare_ns: u64 = 0,
+    sync_to_ns: u64 = 0,
+    setup_ns: u64 = 0,
+    wait_ns: u64 = 0,
+    sync_from_ns: u64 = 0,
+    result_layout_ns: u64 = 0,
+    requested_n_kv_sum: u64 = 0,
+    valid_n_kv_sum: u64 = 0,
+    processed_n_kv_sum: u64 = 0,
+    requested_qkv_pairs: u64 = 0,
+    valid_qkv_pairs: u64 = 0,
+    processed_qkv_pairs: u64 = 0,
+    q_bytes: u64 = 0,
+    k_bytes: u64 = 0,
+    v_bytes: u64 = 0,
+    mask_bytes: u64 = 0,
+    o_bytes: u64 = 0,
+    cycles: u64 = 0,
+    q_beats: u64 = 0,
+    k_beats: u64 = 0,
+    k_stall_cycles: u64 = 0,
+    v_beats: u64 = 0,
+    v_stall_cycles: u64 = 0,
+    o_beats: u64 = 0,
+    o_stall_cycles: u64 = 0,
+    requested_n_kv_max: u32 = 0,
+    valid_n_kv_max: u32 = 0,
+    processed_n_kv_max: u32 = 0,
+
+    pub fn sameKey(a: FlashStat, b: FlashStat) bool {
+        return a.backend == b.backend and a.path == b.path and
+            a.n_heads == b.n_heads and a.n_head_kv == b.n_head_kv and
+            a.head_dim_q == b.head_dim_q and a.head_dim_v == b.head_dim_v and
+            a.n_tokens == b.n_tokens;
+    }
+
+    pub fn wrapperChildrenNs(self: FlashStat) u64 {
+        return self.prepare_ns +| self.sync_to_ns +| self.setup_ns +| self.wait_ns +|
+            self.sync_from_ns +| self.result_layout_ns;
+    }
 };
 
 pub const ReportView = struct {
@@ -117,18 +201,14 @@ pub fn encodedLen(report: ReportView) usize {
         report.matmul_stats.len * matmul_stat_len + report.flash_stats.len * flash_stat_len;
 }
 
-pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
+pub fn encode(report: ReportView, out: []u8) error{ OutputTooSmall, InvalidLayout }!usize {
     const want = encodedLen(report);
     if (out.len < want) return error.OutputTooSmall;
     var cursor: usize = 0;
     putU32(out, &cursor, magic);
     putU16(out, &cursor, version);
     putU16(out, &cursor, 0);
-    putU64(out, &cursor, report.summary.device_total_ns);
-    putU64(out, &cursor, report.summary.decode_ns);
-    putU64(out, &cursor, report.summary.execute_ns);
-    putU32(out, &cursor, report.summary.command_count);
-    putU32(out, &cursor, report.summary.device_fclk_hz);
+    putSummary(out, &cursor, report.summary);
     putU32(out, &cursor, @intCast(report.aggregates.len));
     putU32(out, &cursor, @intCast(report.matmul_stats.len));
     putU32(out, &cursor, @intCast(report.flash_stats.len));
@@ -140,36 +220,22 @@ pub fn encode(report: ReportView, out: []u8) error{OutputTooSmall}!usize {
         putU64(out, &cursor, aggregate.total_ns);
         putU64(out, &cursor, aggregate.bytes);
     }
-    for (report.matmul_stats) |stat| {
-        putU16(out, &cursor, stat.fmt);
-        putU16(out, &cursor, 0);
-        putU32(out, &cursor, stat.count);
-        putU64(out, &cursor, stat.macs);
-        putU64(out, &cursor, stat.total_ns);
-        putU32(out, &cursor, stat.pl_count);
-        putU32(out, &cursor, 0);
-        putU64(out, &cursor, stat.pl_macs);
-        putU64(out, &cursor, stat.pl_ns);
-        putU64(out, &cursor, stat.cycles);
-        putU64(out, &cursor, stat.w_stall_cycles);
-        putU64(out, &cursor, stat.a_stall_cycles);
-        putU64(out, &cursor, stat.r_stall_cycles);
-        putU64(out, &cursor, stat.w_beats);
-        putU64(out, &cursor, stat.a_beats);
-        putU64(out, &cursor, stat.r_beats);
-    }
-    for (report.flash_stats) |stat| {
-        putU32(out, &cursor, stat.count);
-        putU16(out, &cursor, stat.n_heads);
-        putU16(out, &cursor, stat.n_head_kv);
-        putU16(out, &cursor, stat.head_dim_q);
-        putU16(out, &cursor, stat.head_dim_v);
-        putU64(out, &cursor, stat.sum_n_kv);
-        putU32(out, &cursor, stat.max_n_kv);
-        putU64(out, &cursor, stat.total_ns);
-        putU64(out, &cursor, stat.bytes);
-    }
+    for (report.matmul_stats) |stat| putMatmul(out, &cursor, stat);
+    for (report.flash_stats) |stat| putFlash(out, &cursor, stat);
+    if (cursor != want) return error.InvalidLayout;
     return cursor;
+}
+
+/// Patch fields only known after profile serialization without re-encoding the
+/// bounded bucket payload.
+pub fn patchProfileSpan(out: []u8, profile_span_ns: u64, profile_encode_ns: u64, extra_violations: u32) DecodeError!void {
+    if (out.len < header_len) return error.Truncated;
+    if (std.mem.readInt(u32, out[0..4], .little) != magic) return error.BadMagic;
+    if (std.mem.readInt(u16, out[4..6], .little) != version) return error.UnsupportedVersion;
+    std.mem.writeInt(u64, out[8..16], profile_span_ns, .little);
+    std.mem.writeInt(u64, out[48..56], profile_encode_ns, .little);
+    const old = std.mem.readInt(u32, out[80..84], .little);
+    std.mem.writeInt(u32, out[80..84], old | extra_violations, .little);
 }
 
 pub fn encodeAlloc(allocator: std.mem.Allocator, report: ReportView) std.mem.Allocator.Error![]u8 {
@@ -185,13 +251,7 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
     if (try takeU32(bytes, &cursor) != magic) return error.BadMagic;
     if (try takeU16(bytes, &cursor) != version) return error.UnsupportedVersion;
     _ = try takeU16(bytes, &cursor);
-    const summary = Summary{
-        .device_total_ns = try takeU64(bytes, &cursor),
-        .decode_ns = try takeU64(bytes, &cursor),
-        .execute_ns = try takeU64(bytes, &cursor),
-        .command_count = try takeU32(bytes, &cursor),
-        .device_fclk_hz = try takeU32(bytes, &cursor),
-    };
+    const summary = try takeSummary(bytes, &cursor);
     const aggregate_count = try takeU32(bytes, &cursor);
     const matmul_stat_count = try takeU32(bytes, &cursor);
     const flash_stat_count = try takeU32(bytes, &cursor);
@@ -222,46 +282,108 @@ pub fn decodeAlloc(allocator: std.mem.Allocator, bytes: []const u8) DecodeError!
             .bytes = try takeU64(bytes, &cursor),
         };
     }
-    for (matmul_stats) |*stat| {
-        stat.* = .{
-            .fmt = try takeU16(bytes, &cursor),
-            .count = blk: {
-                _ = try takeU16(bytes, &cursor);
-                break :blk try takeU32(bytes, &cursor);
-            },
-            .macs = try takeU64(bytes, &cursor),
-            .total_ns = try takeU64(bytes, &cursor),
-            .pl_count = blk: {
-                const c = try takeU32(bytes, &cursor);
-                _ = try takeU32(bytes, &cursor);
-                break :blk c;
-            },
-            .pl_macs = try takeU64(bytes, &cursor),
-            .pl_ns = try takeU64(bytes, &cursor),
-            .cycles = try takeU64(bytes, &cursor),
-            .w_stall_cycles = try takeU64(bytes, &cursor),
-            .a_stall_cycles = try takeU64(bytes, &cursor),
-            .r_stall_cycles = try takeU64(bytes, &cursor),
-            .w_beats = try takeU64(bytes, &cursor),
-            .a_beats = try takeU64(bytes, &cursor),
-            .r_beats = try takeU64(bytes, &cursor),
-        };
-    }
-    for (flash_stats) |*stat| {
-        stat.* = .{
-            .count = try takeU32(bytes, &cursor),
-            .n_heads = try takeU16(bytes, &cursor),
-            .n_head_kv = try takeU16(bytes, &cursor),
-            .head_dim_q = try takeU16(bytes, &cursor),
-            .head_dim_v = try takeU16(bytes, &cursor),
-            .sum_n_kv = try takeU64(bytes, &cursor),
-            .max_n_kv = try takeU32(bytes, &cursor),
-            .total_ns = try takeU64(bytes, &cursor),
-            .bytes = try takeU64(bytes, &cursor),
-        };
-    }
+    for (matmul_stats) |*stat| stat.* = try takeMatmul(bytes, &cursor);
+    for (flash_stats) |*stat| stat.* = try takeFlash(bytes, &cursor);
+    if (cursor != bytes.len) return error.InvalidLength;
 
     return .{ .summary = summary, .aggregates = aggregates, .matmul_stats = matmul_stats, .flash_stats = flash_stats };
+}
+
+fn putSummary(out: []u8, cursor: *usize, s: Summary) void {
+    putU64(out, cursor, s.profile_span_ns);
+    putU64(out, cursor, s.request_decode_ns);
+    putU64(out, cursor, s.preload_ns);
+    putU64(out, cursor, s.command_decode_ns);
+    putU64(out, cursor, s.execute_ns);
+    putU64(out, cursor, s.profile_encode_ns);
+    putU64(out, cursor, s.preload_bytes);
+    putU64(out, cursor, s.command_bytes);
+    putU32(out, cursor, s.command_count);
+    putU32(out, cursor, s.device_fclk_hz);
+    putU32(out, cursor, s.accounting_violations);
+    putU32(out, cursor, s.matmul_bucket_overflow);
+    putU32(out, cursor, s.flash_bucket_overflow);
+}
+
+fn takeSummary(bytes: []const u8, cursor: *usize) DecodeError!Summary {
+    return .{
+        .profile_span_ns = try takeU64(bytes, cursor),
+        .request_decode_ns = try takeU64(bytes, cursor),
+        .preload_ns = try takeU64(bytes, cursor),
+        .command_decode_ns = try takeU64(bytes, cursor),
+        .execute_ns = try takeU64(bytes, cursor),
+        .profile_encode_ns = try takeU64(bytes, cursor),
+        .preload_bytes = try takeU64(bytes, cursor),
+        .command_bytes = try takeU64(bytes, cursor),
+        .command_count = try takeU32(bytes, cursor),
+        .device_fclk_hz = try takeU32(bytes, cursor),
+        .accounting_violations = try takeU32(bytes, cursor),
+        .matmul_bucket_overflow = try takeU32(bytes, cursor),
+        .flash_bucket_overflow = try takeU32(bytes, cursor),
+    };
+}
+
+fn putMatmul(out: []u8, cursor: *usize, s: MatmulStat) void {
+    putU8(out, cursor, @intFromEnum(s.backend));
+    putU8(out, cursor, @intFromEnum(s.path));
+    putU16(out, cursor, s.fmt);
+    putU32(out, cursor, s.rows);
+    putU32(out, cursor, s.cols);
+    putU32(out, cursor, s.k);
+    putU32(out, cursor, s.count);
+    putU32(out, cursor, s.kernel_runs);
+    putU32(out, cursor, 0);
+    putU32(out, cursor, 0);
+    inline for (.{ s.macs, s.command_ns, s.wrapper_ns, s.quantize_pack_ns, s.sync_to_ns, s.setup_ns, s.wait_ns, s.sync_from_ns, s.result_layout_ns, s.cycles, s.w_stall_cycles, s.a_stall_cycles, s.r_stall_cycles, s.w_beats, s.a_beats, s.r_beats }) |value| putU64(out, cursor, value);
+}
+
+fn takeMatmul(bytes: []const u8, cursor: *usize) DecodeError!MatmulStat {
+    const backend = try takeBackend(bytes, cursor);
+    const path = try takePath(bytes, cursor);
+    var s = MatmulStat{ .backend = backend, .path = path, .fmt = try takeU16(bytes, cursor), .rows = try takeU32(bytes, cursor), .cols = try takeU32(bytes, cursor), .k = try takeU32(bytes, cursor), .count = try takeU32(bytes, cursor), .kernel_runs = try takeU32(bytes, cursor) };
+    _ = try takeU32(bytes, cursor);
+    _ = try takeU32(bytes, cursor);
+    inline for (.{ "macs", "command_ns", "wrapper_ns", "quantize_pack_ns", "sync_to_ns", "setup_ns", "wait_ns", "sync_from_ns", "result_layout_ns", "cycles", "w_stall_cycles", "a_stall_cycles", "r_stall_cycles", "w_beats", "a_beats", "r_beats" }) |field| @field(s, field) = try takeU64(bytes, cursor);
+    return s;
+}
+
+fn putFlash(out: []u8, cursor: *usize, s: FlashStat) void {
+    putU8(out, cursor, @intFromEnum(s.backend));
+    putU8(out, cursor, @intFromEnum(s.path));
+    putU16(out, cursor, s.n_heads);
+    putU16(out, cursor, s.n_head_kv);
+    putU16(out, cursor, s.head_dim_q);
+    putU16(out, cursor, s.head_dim_v);
+    putU16(out, cursor, 0);
+    putU32(out, cursor, s.count);
+    putU32(out, cursor, s.kernel_runs);
+    putU32(out, cursor, s.n_tokens);
+    inline for (.{ s.command_ns, s.wrapper_ns, s.prepare_ns, s.sync_to_ns, s.setup_ns, s.wait_ns, s.sync_from_ns, s.result_layout_ns, s.requested_n_kv_sum, s.valid_n_kv_sum, s.processed_n_kv_sum, s.requested_qkv_pairs, s.valid_qkv_pairs, s.processed_qkv_pairs, s.q_bytes, s.k_bytes, s.v_bytes, s.mask_bytes, s.o_bytes, s.cycles, s.q_beats, s.k_beats, s.k_stall_cycles, s.v_beats, s.v_stall_cycles, s.o_beats, s.o_stall_cycles }) |value| putU64(out, cursor, value);
+    putU32(out, cursor, s.requested_n_kv_max);
+    putU32(out, cursor, s.valid_n_kv_max);
+    putU32(out, cursor, s.processed_n_kv_max);
+    putU32(out, cursor, 0);
+}
+
+fn takeFlash(bytes: []const u8, cursor: *usize) DecodeError!FlashStat {
+    const backend = try takeBackend(bytes, cursor);
+    const path = try takePath(bytes, cursor);
+    var s = FlashStat{ .backend = backend, .path = path, .n_heads = try takeU16(bytes, cursor), .n_head_kv = try takeU16(bytes, cursor), .head_dim_q = try takeU16(bytes, cursor), .head_dim_v = try takeU16(bytes, cursor) };
+    _ = try takeU16(bytes, cursor);
+    s.count = try takeU32(bytes, cursor);
+    s.kernel_runs = try takeU32(bytes, cursor);
+    s.n_tokens = try takeU32(bytes, cursor);
+    inline for (.{ "command_ns", "wrapper_ns", "prepare_ns", "sync_to_ns", "setup_ns", "wait_ns", "sync_from_ns", "result_layout_ns", "requested_n_kv_sum", "valid_n_kv_sum", "processed_n_kv_sum", "requested_qkv_pairs", "valid_qkv_pairs", "processed_qkv_pairs", "q_bytes", "k_bytes", "v_bytes", "mask_bytes", "o_bytes", "cycles", "q_beats", "k_beats", "k_stall_cycles", "v_beats", "v_stall_cycles", "o_beats", "o_stall_cycles" }) |field| @field(s, field) = try takeU64(bytes, cursor);
+    s.requested_n_kv_max = try takeU32(bytes, cursor);
+    s.valid_n_kv_max = try takeU32(bytes, cursor);
+    s.processed_n_kv_max = try takeU32(bytes, cursor);
+    _ = try takeU32(bytes, cursor);
+    return s;
+}
+
+fn putU8(out: []u8, cursor: *usize, value: u8) void {
+    out[cursor.*] = value;
+    cursor.* += 1;
 }
 
 fn putU16(out: []u8, cursor: *usize, value: u16) void {
@@ -277,6 +399,29 @@ fn putU32(out: []u8, cursor: *usize, value: u32) void {
 fn putU64(out: []u8, cursor: *usize, value: u64) void {
     std.mem.writeInt(u64, out[cursor.*..][0..8], value, .little);
     cursor.* += 8;
+}
+
+fn takeU8(bytes: []const u8, cursor: *usize) DecodeError!u8 {
+    if (cursor.* >= bytes.len) return error.Truncated;
+    defer cursor.* += 1;
+    return bytes[cursor.*];
+}
+
+fn takeBackend(bytes: []const u8, cursor: *usize) DecodeError!Backend {
+    return switch (try takeU8(bytes, cursor)) {
+        @intFromEnum(Backend.ps) => .ps,
+        @intFromEnum(Backend.pl) => .pl,
+        else => error.InvalidEnum,
+    };
+}
+
+fn takePath(bytes: []const u8, cursor: *usize) DecodeError!ExecutionPath {
+    return switch (try takeU8(bytes, cursor)) {
+        @intFromEnum(ExecutionPath.software) => .software,
+        @intFromEnum(ExecutionPath.direct) => .direct,
+        @intFromEnum(ExecutionPath.staged) => .staged,
+        else => error.InvalidEnum,
+    };
 }
 
 fn takeU16(bytes: []const u8, cursor: *usize) DecodeError!u16 {
@@ -298,44 +443,40 @@ fn takeU64(bytes: []const u8, cursor: *usize) DecodeError!u64 {
 }
 
 test "profile report roundtrips" {
-    const aggregates = [_]Aggregate{
-        .{ .tag = 2, .count = 3, .total_ns = 99, .bytes = 1234 },
-    };
-    const matmul_stats = [_]MatmulStat{
-        .{ .fmt = 1, .count = 5, .macs = 9000, .total_ns = 42, .pl_count = 3, .pl_macs = 6000, .pl_ns = 30, .cycles = 1000, .w_stall_cycles = 100, .a_stall_cycles = 20, .r_stall_cycles = 5, .w_beats = 700, .a_beats = 80, .r_beats = 16 },
-    };
-    const flash_stats = [_]FlashStat{
-        .{ .count = 28, .n_heads = 16, .n_head_kv = 8, .head_dim_q = 128, .head_dim_v = 128, .sum_n_kv = 784, .max_n_kv = 54, .total_ns = 56000, .bytes = 1_234_567 },
-    };
+    const aggregates = [_]Aggregate{.{ .tag = 2, .count = 3, .total_ns = 99, .bytes = 1234 }};
+    const matmul_stats = [_]MatmulStat{.{ .backend = .pl, .path = .direct, .fmt = 1, .rows = 2, .cols = 3, .k = 4, .count = 5, .kernel_runs = 5, .macs = 9000, .command_ns = 42, .wrapper_ns = 40, .wait_ns = 30, .cycles = 1000, .w_stall_cycles = 100, .r_beats = 16 }};
+    const flash_stats = [_]FlashStat{.{ .backend = .pl, .path = .staged, .count = 28, .kernel_runs = 28, .n_heads = 16, .n_head_kv = 8, .head_dim_q = 128, .head_dim_v = 128, .n_tokens = 8, .requested_n_kv_sum = 1024, .valid_n_kv_sum = 784, .processed_n_kv_sum = 784, .requested_qkv_pairs = 8192, .valid_qkv_pairs = 3136, .processed_qkv_pairs = 3136, .requested_n_kv_max = 64, .valid_n_kv_max = 54, .processed_n_kv_max = 54, .command_ns = 56000, .wrapper_ns = 55000, .q_bytes = 1234, .cycles = 9000 }};
     const view = ReportView{
-        .summary = .{
-            .device_total_ns = 100,
-            .decode_ns = 7,
-            .execute_ns = 90,
-            .command_count = 3,
-            .device_fclk_hz = 250_000_000,
-        },
+        .summary = .{ .profile_span_ns = 100, .request_decode_ns = 1, .preload_ns = 2, .command_decode_ns = 6, .execute_ns = 80, .profile_encode_ns = 11, .preload_bytes = 64, .command_bytes = 256, .command_count = 3, .device_fclk_hz = 250_000_000, .matmul_bucket_overflow = 2 },
         .aggregates = &aggregates,
         .matmul_stats = &matmul_stats,
         .flash_stats = &flash_stats,
     };
     const encoded = try encodeAlloc(std.testing.allocator, view);
     defer std.testing.allocator.free(encoded);
+    try std.testing.expectEqual(encodedLen(view), encoded.len);
     var decoded = try decodeAlloc(std.testing.allocator, encoded);
     defer decoded.deinit(std.testing.allocator);
-    try std.testing.expectEqual(view.summary.device_total_ns, decoded.summary.device_total_ns);
-    try std.testing.expectEqual(view.summary.device_fclk_hz, decoded.summary.device_fclk_hz);
-    try std.testing.expectEqual(aggregates[0].bytes, decoded.aggregates[0].bytes);
-    try std.testing.expectEqual(@as(usize, 1), decoded.matmul_stats.len);
-    try std.testing.expectEqual(matmul_stats[0].macs, decoded.matmul_stats[0].macs);
-    try std.testing.expectEqual(matmul_stats[0].pl_macs, decoded.matmul_stats[0].pl_macs);
-    try std.testing.expectEqual(matmul_stats[0].pl_ns, decoded.matmul_stats[0].pl_ns);
-    try std.testing.expectEqual(matmul_stats[0].w_stall_cycles, decoded.matmul_stats[0].w_stall_cycles);
-    try std.testing.expectEqual(matmul_stats[0].r_beats, decoded.matmul_stats[0].r_beats);
-    try std.testing.expectEqual(@as(usize, 1), decoded.flash_stats.len);
-    try std.testing.expectEqual(flash_stats[0].sum_n_kv, decoded.flash_stats[0].sum_n_kv);
-    try std.testing.expectEqual(flash_stats[0].max_n_kv, decoded.flash_stats[0].max_n_kv);
-    try std.testing.expectEqual(flash_stats[0].n_heads, decoded.flash_stats[0].n_heads);
-    try std.testing.expectEqual(flash_stats[0].total_ns, decoded.flash_stats[0].total_ns);
-    try std.testing.expectEqual(flash_stats[0].bytes, decoded.flash_stats[0].bytes);
+    try std.testing.expectEqualDeep(view.summary, decoded.summary);
+    try std.testing.expectEqualDeep(matmul_stats[0], decoded.matmul_stats[0]);
+    try std.testing.expectEqualDeep(flash_stats[0], decoded.flash_stats[0]);
+}
+
+test "profile decoder rejects unknown backend tags" {
+    const stats = [_]MatmulStat{.{ .backend = .pl, .path = .direct }};
+    const encoded = try encodeAlloc(std.testing.allocator, .{ .summary = .{}, .matmul_stats = &stats });
+    defer std.testing.allocator.free(encoded);
+    encoded[header_len] = 0xff;
+    try std.testing.expectError(error.InvalidEnum, decodeAlloc(std.testing.allocator, encoded));
+}
+
+test "profile service accounting can be patched after serialization" {
+    const encoded = try encodeAlloc(std.testing.allocator, .{ .summary = .{} });
+    defer std.testing.allocator.free(encoded);
+    try patchProfileSpan(encoded, 123, 17, AccountingViolation.device_stages);
+    var decoded = try decodeAlloc(std.testing.allocator, encoded);
+    defer decoded.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u64, 123), decoded.summary.profile_span_ns);
+    try std.testing.expectEqual(@as(u64, 17), decoded.summary.profile_encode_ns);
+    try std.testing.expectEqual(AccountingViolation.device_stages, decoded.summary.accounting_violations);
 }

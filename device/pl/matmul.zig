@@ -22,6 +22,7 @@ const profile = @import("../profile.zig");
 
 const wire = shared.wire;
 const layout = shared.layout;
+const capabilities = shared.capabilities;
 
 // The AXI-Lite base addresses, staging reservations, and COLS_MAX all come from
 // the generated bitstream manifest (fpga/regmap/matmul.zig) — the same source
@@ -154,6 +155,25 @@ pub const Kernel = struct {
     }
 };
 
+pub fn capabilityInfo(kernel: Kernel) capabilities.EngineInfo {
+    return .{
+        .id = expected_id,
+        .version = kernel.version,
+        .clock_hz = kernel.clk_hz,
+        .dim0 = expected_rows,
+        .dim1 = expected_weight_ports,
+        .dim2 = @intCast(mc_cols_max),
+        .dim3 = @intCast(layout.max_q1_blocks * layout.q1_block),
+    };
+}
+
+pub fn formatMask(kernel: Kernel) u32 {
+    var mask = capabilities.Format.weight_q1_0 |
+        capabilities.Format.activation_q8_0 | capabilities.Format.io_f32;
+    if (kernel.version >= version_with_ternary) mask |= capabilities.Format.weight_q2_0_g64;
+    return mask;
+}
+
 // ---- seq.v run builder ------------------------------------------------------------------------
 
 /// Every DMA window the matmul stream may program — what seq.validate scans for transfer
@@ -205,25 +225,15 @@ pub fn buildOp(
     dma_mod.record.waitWriteDone(b, seq_dma_bases[0]);
 }
 
-/// Temporary per-segment timing accumulator for localizing per-call overhead.
-const Seg = struct {
-    calls: u64 = 0,
-    quant_ns: u64 = 0,
-    sync_to_ns: u64 = 0,
-    setup_ns: u64 = 0,
-    wait_ns: u64 = 0,
-    sync_from_ns: u64 = 0,
-    copy_ns: u64 = 0,
+const Counters = struct {
     cycles: u64 = 0,
+    w_stall: u64 = 0,
+    a_stall: u64 = 0,
+    r_stall: u64 = 0,
+    w_beats: u64 = 0,
+    a_beats: u64 = 0,
+    r_beats: u64 = 0,
 };
-const seg_report_interval: u64 = 200;
-
-fn lapNs(io: ?std.Io, last: *u64) u64 {
-    const now = shared.profiling.nowNs(io);
-    const d = if (now >= last.*) now - last.* else 0;
-    last.* = now;
-    return d;
-}
 
 /// Generic over the heap so the runtime composes it only for heaps with physical
 /// addressing (XRT); the fake heap never instantiates it.
@@ -246,7 +256,6 @@ pub fn Backend(comptime Heap: type) type {
         column: []f32 = &.{},
         quants: []i8 = &.{},
         act_scales: []f16 = &.{},
-        seg: Seg = .{},
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             // The resident weight packing splits each 16-row block across this
@@ -309,10 +318,9 @@ pub fn Backend(comptime Heap: type) type {
             return self.kernel.hasCounters();
         }
 
-        /// Run `mm` on the PL if its shape is supported; return counters on
-        /// success, null to defer to the PS kernel. Errors are hardware/heap
-        /// failures the runtime should surface, not silent fallbacks.
-        pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8, io: ?std.Io) Error!?profile.PlCounters {
+        /// Run `mm` on the PL if its shape is supported. Detailed timing and
+        /// counter reads are structurally absent when `ctx` is null.
+        pub fn tryMatmul(self: *Self, heap: *Heap, mm: wire.MatmulQ1A8, ctx: ?*profile.ProfileContext) Error!?profile.MatmulExecution {
             if (mm.weight_fmt == .w158a8 and self.kernel.version < version_with_ternary) return null;
             const rows: usize = mm.rows;
             const cols: usize = mm.cols;
@@ -342,6 +350,7 @@ pub fn Backend(comptime Heap: type) type {
             if (mc_cols_max * act_stream_bytes > acts_staging_cap) return null;
             if (num_rb * mc_cols_max * result_bytes_per_rb > result_staging_cap) return null;
 
+            const wrapper_start = profile.begin(ctx);
             try self.ensureScratch(k);
             const q8_blocks = q1_blocks * layout.q8_subblocks;
             const weights_phys = heap.deviceAddress(mm.weights) catch return error.HeapFailure;
@@ -352,9 +361,9 @@ pub fn Backend(comptime Heap: type) type {
             const acts_bytes = heap.bytes(mm.acts) catch return error.HeapFailure; // col-major k*cols f32
             const dst_buf = heap.bytes(mm.dst) catch return error.HeapFailure; // col-major rows*cols f32
 
-            var counters: profile.PlCounters = .{};
-            var seg: Seg = .{};
-            var last = shared.profiling.nowNs(io);
+            var counters: Counters = .{};
+            var result = profile.MatmulExecution{ .path = .direct };
+            var last = wrapper_start;
 
             var col0: usize = 0;
             while (col0 < cols) {
@@ -362,6 +371,7 @@ pub fn Backend(comptime Heap: type) type {
                 const act_total = group * act_stream_bytes;
                 const result_bytes = num_rb * group * result_bytes_per_rb;
                 const direct_result = group == 1 and rows % layout.rows_per_block == 0;
+                if (!direct_result) result.path = .staged;
                 const acts_dma = subRange(self.acts_staging, act_total);
                 const result_dma = if (direct_result)
                     offsetRange(mm.dst, col0 * rows * @sizeOf(f32), result_bytes)
@@ -377,9 +387,9 @@ pub fn Backend(comptime Heap: type) type {
                     layout.quantizeQ8_0Simd(self.column[0..k], self.quants[0..k], self.act_scales[0..q8_blocks]) catch return error.HeapFailure;
                     packActs(q1_blocks, self.quants[0..k], self.act_scales[0..q8_blocks], acts_staging_buf[c * act_stream_bytes ..][0..act_stream_bytes]);
                 }
-                seg.quant_ns += lapNs(io, &last);
+                result.quantize_pack_ns +|= profile.lap(ctx, &last);
                 heap.syncToDevice(acts_dma) catch return error.HeapFailure;
-                seg.sync_to_ns += lapNs(io, &last);
+                result.sync_to_ns +|= profile.lap(ctx, &last);
 
                 const acts_phys = heap.deviceAddress(acts_dma) catch return error.HeapFailure;
                 const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
@@ -404,13 +414,13 @@ pub fn Backend(comptime Heap: type) type {
                     };
                     sc.load(0, b.entries()) catch return error.SeqDispatch;
                     sc.run(0, b.count()) catch return error.SeqDispatch;
-                    seg.setup_ns += lapNs(io, &last);
+                    result.setup_ns +|= profile.lap(ctx, &last);
                     sc.waitDone() catch |e| {
                         std.debug.print("pl: seq run FAILED ({s}) at entry {d}; aborting executor\n", .{ @errorName(e), sc.errIndex() });
                         sc.abort();
                         return error.SeqDispatch;
                     };
-                    seg.wait_ns += lapNs(io, &last);
+                    result.wait_ns +|= profile.lap(ctx, &last);
                 } else {
                     try self.dma_w[0].reset();
                     for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
@@ -421,67 +431,42 @@ pub fn Backend(comptime Heap: type) type {
                     }
                     try self.dma_a.startReadFromDdr(acts_phys, act_total);
                     self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group), mm.weight_fmt);
-                    seg.setup_ns += lapNs(io, &last);
+                    result.setup_ns +|= profile.lap(ctx, &last);
                     try self.kernel.waitDone();
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
                     try self.dma_a.waitReadDone();
                     try self.dma_w[0].waitWriteDone();
-                    seg.wait_ns += lapNs(io, &last);
+                    result.wait_ns +|= profile.lap(ctx, &last);
                 }
 
-                accumulateCounters(&counters, self.readCounters());
+                result.kernel_runs +|= 1;
+                if (ctx != null) accumulateCounters(&counters, self.readCounters());
 
                 // 3. Gather results: stream is [rowblock][col][row],
                 // rowblock-lane-major; place into the col-major destination,
                 // dropping pad rows.
                 heap.syncFromDevice(result_dma) catch return error.HeapFailure;
-                seg.sync_from_ns += lapNs(io, &last);
+                result.sync_from_ns +|= profile.lap(ctx, &last);
                 if (!direct_result) {
                     const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
                     gather.gatherResults(dst_buf, result_buf, rows, group, col0, num_rb);
-                    seg.copy_ns += lapNs(io, &last);
+                    result.result_layout_ns +|= profile.lap(ctx, &last);
                 }
                 col0 += group;
             }
 
-            self.seg.calls += 1;
-            self.seg.quant_ns += seg.quant_ns;
-            self.seg.sync_to_ns += seg.sync_to_ns;
-            self.seg.setup_ns += seg.setup_ns;
-            self.seg.wait_ns += seg.wait_ns;
-            self.seg.sync_from_ns += seg.sync_from_ns;
-            self.seg.copy_ns += seg.copy_ns;
-            self.seg.cycles += counters.cycles;
-            if (self.seg.calls % seg_report_interval == 0) self.flushSeg();
-
-            return counters;
+            if (ctx) |active| result.wrapper_ns = shared.profiling.elapsed(wrapper_start, active.now());
+            result.cycles = counters.cycles;
+            result.w_stall_cycles = counters.w_stall;
+            result.a_stall_cycles = counters.a_stall;
+            result.r_stall_cycles = counters.r_stall;
+            result.w_beats = counters.w_beats;
+            result.a_beats = counters.a_beats;
+            result.r_beats = counters.r_beats;
+            return result;
         }
 
-        /// Print mean per-segment times for the last window of PL calls to stderr,
-        /// then reset. A temporary diagnostic for localizing per-call overhead.
-        fn flushSeg(self: *Self) void {
-            const s = self.seg;
-            if (s.calls == 0) return;
-            const n: f64 = @floatFromInt(s.calls);
-            const us = struct {
-                fn f(ns: u64, count: f64) f64 {
-                    return @as(f64, @floatFromInt(ns)) / count / 1000.0;
-                }
-            }.f;
-            std.debug.print("pl seg us/call (n={d}): quant={d:.1} sync_to={d:.1} setup={d:.1} wait={d:.1} sync_from={d:.1} copy={d:.1} | kernel_compute={d:.1}\n", .{
-                s.calls,
-                us(s.quant_ns, n),
-                us(s.sync_to_ns, n),
-                us(s.setup_ns, n),
-                us(s.wait_ns, n),
-                us(s.sync_from_ns, n),
-                us(s.copy_ns, n),
-                @as(f64, @floatFromInt(s.cycles)) / n / self.kernel.clkMhz(), // cycles -> us
-            });
-            self.seg = .{};
-        }
-
-        fn readCounters(self: *Self) profile.PlCounters {
+        fn readCounters(self: *Self) Counters {
             const cycles: u64 = self.kernel.cycles();
             if (!self.kernel.hasCounters()) {
                 return .{ .cycles = cycles };
@@ -518,7 +503,7 @@ fn offsetRange(base: wire.TensorRange, offset: usize, nbytes: usize) wire.Tensor
 }
 
 /// Sum the per-group hardware counters into the matmul's total.
-fn accumulateCounters(dst: *profile.PlCounters, src: profile.PlCounters) void {
+fn accumulateCounters(dst: *Counters, src: Counters) void {
     dst.cycles += src.cycles;
     dst.w_stall += src.w_stall;
     dst.a_stall += src.a_stall;

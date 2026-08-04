@@ -9,6 +9,7 @@ const layout = shared.layout;
 
 // Aliases so the renderers below reference the model types/helpers unqualified.
 const RunGraphTotals = model.RunGraphTotals;
+const AccountingStatus = model.AccountingStatus;
 const Phase = model.Phase;
 const phase_count = model.phase_count;
 const LinkOp = model.LinkOp;
@@ -59,7 +60,7 @@ pub fn writeUploadCensus(writer: *std.Io.Writer, census: *const UploadCensus) st
 /// Phase budget: the headline closed-identity table. Each row reconciles
 /// wall = device + transport + residual; the total row sums the columns.
 pub fn writePhaseBudget(writer: *std.Io.Writer, phases: []const PhaseAccum) std.Io.Writer.Error!void {
-    try writer.print("phase            {s:>9} {s:>9} {s:>9} {s:>9}\n", .{ "wall", "device", "transport", "residual" });
+    try writer.print("phase            {s:>9} {s:>9} {s:>9} {s:>9} {s:>8}\n", .{ "wall", "device", "transport", "residual", "account" });
     var tot_wall: u64 = 0;
     var tot_dev: u64 = 0;
     var tot_tr: u64 = 0;
@@ -67,27 +68,61 @@ pub fn writePhaseBudget(writer: *std.Io.Writer, phases: []const PhaseAccum) std.
     for (phases, 0..) |phase, i| {
         if (phase.isEmpty()) continue;
         const label = @as(Phase, @enumFromInt(i)).label();
-        try phaseBudgetRow(writer, label, phase.wall_ns, phase.deviceNs(), phase.transportNs(), phase.residualNs());
+        try phaseBudgetRow(writer, label, phase.wall_ns, phase.deviceNs(), phase.transportNs(), phase.residualNs(), phase.accountingStatus());
         tot_wall += phase.wall_ns;
         tot_dev += phase.deviceNs();
         tot_tr += phase.transportNs();
         tot_res += phase.residualNs();
     }
-    try phaseBudgetRow(writer, "total", tot_wall, tot_dev, tot_tr, tot_res);
+    var status: AccountingStatus = .ok;
+    for (phases) |phase| status = status.combine(phase.accountingStatus());
+    try phaseBudgetRow(writer, "total", tot_wall, tot_dev, tot_tr, tot_res, status);
 }
 
-fn phaseBudgetRow(writer: *std.Io.Writer, label: []const u8, wall: u64, device: u64, transport: u64, residual: u64) std.Io.Writer.Error!void {
+fn phaseBudgetRow(writer: *std.Io.Writer, label: []const u8, wall: u64, device: u64, transport: u64, residual: u64, status: AccountingStatus) std.Io.Writer.Error!void {
     var w: [16]u8 = undefined;
     var d: [16]u8 = undefined;
     var t: [16]u8 = undefined;
     var r: [16]u8 = undefined;
-    try writer.print("  {s:<13} {s:>9} {s:>9} {s:>9} {s:>9}\n", .{
+    try writer.print("  {s:<13} {s:>9} {s:>9} {s:>9} {s:>9} {s:>8}\n", .{
         label,
         formatDuration(&w, wall),
         formatDuration(&d, device),
         formatDuration(&t, transport),
         formatDuration(&r, residual),
+        status.label(),
     });
+}
+
+/// Nested device budgets are diagnostics rather than additive phase columns.
+/// Each residual is shown against its own authoritative parent.
+pub fn writeDeviceAccounting(writer: *std.Io.Writer, phases: []const PhaseAccum) std.Io.Writer.Error!void {
+    var any = false;
+    for (phases) |phase| if (phase.rg.run_graph_count != 0) {
+        any = true;
+    };
+    if (!any) return;
+
+    try writer.print("device accounting {s:>10} {s:>7} {s:>10} {s:>7} {s:>10} {s:>7} {s:>8}\n", .{
+        "service", "svc%", "stages", "stage%", "execute", "exec%", "account",
+    });
+    for (phases, 0..) |phase, i| {
+        if (phase.rg.run_graph_count == 0) continue;
+        const rg = &phase.rg;
+        var service_buf: [16]u8 = undefined;
+        var stage_buf: [16]u8 = undefined;
+        var execution_buf: [16]u8 = undefined;
+        try writer.print("  {s:<13} {s:>10} {d:>6.2}% {s:>10} {d:>6.2}% {s:>10} {d:>6.2}% {s:>8}\n", .{
+            (@as(Phase, @enumFromInt(i))).label(),
+            formatDuration(&service_buf, rg.serviceResidualNs()),
+            percent(rg.serviceResidualNs(), rg.device_service_ns),
+            formatDuration(&stage_buf, rg.stageResidualNs()),
+            percent(rg.stageResidualNs(), rg.profiled_service_ns),
+            formatDuration(&execution_buf, rg.executionResidualNs()),
+            percent(rg.executionResidualNs(), rg.device_execute_ns),
+            rg.accountingStatus().label(),
+        });
+    }
 }
 
 /// Per-phase transfer detail. Rows are (phase, op-kind) with nonzero traffic:
@@ -130,18 +165,44 @@ fn transferRow(writer: *std.Io.Writer, kind: []const u8, phase_label: []const u8
 /// The `link` section: run_graph RPC cost vs measured device work. Shared by the
 /// llama `--prof` report and the bench harness so there is one rendering of it.
 pub fn writeLinkSection(writer: *std.Io.Writer, totals: *const RunGraphTotals) std.Io.Writer.Error!void {
-    var ovh_buf: [32]u8 = undefined;
+    var transport_buf: [32]u8 = undefined;
+    var service_buf: [32]u8 = undefined;
+    var response_encode_buf: [32]u8 = undefined;
+    var request_decode_buf: [32]u8 = undefined;
+    var preload_buf: [32]u8 = undefined;
+    var command_decode_buf: [32]u8 = undefined;
+    var execute_buf: [32]u8 = undefined;
+    var profile_encode_buf: [32]u8 = undefined;
+    var residual_buf: [32]u8 = undefined;
+    var stage_residual_buf: [32]u8 = undefined;
+    var execute_residual_buf: [32]u8 = undefined;
     var req_buf: [32]u8 = undefined;
     var resp_buf: [32]u8 = undefined;
     try writer.print("link\n", .{});
     try writer.print("  graphs           {d}\n", .{totals.run_graph_count});
     try writer.print("  commands         {d}\n", .{totals.command_count});
-    try writer.print("  rpc overhead     {s} ({d:.1}%)\n", .{
-        formatDuration(&ovh_buf, totals.rpcOverheadNs()),
-        percent(totals.rpcOverheadNs(), totals.host_run_graph_ns),
+    try writer.print("  device service   {s}\n", .{formatDuration(&service_buf, totals.device_service_ns)});
+    try writer.print("  response encode  {s}\n", .{formatDuration(&response_encode_buf, totals.device_encode_ns)});
+    try writer.print("  transport        {s} ({d:.1}%)\n", .{
+        formatDuration(&transport_buf, totals.transportNs()),
+        percent(totals.transportNs(), totals.host_run_graph_ns),
     });
+    try writer.print("  service stages   request={s} preload={s} command-decode={s} execute={s} profile-encode={s}\n", .{
+        formatDuration(&request_decode_buf, totals.request_decode_ns),
+        formatDuration(&preload_buf, totals.preload_ns),
+        formatDuration(&command_decode_buf, totals.command_decode_ns),
+        formatDuration(&execute_buf, totals.device_execute_ns),
+        formatDuration(&profile_encode_buf, totals.profile_encode_ns),
+    });
+    try writer.print("  service residual {s} ({d:.2}%)\n", .{ formatDuration(&residual_buf, totals.serviceResidualNs()), percent(totals.serviceResidualNs(), totals.device_service_ns) });
+    try writer.print("  stage residual   {s} ({d:.2}%)\n", .{ formatDuration(&stage_residual_buf, totals.stageResidualNs()), percent(totals.stageResidualNs(), totals.profiled_service_ns) });
+    try writer.print("  execute residual {s} ({d:.2}%)\n", .{ formatDuration(&execute_residual_buf, totals.executionResidualNs()), percent(totals.executionResidualNs(), totals.device_execute_ns) });
     try writer.print("  request          {s}\n", .{formatBytes(&req_buf, totals.request_bytes)});
     try writer.print("  response         {s}\n", .{formatBytes(&resp_buf, totals.response_bytes)});
+    if (totals.matmul_bucket_overflow != 0 or totals.flash_bucket_overflow != 0)
+        try writer.print("  bucket overflow  matmul={d} flash={d}\n", .{ totals.matmul_bucket_overflow, totals.flash_bucket_overflow });
+    if (totals.accountingStatus() != .ok)
+        try writer.print("  accounting       {s} (flags=0x{x})\n", .{ totals.accountingStatus().label(), totals.accounting_violations });
 }
 
 /// Canonical op name from the wire enum — single source of truth.
@@ -182,17 +243,16 @@ pub fn weightFormatName(fmt: u16) []const u8 {
     return @tagName(value);
 }
 
-/// Per-(weight format) matmul breakdown. The top line is all matmuls of that
-/// format (CPU + PL): calls, GMAC, wall MAC/s. When some ran on the PL, a `pl`
-/// sub-line reports the PL-executed subset only: its calls, end-to-end MAC/s
-/// (`pl_macs/pl_ns`, includes per-call quantize/DMA/sync overhead), kernel
-/// MAC/cycle (`pl_macs/cycles`, the array's intrinsic rate — clock-independent),
-/// and array utilization `(cycles - max stall)/cycles`. The gap between the
-/// PL MAC/s and MAC/cycle×fclk is the per-call software overhead. The weight
-/// stream columns are derived from PL counters: W B/cyc is clock-independent;
-/// W GB/s is `W_BEATS·beat_bytes·fclk/cycles` (kernel-busy bandwidth, the figure
-/// to compare against the DDR ceiling) when the bitstream reports its clock
-/// (`device_fclk_hz`), else it falls back to a PL end-to-end wall-time estimate.
+fn backendName(backend: profiling.Backend) []const u8 {
+    return @tagName(backend);
+}
+
+fn pathName(path: profiling.ExecutionPath) []const u8 {
+    return @tagName(path);
+}
+
+/// Shape/path buckets keep PS fallbacks and direct/staged PL executions separate.
+/// Wrapper stages are additive; kernel cycles are nested inside wait.
 pub fn writeMatmulDetail(
     writer: *std.Io.Writer,
     title: []const u8,
@@ -206,50 +266,62 @@ pub fn writeMatmulDetail(
     if (!any) return;
 
     try writer.print("{s}\n", .{title});
-    try writer.print("  {s:<10} {s:>7} {s:>10} {s:>12} {s:>9} {s:>7} {s:>8} {s:>8}\n", .{
-        "fmt", "calls", "GMAC", "MAC/s", "MAC/cyc", "util%", "W B/cyc", "W GB/s",
+    try writer.print("  {s:<9} {s:<8} {s:<15} {s:>7} {s:>10} {s:>10} {s:>10} {s:>9}\n", .{
+        "backend", "fmt", "shape", "calls", "command", "wrapper", "MAC/s", "MAC/cyc",
     });
     for (matmul_stats) |stat| {
         if (stat.count == 0) continue;
-        const gmac = @as(f64, @floatFromInt(stat.macs)) / 1_000_000_000.0;
+        var shape_buf: [32]u8 = undefined;
+        var command_buf: [16]u8 = undefined;
+        var wrapper_buf: [16]u8 = undefined;
         var macps_buf: [24]u8 = undefined;
-        try writer.print("  {s:<10} {d:>7} {d:>10.1} {s:>12} {s:>9} {s:>7} {s:>8} {s:>8}\n", .{
+        const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.macs)) / @as(f64, @floatFromInt(stat.cycles));
+        try writer.print("  {s:<2}/{s:<6} {s:<8} {s:<15} {d:>7} {s:>10} {s:>10} {s:>10} {d:>9.1}\n", .{
+            backendName(stat.backend),
+            pathName(stat.path),
             weightFormatName(stat.fmt),
+            std.fmt.bufPrint(&shape_buf, "{d}x{d}x{d}", .{ stat.rows, stat.cols, stat.k }) catch "?",
             stat.count,
-            gmac,
-            std.fmt.bufPrint(&macps_buf, "{d:.2} G/s", .{giga(stat.macs, stat.total_ns)}) catch unreachable,
-            "-",
-            "-",
-            "-",
-            "-",
+            formatDuration(&command_buf, stat.command_ns / stat.count),
+            formatDuration(&wrapper_buf, if (stat.count == 0) 0 else stat.wrapper_ns / stat.count),
+            std.fmt.bufPrint(&macps_buf, "{d:.2} G/s", .{giga(stat.macs, stat.command_ns)}) catch unreachable,
+            mac_per_cyc,
         });
-        if (stat.pl_count == 0) continue;
-        var plps_buf: [24]u8 = undefined;
-        const mac_per_cyc = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(stat.pl_macs)) / @as(f64, @floatFromInt(stat.cycles));
+        if (stat.backend != .pl) continue;
         const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
         const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
         const weight_bytes = stat.w_beats * layout.weight_beat_bytes;
         const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
-        const weight_gb_s_wall = weightGbps(stat, fclk_hz);
-        try writer.print("    {s:<8} {d:>7} {s:>10} {s:>12} {d:>9.1} {d:>7.1} {d:>8.2} {d:>8.2}\n", .{
-            "pl",
-            stat.pl_count,
-            "",
-            std.fmt.bufPrint(&plps_buf, "{d:.2} G/s", .{giga(stat.pl_macs, stat.pl_ns)}) catch unreachable,
-            mac_per_cyc,
-            util,
-            weight_bytes_per_cycle,
-            weight_gb_s_wall,
+        const residual = if (stat.wrapper_ns >= stat.wrapperChildrenNs()) stat.wrapper_ns - stat.wrapperChildrenNs() else 0;
+        var quant_buf: [16]u8 = undefined;
+        var sync_to_buf: [16]u8 = undefined;
+        var setup_buf: [16]u8 = undefined;
+        var wait_buf: [16]u8 = undefined;
+        var sync_from_buf: [16]u8 = undefined;
+        var layout_buf: [16]u8 = undefined;
+        var residual_buf: [16]u8 = undefined;
+        try writer.print("      stages quant/pack={s} sync-to={s} setup={s} wait={s} sync-from={s} layout={s} residual={s}\n", .{
+            formatDuration(&quant_buf, stat.quantize_pack_ns),
+            formatDuration(&sync_to_buf, stat.sync_to_ns),
+            formatDuration(&setup_buf, stat.setup_ns),
+            formatDuration(&wait_buf, stat.wait_ns),
+            formatDuration(&sync_from_buf, stat.sync_from_ns),
+            formatDuration(&layout_buf, stat.result_layout_ns),
+            formatDuration(&residual_buf, residual),
         });
         if (stat.cycles != 0 or stat.w_beats != 0 or stat.a_beats != 0 or stat.r_beats != 0) {
-            try writer.print("      cycles={d} stalls W/A/R={d}/{d}/{d} beats W/A/R={d}/{d}/{d}\n", .{
+            try writer.print("      kernel runs={d} cycles={d} util={d:.1}% stalls W/A/R={d}/{d}/{d} beats W/A/R={d}/{d}/{d} W={d:.2} B/cyc {d:.2} GB/s\n", .{
+                stat.kernel_runs,
                 stat.cycles,
+                util,
                 stat.w_stall_cycles,
                 stat.a_stall_cycles,
                 stat.r_stall_cycles,
                 stat.w_beats,
                 stat.a_beats,
                 stat.r_beats,
+                weight_bytes_per_cycle,
+                weightGbps(stat, fclk_hz),
             });
         }
         if (clockImplausible(stat, fclk_hz)) {
@@ -260,7 +332,7 @@ pub fn writeMatmulDetail(
             try writer.print("      note: CLK_HZ={d} implausible (kernel busy {s} > wall {s}) — W GB/s is wall-time; rebuild bitstream\n", .{
                 fclk_hz,
                 formatDuration(&busy_buf, busy_ns),
-                formatDuration(&wall_buf, stat.pl_ns),
+                formatDuration(&wall_buf, stat.wrapper_ns),
             });
         }
     }
@@ -273,43 +345,77 @@ pub fn formatLatencyFine(buf: []u8, ns: f64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.0} ns", .{ns}) catch unreachable;
 }
 
-/// Flash-attention shape detail for a phase (one row — there is one flash op
-/// kind). The diagnostic is `ns/inner` = total_ns / (n_heads · Σn_kv), the cost
-/// of one (head, kv) inner iteration. Microseconds there at small avg n_kv means
-/// the op is overhead/padding-bound (two passes, walking masked entries), not
-/// bound on the K/V stream — which decides PS rewrite vs PL move. Read it as a
-/// decode metric: decode is always n_tokens=1, so the per-token denominator is
-/// exact; prefill packs n_tokens query rows per call, so its `ns/inner`
-/// aggregates over them (n_tokens is not in the denominator) and runs lower.
+/// Flash shape/path buckets report the padded request, finite-mask extent, and
+/// backend walk separately. Bytes and counters characterize work; they are not
+/// added to the elapsed-time budget.
 pub fn writeFlashDetail(
     writer: *std.Io.Writer,
     title: []const u8,
-    flash: profiling.FlashStat,
+    flash_stats: []const profiling.FlashStat,
 ) std.Io.Writer.Error!void {
-    if (flash.count == 0) return;
+    if (flash_stats.len == 0) return;
     try writer.print("{s}\n", .{title});
-    try writer.print("  {s:<8} {s:>7} {s:>11} {s:>7} {s:>9} {s:>10} {s:>10} {s:>10}\n", .{
-        "qkv", "calls", "n_kv a/max", "heads", "hdim q/v", "ns/call", "ns/inner", "eff MiB/s",
+    try writer.print("  {s:<9} {s:>6} {s:>7} {s:>13} {s:>13} {s:>13} {s:>10} {s:>10}\n", .{
+        "backend", "tokens", "calls", "requested", "valid", "processed", "command", "wrapper",
     });
-    const avg_n_kv = @as(f64, @floatFromInt(flash.sum_n_kv)) / @as(f64, @floatFromInt(flash.count));
-    const ns_per_call = flash.total_ns / flash.count;
-    const inner = @as(f64, @floatFromInt(flash.n_heads)) * @as(f64, @floatFromInt(flash.sum_n_kv));
-    const ns_per_inner = if (inner == 0) 0 else @as(f64, @floatFromInt(flash.total_ns)) / inner;
-    var nkv_buf: [20]u8 = undefined;
-    var heads_buf: [12]u8 = undefined;
-    var hdim_buf: [12]u8 = undefined;
-    var call_buf: [16]u8 = undefined;
-    var inner_buf: [16]u8 = undefined;
-    try writer.print("  {s:<8} {d:>7} {s:>11} {s:>7} {s:>9} {s:>10} {s:>10} {d:>10.1}\n", .{
-        "f32/f16",
-        flash.count,
-        std.fmt.bufPrint(&nkv_buf, "{d:.0}/{d}", .{ avg_n_kv, flash.max_n_kv }) catch "?",
-        std.fmt.bufPrint(&heads_buf, "{d}/{d}", .{ flash.n_heads, flash.n_head_kv }) catch "?",
-        std.fmt.bufPrint(&hdim_buf, "{d}/{d}", .{ flash.head_dim_q, flash.head_dim_v }) catch "?",
-        formatDuration(&call_buf, ns_per_call),
-        formatLatencyFine(&inner_buf, ns_per_inner),
-        mibPerSecond(flash.bytes, flash.total_ns),
-    });
+    for (flash_stats) |flash| {
+        if (flash.count == 0) continue;
+        const count: f64 = @floatFromInt(flash.count);
+        var requested_buf: [20]u8 = undefined;
+        var valid_buf: [20]u8 = undefined;
+        var processed_buf: [20]u8 = undefined;
+        var command_buf: [16]u8 = undefined;
+        var wrapper_buf: [16]u8 = undefined;
+        try writer.print("  {s:<2}/{s:<6} {d:>6} {d:>7} {s:>13} {s:>13} {s:>13} {s:>10} {s:>10}\n", .{
+            backendName(flash.backend),
+            pathName(flash.path),
+            flash.n_tokens,
+            flash.count,
+            std.fmt.bufPrint(&requested_buf, "{d:.1}/{d}", .{ @as(f64, @floatFromInt(flash.requested_n_kv_sum)) / count, flash.requested_n_kv_max }) catch "?",
+            std.fmt.bufPrint(&valid_buf, "{d:.1}/{d}", .{ @as(f64, @floatFromInt(flash.valid_n_kv_sum)) / count, flash.valid_n_kv_max }) catch "?",
+            std.fmt.bufPrint(&processed_buf, "{d:.1}/{d}", .{ @as(f64, @floatFromInt(flash.processed_n_kv_sum)) / count, flash.processed_n_kv_max }) catch "?",
+            formatDuration(&command_buf, flash.command_ns / flash.count),
+            formatDuration(&wrapper_buf, flash.wrapper_ns / flash.count),
+        });
+        try writer.print("      query-KV pairs total requested={d} valid={d} processed={d} (per call {d:.1}/{d:.1}/{d:.1})\n", .{
+            flash.requested_qkv_pairs,
+            flash.valid_qkv_pairs,
+            flash.processed_qkv_pairs,
+            @as(f64, @floatFromInt(flash.requested_qkv_pairs)) / count,
+            @as(f64, @floatFromInt(flash.valid_qkv_pairs)) / count,
+            @as(f64, @floatFromInt(flash.processed_qkv_pairs)) / count,
+        });
+        if (flash.backend != .pl) continue;
+        const residual = if (flash.wrapper_ns >= flash.wrapperChildrenNs()) flash.wrapper_ns - flash.wrapperChildrenNs() else 0;
+        var prep_buf: [16]u8 = undefined;
+        var sync_to_buf: [16]u8 = undefined;
+        var setup_buf: [16]u8 = undefined;
+        var wait_buf: [16]u8 = undefined;
+        var sync_from_buf: [16]u8 = undefined;
+        var layout_buf: [16]u8 = undefined;
+        var residual_buf: [16]u8 = undefined;
+        try writer.print("      stages prepare={s} sync-to={s} setup={s} wait={s} sync-from={s} layout={s} residual={s}\n", .{
+            formatDuration(&prep_buf, flash.prepare_ns),
+            formatDuration(&sync_to_buf, flash.sync_to_ns),
+            formatDuration(&setup_buf, flash.setup_ns),
+            formatDuration(&wait_buf, flash.wait_ns),
+            formatDuration(&sync_from_buf, flash.sync_from_ns),
+            formatDuration(&layout_buf, flash.result_layout_ns),
+            formatDuration(&residual_buf, residual),
+        });
+        try writer.print("      kernel runs={d} cycles={d} beats Q/K/V/O={d}/{d}/{d}/{d} stalls K/V/O={d}/{d}/{d} DMA={d:.1} MiB/s\n", .{
+            flash.kernel_runs,
+            flash.cycles,
+            flash.q_beats,
+            flash.k_beats,
+            flash.v_beats,
+            flash.o_beats,
+            flash.k_stall_cycles,
+            flash.v_stall_cycles,
+            flash.o_stall_cycles,
+            mibPerSecond(flash.q_bytes +| flash.k_bytes +| flash.v_bytes +| flash.mask_bytes +| flash.o_bytes, flash.wrapper_ns),
+        });
+    }
 }
 
 /// One compact, greppable line per run for cross-variant comparison across
@@ -332,13 +438,20 @@ pub fn writeScoreboard(
     }) catch "unknown";
 
     var mm: profiling.MatmulStat = .{};
-    for (rg.matmul_stats) |s| {
-        if (s.count != 0) {
-            mm = s;
-            break;
-        }
+    mm.backend = .pl;
+    mm.path = .direct;
+    for (rg.usedMatmul()) |s| {
+        if (s.backend != .pl) continue;
+        mm.count +|= s.count;
+        mm.kernel_runs +|= s.kernel_runs;
+        mm.macs +|= s.macs;
+        mm.command_ns +|= s.command_ns;
+        mm.wrapper_ns +|= s.wrapper_ns;
+        mm.cycles +|= s.cycles;
+        mm.w_stall_cycles +|= s.w_stall_cycles;
+        mm.w_beats +|= s.w_beats;
     }
-    const mac_cyc = if (mm.cycles == 0) 0 else @as(f64, @floatFromInt(mm.pl_macs)) / @as(f64, @floatFromInt(mm.cycles));
+    const mac_cyc = if (mm.cycles == 0) 0 else @as(f64, @floatFromInt(mm.macs)) / @as(f64, @floatFromInt(mm.cycles));
     const flash_ns = rg.op_totals[@intFromEnum(wire.OpTag.flash_attn_f32)].total_ns;
     const swiglu_ns = rg.op_totals[@intFromEnum(wire.OpTag.swiglu)].total_ns;
 
@@ -352,7 +465,7 @@ pub fn writeScoreboard(
             nsToMs(decode.wall_ns) / t,
             nsToMs(decode.deviceNs()) / t,
             nsToMs(decode.transportNs()) / t,
-            giga(mm.macs, mm.total_ns),
+            giga(mm.macs, mm.command_ns),
             mac_cyc,
             weightGbps(mm, rg.device_fclk_hz),
             percent(mm.w_stall_cycles, mm.cycles),
@@ -411,20 +524,29 @@ pub fn writeProfile(
     try writer.print("penzai profile\n\n", .{});
     try writer.print("  model        {s}\n", .{modelName(model_path)});
     try writer.print("  device       {s}\n", .{device_label});
+    try writer.print("  prompt tokens {d}\n", .{c.prompt_tokens});
     try writer.print("  tokens       {d}\n", .{c.generated_tokens});
-    if (c.steady_decode_count > 0) {
+    if (c.generated_tokens > 0) {
         var avg_buf: [32]u8 = undefined;
-        var ttft_buf: [32]u8 = undefined;
-        try writer.print("  decode       {s}/tok ({d:.2} tok/s), TTFT {s}\n", .{
-            formatDuration(&avg_buf, c.steady_decode_ns / c.steady_decode_count),
+        var first_buf: [32]u8 = undefined;
+        var compute_buf: [32]u8 = undefined;
+        var output_buf: [32]u8 = undefined;
+        const steady_avg = if (c.steady_decode_count == 0) 0 else c.steady_decode_ns / c.steady_decode_count;
+        try writer.print("  decode       {s}/steady-token ({d:.2} tok/s)\n", .{
+            formatDuration(&avg_buf, steady_avg),
             perSecond(c.steady_decode_count, c.steady_decode_ns),
-            formatDuration(&ttft_buf, c.first_decode_ns),
         });
+        try writer.print("  first step   {s}\n", .{formatDuration(&first_buf, c.first_decode_step_ns)});
+        try writer.print("  compute TTFT {s}\n", .{formatDuration(&compute_buf, c.compute_ttft_ns)});
+        if (c.output_ttft_ns != 0)
+            try writer.print("  output TTFT  {s}\n", .{formatDuration(&output_buf, c.output_ttft_ns)});
     }
     try writer.print("  wall         {s}\n\n", .{formatDuration(&buf, c.wallNs())});
 
     // The headline: wall = device + transport + residual, per phase.
     try writePhaseBudget(writer, &c.phases);
+    try writer.writeByte('\n');
+    try writeDeviceAccounting(writer, &c.phases);
     try writer.writeByte('\n');
     try writeTransfers(writer, &c.phases);
     try writer.writeByte('\n');
@@ -443,19 +565,19 @@ pub fn writeProfile(
             writer,
             std.fmt.bufPrint(&ops_title, "ops \u{b7} {s}  {d} graphs, {d} cmds", .{ label, phase.rg.run_graph_count, phase.rg.command_count }) catch "ops",
             &phase.rg.op_totals,
-            phase.rg.device_total_ns,
+            phase.rg.device_execute_ns,
         );
         try writeMatmulDetail(
             writer,
             std.fmt.bufPrint(&mm_title, "matmul \u{b7} {s}", .{label}) catch "matmul",
-            &phase.rg.matmul_stats,
+            phase.rg.usedMatmul(),
             phase.rg.device_fclk_hz,
         );
         var fa_title: [48]u8 = undefined;
         try writeFlashDetail(
             writer,
             std.fmt.bufPrint(&fa_title, "flash \u{b7} {s}", .{label}) catch "flash",
-            phase.rg.flash,
+            phase.rg.usedFlash(),
         );
     }
 
@@ -465,6 +587,32 @@ pub fn writeProfile(
         try writer.writeByte('\n');
         try writeScoreboard(writer, decode, c.generated_tokens);
     }
+
+    var accounting: AccountingStatus = .ok;
+    for (c.phases) |phase| accounting = accounting.combine(phase.accountingStatus());
+    const prefill = &c.phases[@intFromEnum(Phase.prefill)];
+    try writer.print(
+        "benchmark_result schema=1 prompt_tokens={d} generated_tokens={d}" ++
+            " prefill_wall_ns={d} first_decode_step_ns={d} compute_ttft_ns={d}" ++
+            " output_ttft_ns={d} steady_decode_ns={d} steady_decode_count={d}" ++
+            " decode_wall_ns={d} decode_device_ns={d} decode_transport_ns={d}" ++
+            " decode_residual_ns={d} accounting={s}\n",
+        .{
+            c.prompt_tokens,
+            c.generated_tokens,
+            prefill.wall_ns,
+            c.first_decode_step_ns,
+            c.compute_ttft_ns,
+            c.output_ttft_ns,
+            c.steady_decode_ns,
+            c.steady_decode_count,
+            decode.wall_ns,
+            decode.deviceNs(),
+            decode.transportNs(),
+            decode.residualNs(),
+            accounting.label(),
+        },
+    );
 }
 
 /// Basename of the model path with the `.gguf` suffix removed, for the header.

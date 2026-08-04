@@ -54,7 +54,12 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
     if (!std.mem.eql(u8, command, "serve")) return error.InvalidCommand;
 
     var device_text: []const u8 = "tcp:0.0.0.0:9000";
-    var options: device_tcp.ServeOptions = .{};
+    var options: device_tcp.ServeOptions = .{
+        .receipt_path = if (std.c.getenv("PENZAI_BITSTREAM_RECEIPT")) |value|
+            std.mem.span(value)
+        else
+            "/lib/firmware/xilinx/penzai-combined-v1/deployment_receipt.tsv",
+    };
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--device")) {
             device_text = try requireValue(&args);
@@ -72,6 +77,10 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
             options.memory = try parseMemoryBackend(try requireValue(&args));
         } else if (std.mem.startsWith(u8, arg, "--mem=")) {
             options.memory = try parseMemoryBackend(arg["--mem=".len..]);
+        } else if (std.mem.eql(u8, arg, "--bitstream-receipt")) {
+            options.receipt_path = try requireValue(&args);
+        } else if (std.mem.startsWith(u8, arg, "--bitstream-receipt=")) {
+            options.receipt_path = arg["--bitstream-receipt=".len..];
         } else if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             try writeUsage(stdout);
             return;
@@ -84,11 +93,12 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
     switch (device) {
         .fake => return error.UnsupportedDevice,
         .tcp => |tcp| {
-            try stdout.print("penzaid serve device=tcp host={s} port={d} heap_mib={d} mem={s}\n", .{
+            try stdout.print("penzaid serve device=tcp host={s} port={d} heap_mib={d} mem={s} receipt={s}\n", .{
                 tcp.host,
                 tcp.port,
                 options.heap_mib,
                 @tagName(options.memory),
+                options.receipt_path,
             });
             try stdout.flush();
             try device_tcp.serve(init.io, init.gpa, tcp, options);
@@ -113,7 +123,7 @@ fn parseMemoryBackend(value: []const u8) CliError!device_tcp.MemoryBackend {
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
         \\usage:
-        \\  penzaid serve --device tcp:HOST:PORT [--mem fake|xrt] [--heap-mib N] [--max-requests N]
+        \\  penzaid serve --device tcp:HOST:PORT [--mem fake|xrt] [--heap-mib N] [--max-requests N] [--bitstream-receipt PATH]
         \\
         \\commands:
         \\  serve      run the board/device runtime over TCP

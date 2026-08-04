@@ -82,28 +82,58 @@ pub const Shape = struct {
 /// (F16_NEG_INF), so the real extent is the last kv that is *not* it.
 pub const f16_neg_inf: u16 = 0xFC00;
 
-/// Real (unmasked) KV extent: 1 + the largest kv index carrying a finite mask entry,
-/// maximized over the query-token rows. Clamping the kernel to [0, kv_hi) is
-/// bit-identical to walking [0, n_kv): the dropped tail is exactly the −∞-masked
-/// positions the kernel already skips (each contributes exp(−∞)=0 to the running l
-/// and acc). A null mask means no padding — the whole extent is real. Shrinking n_kv
-/// shrinks the K/V DMA and the kernel walk together.
-pub fn maskedExtent(s: Shape, mask_data: ?[]const u8) usize {
-    const m = mask_data orelse return s.n_kv;
-    var hi: usize = 0;
-    for (0..s.n_tokens) |t| {
-        // Scan this token's row from the top down to the current bound; the first
-        // finite entry is its last real kv. Later tokens only extend the bound.
-        var kv: usize = s.n_kv;
-        while (kv > hi) : (kv -= 1) {
-            const bits = std.mem.readInt(u16, m[t * s.mask_nb1 + (kv - 1) * @sizeOf(f16) ..][0..2], .little);
-            if (bits != f16_neg_inf) {
-                hi = kv;
-                break;
+pub const MaskAnalysis = struct {
+    valid_extent: usize,
+    processed_extent: usize,
+    valid_pairs: usize,
+};
+
+/// Analyze the mask for kernel configuration and, when requested, profiling.
+/// Profiling uses a forward scan to count finite entries and find the extent in
+/// one pass. The unprofiled path searches backward and stops at the first finite
+/// entry because valid_pairs is not consumed. The current kernel cannot accept
+/// N_KV=0, so an all-masked row retains its defensive full walk.
+pub fn analyzeMask(s: Shape, mask_data: ?[]const u8, collect_pairs: bool) MaskAnalysis {
+    const m = mask_data orelse return .{
+        .valid_extent = s.n_kv,
+        .processed_extent = s.n_kv,
+        .valid_pairs = if (collect_pairs) s.n_tokens * s.n_kv else 0,
+    };
+
+    if (!collect_pairs) {
+        var hi: usize = 0;
+        for (0..s.n_tokens) |t| {
+            var kv = s.n_kv;
+            while (kv > hi) : (kv -= 1) {
+                const bits = std.mem.readInt(u16, m[t * s.mask_nb1 + (kv - 1) * @sizeOf(f16) ..][0..2], .little);
+                if (bits != f16_neg_inf) {
+                    hi = kv;
+                    break;
+                }
             }
         }
+        return .{
+            .valid_extent = hi,
+            .processed_extent = if (hi == 0) s.n_kv else hi,
+            .valid_pairs = 0,
+        };
     }
-    return if (hi == 0) s.n_kv else hi;
+
+    var hi: usize = 0;
+    var count: usize = 0;
+    for (0..s.n_tokens) |t| {
+        for (0..s.n_kv) |kv| {
+            const bits = std.mem.readInt(u16, m[t * s.mask_nb1 + kv * @sizeOf(f16) ..][0..2], .little);
+            if (bits == f16_neg_inf) continue;
+            hi = @max(hi, kv + 1);
+            count += 1;
+        }
+    }
+    return .{
+        .valid_extent = hi,
+        .processed_extent = if (hi == 0) s.n_kv else hi,
+        .valid_pairs = count,
+    };
 }
 
 /// Scatter the kernel's packed O (dense f32 in (token, head, d) order — the 8-wide
@@ -126,43 +156,73 @@ fn f16bits(v: f32) u16 {
     return @bitCast(@as(f16, @floatCast(v)));
 }
 
-test "maskedExtent clamps to the finite prefix and tolerates a null mask" {
+test "mask analysis separates finite entries from the processed extent" {
     const base: Shape = .{
-        .head_dim_q = 8, .head_dim_v = 8, .n_heads = 1, .n_head_kv = 1,
-        .n_kv = 8, .n_tokens = 1,
-        .q_nb1 = 0, .q_nb2 = 0, .k_nb1 = 0, .k_nb2 = 0, .v_nb1 = 0, .v_nb2 = 0,
-        .mask_nb1 = 8 * @sizeOf(f16), .dst_nb1 = 0, .dst_nb2 = 0,
+        .head_dim_q = 8,
+        .head_dim_v = 8,
+        .n_heads = 1,
+        .n_head_kv = 1,
+        .n_kv = 8,
+        .n_tokens = 1,
+        .q_nb1 = 0,
+        .q_nb2 = 0,
+        .k_nb1 = 0,
+        .k_nb2 = 0,
+        .v_nb1 = 0,
+        .v_nb2 = 0,
+        .mask_nb1 = 8 * @sizeOf(f16),
+        .dst_nb1 = 0,
+        .dst_nb2 = 0,
     };
     // Causal decode: finite prefix [0,3), −∞ tail → extent 3.
     var row = [_]u16{ 0, 0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf };
-    try std.testing.expectEqual(@as(usize, 3), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    var analysis = analyzeMask(base, std.mem.sliceAsBytes(row[0..]), true);
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 3, .processed_extent = 3, .valid_pairs = 3 }, analysis);
     // A finite entry above a masked hole still bounds the extent (last real + 1).
     row = .{ 0, f16_neg_inf, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf };
-    try std.testing.expectEqual(@as(usize, 3), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    analysis = analyzeMask(base, std.mem.sliceAsBytes(row[0..]), true);
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 3, .processed_extent = 3, .valid_pairs = 2 }, analysis);
+    try std.testing.expectEqualDeep(
+        MaskAnalysis{ .valid_extent = 3, .processed_extent = 3, .valid_pairs = 0 },
+        analyzeMask(base, std.mem.sliceAsBytes(row[0..]), false),
+    );
     // All masked → defensive fallback to the full padded extent.
     @memset(row[0..], f16_neg_inf);
-    try std.testing.expectEqual(@as(usize, 8), maskedExtent(base, std.mem.sliceAsBytes(row[0..])));
+    analysis = analyzeMask(base, std.mem.sliceAsBytes(row[0..]), true);
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 0, .processed_extent = 8, .valid_pairs = 0 }, analysis);
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 0, .processed_extent = 8, .valid_pairs = 0 }, analyzeMask(base, std.mem.sliceAsBytes(row[0..]), false));
     // Null mask → the whole extent is real.
-    try std.testing.expectEqual(@as(usize, 8), maskedExtent(base, null));
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 8, .processed_extent = 8, .valid_pairs = 8 }, analyzeMask(base, null, true));
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 8, .processed_extent = 8, .valid_pairs = 0 }, analyzeMask(base, null, false));
     // Two tokens: the bound is the max real extent across rows (t0→2, t1→5).
     var two = base;
     two.n_tokens = 2;
     const rows = [_]u16{
         0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf, f16_neg_inf,
-        0, 0, 0, 0, 0, f16_neg_inf, f16_neg_inf, f16_neg_inf,
+        0, 0, 0,           0,           0,           f16_neg_inf, f16_neg_inf, f16_neg_inf,
     };
-    try std.testing.expectEqual(@as(usize, 5), maskedExtent(two, std.mem.sliceAsBytes(rows[0..])));
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 5, .processed_extent = 5, .valid_pairs = 7 }, analyzeMask(two, std.mem.sliceAsBytes(rows[0..]), true));
+    try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 5, .processed_extent = 5, .valid_pairs = 0 }, analyzeMask(two, std.mem.sliceAsBytes(rows[0..]), false));
 }
 
 test "directDmaCapable accepts the packed Bonsai decode layout, rejects padding/prefill" {
     // Bonsai decode: [head_dim, n_head_kv, n_kv] packed, Q [head_dim, n_heads] packed.
     const ok: Shape = .{
-        .head_dim_q = 128, .head_dim_v = 128, .n_heads = 16, .n_head_kv = 8,
-        .n_kv = 256, .n_tokens = 1,
-        .q_nb1 = 128 * 4, .q_nb2 = 128 * 4,
-        .k_nb1 = 8 * 128 * 2, .k_nb2 = 128 * 2,
-        .v_nb1 = 8 * 128 * 2, .v_nb2 = 128 * 2,
-        .mask_nb1 = 256 * 2, .dst_nb1 = 128 * 4, .dst_nb2 = 16 * 128 * 4,
+        .head_dim_q = 128,
+        .head_dim_v = 128,
+        .n_heads = 16,
+        .n_head_kv = 8,
+        .n_kv = 256,
+        .n_tokens = 1,
+        .q_nb1 = 128 * 4,
+        .q_nb2 = 128 * 4,
+        .k_nb1 = 8 * 128 * 2,
+        .k_nb2 = 128 * 2,
+        .v_nb1 = 8 * 128 * 2,
+        .v_nb2 = 128 * 2,
+        .mask_nb1 = 256 * 2,
+        .dst_nb1 = 128 * 4,
+        .dst_nb2 = 16 * 128 * 4,
     };
     try std.testing.expect(ok.directDmaCapable());
     var prefill = ok; // multi-token Q is strided per head → not direct
@@ -178,10 +238,21 @@ test "scatterO places dense f32 into the strided destination" {
     const a = std.testing.allocator;
     // head_dim_v=4, n_heads=2, n_tokens=1; dst [hd_v, n_heads, n_tokens] strided.
     const s: Shape = .{
-        .head_dim_q = 8, .head_dim_v = 4, .n_heads = 2, .n_head_kv = 1,
-        .n_kv = 1, .n_tokens = 1,
-        .q_nb1 = 0, .q_nb2 = 0, .k_nb1 = 0, .k_nb2 = 0, .v_nb1 = 0, .v_nb2 = 0, .mask_nb1 = 0,
-        .dst_nb1 = 4 * 4, .dst_nb2 = 2 * 4 * 4,
+        .head_dim_q = 8,
+        .head_dim_v = 4,
+        .n_heads = 2,
+        .n_head_kv = 1,
+        .n_kv = 1,
+        .n_tokens = 1,
+        .q_nb1 = 0,
+        .q_nb2 = 0,
+        .k_nb1 = 0,
+        .k_nb2 = 0,
+        .v_nb1 = 0,
+        .v_nb2 = 0,
+        .mask_nb1 = 0,
+        .dst_nb1 = 4 * 4,
+        .dst_nb2 = 2 * 4 * 4,
     };
     // packed O: dense f32 in (h, d) order; tag = h*100 + d.
     const o = try a.alloc(u8, s.oBytes());

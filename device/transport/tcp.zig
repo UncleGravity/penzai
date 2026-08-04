@@ -4,6 +4,7 @@ const runtime_mod = @import("runtime");
 const server_mod = @import("server");
 
 const protocol_transport = shared.protocol_transport;
+const capabilities = shared.capabilities;
 
 const net = std.Io.net;
 
@@ -28,6 +29,7 @@ pub const ServeOptions = struct {
     heap_mib: u32 = 16,
     max_requests: ?u32 = null,
     memory: MemoryBackend = .fake,
+    receipt_path: []const u8 = "",
 };
 
 pub const MemoryBackend = enum {
@@ -56,7 +58,8 @@ fn serveWithRuntime(
     heap_size: usize,
     options: ServeOptions,
 ) ServeError!void {
-    var runtime = Runtime.init(allocator, heap_size) catch |err| return mapInitError(err);
+    const receipt = loadReceipt(io, options.receipt_path);
+    var runtime = Runtime.initWithReceipt(allocator, heap_size, receipt) catch |err| return mapInitError(err);
     defer runtime.deinit();
 
     var remaining = options.max_requests;
@@ -72,6 +75,30 @@ fn serveWithRuntime(
             }
         }
     }
+}
+
+const max_receipt_bytes = 4096;
+
+fn loadReceipt(io: std.Io, path: []const u8) capabilities.Receipt {
+    if (path.len == 0) return .{};
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{ .allow_directory = false }) catch return .{};
+    defer file.close(io);
+
+    var buf: [max_receipt_bytes]u8 = undefined;
+    var used: u64 = 0;
+    while (used < buf.len) {
+        var dst = [_][]u8{buf[@intCast(used)..]};
+        const n = io.vtable.fileReadPositional(io.userdata, file, &dst, used) catch return capabilities.Receipt.invalid();
+        if (n == 0) break;
+        used += n;
+    }
+    if (used == buf.len) {
+        var extra: [1]u8 = undefined;
+        var dst = [_][]u8{extra[0..]};
+        const n = io.vtable.fileReadPositional(io.userdata, file, &dst, used) catch return capabilities.Receipt.invalid();
+        if (n != 0) return capabilities.Receipt.invalid();
+    }
+    return capabilities.Receipt.parse(buf[0..@intCast(used)]) catch capabilities.Receipt.invalid();
 }
 
 fn mapInitError(err: anyerror) ServeError {

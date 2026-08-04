@@ -14,6 +14,7 @@ const framing = shared.framing;
 const protocol_transport = shared.protocol_transport;
 const wire = shared.wire;
 const profiling = shared.profiling;
+const capability_schema = shared.capabilities;
 
 const max_transfer_payload: usize = @intCast(framing.max_payload_len);
 
@@ -21,6 +22,12 @@ pub const LinkError = error{
     OutOfMemory,
     Protocol,
     RemoteFailed,
+    RemoteInvalidRequest,
+    RemoteOutOfMemory,
+    RemoteUnknownHandle,
+    RemoteOutOfBounds,
+    RemoteUnsupportedOp,
+    RemoteBackendFailure,
     Transport,
 };
 
@@ -28,14 +35,14 @@ pub const LinkError = error{
 /// The host pairs it with its own measured round trip to split transport from
 /// device work. Zero when the device was built without profiling.
 pub const OpTiming = struct {
-    device_service_ns: u64 = 0,
+    device_rpc_ns: u64 = 0,
 };
 
 /// Device-side time for the budget = request servicing (device_service_ns) + the
 /// response encode/copy (device_encode_ns), both stamped on the wire ResponseMeta.
 /// Folding them together here keeps the host's transport bucket pure wire time.
 fn opTimingFrom(meta: wire.ResponseMeta) OpTiming {
-    return .{ .device_service_ns = meta.device_service_ns +| meta.device_encode_ns };
+    return .{ .device_rpc_ns = meta.device_service_ns +| meta.device_encode_ns };
 }
 
 /// `alloc` result: the granted range plus the op's service timing.
@@ -48,6 +55,12 @@ pub const RpcTiming = struct {
     request_bytes: u64 = 0,
     response_bytes: u64 = 0,
     round_trip_ns: u64 = 0,
+    device_service_ns: u64 = 0,
+    device_encode_ns: u64 = 0,
+
+    pub fn deviceRpcNs(self: RpcTiming) u64 {
+        return self.device_service_ns +| self.device_encode_ns;
+    }
 };
 
 pub const ProfiledRunGraph = struct {
@@ -73,6 +86,7 @@ pub const Client = struct {
 
     const VTable = struct {
         hello: *const fn (*anyopaque) LinkError!void,
+        capabilities: *const fn (*anyopaque) LinkError!capability_schema.Report,
         alloc: *const fn (*anyopaque, u64, u32) LinkError!AllocResult,
         free: *const fn (*anyopaque, wire.TensorRange) LinkError!OpTiming,
         upload: *const fn (*anyopaque, wire.TensorRange, []const u8) LinkError!OpTiming,
@@ -95,6 +109,10 @@ pub const Client = struct {
 
             fn callHello(ctx: *anyopaque) LinkError!void {
                 return ptr(ctx).hello();
+            }
+
+            fn callCapabilities(ctx: *anyopaque) LinkError!capability_schema.Report {
+                return ptr(ctx).capabilities();
             }
 
             fn callAlloc(ctx: *anyopaque, nbytes: u64, alignment: u32) LinkError!AllocResult {
@@ -127,6 +145,7 @@ pub const Client = struct {
 
             const vtable = VTable{
                 .hello = callHello,
+                .capabilities = callCapabilities,
                 .alloc = callAlloc,
                 .free = callFree,
                 .upload = callUpload,
@@ -145,6 +164,10 @@ pub const Client = struct {
 
     pub fn hello(self: Self) LinkError!void {
         return self.vtable.hello(self.ctx);
+    }
+
+    pub fn capabilities(self: Self) LinkError!capability_schema.Report {
+        return self.vtable.capabilities(self.ctx);
     }
 
     pub fn alloc(self: Self, nbytes: u64, alignment: u32) LinkError!AllocResult {
@@ -233,6 +256,17 @@ pub fn Link(comptime Transport: type) type {
             try response.expectOk(id);
         }
 
+        pub fn capabilities(self: *Self) LinkError!capability_schema.Report {
+            var meta: [32]u8 = undefined;
+            const id = self.nextId();
+            const meta_len = wire.encodeCapabilities(&meta, id) catch return error.Protocol;
+            var response = try self.call(meta[0..meta_len], "");
+            defer response.deinit(self.allocator);
+            try response.expectOk(id);
+            if (response.meta.nbytes != response.payload.len) return error.Protocol;
+            return capability_schema.decode(response.payload) catch return error.Protocol;
+        }
+
         pub fn alloc(self: *Self, nbytes: u64, alignment: u32) LinkError!AllocResult {
             var meta: [64]u8 = undefined;
             const id = self.nextId();
@@ -277,7 +311,7 @@ pub fn Link(comptime Transport: type) type {
                 const chunk_len = @min(chunk_limit, bytes.len - offset);
                 const chunk_range = try transferChunkRange(range, offset, chunk_len);
                 const timing = try self.uploadOne(chunk_range, bytes[offset..][0..chunk_len]);
-                total.device_service_ns = total.device_service_ns +| timing.device_service_ns;
+                total.device_rpc_ns = total.device_rpc_ns +| timing.device_rpc_ns;
                 offset += chunk_len;
             }
             return total;
@@ -324,7 +358,7 @@ pub fn Link(comptime Transport: type) type {
                 const chunk_len = @min(chunk_limit, out.len - offset);
                 const chunk_range = try transferChunkRange(range, offset, chunk_len);
                 const timing = try self.downloadOne(chunk_range, out[offset..][0..chunk_len]);
-                total.device_service_ns = total.device_service_ns +| timing.device_service_ns;
+                total.device_rpc_ns = total.device_rpc_ns +| timing.device_rpc_ns;
                 offset += chunk_len;
             }
             return total;
@@ -344,8 +378,7 @@ pub fn Link(comptime Transport: type) type {
             var response = try self.transport.callInto(self.allocator, request_frame, out);
             defer response.deinit(self.allocator);
             const response_meta = wire.decodeResponseMeta(response.metadata) catch return error.Protocol;
-            if (response_meta.request_id != id) return error.Protocol;
-            if (response_meta.status != .ok) return error.RemoteFailed;
+            try expectResponseOk(response_meta, id);
             if (!response.payload_copied or response.payload_len != out.len) return error.Protocol;
             return opTimingFrom(response_meta);
         }
@@ -391,15 +424,14 @@ pub fn Link(comptime Transport: type) type {
             try response.expectOk(id);
             var report = profiling.decodeAlloc(self.allocator, response.payload) catch return error.Protocol;
             errdefer report.deinit(self.allocator);
-            // Fold the device's response-encode time (framing + the profile payload
-            // copy) into device_total so the host's transport bucket stays pure wire.
-            report.summary.device_total_ns +|= response.meta.device_encode_ns;
             return .{
                 .allocator = self.allocator,
                 .rpc = .{
                     .request_bytes = @intCast(request_len),
                     .response_bytes = @intCast(response.frame.len),
                     .round_trip_ns = profiling.elapsed(start_ns, end_ns),
+                    .device_service_ns = response.meta.device_service_ns,
+                    .device_encode_ns = response.meta.device_encode_ns,
                 },
                 .report = report,
             };
@@ -486,10 +518,33 @@ const Response = struct {
     }
 
     fn expectOk(self: Response, request_id: u64) LinkError!void {
-        if (self.meta.request_id != request_id) return error.Protocol;
-        if (self.meta.status != .ok) return error.RemoteFailed;
+        return expectResponseOk(self.meta, request_id);
     }
 };
+
+fn expectResponseOk(meta: wire.ResponseMeta, request_id: u64) LinkError!void {
+    if (meta.request_id != request_id) return error.Protocol;
+    if (meta.status == .ok) return;
+    return switch (meta.error_code) {
+        .none => error.RemoteFailed,
+        .invalid_request => error.RemoteInvalidRequest,
+        .out_of_memory => error.RemoteOutOfMemory,
+        .unknown_handle => error.RemoteUnknownHandle,
+        .out_of_bounds => error.RemoteOutOfBounds,
+        .unsupported_op => error.RemoteUnsupportedOp,
+        .backend_failure => error.RemoteBackendFailure,
+    };
+}
+
+test "remote response errors retain their wire cause" {
+    const failed: wire.ResponseMeta = .{
+        .request_id = 7,
+        .status = .failed,
+        .error_code = .backend_failure,
+    };
+    try std.testing.expectError(error.RemoteBackendFailure, expectResponseOk(failed, 7));
+    try std.testing.expectError(error.Protocol, expectResponseOk(failed, 8));
+}
 
 test "chunked upload and download preserve ranges, bytes, and timing" {
     const TestTransport = struct {
@@ -581,7 +636,7 @@ test "chunked upload and download preserve ranges, bytes, and timing" {
 
     const range: wire.TensorRange = .{ .handle = 9, .offset = 10, .nbytes = 7 };
     const upload_timing = try link.uploadChunked(range, "abcdefg", 3);
-    try std.testing.expectEqual(@as(u64, 21), upload_timing.device_service_ns);
+    try std.testing.expectEqual(@as(u64, 21), upload_timing.device_rpc_ns);
     try std.testing.expectEqualSlices(u8, "abcdefg", link.transport.uploaded[0..link.transport.uploaded_len]);
     try expectRange(.{ .handle = 9, .offset = 10, .nbytes = 3 }, link.transport.ranges[0]);
     try expectRange(.{ .handle = 9, .offset = 13, .nbytes = 3 }, link.transport.ranges[1]);
@@ -589,7 +644,7 @@ test "chunked upload and download preserve ranges, bytes, and timing" {
 
     var downloaded: [7]u8 = undefined;
     const download_timing = try link.downloadChunked(range, &downloaded, 3);
-    try std.testing.expectEqual(@as(u64, 21), download_timing.device_service_ns);
+    try std.testing.expectEqual(@as(u64, 21), download_timing.device_rpc_ns);
     try std.testing.expectEqualSlices(u8, &.{ 10, 11, 12, 13, 14, 15, 16 }, &downloaded);
     try expectRange(.{ .handle = 9, .offset = 10, .nbytes = 3 }, link.transport.ranges[3]);
     try expectRange(.{ .handle = 9, .offset = 13, .nbytes = 3 }, link.transport.ranges[4]);
@@ -597,10 +652,10 @@ test "chunked upload and download preserve ranges, bytes, and timing" {
 
     const empty_range: wire.TensorRange = .{ .handle = 9, .offset = 17, .nbytes = 0 };
     const empty_upload_timing = try link.uploadChunked(empty_range, "", 3);
-    try std.testing.expectEqual(@as(u64, 7), empty_upload_timing.device_service_ns);
+    try std.testing.expectEqual(@as(u64, 7), empty_upload_timing.device_rpc_ns);
     var empty_download: [0]u8 = .{};
     const empty_download_timing = try link.downloadChunked(empty_range, &empty_download, 3);
-    try std.testing.expectEqual(@as(u64, 7), empty_download_timing.device_service_ns);
+    try std.testing.expectEqual(@as(u64, 7), empty_download_timing.device_rpc_ns);
     try expectRange(empty_range, link.transport.ranges[6]);
     try expectRange(empty_range, link.transport.ranges[7]);
 
