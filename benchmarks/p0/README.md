@@ -86,6 +86,8 @@ median and min/max range. Displayed throughput is derived as
 The harness validates exact requested prompt and generated token counts. That
 proves workload completion, not numerical correctness. Profiled runs must also
 close their accounting, while regression runs must report that profiling was off.
+In an unprofiled machine result, device, transport, and residual sub-buckets are
+zero sentinels meaning unavailable; use wall and steady-decode metrics for regression.
 
 Logits and perplexity tests remain the model-level numerical gates. RTL tests,
 formal verification, and cosimulation remain separate hardware correctness suites.
