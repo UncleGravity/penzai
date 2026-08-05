@@ -35,7 +35,7 @@ create independent prefill and decode attention datapaths.
 
 The P0 characterization has 20 profiled runs per model through 512-token prompts
 and decode contexts 0 and 512. All 280 samples passed accounting and requested-token
-count checks. The first Q1 context-2048 result is also complete; Q2 is still running.
+count checks. One context-2048 feasibility run per model is also complete.
 
 | Workload | Q1 | Q2 | Main signal |
 |---|---:|---:|---|
@@ -43,13 +43,13 @@ count checks. The first Q1 context-2048 result is also complete; Q2 is still run
 | Prefill 512 | 163.43 s | 189.27 s | 63 graphs, about 20,400 commands |
 | Decode context 0 | 106.2 ms/token | 125.8 ms/token | Device is about 84/105 ms/token |
 | Decode context 512 | 210.8 ms/token | 260.6 ms/token | Flash is about 119 ms/token |
-| Decode context 2048 | 581.6 ms/token | pending | Q1 device 533.3 ms; flash 459.1 ms |
+| Decode context 2048 | 581.6 ms/token | 604.5 ms/token | Device is 533.3/554.9 ms; flash about 459 ms |
 
-Q1 context-2048 prefill took 30.8 minutes and issued 255 graphs, 81,550
-commands, and 5.8 GiB of backend downloads. At that context, attention is 86% of
-decode device time. The effective KV rate is only about 0.5 GB/s, far below the
-weight-stream bandwidth, so the current attention schedule is compute/control
-limited rather than DDR limited.
+Context-2048 prefill took 30.8/32.1 minutes for Q1/Q2. Each issued 255 graphs
+and 81,550 commands, with 5.8/11.6 GiB of backend downloads. At that context,
+attention is 86%/83% of decode device time. The effective KV rate is only about
+0.5 GB/s, far below the weight-stream bandwidth, so the current attention schedule
+is compute/control limited rather than DDR limited.
 
 Prefill GEMMs already run in PL, but multi-token attention falls back to PS.
 Backend downloads grow from roughly 1.4/2.8 GiB for Q1/Q2 at a 512-token prompt;
@@ -58,11 +58,25 @@ therefore require both section-level boundary removal and an earlier unified PL
 attention redesign. Old transport tail measurements taken through mixed SSH tunnels
 are not signoff data, but device-clock measurements are stable and trustworthy.
 
+The canonical unprofiled regression artifact is
+`20260805T001719Z-regression-632dcf611699` (fingerprint prefix
+`632dcf611699`). It completed and validated all 30 samples:
+
+| Workload | Q1 median | Q2 median |
+|---|---:|---:|
+| Prefill 128 | 22.52 s | 27.76 s |
+| Decode context 0 | 99.0 ms/token | 118.4 ms/token |
+| Decode context 512 | 205.3 ms/token | 248.6 ms/token |
+
+Comparing overlapping medians puts aggregate-profiling overhead at roughly 2-7%,
+depending on workload. Product throughput therefore comes from unprofiled regression;
+profiled measurements are compared only against profiled measurements.
+
 ## Ranked work
 
 | Rank | Track | Why now | Completion gate |
 |---:|---|---|---|
-| 0 | Measurement closeout | Architecture decisions are supported; keep the permanent suite small | Q2 2K result, profiler A/B, immutable artifact identity |
+| 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
 | 1 | Bounded waste removal | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
 | 2 | Section substrate and unified PL attention | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, faster 512/2K decode |
 | 3 | FFN section pipeline | Contained proof of the P2 scratch and command contracts | Named FFN command retains intermediates on chip and beats the op path |
@@ -83,15 +97,15 @@ are not signoff data, but device-clock measurements are stable and trustworthy.
   enabled engines, frequency, dimensions, and formats.
 - [x] Establish repeated Q1/Q2 prefill and decode characterization through context
   512, plus a context-2048 feasibility measurement.
-- [ ] Measure profiler overhead against an unprofiled run.
-- [ ] Replace the large p95 matrix with small immutable characterization and
+- [x] Measure profiler overhead against an unprofiled run.
+- [x] Replace the large p95 matrix with small immutable characterization and
   regression artifacts that report median and range.
-- [ ] Retain successful bitstreams with a small versioned manifest and timing,
-  utilization, test, and numerical-quality results.
+- [x] Retain successful bitstreams with a versioned source/build manifest,
+  timing/utilization reports, and a hash-verified deployment receipt.
 
-P0 is decision-complete. Its remaining items are measurement closeout and build
-hygiene, not blockers for P1 or P2. Context 4096 remains an optional heap, bounds,
-and feasibility check rather than a repeated performance benchmark.
+P0 is complete. Context 4096 remains an optional heap, bounds, and feasibility
+check rather than a repeated performance benchmark. Numerical quality, formal,
+cosim, OOC, and routed-build evidence remain continuous gates on later priorities.
 
 ### P1: bounded waste removal
 
