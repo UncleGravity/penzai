@@ -136,6 +136,7 @@ module decode_top #(
 
     reg [15:0] num_q1_blocks_q;
     reg [15:0] num_rowblocks_q;
+    reg [31:0] num_rows_q;
     reg [15:0] num_cols_q;
     reg [1:0]  weight_fmt_q;
     reg        start_strobe;
@@ -174,6 +175,7 @@ module decode_top #(
         .start_kernel(start_strobe),
         .num_q1_blocks(num_q1_blocks_q),
         .num_rowblocks(num_rowblocks_q),
+        .num_rows(num_rows_q),
         .num_cols(num_cols_q),
         .weight_fmt(weight_fmt_q),
         .emin(EMIN_FLOOR),
@@ -239,6 +241,7 @@ module decode_top #(
             awaddr_q        <= 8'd0;
             num_q1_blocks_q <= 16'd0;
             num_rowblocks_q <= 16'd0;
+            num_rows_q      <= 32'd0;
             num_cols_q      <= 16'd0;
             weight_fmt_q    <= 2'd1;
             start_strobe    <= 1'b0;
@@ -270,6 +273,12 @@ module decode_top #(
                         if (s_axi_wstrb[0]) num_cols_q[7:0]  <= s_axi_wdata[7:0];
                         if (s_axi_wstrb[1]) num_cols_q[15:8] <= s_axi_wdata[15:8];
                     end
+                    MATMUL_OFF_NUM_ROWS[7:0]: begin
+                        if (s_axi_wstrb[0]) num_rows_q[7:0]   <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[1]) num_rows_q[15:8]  <= s_axi_wdata[15:8];
+                        if (s_axi_wstrb[2]) num_rows_q[23:16] <= s_axi_wdata[23:16];
+                        if (s_axi_wstrb[3]) num_rows_q[31:24] <= s_axi_wdata[31:24];
+                    end
                     MATMUL_OFF_WEIGHT_FMT[7:0]: begin
                         if (s_axi_wstrb[0]) weight_fmt_q <= s_axi_wdata[1:0];
                     end
@@ -300,6 +309,7 @@ module decode_top #(
                     MATMUL_OFF_NUM_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, num_q1_blocks_q};
                     MATMUL_OFF_NUM_ROWBLOCKS[7:0]: rdata_q <= {16'd0, num_rowblocks_q};
                     MATMUL_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
+                    MATMUL_OFF_NUM_ROWS[7:0]:      rdata_q <= num_rows_q;
                     MATMUL_OFF_WEIGHT_FMT[7:0]:    rdata_q <= {30'd0, weight_fmt_q};
                     MATMUL_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
                     MATMUL_OFF_ROWS[7:0]:          rdata_q <= MATMUL_RST_ROWS;

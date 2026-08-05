@@ -70,6 +70,7 @@ pub const version_with_counters: u32 = 5;
 /// refuses rather than trusts the env var.
 pub const version_with_seq: u32 = 10;
 pub const version_with_ternary: u32 = 11;
+pub const version_with_logical_rows: u32 = 12;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -115,10 +116,22 @@ pub const Kernel = struct {
     }
 
     /// Set dims then strobe start. done_latched clears on the strobe.
-    pub fn run(self: *Kernel, num_q1_blocks: u32, num_rowblocks: u32, num_cols: u32, weight_fmt: wire.WeightFormat) void {
+    pub fn hasLogicalRows(self: Kernel) bool {
+        return self.version >= version_with_logical_rows;
+    }
+
+    pub fn run(
+        self: *Kernel,
+        num_q1_blocks: u32,
+        num_rowblocks: u32,
+        num_cols: u32,
+        logical_rows: ?u32,
+        weight_fmt: wire.WeightFormat,
+    ) void {
         self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
         self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
         self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
+        if (logical_rows) |rows| self.win.wr(regmap.offsetOf("NUM_ROWS"), rows);
         self.win.wr(regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(weight_fmt));
         self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
     }
@@ -185,9 +198,9 @@ pub const seq_dma_bases: [layout.weight_ports + 1]u32 = blk: {
     break :blk bases;
 };
 
-/// Entries one column-group programs: dma_w0 reset (4) + 4x MM2S-only resets (8) + S2MM arm (4)
-/// + 5x MM2S start (20) + kernel config/start (4) + kernel done + 5x MM2S idle + S2MM idle (7).
-pub const seq_entries_per_op: usize = 48;
+/// Maximum entries for one column group. Kernel v12 adds NUM_ROWS to the legacy
+/// 48-entry program; older bitstreams omit it.
+pub const seq_entries_per_op: usize = 49;
 
 /// Push one column-group's register program onto `b` — identical in order and value to the
 /// MMIO pokes in tryMatmul step 2 (pinned by the golden test below). seq.v replays it with no
@@ -203,6 +216,7 @@ pub fn buildOp(
     q1_blocks: u32,
     num_rb: u32,
     group: u32,
+    logical_rows: ?u32,
     weight_fmt: wire.WeightFormat,
 ) void {
     const kb: u32 = @intCast(kernel_base);
@@ -217,6 +231,7 @@ pub fn buildOp(
     b.write(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), q1_blocks);
     b.write(kb + regmap.offsetOf("NUM_ROWBLOCKS"), num_rb);
     b.write(kb + regmap.offsetOf("NUM_COLS"), group);
+    if (logical_rows) |rows| b.write(kb + regmap.offsetOf("NUM_ROWS"), rows);
     b.write(kb + regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(weight_fmt));
     b.write(kb + regmap.offsetOf("CTRL"), CTRL_START);
     b.wait(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE);
@@ -234,6 +249,23 @@ const Counters = struct {
     a_beats: u64 = 0,
     r_beats: u64 = 0,
 };
+
+const ResultPlan = struct {
+    direct: bool,
+    dma_bytes: usize,
+    logical_rows: ?u32,
+};
+
+fn resultPlan(rows: usize, group: usize, num_rb: usize, has_logical_rows: bool) ResultPlan {
+    const padded_rows = num_rb * layout.rows_per_block;
+    const direct = group == 1 and (rows == padded_rows or has_logical_rows);
+    return .{
+        .direct = direct,
+        .dma_bytes = if (direct) rows * @sizeOf(f32) else padded_rows * group * @sizeOf(f32),
+        // Staged multi-column results retain their fixed rowblock stride.
+        .logical_rows = if (has_logical_rows) @intCast(if (direct) rows else padded_rows) else null,
+    };
+}
 
 /// Generic over the heap so the runtime composes it only for heaps with physical
 /// addressing (XRT); the fake heap never instantiates it.
@@ -369,14 +401,13 @@ pub fn Backend(comptime Heap: type) type {
             while (col0 < cols) {
                 const group = @min(mc_cols_max, cols - col0);
                 const act_total = group * act_stream_bytes;
-                const result_bytes = num_rb * group * result_bytes_per_rb;
-                const direct_result = group == 1 and rows % layout.rows_per_block == 0;
-                if (!direct_result) result.path = .staged;
+                const result_plan = resultPlan(rows, group, num_rb, self.kernel.hasLogicalRows());
+                if (!result_plan.direct) result.path = .staged;
                 const acts_dma = subRange(self.acts_staging, act_total);
-                const result_dma = if (direct_result)
-                    offsetRange(mm.dst, col0 * rows * @sizeOf(f32), result_bytes)
+                const result_dma = if (result_plan.direct)
+                    offsetRange(mm.dst, col0 * rows * @sizeOf(f32), result_plan.dma_bytes)
                 else
-                    subRange(self.result_staging, result_bytes);
+                    subRange(self.result_staging, result_plan.dma_bytes);
                 const acts_staging_buf = heap.bytes(acts_dma) catch return error.HeapFailure;
 
                 // 1. Quantize + pack each column of the group (acts are col-major,
@@ -399,14 +430,14 @@ pub fn Backend(comptime Heap: type) type {
                 // same register program: seq.v replays it in fabric, or the PS pokes it.
                 if (self.seq_ctrl) |*sc| {
                     var b = seq.Builder.init(&self.seq_entries);
-                    buildOp(&b, weight_phys, weight_port_bytes, acts_phys, act_total, result_phys, result_bytes, @intCast(q1_blocks), @intCast(num_rb), @intCast(group), mm.weight_fmt);
+                    buildOp(&b, weight_phys, weight_port_bytes, acts_phys, act_total, result_phys, result_plan.dma_bytes, @intCast(q1_blocks), @intCast(num_rb), @intCast(group), result_plan.logical_rows, mm.weight_fmt);
                     std.debug.assert(!b.overflow);
                     // The gate that keeps a bad stream from ever reaching a DMA: every
                     // transfer must land inside this op's own buffers.
                     const allowed = [_]seq.Range{
                         .{ .lo = weights_phys, .hi = weights_phys + weight_bytes },
                         .{ .lo = acts_phys, .hi = acts_phys + act_total },
-                        .{ .lo = result_phys, .hi = result_phys + result_bytes },
+                        .{ .lo = result_phys, .hi = result_phys + result_plan.dma_bytes },
                     };
                     seq.validate(b.entries(), &seq_dma_bases, &allowed) catch |e| {
                         std.debug.print("pl: seq stream REJECTED ({s}) — not submitting\n", .{@errorName(e)});
@@ -425,12 +456,12 @@ pub fn Backend(comptime Heap: type) type {
                     try self.dma_w[0].reset();
                     for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
                     try self.dma_a.resetMm2s();
-                    try self.dma_w[0].startWriteToDdr(result_phys, result_bytes);
+                    try self.dma_w[0].startWriteToDdr(result_phys, result_plan.dma_bytes);
                     for (&self.dma_w, 0..) |*dma, port| {
                         try dma.startReadFromDdr(weight_phys[port], weight_port_bytes);
                     }
                     try self.dma_a.startReadFromDdr(acts_phys, act_total);
-                    self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group), mm.weight_fmt);
+                    self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group), result_plan.logical_rows, mm.weight_fmt);
                     result.setup_ns +|= profile.lap(ctx, &last);
                     try self.kernel.waitDone();
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
@@ -447,7 +478,7 @@ pub fn Backend(comptime Heap: type) type {
                 // dropping pad rows.
                 heap.syncFromDevice(result_dma) catch return error.HeapFailure;
                 result.sync_from_ns +|= profile.lap(ctx, &last);
-                if (!direct_result) {
+                if (!result_plan.direct) {
                     const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
                     gather.gatherResults(dst_buf, result_buf, rows, group, col0, num_rb);
                     result.result_layout_ns +|= profile.lap(ctx, &last);
@@ -554,7 +585,7 @@ test "buildOp: exact per-col-group register program (bit-parity with the MMIO pa
     var buf: [seq_entries_per_op]seq.Entry = undefined;
     var b = seq.Builder.init(&buf);
     const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0100, 0x8_0000_0200, 0x8_0000_0300 };
-    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, .w1a8);
+    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, 31, .w1a8);
     try std.testing.expect(!b.overflow);
     try std.testing.expectEqual(@as(u32, seq_entries_per_op), b.count());
 
@@ -579,24 +610,25 @@ test "buildOp: exact per-col-group register program (bit-parity with the MMIO pa
     const kb: u32 = 0xA005_0000;
     const want = [_]E{
         // dma_w0.reset() (both channels), then MM2S-only resets: w1..w3 + acts
-        W.wr(w0 + 0x00, RESET),                         W.wr(w0 + 0x30, RESET),                                         W.wt(w0 + 0x00, RESET, 0),                 W.wt(w0 + 0x30, RESET, 0),
-        W.wr(w1 + 0x00, RESET),                         W.wt(w1 + 0x00, RESET, 0),                                      W.wr(w2 + 0x00, RESET),                    W.wt(w2 + 0x00, RESET, 0),
-        W.wr(w3 + 0x00, RESET),                         W.wt(w3 + 0x00, RESET, 0),                                      W.wr(da + 0x00, RESET),                    W.wt(da + 0x00, RESET, 0),
+        W.wr(w0 + 0x00, RESET),                                                         W.wr(w0 + 0x30, RESET),                         W.wt(w0 + 0x00, RESET, 0),                                      W.wt(w0 + 0x30, RESET, 0),
+        W.wr(w1 + 0x00, RESET),                                                         W.wt(w1 + 0x00, RESET, 0),                      W.wr(w2 + 0x00, RESET),                                         W.wt(w2 + 0x00, RESET, 0),
+        W.wr(w3 + 0x00, RESET),                                                         W.wt(w3 + 0x00, RESET, 0),                      W.wr(da + 0x00, RESET),                                         W.wt(da + 0x00, RESET, 0),
         // arm the result S2MM FIRST
-        W.wr(w0 + 0x30, RS),                            W.wr(w0 + 0x48, 0x2000_0000),                                   W.wr(w0 + 0x4C, 0x8),                      W.wr(w0 + 0x58, 0x40),
+        W.wr(w0 + 0x30, RS),                                                            W.wr(w0 + 0x48, 0x2000_0000),                   W.wr(w0 + 0x4C, 0x8),                                           W.wr(w0 + 0x58, 0x40),
         // weight MM2S x4
-        W.wr(w0 + 0x00, RS),                            W.wr(w0 + 0x18, 0x0000_0000),                                   W.wr(w0 + 0x1C, 0x8),                      W.wr(w0 + 0x28, 0x100),
-        W.wr(w1 + 0x00, RS),                            W.wr(w1 + 0x18, 0x0000_0100),                                   W.wr(w1 + 0x1C, 0x8),                      W.wr(w1 + 0x28, 0x100),
-        W.wr(w2 + 0x00, RS),                            W.wr(w2 + 0x18, 0x0000_0200),                                   W.wr(w2 + 0x1C, 0x8),                      W.wr(w2 + 0x28, 0x100),
-        W.wr(w3 + 0x00, RS),                            W.wr(w3 + 0x18, 0x0000_0300),                                   W.wr(w3 + 0x1C, 0x8),                      W.wr(w3 + 0x28, 0x100),
+        W.wr(w0 + 0x00, RS),                                                            W.wr(w0 + 0x18, 0x0000_0000),                   W.wr(w0 + 0x1C, 0x8),                                           W.wr(w0 + 0x28, 0x100),
+        W.wr(w1 + 0x00, RS),                                                            W.wr(w1 + 0x18, 0x0000_0100),                   W.wr(w1 + 0x1C, 0x8),                                           W.wr(w1 + 0x28, 0x100),
+        W.wr(w2 + 0x00, RS),                                                            W.wr(w2 + 0x18, 0x0000_0200),                   W.wr(w2 + 0x1C, 0x8),                                           W.wr(w2 + 0x28, 0x100),
+        W.wr(w3 + 0x00, RS),                                                            W.wr(w3 + 0x18, 0x0000_0300),                   W.wr(w3 + 0x1C, 0x8),                                           W.wr(w3 + 0x28, 0x100),
         // acts MM2S
-        W.wr(da + 0x00, RS),                            W.wr(da + 0x18, 0x1000_0000),                                   W.wr(da + 0x1C, 0x8),                      W.wr(da + 0x28, 0x200),
+        W.wr(da + 0x00, RS),                                                            W.wr(da + 0x18, 0x1000_0000),                   W.wr(da + 0x1C, 0x8),                                           W.wr(da + 0x28, 0x200),
         // kernel config + start
-        W.wr(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), 7), W.wr(kb + regmap.offsetOf("NUM_ROWBLOCKS"), 2),                 W.wr(kb + regmap.offsetOf("NUM_COLS"), 1), W.wr(kb + regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(wire.WeightFormat.w1a8)),
-        W.wr(kb + regmap.offsetOf("CTRL"), CTRL_START),
+        W.wr(kb + regmap.offsetOf("NUM_Q1_BLOCKS"), 7),                                 W.wr(kb + regmap.offsetOf("NUM_ROWBLOCKS"), 2), W.wr(kb + regmap.offsetOf("NUM_COLS"), 1),                      W.wr(kb + regmap.offsetOf("NUM_ROWS"), 31),
+        W.wr(kb + regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(wire.WeightFormat.w1a8)), W.wr(kb + regmap.offsetOf("CTRL"), CTRL_START),
         // waits: kernel done, then every mover idle (read x5, write x1)
-        W.wt(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE), W.wt(w0 + 0x04, IDLE, IDLE),               W.wt(w1 + 0x04, IDLE, IDLE),
-        W.wt(w2 + 0x04, IDLE, IDLE),                    W.wt(w3 + 0x04, IDLE, IDLE),                                    W.wt(da + 0x04, IDLE, IDLE),               W.wt(w0 + 0x34, IDLE, IDLE),
+        W.wt(kb + regmap.offsetOf("STATUS"), STATUS_DONE, STATUS_DONE), W.wt(w0 + 0x04, IDLE, IDLE),
+        W.wt(w1 + 0x04, IDLE, IDLE),                                                    W.wt(w2 + 0x04, IDLE, IDLE),                    W.wt(w3 + 0x04, IDLE, IDLE),                                    W.wt(da + 0x04, IDLE, IDLE),
+        W.wt(w0 + 0x34, IDLE, IDLE),
     };
     try std.testing.expectEqualSlices(E, &want, b.entries());
 }
@@ -605,7 +637,7 @@ test "buildOp stream passes validation against its own ranges, fails without the
     var buf: [seq_entries_per_op]seq.Entry = undefined;
     var b = seq.Builder.init(&buf);
     const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0100, 0x8_0000_0200, 0x8_0000_0300 };
-    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, .w1a8);
+    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, 31, .w1a8);
     const weights = seq.Range{ .lo = 0x8_0000_0000, .hi = 0x8_0000_0400 };
     const acts = seq.Range{ .lo = 0x8_1000_0000, .hi = 0x8_1000_0200 };
     const result = seq.Range{ .lo = 0x8_2000_0000, .hi = 0x8_2000_0040 };
@@ -617,7 +649,7 @@ test "buildOp programs ternary weight format" {
     var buf: [seq_entries_per_op]seq.Entry = undefined;
     var b = seq.Builder.init(&buf);
     const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0080, 0x8_0000_0100, 0x8_0000_0180 };
-    buildOp(&b, wp, 0x80, 0x8_1000_0000, 0xa0, 0x8_2000_0000, 0x40, 1, 1, 1, .w158a8);
+    buildOp(&b, wp, 0x80, 0x8_1000_0000, 0xa0, 0x8_2000_0000, 0x40, 1, 1, 1, 16, .w158a8);
 
     const weight_fmt_addr: u32 = 0xA005_0000 + regmap.offsetOf("WEIGHT_FMT");
     var found = false;
@@ -628,4 +660,36 @@ test "buildOp programs ternary weight format" {
         }
     }
     try std.testing.expect(found);
+}
+
+test "result plan makes partial single-column outputs direct only on v12" {
+    const rows: usize = 151_669;
+    const num_rb = layout.rowblocksFor(rows);
+
+    const legacy = resultPlan(rows, 1, num_rb, false);
+    try std.testing.expect(!legacy.direct);
+    try std.testing.expectEqual(@as(usize, 151_680 * @sizeOf(f32)), legacy.dma_bytes);
+    try std.testing.expectEqual(@as(?u32, null), legacy.logical_rows);
+
+    const direct = resultPlan(rows, 1, num_rb, true);
+    try std.testing.expect(direct.direct);
+    try std.testing.expectEqual(rows * @sizeOf(f32), direct.dma_bytes);
+    try std.testing.expectEqual(@as(?u32, 151_669), direct.logical_rows);
+
+    const staged = resultPlan(rows, 8, num_rb, true);
+    try std.testing.expect(!staged.direct);
+    try std.testing.expectEqual(@as(usize, 151_680 * 8 * @sizeOf(f32)), staged.dma_bytes);
+    try std.testing.expectEqual(@as(?u32, 151_680), staged.logical_rows);
+}
+
+test "legacy sequencer program omits unsupported logical-row register" {
+    var buf: [seq_entries_per_op]seq.Entry = undefined;
+    var b = seq.Builder.init(&buf);
+    const wp = [_]u64{ 0x8_0000_0000, 0x8_0000_0100, 0x8_0000_0200, 0x8_0000_0300 };
+    buildOp(&b, wp, 0x100, 0x8_1000_0000, 0x200, 0x8_2000_0000, 0x40, 7, 2, 1, null, .w1a8);
+    try std.testing.expect(!b.overflow);
+    try std.testing.expectEqual(@as(u32, seq_entries_per_op - 1), b.count());
+    for (b.entries()) |entry| {
+        try std.testing.expect(entry.addr != @as(u32, @intCast(kernel_base)) + regmap.offsetOf("NUM_ROWS"));
+    }
 }

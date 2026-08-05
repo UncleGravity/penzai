@@ -30,6 +30,7 @@ module gemm_kernel #(
     input  wire                  start_kernel,
     input  wire [15:0]           num_q1_blocks,
     input  wire [15:0]           num_rowblocks,
+    input  wire [31:0]           num_rows,
     input  wire [15:0]           num_cols,
     input  wire [1:0]            weight_fmt,
     input  wire signed [7:0]     emin,            // global window floor (calibration, set once)
@@ -53,6 +54,7 @@ module gemm_kernel #(
     output wire [3:0]            dbg_state
 );
     localparam integer CW = (COLS_MAX <= 1) ? 1 : $clog2(COLS_MAX);
+    localparam integer ROWW = (ROWS <= 1) ? 1 : $clog2(ROWS);
 
     localparam [3:0] ST_IDLE        = 4'd0;
     localparam [3:0] ST_LOAD_ACTS   = 4'd1;
@@ -87,6 +89,7 @@ module gemm_kernel #(
     reg        busy_q;
     reg [15:0] run_num_q1_blocks;
     reg [15:0] run_num_rowblocks;
+    reg [31:0] run_num_rows;
     reg [15:0] run_num_cols;
     reg signed [7:0] run_emin;
     reg [1:0] run_weight_fmt;
@@ -251,14 +254,27 @@ module gemm_kernel #(
 
     wire [15:0] n_total = run_num_cols * EMIT_BEATS[15:0];
 
-    // EMIT: stream the buffer 2 fp32/beat, lane-major, with AXIS backpressure. The buffer
-    // index is {col, beat} since EMIT_BEATS = 2^EBW (matches the precompute walk order).
+    // EMIT: stream the buffer 2 fp32/beat, lane-major, with AXIS backpressure. NUM_ROWS
+    // shortens only the final rowblock; zero or an exact multiple of ROWS preserves the
+    // historical full-rowblock stream. Invalid high-lane bytes never reach S2MM.
+    localparam [ROWW:0] ROWS_VALUE = ROWS[ROWW:0];
+    wire [ROWW-1:0] final_row_remainder = run_num_rows[ROWW-1:0];
+    wire [ROWW:0] final_row_count = (final_row_remainder == {ROWW{1'b0}}) ?
+        ROWS_VALUE : {1'b0, final_row_remainder};
+    wire [ROWW:0] final_emit_index = (final_row_count - 1'b1) >> 1;
+    wire [EBW-1:0] final_emit_last = final_emit_index[EBW-1:0];
+    wire [EBW-1:0] active_emit_last = (rowblock_remaining == 16'd1) ?
+        final_emit_last : EMIT_LAST[EBW-1:0];
+
+    // The buffer index is {col, beat} since EMIT_BEATS = 2^EBW (matches the
+    // precompute walk order).
     wire [BUFAW-1:0] rd_idx = {emit_col[CW-1:0], emit_beat};
     assign m_axis_tdata  = result_buf[rd_idx];
     assign m_axis_tvalid = (state == ST_EMIT);
-    assign m_axis_tlast  = (state == ST_EMIT) && (emit_beat == EMIT_LAST[EBW-1:0]) &&
+    assign m_axis_tlast  = (state == ST_EMIT) && (emit_beat == active_emit_last) &&
                            (emit_col == run_num_cols - 16'd1) && (rowblock_remaining == 16'd1);
-    assign m_axis_tkeep  = 8'hFF;
+    assign m_axis_tkeep  = ((state == ST_EMIT) && (rowblock_remaining == 16'd1) &&
+                            (emit_beat == active_emit_last) && run_num_rows[0]) ? 8'h0F : 8'hFF;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -266,6 +282,7 @@ module gemm_kernel #(
             busy_q              <= 1'b0;
             run_num_q1_blocks   <= 16'd0;
             run_num_rowblocks   <= 16'd0;
+            run_num_rows        <= 32'd0;
             run_num_cols        <= 16'd0;
             run_emin            <= 8'sd0;
             run_weight_fmt      <= 2'd1;
@@ -315,6 +332,7 @@ module gemm_kernel #(
                 busy_q         <= 1'b1;
                 run_num_q1_blocks <= num_q1_blocks;
                 run_num_rowblocks <= num_rowblocks;
+                run_num_rows      <= num_rows;
                 run_num_cols      <= num_cols;
                 run_emin          <= emin;
                 run_weight_fmt    <= weight_fmt;
@@ -476,7 +494,7 @@ module gemm_kernel #(
 
                     ST_EMIT: begin
                         if (m_axis_tready) begin
-                            if (emit_beat == EMIT_LAST[EBW-1:0]) begin
+                            if (emit_beat == active_emit_last) begin
                                 emit_beat <= {EBW{1'b0}};
                                 if (emit_col + 16'd1 == run_num_cols) begin
                                     if (rowblock_remaining == 16'd1) begin

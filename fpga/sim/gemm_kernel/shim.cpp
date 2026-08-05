@@ -26,6 +26,7 @@ void dut_set_rst_n(Dut *d, int v) { d->t->rst_n = v; }
 void dut_set_start(Dut *d, int v) { d->t->start_kernel = v; }
 void dut_set_num_q1(Dut *d, int v) { d->t->num_q1_blocks = v; }
 void dut_set_num_rb(Dut *d, int v) { d->t->num_rowblocks = v; }
+void dut_set_num_rows(Dut *d, uint32_t v) { d->t->num_rows = v; }
 void dut_set_num_cols(Dut *d, int v) { d->t->num_cols = v; }
 void dut_set_emin(Dut *d, int v) { d->t->emin = v; }
 void dut_set_weight_fmt(Dut *d, int v) { d->t->weight_fmt = v; }
@@ -43,6 +44,7 @@ int dut_w_ready(Dut *d) { return d->t->s_axis_tready; }
 int dut_a_ready(Dut *d) { return d->t->s_axis_acts_tready; }
 int dut_m_valid(Dut *d) { return d->t->m_axis_tvalid; }
 int dut_m_last(Dut *d) { return d->t->m_axis_tlast; }
+int dut_m_keep(Dut *d) { return d->t->m_axis_tkeep; }
 uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
 int dut_busy(Dut *d) { return d->t->busy; }
 int dut_done(Dut *d) { return d->t->kernel_done; }

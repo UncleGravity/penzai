@@ -25,6 +25,7 @@ int dut_w_ready(Dut *, int port);
 int dut_a_ready(Dut *);
 int dut_m_valid(Dut *);
 int dut_m_last(Dut *);
+int dut_m_keep(Dut *);
 uint64_t dut_m_data(Dut *);
 
 #ifdef __cplusplus

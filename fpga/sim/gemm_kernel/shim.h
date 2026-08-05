@@ -16,6 +16,7 @@ void dut_set_rst_n(Dut *, int v);
 void dut_set_start(Dut *, int v);
 void dut_set_num_q1(Dut *, int v);
 void dut_set_num_rb(Dut *, int v);
+void dut_set_num_rows(Dut *, uint32_t v);
 void dut_set_num_cols(Dut *, int v);
 void dut_set_emin(Dut *, int v);                     /* signed 8-bit window floor */
 void dut_set_weight_fmt(Dut *, int v);
@@ -27,6 +28,7 @@ int dut_w_ready(Dut *);
 int dut_a_ready(Dut *);
 int dut_m_valid(Dut *);
 int dut_m_last(Dut *);
+int dut_m_keep(Dut *);
 uint64_t dut_m_data(Dut *);
 int dut_busy(Dut *);
 int dut_done(Dut *);

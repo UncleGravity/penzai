@@ -114,7 +114,7 @@ cosim, OOC, and routed-build evidence remain continuous gates on later prioritie
   single-sequence topology and retains PAD as a strict fallback.
 - [x] Fuse RMSNorm and gamma multiplication in the PS fallback/reference path;
   its PL implementation belongs in the P2 section substrate.
-- [ ] Remove avoidable final-row result padding and copies.
+- [x] Remove avoidable final-row result padding and copies.
 - [x] Keep the current sequencer disabled; its measured A/B regressed decode.
 
 P1a removed PAD from every characterized decode graph while retaining one ARGMAX
@@ -154,17 +154,30 @@ CPU logit comparisons had zero token mismatches and maximum absolute errors of
 `20260805T050508Z-characterize-c2598349015c` and
 `20260805T052006Z-regression-b3f1211a2b6c`.
 
-Timebox P1 and measure each change independently. A realistic combined target is
-roughly 10-15 ms/token at short context; it cannot materially change the 533 ms
-context-2048 device time. Do not add a cross-graph activation cache or temporary
-PS protocol to reuse quantization. Shared Q/K/V and gate/up quantization belongs
-to the explicit P2 scratch lifetime.
+P1c made the single-column GEMM result length explicit in the v12 kernel contract.
+The `151669x1x2048` vocabulary projection now emits exact final `TKEEP`/`TLAST`
+and writes directly to its logical output. Its Q1/Q2 result-layout time fell from
+3.2/3.3 ms to zero, while generated text and CPU logit comparisons remained
+identical to P1b:
 
-Next, remove and A/B the measured final-row padding/copy waste. Skip it if it
-requires a general graph rewrite or new cross-graph state. Then close P1 and begin
-P2 with the explicit section/scratch contract and a cycle-per-query-KV-pair
-baseline for the unified attention engine; do not extend P1 with additional
-micro-optimizations.
+| P1c metric | P1b | P1c | Change |
+|---|---:|---:|---:|
+| Q1 profiled device | 74.68 ms/token | 71.46 ms/token | -3.22 ms/token |
+| Q2 profiled device | 96.52 ms/token | 93.16 ms/token | -3.36 ms/token |
+| Q1 unprofiled steady | 92.29 ms/token | 88.60 ms/token | -3.69 ms/token |
+| Q2 unprofiled steady | 114.69 ms/token | 107.29 ms/token | -7.40 ms/token |
+
+The profiled device ranges do not overlap. The unprofiled ranges still overlap,
+so P1c claims the repeatable device-work reduction rather than a product-throughput
+gain. Accounting closed in every profiled sample. The characterization and
+regression artifacts are `20260805T111905Z-characterize-48513b8ea6c1` and
+`20260805T112859Z-regression-21f7adb4ccf7`.
+
+P1 is closed. Its changes remove about 12 ms/token of measured short-context
+device work but cannot materially change the 533 ms context-2048 device time. Do
+not add more primitive fusion, cross-graph activation caches, or PS-side command
+extensions. Begin P2 with the explicit section/scratch contract and a
+cycle-per-query-KV-pair baseline for the unified attention engine.
 
 ### P2: section substrate and unified PL attention
 

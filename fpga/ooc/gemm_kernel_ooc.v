@@ -18,6 +18,7 @@ module gemm_kernel_ooc #(
     input  wire        start_kernel,
     input  wire [15:0] num_q1_blocks,
     input  wire [15:0] num_rowblocks,
+    input  wire [31:0] num_rows,
     input  wire [15:0] num_cols,
     input  wire [1:0]  weight_fmt,
     input  wire signed [7:0] emin,
@@ -29,6 +30,7 @@ module gemm_kernel_ooc #(
     output reg  [63:0] m_data_q,
     output reg         m_valid_q,
     output reg         m_last_q,
+    output reg  [7:0]  m_keep_q,
     output reg         w_ready_q,
     output reg         a_ready_q,
     output reg         busy_q,
@@ -40,7 +42,7 @@ module gemm_kernel_ooc #(
     wire [3:0]  dbg;
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .MAX_SUB_INDEX(512)) u ( // 512 = deployed (decode_top)
         .clk(clk), .rst_n(rst_n), .start_kernel(start_kernel),
-        .num_q1_blocks(num_q1_blocks), .num_rowblocks(num_rowblocks), .num_cols(num_cols),
+        .num_q1_blocks(num_q1_blocks), .num_rowblocks(num_rowblocks), .num_rows(num_rows), .num_cols(num_cols),
         .weight_fmt(weight_fmt),
         .emin(emin), .kernel_done(done), .busy(busy),
         .s_axis_tdata(s_axis_tdata), .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(w_ready),
@@ -53,6 +55,7 @@ module gemm_kernel_ooc #(
         m_data_q  <= m_data;
         m_valid_q <= m_valid;
         m_last_q  <= m_last;
+        m_keep_q  <= m_keep;
         w_ready_q <= w_ready;
         a_ready_q <= a_ready;
         busy_q    <= busy;

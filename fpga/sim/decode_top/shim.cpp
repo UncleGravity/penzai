@@ -100,5 +100,6 @@ int dut_w_ready(Dut *d, int port) {
 int dut_a_ready(Dut *d) { return d->t->s_axis_acts_tready; }
 int dut_m_valid(Dut *d) { return d->t->m_axis_tvalid; }
 int dut_m_last(Dut *d) { return d->t->m_axis_tlast; }
+int dut_m_keep(Dut *d) { return d->t->m_axis_tkeep; }
 uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
 }

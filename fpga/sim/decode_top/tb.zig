@@ -16,13 +16,13 @@ const PORTS: usize = 4;
 const ROWS = layout.ROWS;
 const ROWS_PER_PORT = ROWS / PORTS;
 const PORT_BEAT_BYTES = ROWS_PER_PORT * 4;
-const RESULT_BYTES_PER_RB = layout.RESULT_BYTES_PER_ROWBLOCK;
 
 const REG_CTRL: u8 = 0x08;
 const REG_NUM_Q1_BLOCKS: u8 = 0x10;
 const REG_NUM_ROWBLOCKS: u8 = 0x14;
 const REG_NUM_COLS: u8 = 0x38;
 const REG_WEIGHT_FMT: u8 = 0x44;
+const REG_NUM_ROWS: u8 = 0x48;
 
 const WEIGHT_FMT_BINARY: u32 = 1;
 const WEIGHT_FMT_TERNARY: u32 = 2;
@@ -111,8 +111,8 @@ fn readPortBeat(bytes: []const u8, index: usize) [ROWS_PER_PORT]u32 {
     return words;
 }
 
-fn runTop(a: std.mem.Allocator, rows: usize, q1_blocks: usize, num_cols: usize, weight_fmt: u32, port_bytes: [PORTS][]const u8, act_bytes: []const u8) ![]u8 {
-    const num_rb = rows / ROWS;
+fn runTop(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, program_rows: usize, q1_blocks: usize, num_cols: usize, weight_fmt: u32, port_bytes: [PORTS][]const u8, act_bytes: []const u8) ![]u8 {
+    const num_rb = physical_rows / ROWS;
     var dut = Dut.init();
     defer dut.deinit();
     reset(&dut);
@@ -120,6 +120,7 @@ fn runTop(a: std.mem.Allocator, rows: usize, q1_blocks: usize, num_cols: usize, 
     axiWrite(&dut, REG_NUM_Q1_BLOCKS, @intCast(q1_blocks));
     axiWrite(&dut, REG_NUM_ROWBLOCKS, @intCast(num_rb));
     axiWrite(&dut, REG_NUM_COLS, @intCast(num_cols));
+    axiWrite(&dut, REG_NUM_ROWS, @intCast(program_rows));
     axiWrite(&dut, REG_WEIGHT_FMT, weight_fmt);
     // No EMIN write: v9 bakes the window floor in (decode_top.EMIN_FLOOR), no register.
     axiWrite(&dut, REG_CTRL, 1);
@@ -130,7 +131,7 @@ fn runTop(a: std.mem.Allocator, rows: usize, q1_blocks: usize, num_cols: usize, 
     var ai: usize = 0;
     var ri: usize = 0;
     var saw_last = false;
-    const result = try a.alloc(u8, num_rb * num_cols * RESULT_BYTES_PER_RB);
+    const result = try a.alloc(u8, logical_rows * num_cols * @sizeOf(f32));
 
     var cycle: usize = 0;
     while (cycle < CYCLE_LIMIT) : (cycle += 1) {
@@ -150,10 +151,21 @@ fn runTop(a: std.mem.Allocator, rows: usize, q1_blocks: usize, num_cols: usize, 
         for (0..PORTS) |port| w_fire[port] = w_valid[port] and c.dut_w_ready(dut.h, @intCast(port)) != 0;
         const a_fire = a_valid and c.dut_a_ready(dut.h) != 0;
         if (c.dut_m_valid(dut.h) != 0) {
-            if (ri + 8 > result.len) return error.TooManyResultBeats;
-            std.mem.writeInt(u64, result[ri..][0..8], c.dut_m_data(dut.h), .little);
-            ri += 8;
-            saw_last = c.dut_m_last(dut.h) != 0;
+            const keep: u8 = @intCast(c.dut_m_keep(dut.h));
+            const beat_bytes: usize = switch (keep) {
+                0xFF => 8,
+                0x0F => 4,
+                else => return error.InvalidTkeep,
+            };
+            if (ri + beat_bytes > result.len) return error.TooManyResultBytes;
+            var beat: [8]u8 = undefined;
+            std.mem.writeInt(u64, &beat, c.dut_m_data(dut.h), .little);
+            @memcpy(result[ri..][0..beat_bytes], beat[0..beat_bytes]);
+            ri += beat_bytes;
+            if (c.dut_m_last(dut.h) != 0) {
+                if (saw_last or ri != result.len) return error.InvalidTlast;
+                saw_last = true;
+            }
         }
 
         dut.step();
@@ -163,22 +175,25 @@ fn runTop(a: std.mem.Allocator, rows: usize, q1_blocks: usize, num_cols: usize, 
         if (a_fire) ai += 1;
         if (saw_last and ri == result.len) break;
     }
-    if (!saw_last or ri != result.len) return error.MissingResultBeats;
+    if (!saw_last or ri != result.len) return error.MissingResultBytes;
     return result;
 }
 
-fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, ternary: bool, seed: u64, note: []const u8) !void {
-    const rows = num_rb * ROWS;
+fn runCase(a: std.mem.Allocator, num_rb: usize, logical_rows_raw: ?usize, program_rows_raw: ?usize, blocks: usize, num_cols: usize, ternary: bool, seed: u64, note: []const u8) !void {
+    const physical_rows = num_rb * ROWS;
+    const logical_rows = logical_rows_raw orelse physical_rows;
+    const program_rows = program_rows_raw orelse logical_rows;
+    if (logical_rows <= physical_rows - ROWS or logical_rows > physical_rows) return error.InvalidLogicalRows;
     var prng = std.Random.DefaultPrng.init(seed);
     const rnd = prng.random();
 
-    const bits = try a.alloc(u128, rows * blocks);
+    const bits = try a.alloc(u128, physical_rows * blocks);
     defer a.free(bits);
-    const nonzero = try a.alloc(u128, rows * blocks);
+    const nonzero = try a.alloc(u128, physical_rows * blocks);
     defer a.free(nonzero);
-    const wscales = try a.alloc(f16, rows * blocks);
+    const wscales = try a.alloc(f16, physical_rows * blocks);
     defer a.free(wscales);
-    const wscales_hi = try a.alloc(f16, rows * blocks);
+    const wscales_hi = try a.alloc(f16, physical_rows * blocks);
     defer a.free(wscales_hi);
     for (bits) |*b| b.* = (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64);
     for (nonzero) |*nz| nz.* = if (ternary) (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64) else std.math.maxInt(u128);
@@ -202,7 +217,7 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
     if (ternary) {
         const wide = try a.alloc(u8, pack.ternaryWeightBytesWide(num_rb, blocks));
         defer a.free(wide);
-        pack.packTernaryWeightsWide(rows, blocks, bits, nonzero, wscales, wscales_hi, wide);
+        pack.packTernaryWeightsWide(physical_rows, blocks, bits, nonzero, wscales, wscales_hi, wide);
         for (0..num_rb * blocks) |resident_block| {
             for (0..layout.ternary_beats_per_port_block) |beat| {
                 for (0..PORTS) |port| {
@@ -213,7 +228,7 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
             }
         }
     } else {
-        packWeightPorts(rows, blocks, bits, wscales, port_storage);
+        packWeightPorts(physical_rows, blocks, bits, wscales, port_storage);
     }
 
     const acts = try a.alloc(u8, num_cols * pack.actBytes(blocks));
@@ -237,7 +252,7 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
     var probs = try a.alloc(ref.Problem, num_cols);
     defer a.free(probs);
     for (0..num_cols) |col| probs[col] = .{
-        .rows = rows,
+        .rows = physical_rows,
         .q1_blocks = blocks,
         .weight_bits = bits,
         .weight_scales = wscales,
@@ -248,32 +263,34 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, blocks: usize, num_cols: usize, 
     };
     const w = ref.fixedWindow(); // the deployed fixed window (emin -48, ACC_W 104) — no calibration
 
-    const expected = try a.alloc(f32, num_cols * rows);
+    const expected = try a.alloc(f32, num_cols * physical_rows);
     defer a.free(expected);
     var sats: usize = 0;
     for (0..num_cols) |col| {
         var s: usize = 0;
-        ref.windowedFixedOutput(probs[col], w, expected[col * rows ..][0..rows], &s);
+        ref.windowedFixedOutput(probs[col], w, expected[col * physical_rows ..][0..physical_rows], &s);
         sats += s;
     }
 
-    const got = try runTop(a, rows, blocks, num_cols, weight_fmt, port_views, acts);
+    const got = try runTop(a, physical_rows, logical_rows, program_rows, blocks, num_cols, weight_fmt, port_views, acts);
     defer a.free(got);
 
     var mism: usize = 0;
-    for (0..num_cols) |col| {
-        for (0..num_rb) |rb| {
-            const chunk = got[(rb * num_cols + col) * RESULT_BYTES_PER_RB ..][0..RESULT_BYTES_PER_RB];
-            for (0..ROWS / 2) |beat| {
-                const word = std.mem.readInt(u64, chunk[beat * 8 ..][0..8], .little);
-                const row0 = rb * ROWS + beat * 2;
-                const e0: u32 = @bitCast(expected[col * rows + row0]);
-                const e1: u32 = @bitCast(expected[col * rows + row0 + 1]);
-                if (@as(u32, @truncate(word)) != e0 or @as(u32, @truncate(word >> 32)) != e1) mism += 1;
+    var result_offset: usize = 0;
+    for (0..num_rb) |rb| {
+        const row0 = rb * ROWS;
+        const valid_rows = @min(ROWS, logical_rows - row0);
+        for (0..num_cols) |col| {
+            for (0..valid_rows) |lane| {
+                const result_bits = std.mem.readInt(u32, got[result_offset..][0..4], .little);
+                result_offset += 4;
+                const expected_bits: u32 = @bitCast(expected[col * physical_rows + row0 + lane]);
+                if (result_bits != expected_bits) mism += 1;
             }
         }
     }
-    std.debug.print("decode_top case rows={d} blocks={d} cols={d} emin={d} sats={d} mism={d}  {s}\n", .{ rows, blocks, num_cols, w.emin, sats, mism, note });
+    if (result_offset != got.len) return error.InvalidResultLength;
+    std.debug.print("decode_top case rows={d}/{d} blocks={d} cols={d} emin={d} sats={d} mism={d}  {s}\n", .{ logical_rows, physical_rows, blocks, num_cols, w.emin, sats, mism, note });
     if (sats != 0) return error.WindowTooNarrow;
     if (mism != 0) return error.ResultMismatch;
 }
@@ -283,12 +300,15 @@ pub fn main() !void {
     defer _ = gpa.deinit();
     const a = gpa.allocator();
 
-    try runCase(a, 1, 2, 1, false, 0x4101, "decode, 1 rb");
-    try runCase(a, 2, 3, 3, false, 0x4102, "multi-rb prefill C=3");
-    try runCase(a, 1, 4, 8, false, 0x4103, "prefill C=8 full bank");
-    try runCase(a, 1, 76, 1, false, 0x4104, "decode, K=9728 (4B down, 76 blk)");
-    try runCase(a, 1, 96, 1, false, 0x4105, "decode, K=12288 (8B down, 96 blk)");
-    try runCase(a, 3, 96, 4, false, 0x4106, "prefill, K=12288 96 blk, multi-rb C=4");
-    try runCase(a, 2, 3, 3, true, 0x4107, "ternary multi-rb prefill C=3");
+    try runCase(a, 1, null, null, 2, 1, false, 0x4101, "decode, 1 rb");
+    try runCase(a, 2, null, null, 3, 3, false, 0x4102, "multi-rb prefill C=3");
+    try runCase(a, 1, null, null, 4, 8, false, 0x4103, "prefill C=8 full bank");
+    try runCase(a, 1, null, null, 76, 1, false, 0x4104, "decode, K=9728 (4B down, 76 blk)");
+    try runCase(a, 1, null, null, 96, 1, false, 0x4105, "decode, K=12288 (8B down, 96 blk)");
+    try runCase(a, 3, null, null, 96, 4, false, 0x4106, "prefill, K=12288 96 blk, multi-rb C=4");
+    try runCase(a, 2, null, null, 3, 3, true, 0x4107, "ternary multi-rb prefill C=3");
+    try runCase(a, 1, null, 0, 2, 1, false, 0x4108, "legacy zero NUM_ROWS emits full rowblock");
+    try runCase(a, 1, 5, null, 2, 1, false, 0x4109, "partial one-column output, odd final TKEEP");
+    try runCase(a, 2, 22, null, 2, 1, false, 0x410A, "partial one-column output, even final TKEEP");
     std.debug.print("all decode_top cosim cases passed (decode_top === windowedFixedOutput, bit-exact)\n", .{});
 }

@@ -1,7 +1,7 @@
 `default_nettype none
 
 module gemm_kernel_formal(input wire clk);
-    localparam integer ROWS = 2;
+    localparam integer ROWS = 4;
     localparam integer COLS_MAX = 2;
     localparam integer MAX_SUB_INDEX = 8;
     localparam integer ACC_W = 16;
@@ -10,6 +10,7 @@ module gemm_kernel_formal(input wire clk);
     (* anyseq *) reg start_kernel;
     (* anyseq *) reg [15:0] num_q1_blocks;
     (* anyseq *) reg [15:0] num_rowblocks;
+    (* anyseq *) reg [31:0] num_rows;
     (* anyseq *) reg [15:0] num_cols;
     (* anyseq *) reg signed [7:0] emin;
     (* anyseq *) reg [1:0] weight_fmt;
@@ -29,6 +30,7 @@ module gemm_kernel_formal(input wire clk);
         .MAX_SUB_INDEX(MAX_SUB_INDEX), .ACC_W(ACC_W)) dut (
         .clk(clk), .rst_n(rst_n), .start_kernel(start_kernel),
         .num_q1_blocks(num_q1_blocks), .num_rowblocks(num_rowblocks),
+        .num_rows(num_rows),
         .num_cols(num_cols), .emin(emin), .kernel_done(kernel_done), .busy(busy),
         .weight_fmt(weight_fmt),
         .s_axis_tdata(s_axis_tdata), .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(s_axis_tready),
@@ -46,6 +48,9 @@ module gemm_kernel_formal(input wire clk);
         if (start_kernel && !busy) begin
             assume(num_q1_blocks > 0 && num_q1_blocks <= 2);
             assume(num_rowblocks > 0 && num_rowblocks <= 2);
+            assume(num_rows == 0 ||
+                   (num_rows > (num_rowblocks - 1'b1) * ROWS &&
+                    num_rows <= num_rowblocks * ROWS));
             assume(num_cols > 0 && num_cols <= COLS_MAX);
             assume(weight_fmt == 1 || weight_fmt == 2);
         end

@@ -2,6 +2,8 @@
 
 1-Bit / 1.58-Bit LLM inference accelerator on FPGA (KR260)
 
+![Llama generating tokens](docs/assets/llama-token-generation.gif)
+
 ## TLDR
 ```sh
 # Terminal 1
