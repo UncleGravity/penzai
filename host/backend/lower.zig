@@ -93,6 +93,11 @@ pub fn lowerGraph(
             continue;
         }
         if (supportsRmsNormF32(node)) {
+            if (tryLowerRmsNormMulF32(graph, i, lookup)) |command| {
+                try commands.append(allocator, command);
+                i += 1;
+                continue;
+            }
             try commands.append(allocator, try lowerRmsNormF32(node, lookup));
             continue;
         }
@@ -202,6 +207,73 @@ fn supportsRmsNormF32(op: *const c.ggml_tensor) bool {
     if (op.*.op != c.GGML_OP_RMS_NORM or !isContiguousF32(op)) return false;
     const src: *const c.ggml_tensor = op.*.src[0] orelse return false;
     return isContiguousF32(src) and sameShape(src, op);
+}
+
+const RmsNormMulF32Pair = struct {
+    rmsnorm: *const c.ggml_tensor,
+    input: *const c.ggml_tensor,
+    weight: *const c.ggml_tensor,
+    mul: *const c.ggml_tensor,
+};
+
+fn rmsNormMulF32Pair(graph: *c.ggml_cgraph, rms_index: c_int) ?RmsNormMulF32Pair {
+    const n = c.ggml_graph_n_nodes(graph);
+    if (rms_index < 0 or rms_index + 1 >= n) return null;
+
+    const rmsnorm: *const c.ggml_tensor = c.ggml_graph_node(graph, rms_index) orelse return null;
+    const mul: *const c.ggml_tensor = c.ggml_graph_node(graph, rms_index + 1) orelse return null;
+    if (!supportsRmsNormF32(rmsnorm) or mul.*.op != c.GGML_OP_MUL) return null;
+    if ((rmsnorm.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0 or (mul.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0) return null;
+    if ((rmsnorm.*.flags & c.GGML_TENSOR_FLAG_OUTPUT) != 0 or rmsnorm.*.view_src != null) return null;
+
+    const input: *const c.ggml_tensor = rmsnorm.*.src[0] orelse return null;
+    const weight: *const c.ggml_tensor = if (mul.*.src[0] == rmsnorm)
+        mul.*.src[1] orelse return null
+    else if (mul.*.src[1] == rmsnorm)
+        mul.*.src[0] orelse return null
+    else
+        return null;
+
+    if (!isContiguousF32(mul) or !sameShape(rmsnorm, mul)) return null;
+    if (!isRowBroadcastFor(weight, mul)) return null;
+    const eps = opParamF32(rmsnorm, 0);
+    if (eps < 0 or !std.math.isFinite(eps)) return null;
+
+    var uses: usize = 0;
+    var graph_index: c_int = 0;
+    while (graph_index < n) : (graph_index += 1) {
+        const node = c.ggml_graph_node(graph, graph_index) orelse continue;
+        if (node.*.view_src == rmsnorm) return null;
+        for (node.*.src) |src| {
+            if (src == rmsnorm) uses += 1;
+        }
+    }
+    if (uses != 1) return null;
+
+    return .{ .rmsnorm = rmsnorm, .input = input, .weight = weight, .mul = mul };
+}
+
+fn tryLowerRmsNormMulF32(graph: *c.ggml_cgraph, rms_index: c_int, lookup: Lookup) ?wire.Command {
+    const pair = rmsNormMulF32Pair(graph, rms_index) orelse return null;
+    const rows = u32Dim(dim(pair.mul, 0)) catch return null;
+    const cols = flattenedCols(pair.mul, rows) catch return null;
+    const total_bytes = f32MatrixBytes(rows, cols) catch return null;
+    const weight_bytes = f32MatrixBytes(rows, 1) catch return null;
+
+    const input_binding = lookup.find(pair.input) orelse return null;
+    _ = lookup.find(pair.rmsnorm) orelse return null;
+    const weight_binding = lookup.find(pair.weight) orelse return null;
+    const dst_binding = lookup.find(pair.mul) orelse return null;
+
+    return .{ .rmsnorm = .{
+        .input = backingRange(input_binding, total_bytes) catch return null,
+        .weight = backingRange(weight_binding, weight_bytes) catch return null,
+        .dst = backingRange(dst_binding, total_bytes) catch return null,
+        .rows = rows,
+        .cols = cols,
+        .eps = opParamF32(pair.rmsnorm, 0),
+        .has_weight = true,
+    } };
 }
 
 fn supportsRopeF32(op: *const c.ggml_tensor) bool {
@@ -862,4 +934,278 @@ fn checkedAdd(a: usize, b: usize) LowerError!usize {
 
 fn checkedMul(a: usize, b: usize) LowerError!usize {
     return std.math.mul(usize, a, b) catch return error.InvalidShape;
+}
+
+const TestRmsNormMul = struct {
+    input: *c.ggml_tensor,
+    weight: *c.ggml_tensor,
+    rmsnorm: *c.ggml_tensor,
+    mul: *c.ggml_tensor,
+};
+
+fn testContext() !*c.ggml_context {
+    return c.ggml_init(.{
+        .mem_size = 1024 * 1024,
+        .mem_buffer = null,
+        .no_alloc = true,
+    }) orelse error.OutOfMemory;
+}
+
+fn testGraph(ctx: *c.ggml_context) !*c.ggml_cgraph {
+    return c.ggml_new_graph_custom(ctx, 128, false) orelse error.OutOfMemory;
+}
+
+fn testRmsNormMul(ctx: *c.ggml_context, rows: i64, cols: i64, eps: f32, reverse: bool) !TestRmsNormMul {
+    const input = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, rows, cols) orelse return error.OutOfMemory;
+    const weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, rows) orelse return error.OutOfMemory;
+    const rmsnorm = c.ggml_rms_norm(ctx, input, eps) orelse return error.OutOfMemory;
+    const mul = if (reverse)
+        c.ggml_mul(ctx, weight, rmsnorm) orelse return error.OutOfMemory
+    else
+        c.ggml_mul(ctx, rmsnorm, weight) orelse return error.OutOfMemory;
+    return .{ .input = input, .weight = weight, .rmsnorm = rmsnorm, .mul = mul };
+}
+
+fn testFindBinding(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
+    _ = ctx;
+    const t = tensor orelse return null;
+    const nbytes = tensorNbytes(t);
+    return .{
+        .range = .{ .handle = @intCast(@intFromPtr(t)), .offset = 0, .nbytes = @intCast(nbytes) },
+        .handle_nbytes = @intCast(nbytes),
+    };
+}
+
+fn testLookup() Lookup {
+    const dummy: *anyopaque = @ptrFromInt(@alignOf(usize));
+    return .{ .ctx = dummy, .findFn = testFindBinding };
+}
+
+const TestMissingBinding = struct {
+    tensor: *const c.ggml_tensor,
+
+    fn find(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
+        const self: *TestMissingBinding = @ptrCast(@alignCast(ctx));
+        if (tensor == self.tensor) return null;
+        return testFindBinding(ctx, tensor);
+    }
+
+    fn lookup(self: *TestMissingBinding) Lookup {
+        return .{ .ctx = self, .findFn = find };
+    }
+};
+
+fn expectStandaloneRmsNormMul(commands: []const wire.Command) !void {
+    try std.testing.expectEqual(@as(usize, 2), commands.len);
+    switch (commands[0]) {
+        .rmsnorm => |op| try std.testing.expect(!op.has_weight),
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commands[1]) {
+        .mul_f32 => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowering fuses exact adjacent rmsnorm gamma multiply" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 3, 1e-5, false);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    switch (commands[0]) {
+        .rmsnorm => |op| {
+            try std.testing.expect(op.has_weight);
+            try std.testing.expectEqual(@as(u64, 8 * @sizeOf(f32)), op.weight.nbytes);
+            try std.testing.expectEqual(@as(u64, 8 * 3 * @sizeOf(f32)), op.dst.nbytes);
+            try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.weight))), op.weight.handle);
+            try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.mul))), op.dst.handle);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowering fuses rmsnorm when it is the reversed multiply operand" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 1, 1e-5, true);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    try std.testing.expect(commands[0].rmsnorm.has_weight);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.weight))), commands[0].rmsnorm.weight.handle);
+}
+
+test "lowering retains rmsnorm and mul for extra consumers" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    const other_weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const other_mul = c.ggml_mul(ctx, pair.rmsnorm, other_weight) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+    c.ggml_build_forward_expand(graph, other_mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 3), commands.len);
+    try std.testing.expect(!commands[0].rmsnorm.has_weight);
+    switch (commands[1]) {
+        .mul_f32 => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commands[2]) {
+        .mul_f32 => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowering retains rmsnorm and mul when rmsnorm is an output" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    c.ggml_set_output(pair.rmsnorm);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try expectStandaloneRmsNormMul(commands);
+}
+
+test "lowering retains rmsnorm and mul for rmsnorm views" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const input = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 8, 2) orelse return error.OutOfMemory;
+    const weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const rmsnorm = c.ggml_rms_norm_inplace(ctx, input, 1e-5) orelse return error.OutOfMemory;
+    const mul = c.ggml_mul(ctx, rmsnorm, weight) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try expectStandaloneRmsNormMul(commands);
+}
+
+test "lowering retains rmsnorm and mul when a view also consumes rmsnorm" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    const view = c.ggml_view_2d(ctx, pair.rmsnorm, 8, 2, 8 * @sizeOf(f32), 0) orelse return error.OutOfMemory;
+    const view_weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const view_mul = c.ggml_mul(ctx, view, view_weight) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+    c.ggml_build_forward_expand(graph, view_mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 3), commands.len);
+    try std.testing.expect(!commands[0].rmsnorm.has_weight);
+}
+
+test "lowering requires raw adjacency for rmsnorm fusion" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    const other_weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const zero = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const computed_weight = c.ggml_add(ctx, other_weight, zero) orelse return error.OutOfMemory;
+    pair.mul.*.src[1] = computed_weight;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 3), commands.len);
+    try std.testing.expect(!commands[0].rmsnorm.has_weight);
+}
+
+test "lowering keeps same-shape non-gamma multiply generic" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const input = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 8, 2) orelse return error.OutOfMemory;
+    const weight = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 8, 2) orelse return error.OutOfMemory;
+    const rmsnorm = c.ggml_rms_norm(ctx, input, 1e-5) orelse return error.OutOfMemory;
+    const mul = c.ggml_mul(ctx, rmsnorm, weight) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, mul);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try expectStandaloneRmsNormMul(commands);
+    try std.testing.expectEqual(wire.BinaryF32Mode.same_shape, commands[1].mul_f32.mode);
+}
+
+test "rmsnorm fusion rejects invalid epsilon type and stride" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+
+    const invalid_eps = try testRmsNormMul(ctx, 8, 2, -1, false);
+    const eps_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(eps_graph, invalid_eps.mul);
+    try std.testing.expect(rmsNormMulF32Pair(eps_graph, 0) == null);
+    const eps_commands = try lowerGraph(std.testing.allocator, eps_graph, testLookup());
+    defer std.testing.allocator.free(eps_commands);
+    try expectStandaloneRmsNormMul(eps_commands);
+
+    const typed_input = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 8, 2) orelse return error.OutOfMemory;
+    const typed_weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F16, 8) orelse return error.OutOfMemory;
+    const typed_rms = c.ggml_rms_norm(ctx, typed_input, 1e-5) orelse return error.OutOfMemory;
+    const typed_mul = c.ggml_mul(ctx, typed_rms, typed_weight) orelse return error.OutOfMemory;
+    const typed_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(typed_graph, typed_mul);
+    try std.testing.expect(rmsNormMulF32Pair(typed_graph, 0) == null);
+    try std.testing.expect(!supportsOp(typed_mul));
+
+    const strided = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    strided.weight.*.nb[0] = 2 * @sizeOf(f32);
+    const strided_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(strided_graph, strided.mul);
+    try std.testing.expect(rmsNormMulF32Pair(strided_graph, 0) == null);
+    try std.testing.expect(!supportsOp(strided.mul));
+
+    const shaped = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    shaped.mul.*.ne[1] = 3;
+    const shaped_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(shaped_graph, shaped.mul);
+    try std.testing.expect(rmsNormMulF32Pair(shaped_graph, 0) == null);
+    try std.testing.expect(!supportsOp(shaped.mul));
+}
+
+test "rmsnorm fusion requires every resident binding" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testRmsNormMul(ctx, 8, 2, 1e-5, false);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.mul);
+
+    var missing_weight = TestMissingBinding{ .tensor = pair.weight };
+    try std.testing.expect(tryLowerRmsNormMulF32(graph, 0, missing_weight.lookup()) == null);
+    var missing_intermediate = TestMissingBinding{ .tensor = pair.rmsnorm };
+    try std.testing.expect(tryLowerRmsNormMulF32(graph, 0, missing_intermediate.lookup()) == null);
+    var missing_output = TestMissingBinding{ .tensor = pair.mul };
+    try std.testing.expect(tryLowerRmsNormMulF32(graph, 0, missing_output.lookup()) == null);
+}
+
+test "lowering leaves standalone rmsnorm unchanged" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const input = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 8, 2) orelse return error.OutOfMemory;
+    const rmsnorm = c.ggml_rms_norm(ctx, input, 1e-5) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, rmsnorm);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    try std.testing.expect(!commands[0].rmsnorm.has_weight);
 }

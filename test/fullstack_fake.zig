@@ -187,6 +187,54 @@ test "fake link ps f32 command graph" {
     try expectTensor(&link, out_add_scaled, &.{ 3.5, 5 });
 }
 
+test "fake link fused rmsnorm weight matches standalone rmsnorm then mul" {
+    var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);
+    defer runtime.deinit();
+    var link = link_mod.FakeLink.init(std.testing.allocator, &runtime);
+
+    const rows = 35;
+    const cols = 3;
+    const input = try allocTensor(&link, rows * cols);
+    const weight = try allocTensor(&link, rows);
+    const normalized = try allocTensor(&link, rows * cols);
+    const sequential = try allocTensor(&link, rows * cols);
+    const fused = try allocTensor(&link, rows * cols);
+
+    var input_values: [rows * cols]f32 = undefined;
+    var weight_values: [rows]f32 = undefined;
+    for (0..rows) |row| weight_values[row] = 0.5 + @as(f32, @floatFromInt(row)) / 64.0;
+    for (0..rows * cols) |i| input_values[i] = @as(f32, @floatFromInt(i + 1)) / 23.0 - 1.5;
+    try uploadTensor(&link, input, &input_values);
+    try uploadTensor(&link, weight, &weight_values);
+
+    try link.runGraph(&.{
+        .{ .rmsnorm = .{ .input = input, .dst = normalized, .rows = rows, .cols = cols, .eps = 1e-5 } },
+        .{ .mul_f32 = .{
+            .lhs = normalized,
+            .rhs = weight,
+            .dst = sequential,
+            .rows = rows,
+            .cols = cols,
+            .mode = .rhs_row_broadcast,
+        } },
+        .{ .rmsnorm = .{
+            .input = input,
+            .weight = weight,
+            .dst = fused,
+            .rows = rows,
+            .cols = cols,
+            .eps = 1e-5,
+            .has_weight = true,
+        } },
+    });
+
+    var sequential_bytes: [rows * cols * @sizeOf(f32)]u8 = undefined;
+    var fused_bytes: [rows * cols * @sizeOf(f32)]u8 = undefined;
+    _ = try link.download(sequential, &sequential_bytes);
+    _ = try link.download(fused, &fused_bytes);
+    try std.testing.expectEqualSlices(u8, &sequential_bytes, &fused_bytes);
+}
+
 test "fake link runGraphProfile reports per-op aggregates" {
     if (!build_options.enable_profiling) return error.SkipZigTest;
     var runtime = try runtime_mod.Runtime.init(std.testing.allocator, 1024 * 1024);

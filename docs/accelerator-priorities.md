@@ -109,18 +109,62 @@ cosim, OOC, and routed-build evidence remain continuous gates on later prioritie
 
 ### P1: bounded waste removal
 
-- [ ] Remove full padded-vocabulary work before argmax, or fuse real-vocabulary
-  argmax into the logits epilogue. Current pad plus argmax is about 6.3 ms/token.
-- [ ] Fuse RMSNorm and gamma multiplication in the PS fallback/reference path;
+- [x] Remove full padded-vocabulary work before argmax. Penzai's terminal greedy
+  sampler now connects ARGMAX directly to the real logits for the proven
+  single-sequence topology and retains PAD as a strict fallback.
+- [x] Fuse RMSNorm and gamma multiplication in the PS fallback/reference path;
   its PL implementation belongs in the P2 section substrate.
 - [ ] Remove avoidable final-row result padding and copies.
 - [x] Keep the current sequencer disabled; its measured A/B regressed decode.
+
+P1a removed PAD from every characterized decode graph while retaining one ARGMAX
+and a four-byte token download. Generated Q1 and Q2 output remained byte-identical
+to the canonical P0 regression, and accounting closed in every sample:
+
+| P1a metric | P0 | P1a | Change |
+|---|---:|---:|---:|
+| Q1 profiled device | 83.35 ms/token | 77.66 ms/token | -5.68 ms/token |
+| Q2 profiled device | 104.87 ms/token | 99.49 ms/token | -5.38 ms/token |
+| Q1 unprofiled steady | 99.00 ms/token | 95.95 ms/token | -3.05 ms/token |
+| Q2 unprofiled steady | 118.42 ms/token | 118.88 ms/token | +0.45 ms/token |
+
+The Q2 unprofiled wall result is within short-run variance, so P1a claims the
+measured device-work reduction rather than a Q2 product-throughput improvement.
+The sampler uses llama.cpp's experimental backend-sampling API, but topology
+changes fail closed to the existing PAD path. The characterization and regression
+artifacts are `20260805T031434Z-characterize-290c86efece2` and
+`20260805T032338Z-regression-923832fe70a8`.
+
+P1b fused each supported adjacent RMSNorm-gamma pair into one PS command. Decode
+graphs fell from 650 to 537 commands: the 113 RMSNorm commands remain and the 113
+gamma MUL commands disappear. Accounting closed in all samples, and profiled
+device time improved consistently:
+
+| P1b metric | P1a | P1b | Change |
+|---|---:|---:|---:|
+| Q1 profiled device | 77.66 ms/token | 74.68 ms/token | -2.98 ms/token |
+| Q2 profiled device | 99.49 ms/token | 96.52 ms/token | -2.97 ms/token |
+| Q1 unprofiled steady | 95.95 ms/token | 92.29 ms/token | -3.66 ms/token |
+| Q2 unprofiled steady | 118.88 ms/token | 114.69 ms/token | -4.19 ms/token |
+
+The unprofiled ranges overlap, so P1b claims the repeatable device-work reduction,
+not a product-throughput gain. Q1/Q2 generated text remained byte-identical to P1a;
+CPU logit comparisons had zero token mismatches and maximum absolute errors of
+0.151340/0.136081. The characterization and regression artifacts are
+`20260805T050508Z-characterize-c2598349015c` and
+`20260805T052006Z-regression-b3f1211a2b6c`.
 
 Timebox P1 and measure each change independently. A realistic combined target is
 roughly 10-15 ms/token at short context; it cannot materially change the 533 ms
 context-2048 device time. Do not add a cross-graph activation cache or temporary
 PS protocol to reuse quantization. Shared Q/K/V and gate/up quantization belongs
 to the explicit P2 scratch lifetime.
+
+Next, remove and A/B the measured final-row padding/copy waste. Skip it if it
+requires a general graph rewrite or new cross-graph state. Then close P1 and begin
+P2 with the explicit section/scratch contract and a cycle-per-query-KV-pair
+baseline for the unified attention engine; do not extend P1 with additional
+micro-optimizations.
 
 ### P2: section substrate and unified PL attention
 

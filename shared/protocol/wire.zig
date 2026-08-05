@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 12;
+pub const version: u16 = 13;
 pub const response_meta_len: usize = 64;
 
 pub const RequestTag = enum(u16) {
@@ -272,10 +272,12 @@ pub const BinaryBroadcastF32 = struct {
 
 pub const RmsNorm = struct {
     input: TensorRange,
+    weight: TensorRange = .{ .handle = 0, .offset = 0, .nbytes = 0 },
     dst: TensorRange,
     rows: u32,
     cols: u32,
     eps: f32,
+    has_weight: bool = false,
 };
 
 pub const Rope = struct {
@@ -611,7 +613,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .copy => 4 + rangeLen * 2,
             .cpy_f32_to_f16 => 4 + rangeLen * 2,
             .matmul_q1a8 => 4 + rangeLen * 3 + 16,
-            .rmsnorm => 4 + rangeLen * 2 + 16,
+            .rmsnorm => 4 + rangeLen * 3 + 16,
             .rope => 4 + rangeLen * 3 + 48,
             .softmax, .silu => 4 + rangeLen * 2,
             .swiglu => 4 + rangeLen * 3,
@@ -661,11 +663,12 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putU16(out, &cursor, @intFromEnum(OpTag.rmsnorm));
             putU16(out, &cursor, 0);
             putRange(out, &cursor, rmsnorm.input);
+            putRange(out, &cursor, rmsnorm.weight);
             putRange(out, &cursor, rmsnorm.dst);
             putU32(out, &cursor, rmsnorm.rows);
             putU32(out, &cursor, rmsnorm.cols);
             putF32(out, &cursor, rmsnorm.eps);
-            putU32(out, &cursor, 0);
+            putU32(out, &cursor, @intFromBool(rmsnorm.has_weight));
         },
         .rope => |rope| {
             putU16(out, &cursor, @intFromEnum(OpTag.rope));
@@ -859,12 +862,23 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
             },
             .rmsnorm => blk: {
                 const input = try takeRange(bytes, &cursor);
+                const weight = try takeRange(bytes, &cursor);
                 const dst = try takeRange(bytes, &cursor);
                 const rows = try takeU32(bytes, &cursor);
                 const cols = try takeU32(bytes, &cursor);
                 const eps = try takeF32(bytes, &cursor);
-                _ = try takeU32(bytes, &cursor);
-                break :blk .{ .rmsnorm = .{ .input = input, .dst = dst, .rows = rows, .cols = cols, .eps = eps } };
+                const has_weight_raw = try takeU32(bytes, &cursor);
+                if (has_weight_raw > 1) return error.InvalidFlags;
+                if (has_weight_raw == 0 and !emptyRange(weight)) return error.InvalidFlags;
+                break :blk .{ .rmsnorm = .{
+                    .input = input,
+                    .weight = weight,
+                    .dst = dst,
+                    .rows = rows,
+                    .cols = cols,
+                    .eps = eps,
+                    .has_weight = has_weight_raw == 1,
+                } };
             },
             .rope => blk: {
                 const input = try takeRange(bytes, &cursor);
@@ -1090,6 +1104,10 @@ fn takeRange(bytes: []const u8, cursor: *usize) DecodeError!TensorRange {
         .offset = try takeU64(bytes, cursor),
         .nbytes = try takeU64(bytes, cursor),
     };
+}
+
+fn emptyRange(range: TensorRange) bool {
+    return range.handle == 0 and range.offset == 0 and range.nbytes == 0;
 }
 
 fn checkedUsize(value: u64) DecodeError!usize {
@@ -1447,4 +1465,48 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[15].argmax.dst.handle, got[15].argmax.dst.handle);
     try std.testing.expectEqual(commands[16].pad.src.handle, got[16].pad.src.handle);
     try std.testing.expectEqual(commands[16].pad.dst.offset, got[16].pad.dst.offset);
+}
+
+test "rmsnorm optional weight encoding is exact and rejects invalid flags" {
+    const input: TensorRange = .{ .handle = 1, .offset = 16, .nbytes = 96 };
+    const weight: TensorRange = .{ .handle = 2, .offset = 32, .nbytes = 12 };
+    const dst: TensorRange = .{ .handle = 3, .offset = 48, .nbytes = 96 };
+    const commands = [_]Command{
+        .{ .rmsnorm = .{ .input = input, .dst = dst, .rows = 3, .cols = 8, .eps = 1e-5 } },
+        .{ .rmsnorm = .{
+            .input = input,
+            .weight = weight,
+            .dst = dst,
+            .rows = 3,
+            .cols = 8,
+            .eps = 1e-5,
+            .has_weight = true,
+        } },
+    };
+    const one_command_len = 4 + 4 + rangeLen * 3 + 16;
+    var buf: [256]u8 = undefined;
+    const n = try encodeCommandBuffer(&commands, &buf);
+    try std.testing.expectEqual(@as(usize, one_command_len * 2 - 4), n);
+
+    const got = try decodeCommandBuffer(std.testing.allocator, buf[0..n]);
+    defer std.testing.allocator.free(got);
+    try std.testing.expect(!got[0].rmsnorm.has_weight);
+    try std.testing.expect(emptyRange(got[0].rmsnorm.weight));
+    try std.testing.expect(got[1].rmsnorm.has_weight);
+    try std.testing.expectEqual(weight, got[1].rmsnorm.weight);
+    try std.testing.expectEqual(dst, got[1].rmsnorm.dst);
+
+    try std.testing.expectError(error.Truncated, decodeCommandBuffer(std.testing.allocator, buf[0 .. n - 1]));
+    buf[n] = 0;
+    try std.testing.expectError(error.TrailingBytes, decodeCommandBuffer(std.testing.allocator, buf[0 .. n + 1]));
+
+    var bad_flag = buf;
+    const first_flag_offset = one_command_len - @sizeOf(u32);
+    std.mem.writeInt(u32, bad_flag[first_flag_offset..][0..4], 2, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeCommandBuffer(std.testing.allocator, bad_flag[0..n]));
+
+    var bad_absent_weight = buf;
+    const first_weight_offset = 4 + 4 + rangeLen;
+    std.mem.writeInt(u64, bad_absent_weight[first_weight_offset..][0..8], 9, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeCommandBuffer(std.testing.allocator, bad_absent_weight[0..n]));
 }

@@ -638,6 +638,7 @@ fn addTests(
 
     addHostTest(b, test_step, "host/run.zig", target, optimize, build_options, shared, runtime, server, link, llama_config, c_mod, true);
     addHostTest(b, test_step, "test/fullstack_fake.zig", target, optimize, build_options, shared, runtime, server, link, llama_config, c_mod, false);
+    addLowerTest(b, test_step, target, optimize, shared, llama_config);
 }
 
 fn addSharedTest(
@@ -867,6 +868,34 @@ fn createBackendModule(
     backend.addImport("link", link);
     backend.addImport("prof", prof);
     return backend;
+}
+
+fn addLowerTest(
+    b: *std.Build,
+    test_step: *std.Build.Step,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    shared: *std.Build.Module,
+    llama_config: LlamaConfig,
+) void {
+    if (!llama_config.enabled) return;
+
+    const c_ggml = createGgmlCModule(b, target, llama_config.src);
+    const mod = b.createModule(.{
+        .root_source_file = b.path("host/backend/lower.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    mod.addImport("c_ggml", c_ggml);
+    mod.addImport("shared", shared);
+    const lib_path = b.pathJoin(&.{ llama_config.lib, "lib" });
+    mod.addLibraryPath(.{ .cwd_relative = lib_path });
+    mod.addRPath(.{ .cwd_relative = lib_path });
+    mod.linkSystemLibrary("ggml-base", .{});
+
+    const test_exe = b.addTest(.{ .root_module = mod });
+    test_step.dependOn(&b.addRunArtifact(test_exe).step);
 }
 
 // The host-side modules not shared with the device: `prof` (always) and, when

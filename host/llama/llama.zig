@@ -47,10 +47,10 @@ pub const Options = struct {
     enable_thinking: bool = false,
     profile: bool = false,
     device_label: []const u8 = "fake",
-    /// Build the greedy sampler on the llama.cpp backend (bound to seq 0) so the
-    /// argmax runs in the device compute graph and only the sampled token id is
-    /// transferred back, instead of the full f32 logits vector. Requires device
-    /// support for GGML_OP_ARGMAX and GGML_OP_PAD (the static-graph dummy row).
+    /// Build the terminal greedy sampler on the llama.cpp backend (bound to seq
+    /// 0) so the argmax runs in the device compute graph and only the sampled
+    /// token id is transferred back. Its exact single-row path bypasses the
+    /// static sampling PAD; unsupported graph shapes retain the PAD fallback.
     backend_sampling: bool = false,
     /// Benchmark-only: continue feeding sampled EOG tokens until max_tokens.
     exact_tokens: bool = false,
@@ -157,7 +157,11 @@ pub fn runPrompt(
     sparams.no_perf = true;
     const sampler = c.llama_sampler_chain_init(sparams) orelse return error.SamplerInitFailed;
     defer c.llama_sampler_free(sampler);
-    c.llama_sampler_chain_add(sampler, c.llama_sampler_init_greedy() orelse return error.SamplerInitFailed);
+    const greedy = if (options.backend_sampling)
+        c.penzai_sampler_init_terminal_greedy()
+    else
+        c.llama_sampler_init_greedy();
+    c.llama_sampler_chain_add(sampler, greedy orelse return error.SamplerInitFailed);
 
     var sampler_config: c.llama_sampler_seq_config = .{ .seq_id = 0, .sampler = sampler };
     if (options.backend_sampling) {
@@ -599,4 +603,128 @@ fn quietLog(level: c.enum_ggml_log_level, text: [*c]const u8, user_data: ?*anyop
     _ = level;
     _ = text;
     _ = user_data;
+}
+
+const SamplingGraphOptions = struct {
+    real_rows: i64 = 1,
+    pad_rows: c_int = 1,
+    view_row: usize = 0,
+    noncontiguous_view: bool = false,
+    preexpanded_consumer: bool = false,
+    existing_probs: bool = false,
+};
+
+const SamplingGraphResult = struct {
+    direct: bool,
+    logits_cleared: bool,
+    pad_count: usize,
+    argmax_count: usize,
+    selected: i32,
+};
+
+fn exerciseTerminalGreedy(options: SamplingGraphOptions) !SamplingGraphResult {
+    const ctx = c.ggml_init(.{
+        .mem_size = 64 * 1024,
+        .mem_buffer = null,
+        .no_alloc = false,
+    }) orelse return error.OutOfMemory;
+    defer c.ggml_free(ctx);
+
+    const real = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, 4, options.real_rows) orelse return error.OutOfMemory;
+    const pad = c.ggml_pad(ctx, real, 0, options.pad_rows, 0, 0) orelse return error.OutOfMemory;
+    const view_offset = options.view_row * pad[0].nb[1];
+    const view = c.ggml_view_1d(ctx, pad, real[0].ne[0], view_offset) orelse return error.OutOfMemory;
+    if (options.noncontiguous_view) view[0].nb[0] += @sizeOf(f32);
+
+    const values = [_]f32{ std.math.nan(f32), 5, 5, std.math.nan(f32) };
+    const real_data: [*]f32 = @ptrCast(@alignCast(real[0].data orelse return error.OutOfMemory));
+    for (0..@intCast(options.real_rows)) |row| {
+        @memcpy(real_data[row * values.len ..][0..values.len], &values);
+    }
+
+    const gf = c.ggml_new_graph_custom(ctx, 32, false) orelse return error.OutOfMemory;
+    const other = c.ggml_dup(ctx, view) orelse return error.OutOfMemory;
+    if (options.preexpanded_consumer) c.ggml_build_forward_expand(gf, other);
+
+    var data: c.llama_sampler_data = .{
+        .logits = view,
+        .probs = if (options.existing_probs) other else null,
+        .sampled = null,
+        .candidates = null,
+    };
+    const sampler = c.penzai_sampler_init_terminal_greedy() orelse return error.OutOfMemory;
+    defer c.llama_sampler_free(sampler);
+    const backend_apply = sampler[0].iface.*.backend_apply orelse return error.SamplerInitFailed;
+    backend_apply(sampler, ctx, gf, &data);
+
+    const sampled = data.sampled orelse return error.SamplerInitFailed;
+    const direct = sampled[0].src[0] == real;
+    c.ggml_build_forward_expand(gf, sampled);
+    if (data.probs) |probs| c.ggml_build_forward_expand(gf, probs);
+
+    var pad_count: usize = 0;
+    var argmax_count: usize = 0;
+    var i: c_int = 0;
+    while (i < c.ggml_graph_n_nodes(gf)) : (i += 1) {
+        const node = c.ggml_graph_node(gf, i) orelse continue;
+        if (node[0].op == c.GGML_OP_PAD) pad_count += 1;
+        if (node[0].op == c.GGML_OP_ARGMAX) argmax_count += 1;
+    }
+
+    var selected: i32 = -1;
+    if (!options.noncontiguous_view) {
+        try std.testing.expectEqual(c.GGML_STATUS_SUCCESS, c.ggml_graph_compute_with_ctx(ctx, gf, 1));
+        const selected_ptr: *const i32 = @ptrCast(@alignCast(sampled[0].data orelse return error.OutOfMemory));
+        selected = selected_ptr.*;
+    }
+
+    return .{
+        .direct = direct,
+        .logits_cleared = data.logits == null,
+        .pad_count = pad_count,
+        .argmax_count = argmax_count,
+        .selected = selected,
+    };
+}
+
+test "terminal greedy uses real single-row logits and preserves ggml argmax" {
+    const result = try exerciseTerminalGreedy(.{});
+    try std.testing.expect(result.direct);
+    try std.testing.expect(result.logits_cleared);
+    try std.testing.expectEqual(@as(usize, 0), result.pad_count);
+    try std.testing.expectEqual(@as(usize, 1), result.argmax_count);
+    // ggml argmax skips NaNs and chooses the last equal maximum.
+    try std.testing.expectEqual(@as(i32, 2), result.selected);
+}
+
+test "terminal greedy retains PAD when the padded view has another consumer" {
+    const result = try exerciseTerminalGreedy(.{ .preexpanded_consumer = true });
+    try std.testing.expect(!result.direct);
+    try std.testing.expect(result.logits_cleared);
+    try std.testing.expectEqual(@as(usize, 1), result.pad_count);
+    try std.testing.expectEqual(@as(usize, 1), result.argmax_count);
+}
+
+test "terminal greedy retains PAD for multiple output rows" {
+    const result = try exerciseTerminalGreedy(.{ .real_rows = 2 });
+    try std.testing.expect(!result.direct);
+    try std.testing.expectEqual(@as(usize, 1), result.pad_count);
+}
+
+test "terminal greedy rejects unexpected PAD views and sampler outputs" {
+    const wider_pad = try exerciseTerminalGreedy(.{ .pad_rows = 2 });
+    try std.testing.expect(!wider_pad.direct);
+    try std.testing.expectEqual(@as(usize, 1), wider_pad.pad_count);
+
+    const nonzero_view = try exerciseTerminalGreedy(.{ .view_row = 1 });
+    try std.testing.expect(!nonzero_view.direct);
+    try std.testing.expectEqual(@as(usize, 1), nonzero_view.pad_count);
+
+    const noncontiguous = try exerciseTerminalGreedy(.{ .noncontiguous_view = true });
+    try std.testing.expect(!noncontiguous.direct);
+    try std.testing.expectEqual(@as(usize, 1), noncontiguous.pad_count);
+
+    const existing_probs = try exerciseTerminalGreedy(.{ .existing_probs = true });
+    try std.testing.expect(!existing_probs.direct);
+    try std.testing.expectEqual(@as(usize, 1), existing_probs.pad_count);
 }

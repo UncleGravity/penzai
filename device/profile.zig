@@ -324,7 +324,7 @@ pub fn commandBytes(command: wire.Command) u64 {
         .cpy_f32_to_f16 => |op| op.src.nbytes +| op.dst.nbytes,
         // Per-op read traffic: weights are persistent but re-read every decode, so count them each call.
         .matmul_q1a8 => |op| op.weights.nbytes +| op.acts.nbytes +| op.dst.nbytes,
-        .rmsnorm => |op| op.input.nbytes +| op.dst.nbytes,
+        .rmsnorm => |op| op.input.nbytes +| (if (op.has_weight) op.weight.nbytes else 0) +| op.dst.nbytes,
         .rope => |op| op.input.nbytes +| op.positions.nbytes +| op.dst.nbytes,
         .softmax => |op| op.src.nbytes +| op.dst.nbytes,
         .silu => |op| op.src.nbytes +| op.dst.nbytes,
@@ -438,6 +438,24 @@ test "profile byte estimates for row ops count touched rows, not backing spans" 
     ternary_rows.get_rows.src_type = .q2_0;
     const ternary_source_bytes = 2 * layout.ternary_block_bytes;
     try std.testing.expectEqual(@as(u64, 6 * (ternary_source_bytes + 4 + 256 * 4)), commandBytes(ternary_rows));
+}
+
+test "profile byte estimate includes optional rmsnorm weight" {
+    const input = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 96 };
+    const weight = wire.TensorRange{ .handle = 2, .offset = 0, .nbytes = 12 };
+    const dst = wire.TensorRange{ .handle = 3, .offset = 0, .nbytes = 96 };
+    const standalone = wire.Command{ .rmsnorm = .{ .input = input, .dst = dst, .rows = 3, .cols = 8, .eps = 1e-5 } };
+    const fused = wire.Command{ .rmsnorm = .{
+        .input = input,
+        .weight = weight,
+        .dst = dst,
+        .rows = 3,
+        .cols = 8,
+        .eps = 1e-5,
+        .has_weight = true,
+    } };
+    try std.testing.expectEqual(@as(u64, 192), commandBytes(standalone));
+    try std.testing.expectEqual(@as(u64, 204), commandBytes(fused));
 }
 
 fn testMatmulCommand(rows: u32) wire.Command {

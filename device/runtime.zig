@@ -414,7 +414,12 @@ pub fn RuntimeFor(comptime Heap: type) type {
                 .rmsnorm => |rmsnorm| {
                     const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(rmsnorm.dst) catch |err| return mapHeapError(err);
-                    ps_rmsnorm.runBytes(input, dst, rmsnorm.rows, rmsnorm.cols, rmsnorm.eps) catch |err| return mapKernelError(err);
+                    if (rmsnorm.has_weight) {
+                        const weight = self.heap.read(rmsnorm.weight) catch |err| return mapHeapError(err);
+                        ps_rmsnorm.runWeightedBytes(input, weight, dst, rmsnorm.rows, rmsnorm.cols, rmsnorm.eps) catch |err| return mapKernelError(err);
+                    } else {
+                        ps_rmsnorm.runBytes(input, dst, rmsnorm.rows, rmsnorm.cols, rmsnorm.eps) catch |err| return mapKernelError(err);
+                    }
                 },
                 .rope => |rope| {
                     const input = self.heap.read(rope.input) catch |err| return mapHeapError(err);
@@ -703,6 +708,7 @@ test "runtime dispatches ps f32 command variants" {
     const flash_k = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
     const flash_v = try rawTensor(&runtime, 4 * @sizeOf(f16), @alignOf(f16));
     const out_rms = try tensor(&runtime, 2);
+    const out_rms_weighted = try tensor(&runtime, 2);
     const out_rope = try tensor(&runtime, 2);
     const out_softmax = try tensor(&runtime, 2);
     const out_silu = try tensor(&runtime, 2);
@@ -728,6 +734,15 @@ test "runtime dispatches ps f32 command variants" {
 
     const commands = [_]wire.Command{
         .{ .rmsnorm = .{ .input = a, .dst = out_rms, .rows = 2, .cols = 1, .eps = 0 } },
+        .{ .rmsnorm = .{
+            .input = a,
+            .weight = b,
+            .dst = out_rms_weighted,
+            .rows = 2,
+            .cols = 1,
+            .eps = 0,
+            .has_weight = true,
+        } },
         .{ .rope = .{
             .input = b,
             .positions = indices,
@@ -829,6 +844,7 @@ test "runtime dispatches ps f32 command variants" {
     try std.testing.expectEqual(@as(u64, commands.len), result.meta.value0);
 
     try expectTensor(&runtime, out_rms, &.{ 0.84852815, 1.1313709 });
+    try expectTensor(&runtime, out_rms_weighted, &.{ 0.84852815, 2.2627418 });
     try expectTensor(&runtime, out_rope, &.{ -1.1426396, 1.9220756 });
     try expectTensor(&runtime, out_softmax, &.{ 0.26894143, 0.7310586 });
     try expectTensor(&runtime, out_silu, &.{ 0.7310586, 1.761594 });
