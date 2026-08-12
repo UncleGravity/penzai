@@ -9,17 +9,20 @@ module flash_kernel_formal(input wire clk);
     localparam integer VBEATS = 2;
     localparam integer N_HEADS = 2;
     localparam integer N_HEAD_KV = 1;
+    // Two resident queries expose sparse query-slot ordering. Two KV positions
+    // exhaust the finite/all-masked transition pairs under arbitrary prove masks;
+    // the directed trace uses a mixed KV followed by an all-masked KV.
     localparam integer N_KV = 2;
-    localparam integer N_TOKENS = 1;
+    localparam integer N_TOKENS = 2;
     localparam integer EXPECT_Q = N_TOKENS * N_HEADS * QBEATS;
-    localparam integer EXPECT_K = N_TOKENS * N_KV * N_HEAD_KV * QBEATS;
-    localparam integer EXPECT_V = N_TOKENS * N_KV * N_HEAD_KV * VBEATS;
+    localparam integer EXPECT_K = N_KV * N_HEAD_KV * QBEATS;
+    localparam integer EXPECT_V = N_KV * N_HEAD_KV * VBEATS;
     localparam integer EXPECT_MASK = N_TOKENS * N_KV;
     localparam integer EXPECT_O = N_TOKENS * N_HEADS * VBEATS;
 `ifdef FORMAL_DIRECTED_COVER
-    localparam integer EXPECT_PROCESSED_KV = 1;
+    localparam integer EXPECT_PROCESSED_PAIRS = 1;
 `else
-    localparam integer EXPECT_PROCESSED_KV = N_KV;
+    localparam integer EXPECT_PROCESSED_PAIRS = N_TOKENS * N_KV;
 `endif
 
     (* anyseq *) reg rst_n;
@@ -53,6 +56,7 @@ module flash_kernel_formal(input wire clk);
         .HEAD_DIM_MAX(HEAD_DIM_MAX),
         .MAX_HEADS(MAX_HEADS),
         .MAX_HEAD_KV(MAX_HEAD_KV),
+        .MAX_TOKENS(4),
         .LANES(LANES)
     ) dut (
         .clk(clk), .rst_n(rst_n), .start(start),
@@ -79,8 +83,14 @@ module flash_kernel_formal(input wire clk);
     reg [7:0] f_v_count = 0;
     reg [7:0] f_mask_count = 0;
     reg [7:0] f_o_count = 0;
-    reg [1:0] f_processed_kv = 0;
+    reg [3:0] f_processed_pairs = 0;
     reg f_cover_stalled = 1'b0;
+    reg f_cover_mixed = 1'b0;
+    reg f_cover_all_masked = 1'b0;
+    reg [1:0] f_kv_finite_count = 0;
+    reg [N_TOKENS-1:0] f_query_ever_finite = 0;
+    reg [1:0] f_o_stall_count = 0;
+    reg [9:0] f_run_cycles = 0;
 
     wire q_fire = q_tvalid && q_tready;
     wire k_fire = k_tvalid && k_tready;
@@ -98,9 +108,12 @@ module flash_kernel_formal(input wire clk);
             assume(start == !$past(rst_n));
         end
 `ifdef FORMAL_DIRECTED_COVER
-        // One processed pair followed by one skipped pair reaches both mask
-        // branches and the inter-KV barrier without a symbolic cover search.
-        assume(mask_tdata == ((f_mask_count == 0) ? 16'h0000 : 16'hfc00));
+        // KV-major masks for two causal queries:
+        //   kv0: q0 masked, q1 finite; kv1: both masked.
+        // Thus q0 is all-masked for the whole tile while q1 has a finite causal
+        // prefix. This reaches sparse-slot and all-masked-KV paths in one trace.
+        assume(mask_tdata == ((f_mask_count == 1) ?
+                              16'h0000 : 16'hfc00));
         // Force exactly one output stall, then drain the packet immediately.
         if (o_tvalid && !f_cover_stalled)
             assume(!o_tready);
@@ -115,8 +128,8 @@ module flash_kernel_formal(input wire clk);
             assume(n_heads == 16'd2);
             assume(n_head_kv == 16'd1);
             assume(head_ratio == 16'd2);
-            assume(n_kv == 16'd2);
-            assume(n_tokens == 16'd1);
+            assume(n_kv == N_KV);
+            assume(n_tokens == N_TOKENS);
             assume(scale == 32'h3f000000);
         end
 
@@ -134,8 +147,14 @@ module flash_kernel_formal(input wire clk);
             f_v_count <= 0;
             f_mask_count <= 0;
             f_o_count <= 0;
-            f_processed_kv <= 0;
+            f_processed_pairs <= 0;
             f_cover_stalled <= 1'b0;
+            f_cover_mixed <= 1'b0;
+            f_cover_all_masked <= 1'b0;
+            f_kv_finite_count <= 0;
+            f_query_ever_finite <= 0;
+            f_o_stall_count <= 0;
+            f_run_cycles <= 0;
         end else begin
             if (start && !busy) begin
                 f_run_active <= 1'b1;
@@ -144,23 +163,52 @@ module flash_kernel_formal(input wire clk);
                 f_v_count <= 0;
                 f_mask_count <= 0;
                 f_o_count <= 0;
-                f_processed_kv <= 0;
+                f_processed_pairs <= 0;
+                f_cover_mixed <= 1'b0;
+                f_cover_all_masked <= 1'b0;
+                f_kv_finite_count <= 0;
+                f_query_ever_finite <= 0;
+                f_run_cycles <= 0;
             end else if (done) begin
                 f_run_active <= 1'b0;
             end
+
+            if (f_run_active)
+                f_run_cycles <= f_run_cycles + 1'b1;
+
+            // A bounded fairness assumption is necessary for a liveness proof:
+            // the output consumer may stall, but not forever. Stream inputs are
+            // explicitly always valid above.
+            if (o_tvalid && !o_tready)
+                f_o_stall_count <= f_o_stall_count + 1'b1;
+            else
+                f_o_stall_count <= 0;
+            if (o_tvalid && f_o_stall_count == 2)
+                assume(o_tready);
 
             if (q_fire) f_q_count <= f_q_count + 1'b1;
             if (k_fire) f_k_count <= f_k_count + 1'b1;
             if (v_fire) f_v_count <= f_v_count + 1'b1;
             if (mask_fire) begin
                 f_mask_count <= f_mask_count + 1'b1;
-                if (mask_tdata != 16'hfc00)
-                    f_processed_kv <= f_processed_kv + 1'b1;
+                if (mask_tdata != 16'hfc00) begin
+                    f_processed_pairs <= f_processed_pairs + 1'b1;
+                    f_kv_finite_count <= f_kv_finite_count + 1'b1;
+                    f_query_ever_finite[f_mask_count % N_TOKENS] <= 1'b1;
+                end
+                if ((f_mask_count % N_TOKENS) + 1 == N_TOKENS) begin
+                    if (f_kv_finite_count + (mask_tdata != 16'hfc00) == 1)
+                        f_cover_mixed <= 1'b1;
+                    if (f_kv_finite_count == 0 && mask_tdata == 16'hfc00)
+                        f_cover_all_masked <= 1'b1;
+                    f_kv_finite_count <= 0;
+                end
             end
             if (o_fire) f_o_count <= f_o_count + 1'b1;
             if (o_tvalid && !o_tready) f_cover_stalled <= 1'b1;
         end
 
+`ifndef FORMAL_LIVENESS_ONLY
         if (f_past_valid && !$past(rst_n)) begin
             assert(!busy && !done);
             assert(!o_tvalid);
@@ -179,13 +227,13 @@ module flash_kernel_formal(input wire clk);
             assert(f_v_count <= EXPECT_V);
             assert(f_mask_count <= EXPECT_MASK);
             assert(f_o_count <= EXPECT_O);
-
-            // Requesting the next mask is the externally visible KV barrier. K and
-            // V for every preceding KV item, including masked items, must already
-            // have been consumed in full.
+            assert(f_processed_pairs <= EXPECT_MASK);
+            // Before accepting the first mask for a KV position, the KV-outer
+            // scheduler has retired exactly one preceding K/V block per completed
+            // KV position, independent of query count or mask density.
             if (mask_fire) begin
-                assert(f_k_count == f_mask_count * N_HEAD_KV * QBEATS);
-                assert(f_v_count == f_mask_count * N_HEAD_KV * VBEATS);
+                assert(f_k_count == (f_mask_count / N_TOKENS) * N_HEAD_KV * QBEATS);
+                assert(f_v_count == (f_mask_count / N_TOKENS) * N_HEAD_KV * VBEATS);
             end
 
             if (o_tvalid) begin
@@ -216,7 +264,19 @@ module flash_kernel_formal(input wire clk);
         cover(rst_n && mask_fire && mask_tdata != 16'hfc00);
         cover(rst_n && o_tvalid && !o_tready);
         cover(rst_n && done);
-        cover(rst_n && done && f_processed_kv == EXPECT_PROCESSED_KV);
+        cover(rst_n && done && f_processed_pairs == EXPECT_PROCESSED_PAIRS);
+        cover(rst_n && done && f_cover_mixed && f_cover_all_masked);
+        cover(rst_n && done && !f_query_ever_finite[0] && f_query_ever_finite[1] &&
+              f_o_count == EXPECT_O);
+`endif
+
+        // This watchdog is a bounded-liveness property, not an inductive
+        // invariant. The dedicated 272-step BMC exhausts the complete run before
+        // this 10-bit counter could wrap. Its reduced cone contains the real
+        // controller plus only the fairness assumptions needed for progress.
+`ifdef FORMAL_BOUNDED_LIVENESS
+        if (rst_n) assert(f_run_cycles < 10'd256);
+`endif
     end
 endmodule
 

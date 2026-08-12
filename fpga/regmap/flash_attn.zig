@@ -63,12 +63,14 @@ pub const caps = struct {
     pub const head_dim_max: u32 = 128;
     pub const max_heads: usize = 32;
     pub const max_head_kv: usize = 8;
-    // The only host staging the v2 tenant reserves: the DMA sink for the kernel's
-    // packed 8-wide O emit (dense n_tokens·n_heads·head_dim_v f32). Q/K/V/mask are
-    // DMA'd straight from the resident tensors in their native layout — there is no
-    // input staging (that materialized-and-replicated gather was the v1 bottleneck).
-    // 128 KiB covers the 1.7B/8B decode output with margin; a larger O falls back to PS.
+    pub const query_tile_max: usize = 4;
+    pub const context_max: usize = 8192;
+    // Decode keeps v3's direct streams and reserves O staging only for a strided
+    // destination. V4 prefill gathers bounded Q/mask tiles; packed tile output DMAs
+    // straight into its final destination subrange.
     pub const o_staging_bytes: usize = 128 * 1024;
+    pub const q_staging_bytes: usize = query_tile_max * max_heads * head_dim_max * @sizeOf(f32);
+    pub const mask_staging_bytes: usize = query_tile_max * context_max * @sizeOf(f16);
 };
 
 comptime {
@@ -76,6 +78,7 @@ comptime {
     std.debug.assert(caps.lanes == resetOf("LANES"));
     // head_dim_max must be a multiple of the lane count.
     std.debug.assert(caps.head_dim_max % caps.lanes == 0);
+    std.debug.assert(caps.query_tile_max == 4);
 }
 
 fn isDataLine(line: []const u8) bool {
@@ -143,7 +146,7 @@ pub fn emitAddrTcl(buf: []u8) std.fmt.BufPrintError![]const u8 {
     cursor += (try std.fmt.bufPrint(buf[cursor..], "# AXI-Lite address map for the flash bitstream; {{cell intf offset}} per block.\n", .{})).len;
     cursor += (try std.fmt.bufPrint(buf[cursor..], "set flash_address_map {{\n", .{})).len;
     const dmas = .{
-        .{ "dma_q", addr.dma_q }, .{ "dma_k", addr.dma_k },   .{ "dma_v", addr.dma_v },
+        .{ "dma_q", addr.dma_q },       .{ "dma_k", addr.dma_k }, .{ "dma_v", addr.dma_v },
         .{ "dma_mask", addr.dma_mask }, .{ "dma_o", addr.dma_o },
     };
     inline for (dmas) |d| {
@@ -158,7 +161,7 @@ test "regmap parses known offsets and resets" {
     try std.testing.expect(table.len >= 20);
     try std.testing.expectEqual(@as(u32, 0x00), offsetOf("ID"));
     try std.testing.expectEqual(@as(u32, 0xF1A54A00), resetOf("ID"));
-    try std.testing.expectEqual(@as(u32, 3), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 4), resetOf("VERSION"));
     try std.testing.expectEqual(@as(u32, 0x08), offsetOf("CTRL"));
     try std.testing.expectEqual(@as(u32, 0x1C), offsetOf("N_HEAD_KV"));
     try std.testing.expectEqual(@as(u32, 0x20), offsetOf("HEAD_RATIO"));

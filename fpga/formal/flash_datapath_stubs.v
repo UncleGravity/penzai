@@ -85,9 +85,10 @@ module flash_softmax (
     output wire [31:0] l_out, output wire [31:0] p,
     output wire [31:0] corr, output wire grew
 );
-    // Longer than the controller's eight-cycle launch interval, so the reduced
-    // two-head proof reaches the maximum two softmax operations in flight. The
-    // arithmetic pipeline's exact latency is irrelevant to these ordering checks.
+    // Accept a tuple every cycle and preserve completion order. Four independent
+    // query/head slots can therefore be in flight in the reduced P2c proof. The
+    // arithmetic pipeline's exact production latency is a leaf-cosim contract;
+    // the controller proof needs only a fixed, feed-forward latency.
     flash_formal_pipe #(.LATENCY(12)) u_v (
         .clk(clk), .rst_n(rst_n), .valid_in(valid_in), .valid_out(valid_out));
     (* anyseq *) reg arbitrary_out;

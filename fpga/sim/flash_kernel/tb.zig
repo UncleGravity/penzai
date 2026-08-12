@@ -18,8 +18,18 @@ const Cfg = struct {
     nkv: usize,
     ntok: usize,
     scale: f32,
-    masked_kv: i32, // a kv index to mask (-inf), or -1 for none
+    mask_kind: MaskKind = .none,
+    mask_index: usize = 2,
     expected_hash: u64 = 0,
+};
+
+const MaskKind = enum {
+    none,
+    one_interior,
+    causal,
+    first_query_all,
+    all,
+    finite_bias,
 };
 
 const Traffic = enum { baseline, stressed };
@@ -27,6 +37,8 @@ const Traffic = enum { baseline, stressed };
 const RunResult = struct {
     cycles: usize,
     hash: u64,
+    k_beats: usize,
+    v_beats: usize,
 };
 
 const zero8 = [_]u32{0} ** 8;
@@ -93,15 +105,25 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult 
     var k: [NKV * NHKV * HDQ]u16 = undefined; // f16 bits
     var v: [NKV * NHKV * HDV]u16 = undefined;
     var mask: [NTOK * NKV]u16 = undefined;
+    var query_all_masked = [_]bool{true} ** NTOK;
 
     var data_prng = std.Random.DefaultPrng.init(seed);
     const rnd = data_prng.random();
     for (&q) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
     for (&k) |*x| x.* = f16bits((rnd.float(f32) - 0.5) * 2.0);
     for (&v) |*x| x.* = f16bits((rnd.float(f32) - 0.5) * 2.0);
-    for (0..NTOK) |t| {
-        for (0..NKV) |kv| mask[t * NKV + kv] = if (@as(i32, @intCast(kv)) == cfg.masked_kv) f16bits(-std.math.inf(f32)) else f16bits(0.0);
-    }
+    for (0..NTOK) |t| for (0..NKV) |kv| {
+        const value: f32 = switch (cfg.mask_kind) {
+            .none => 0.0,
+            .one_interior => if (kv == @min(cfg.mask_index, NKV - 1)) -std.math.inf(f32) else 0.0,
+            .causal => if (kv <= @min(t + 1, NKV - 1)) 0.0 else -std.math.inf(f32),
+            .first_query_all => if (t == 0) -std.math.inf(f32) else if (kv <= @min(t, NKV - 1)) 0.0 else -std.math.inf(f32),
+            .all => -std.math.inf(f32),
+            .finite_bias => if ((t + kv) % 3 == 0) -0.5 else if ((t + kv) % 3 == 1) 0.25 else -std.math.inf(f32),
+        };
+        mask[t * NKV + kv] = f16bits(value);
+        if (mask[t * NKV + kv] != f16bits(-std.math.inf(f32))) query_all_masked[t] = false;
+    };
 
     // ---- reference O (mirror flash_ref.attendHead with HW exp/recip) ----
     var o_exp: [NTOK * NH * HDV]f32 = undefined; // bf16 p·V (matches the RTL datapath)
@@ -135,10 +157,17 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult 
                     acc_fp32[d] += p * vd; // fp32 reference
                 }
             }
-            const inv_l = ref.recip(8, l);
-            for (0..HDV) |d| {
-                o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;
-                o_fp32[(t * NH + h) * HDV + d] = acc_fp32[d] * inv_l;
+            if (l == 0) {
+                for (0..HDV) |d| {
+                    o_exp[(t * NH + h) * HDV + d] = 0;
+                    o_fp32[(t * NH + h) * HDV + d] = 0;
+                }
+            } else {
+                const inv_l = ref.recip(8, l);
+                for (0..HDV) |d| {
+                    o_exp[(t * NH + h) * HDV + d] = acc[d] * inv_l;
+                    o_fp32[(t * NH + h) * HDV + d] = acc_fp32[d] * inv_l;
+                }
             }
         }
     }
@@ -148,36 +177,36 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult 
     // kv-head — the native cache layout the device DMAs directly). GQA is done in the
     // kernel, so heads sharing a kv-head are no longer expanded in the feed.
     var q_seq: [NTOK * NH * QB][8]u32 = undefined;
-    var k_seq: [NTOK * NKV * NHKV * QB][4]u32 = undefined;
-    var v_seq: [NTOK * NKV * NHKV * VB][4]u32 = undefined;
+    var k_seq: [NKV * NHKV * QB][4]u32 = undefined;
+    var v_seq: [NKV * NHKV * VB][4]u32 = undefined;
     var mask_seq: [NTOK * NKV]u16 = undefined;
     var qi: usize = 0;
     var ki: usize = 0;
     var vi: usize = 0;
     var mi: usize = 0;
-    for (0..NTOK) |t| {
-        for (0..NH) |h| {
-            for (0..QB) |b| {
-                for (0..8) |i| q_seq[qi][i] = f32bits(q[(t * NH + h) * HDQ + b * 8 + i]);
-                qi += 1;
-            }
+    for (0..NTOK) |t| for (0..NH) |h| {
+        for (0..QB) |b| {
+            for (0..8) |i| q_seq[qi][i] = f32bits(q[(t * NH + h) * HDQ + b * 8 + i]);
+            qi += 1;
         }
-        for (0..NKV) |kv| {
+    };
+    for (0..NKV) |kv| {
+        for (0..NTOK) |t| {
             mask_seq[mi] = mask[t * NKV + kv];
             mi += 1;
-            for (0..NHKV) |kvh| {
-                for (0..QB) |b| {
-                    for (0..4) |w| k_seq[ki][w] = @as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w]) |
-                        (@as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w + 1]) << 16);
-                    ki += 1;
-                }
+        }
+        for (0..NHKV) |kvh| {
+            for (0..QB) |b| {
+                for (0..4) |w| k_seq[ki][w] = @as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w]) |
+                    (@as(u32, k[(kv * NHKV + kvh) * HDQ + b * 8 + 2 * w + 1]) << 16);
+                ki += 1;
             }
-            for (0..NHKV) |kvh| {
-                for (0..VB) |b| {
-                    for (0..4) |w| v_seq[vi][w] = @as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w]) |
-                        (@as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w + 1]) << 16);
-                    vi += 1;
-                }
+        }
+        for (0..NHKV) |kvh| {
+            for (0..VB) |b| {
+                for (0..4) |w| v_seq[vi][w] = @as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w]) |
+                    (@as(u32, v[(kv * NHKV + kvh) * HDV + b * 8 + 2 * w + 1]) << 16);
+                vi += 1;
             }
         }
     }
@@ -307,6 +336,11 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult 
     var worst: usize = 0;
     var bf16_vs_fp32: f64 = 0;
     for (0..o_got.len) |i| {
+        const query = i / (NH * HDV);
+        if (query_all_masked[query] and f32bits(o_got[i]) != 0) {
+            std.debug.print("  FAIL: all-masked query {d} emitted nonzero bits at output {d}: 0x{x:0>8}\n", .{ query, i, f32bits(o_got[i]) });
+            return error.AllMaskedOutputNotZero;
+        }
         const e: f64 = o_exp[i];
         const g: f64 = o_got[i];
         const r = @abs(e - g) / @max(@abs(e), 1.0);
@@ -318,19 +352,21 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult 
         if (dvg > bf16_vs_fp32) bf16_vs_fp32 = dvg;
     }
     const output_hash = hashOutputs(&o_got);
-    std.debug.print("    {s: <8} hdq{d} hdv{d} nh{d}/{d} nkv{d} ntok{d} mask{d}: {d} cyc, hash={x:0>16}, RTL-ref={e:.3}, bf16-fp32={e:.3}\n", .{ @tagName(traffic), HDQ, HDV, NH, NHKV, NKV, NTOK, cfg.masked_kv, cyc, output_hash, max_rel, bf16_vs_fp32 });
+    std.debug.print("    {s: <8} hdq{d} hdv{d} nh{d}/{d} nkv{d} ntok{d} {s}: {d} cyc, K/V={d}/{d}, hash={x:0>16}, RTL-ref={e:.3}, bf16-fp32={e:.3}\n", .{ @tagName(traffic), HDQ, HDV, NH, NHKV, NKV, NTOK, @tagName(cfg.mask_kind), cyc, kc, vc, output_hash, max_rel, bf16_vs_fp32 });
     if (max_rel > 0.02) {
         std.debug.print("  FAIL: O exceeds tolerance (worst i={d} exp={d:.5} got={d:.5})\n", .{ worst, o_exp[worst], o_got[worst] });
         return error.ResultMismatch;
     }
     if (cfg.expected_hash != 0 and output_hash != cfg.expected_hash) return error.OutputHashMismatch;
-    return .{ .cycles = cyc, .hash = output_hash };
+    return .{ .cycles = cyc, .hash = output_hash, .k_beats = kc, .v_beats = vc };
 }
 
 fn runPair(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     const baseline = try runCfg(cfg, dut, seed, .baseline);
     const stressed = try runCfg(cfg, dut, seed, .stressed);
     if (stressed.hash != baseline.hash) return error.StressedOutputMismatch;
+    if (baseline.k_beats != cfg.nkv * cfg.nhkv * (cfg.hdq / 8) or
+        baseline.v_beats != cfg.nkv * cfg.nhkv * (cfg.hdv / 8)) return error.QueryScaledKvTraffic;
 }
 
 pub fn main() !void {
@@ -354,21 +390,27 @@ pub fn main() !void {
     std.debug.print("\n  flash_kernel cosim (vs flash_ref.attendHead):\n", .{});
     // GQA r2 + masked kv; fastest one-beat multi-head producer; hdq!=hdv +
     // n_tok>1 + nhkv>1 + no mask; single head + leading mask.
-    try runPair(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .masked_kv = 2, .expected_hash = 0x571c_b97c_8fc5_a57a }, &dut, 0xF1A54EE7);
-    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.35355338, .masked_kv = -1, .expected_hash = 0xe455_4143_ad16_f43c }, &dut, 0x8011);
-    try runPair(.{ .hdq = 24, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 3, .ntok = 2, .scale = 0.125, .masked_kv = -1, .expected_hash = 0xb5ae_b111_cbf4_8077 }, &dut, 0xBEEF01);
-    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .masked_kv = 0, .expected_hash = 0x7d76_2a47_b5e4_31f3 }, &dut, 0xC0FFEE);
+    try runPair(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .mask_kind = .one_interior, .expected_hash = 0x571c_b97c_8fc5_a57a }, &dut, 0xF1A54EE7);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.35355338, .expected_hash = 0xe455_4143_ad16_f43c }, &dut, 0x8011);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 5, .ntok = 2, .scale = 0.125, .mask_kind = .causal, .expected_hash = 0xfb0f_e53d_c122_4bcb }, &dut, 0xBEEF01);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 2, .nhkv = 1, .nkv = 5, .ntok = 4, .scale = 0.25, .mask_kind = .first_query_all, .expected_hash = 0xb37f_d4fd_052d_bd27 }, &dut, 0xA11A5E0);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 2, .nhkv = 1, .nkv = 3, .ntok = 4, .scale = 0.25, .mask_kind = .finite_bias, .expected_hash = 0x507c_23bb_bad3_0e97 }, &dut, 0xB1A5);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 3, .ntok = 4, .scale = 1.0, .mask_kind = .all, .expected_hash = 0x8421_ae12_6c7c_ed25 }, &dut, 0xA11);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .mask_kind = .one_interior, .mask_index = 0, .expected_hash = 0x7d76_2a47_b5e4_31f3 }, &dut, 0xC0FFEE);
     // Non-power-of-two head count, q/v widths, and KV extent. The interior mask also
     // verifies that skip traffic does not disturb ordered head tags or output framing.
-    try runPair(.{ .hdq = 24, .hdv = 16, .nh = 3, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 0.2, .masked_kv = 2, .expected_hash = 0x14e4_ef7c_e532_1e81 }, &dut, 0x3EAD5);
+    try runPair(.{ .hdq = 24, .hdv = 16, .nh = 3, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 0.2, .mask_kind = .one_interior, .expected_hash = 0x14e4_ef7c_e532_1e81 }, &dut, 0x3EAD5);
     // Decode shape: head_dim 128 (qbeats=16, full adder tree, no zero-pad),
     // 16 query heads over 8 kv-heads (GQA r2, half the pool), real 1/sqrt(128) scale.
-    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4, .expected_hash = 0x041a_157f_8f65_bcef }, &dut, 0xD00D);
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .mask_kind = .one_interior, .mask_index = 4, .expected_hash = 0x041a_157f_8f65_bcef }, &dut, 0xD00D);
+    // Query-blocked production geometry: reaches the highest four-query scratch slots,
+    // exercises all 16 beats per head, and still consumes each native K/V block once.
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 4, .ntok = 4, .scale = 0.08838835, .mask_kind = .causal, .expected_hash = 0xd1e4_31e9_6d8f_80e8 }, &dut, 0x4B10C);
     // Scheduler benchmark: enough all-valid KV positions to amortize Q load,
     // accumulator initialization, and final output emission.
-    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 16, .ntok = 1, .scale = 0.08838835, .masked_kv = -1, .expected_hash = 0x8d9f_b8a9_24f4_8301 }, &dut, 0x16BEEF);
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 16, .ntok = 1, .scale = 0.08838835, .expected_hash = 0x8d9f_b8a9_24f4_8301 }, &dut, 0x16BEEF);
     // 32 query heads over 8 kv-heads (GQA r4): exercises the full MAX_HEADS pool and the
     // head-index bits above [3:0] — the aliasing the [3:0] pool index used to cause.
-    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4, .expected_hash = 0xcb4b_8407_4344_2339 }, &dut, 0x32EAD5);
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .mask_kind = .one_interior, .mask_index = 4, .expected_hash = 0xcb4b_8407_4344_2339 }, &dut, 0x32EAD5);
     std.debug.print("  all flash_kernel cosim configs passed\n\n", .{});
 }

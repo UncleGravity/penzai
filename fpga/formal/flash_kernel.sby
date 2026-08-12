@@ -1,6 +1,7 @@
 [tasks]
 prove
 bmc
+liveness
 cover
 
 [options]
@@ -9,18 +10,22 @@ prove: depth 120
 prove: aigsmt boolector
 bmc: mode bmc
 bmc: depth 40
+liveness: mode bmc
+liveness: depth 272
 cover: mode cover
-cover: depth 160
+cover: depth 320
 
 [engines]
 prove: abc pdr
 bmc: smtbmc boolector
+liveness: abc bmc3
 cover: smtbmc boolector
 
 [script]
-prove: read -formal -sv -DFORMAL flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
-bmc: read -formal -sv -DFORMAL flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
-cover: read -formal -sv -DFORMAL -DFORMAL_DIRECTED_COVER flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
+prove: read -formal -sv -DFORMAL -DFORMAL_QUERY_BLOCKED flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
+bmc: read -formal -sv -DFORMAL -DFORMAL_QUERY_BLOCKED flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
+liveness: read -formal -sv -DFORMAL -DFORMAL_QUERY_BLOCKED -DFORMAL_BOUNDED_LIVENESS -DFORMAL_LIVENESS_ONLY flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
+cover: read -formal -sv -DFORMAL -DFORMAL_QUERY_BLOCKED -DFORMAL_DIRECTED_COVER flash_datapath_stubs.v flash_kernel.v flash_kernel_formal.sv
 prep -top flash_kernel_formal
 
 [files]

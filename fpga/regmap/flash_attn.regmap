@@ -11,7 +11,7 @@
 #
 # offset  name          access  reset        description
 0x00      ID            ro      0xF1A54A00   flash kernel identifier
-0x04      VERSION       ro      0x00000003   v3 = v2 kv-major datapath + 32 query-head capacity
+0x04      VERSION       ro      0x00000004   v4 = query-blocked KV-outer schedule, query tile max 4
 0x08      CTRL          wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS        ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      HEAD_DIM_Q    rw      0x00000000   head dim of Q/K (multiple of LANES)

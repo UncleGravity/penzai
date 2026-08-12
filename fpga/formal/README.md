@@ -34,7 +34,7 @@ suite is also exposed as the `formal-control` flake check.
 | `seq_top` | Control responses, command addressing, active-run snapshots, and abort behavior |
 | `gemm_kernel` | Run-configuration snapshots, index bounds, AXIS stalls, and terminal `TLAST` |
 | `gemm_ternary_select` | Exhaustive mapping of all two-bit ternary selector codes |
-| `flash_kernel` | Run snapshots, ordered pipeline tags, address bounds, KV writeback barriers, output stalls, and terminal `TLAST` |
+| `flash_kernel` | Run snapshots, query/head tag and address bounds, sparse-mask advancement, II=1 softmax ordering, once-per-KV stream accounting, KV writeback barriers, output stalls, and terminal `TLAST` |
 
 Each `.sby` file declares its proof, bounded-model, and cover tasks. Files named
 `*_formal.sv` provide the harness and environment assumptions. Files named
@@ -45,11 +45,25 @@ agreement remains a cosim responsibility, isolated mapping belongs to OOC
 synthesis, and timing closure belongs to the routed bitstream build.
 
 The flash-kernel target replaces floating-point leaves with ordered fixed-latency
-stubs and proves the real controller at reduced dimensions. Active configuration
-inputs remain arbitrary after start, exercising the kernel's run snapshot. Input
-streams are kept continuously valid to bound the state space; independent input
-bubbles and numeric agreement are covered by the flash-kernel RTL cosim.
-The cover task directs one processed KV, one masked KV, and one output stall; the
-unbounded proof and BMC leave those choices arbitrary.
+stubs and proves the real controller with a two-query tile at reduced dimensions.
+Two KV positions are sufficient for the control proof: arbitrary masks exercise
+every finite/all-masked transition pair, including recurrence and skip re-entry.
+Active configuration inputs remain arbitrary after start, exercising the kernel's
+run snapshot. Input streams are kept continuously valid and output backpressure is
+bounded explicitly for liveness; independent input bubbles and numeric agreement
+are covered by the flash-kernel RTL cosim. The directed cover uses one all-masked
+query beside a finite causal-prefix query, an all-masked KV position, overlapping
+softmax updates, the final AXPY barrier, and an output stall. The unbounded proof
+and BMC leave mask choices and output stalls arbitrary within those assumptions.
+
+Flash bounded liveness is a separate exhaustive BMC task. The harness launches one
+run immediately after reset, keeps all input streams valid, and permits at most two
+consecutive output-stall cycles. Under those explicit fairness assumptions every
+mask assignment must finish in fewer than 256 run cycles. The liveness task checks
+272 steps, beyond the reset/start prefix and the full watchdog interval, while the
+PDR and the short structural BMC omit only that watchdog; the dedicated liveness
+task enables it and checks the full interval against a reduced cone containing the
+real controller and its progress assumptions, without treating it as an inductive
+invariant. The structural assertions remain exclusively in the PDR/BMC tasks.
 
 See `BUGS.md` for production and verification issues found by the suite.

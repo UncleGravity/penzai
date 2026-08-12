@@ -1,13 +1,11 @@
-//! PL flash-attention backend (v2, kv-major): drives the flash_top fabric kernel for a
+//! PL flash-attention backend (v4, kv-major): drives the flash_top fabric kernel for a
 //! wire flash_attn_f32 command. A tenant on the PL substrate (regwin/dma), beside
 //! pl/matmul.zig.
 //!
-//! The kernel consumes the KV cache in its NATIVE layout (kv-position-major,
-//! n_head_kv heads, GQA done in hardware), so this tenant **DMAs Q/K/V/mask straight
-//! from the resident ggml tensors** — no gather, no GQA replication, no input staging.
-//! That gather was ~89% of a v1 decode call. The mask gives the real KV extent (clamp
-//! the −∞ padding); O comes back 8-wide packed and scatters (or DMAs straight) to dst.
-//! Decode-only (single token, contiguous cache); anything else defers to the PS oracle.
+//! Decode retains v3's direct Q/K/V/mask path. For multi-token commands, v4 gathers
+//! Q and transposes the mask in tiles of at most four queries while K/V remain direct
+//! and are each streamed only once per tile. Unsupported layouts defer to the PS oracle
+//! before any DMA starts.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -21,7 +19,7 @@ const wire = shared.wire;
 const capabilities = shared.capabilities;
 
 const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadLanes, BadClock };
-pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory };
+pub const Error = dma_mod.Error || KernelError || feed.FeedError || error{ HeapFailure, OutOfMemory };
 
 const addr = flash_regmap.addr;
 const caps = flash_regmap.caps;
@@ -33,11 +31,14 @@ const STATUS_DONE: u32 = 1 << 1;
 /// raises its query-head capacity to 32. Older bitstreams must fall back to PS rather
 /// than let the driver submit shapes that alias their smaller on-chip pools.
 pub const min_version: u32 = 3;
+pub const query_blocked_version: u32 = 4;
 pub const expected_id: u32 = flash_regmap.resetOf("ID");
 const expected_lanes: u32 = flash_regmap.resetOf("LANES");
 
 comptime {
     std.debug.assert(min_version <= flash_regmap.resetOf("VERSION"));
+    std.debug.assert(feed.QUERY_TILE_MAX == caps.query_tile_max);
+    std.debug.assert(feed.CONTEXT_MAX == caps.context_max);
 }
 
 /// Per-run hardware counters from the flash kernel (Q/K/V/O streams). Read only
@@ -143,6 +144,8 @@ pub fn Backend(comptime Heap: type) type {
         dma_v: dma_mod.Dma,
         dma_mask: dma_mod.Dma,
         dma_o: dma_mod.Dma,
+        q_staging: wire.TensorRange,
+        mask_staging: wire.TensorRange,
         o_staging: wire.TensorRange,
         logged_reject: bool = false,
 
@@ -160,9 +163,14 @@ pub fn Backend(comptime Heap: type) type {
             var dma_o = try dma_mod.Dma.open(addr.dma_o);
             errdefer dma_o.deinit();
 
-            // The only host reservation: the packed-O DMA sink (used when dst is not
-            // contiguous). Q/K/V/mask DMA straight from the resident tensors.
+            // Decode uses the resident Q/mask ranges directly. Query-blocked prefill
+            // gathers bounded Q/mask tiles into these persistent DMA sources.
+            const q_staging = heap.allocate(caps.q_staging_bytes, 4096) catch return error.HeapFailure;
+            errdefer heap.free(q_staging.handle) catch {};
+            const mask_staging = heap.allocate(caps.mask_staging_bytes, 4096) catch return error.HeapFailure;
+            errdefer heap.free(mask_staging.handle) catch {};
             const o_staging = heap.allocate(caps.o_staging_bytes, 4096) catch return error.HeapFailure;
+            errdefer heap.free(o_staging.handle) catch {};
 
             return .{
                 .allocator = allocator,
@@ -172,6 +180,8 @@ pub fn Backend(comptime Heap: type) type {
                 .dma_v = dma_v,
                 .dma_mask = dma_mask,
                 .dma_o = dma_o,
+                .q_staging = q_staging,
+                .mask_staging = mask_staging,
                 .o_staging = o_staging,
             };
         }
@@ -191,61 +201,69 @@ pub fn Backend(comptime Heap: type) type {
             return true;
         }
 
-        fn shapeOf(attn: wire.FlashAttnF32) feed.Shape {
+        fn shapeOf(attn: wire.FlashAttnF32) ?feed.Shape {
             return .{
-                .head_dim_q = attn.head_dim_q,
-                .head_dim_v = attn.head_dim_v,
-                .n_heads = attn.n_heads,
-                .n_head_kv = attn.n_head_kv,
-                .n_kv = attn.n_kv,
-                .n_tokens = attn.n_tokens,
-                .q_nb1 = @intCast(attn.q_nb1),
-                .q_nb2 = @intCast(attn.q_nb2),
-                .k_nb1 = @intCast(attn.k_nb1),
-                .k_nb2 = @intCast(attn.k_nb2),
-                .v_nb1 = @intCast(attn.v_nb1),
-                .v_nb2 = @intCast(attn.v_nb2),
-                .mask_nb1 = @intCast(attn.mask_nb1),
-                .dst_nb1 = @intCast(attn.dst_nb1),
-                .dst_nb2 = @intCast(attn.dst_nb2),
+                .head_dim_q = std.math.cast(usize, attn.head_dim_q) orelse return null,
+                .head_dim_v = std.math.cast(usize, attn.head_dim_v) orelse return null,
+                .n_heads = std.math.cast(usize, attn.n_heads) orelse return null,
+                .n_head_kv = std.math.cast(usize, attn.n_head_kv) orelse return null,
+                .n_kv = std.math.cast(usize, attn.n_kv) orelse return null,
+                .n_tokens = std.math.cast(usize, attn.n_tokens) orelse return null,
+                .q_nb1 = std.math.cast(usize, attn.q_nb1) orelse return null,
+                .q_nb2 = std.math.cast(usize, attn.q_nb2) orelse return null,
+                .k_nb1 = std.math.cast(usize, attn.k_nb1) orelse return null,
+                .k_nb2 = std.math.cast(usize, attn.k_nb2) orelse return null,
+                .v_nb1 = std.math.cast(usize, attn.v_nb1) orelse return null,
+                .v_nb2 = std.math.cast(usize, attn.v_nb2) orelse return null,
+                .mask_nb1 = std.math.cast(usize, attn.mask_nb1) orelse return null,
+                .dst_nb1 = std.math.cast(usize, attn.dst_nb1) orelse return null,
+                .dst_nb2 = std.math.cast(usize, attn.dst_nb2) orelse return null,
             };
         }
 
         /// Run `attn` on the PL if its shape is supported. Detailed timing and
         /// counter reads are structurally absent when `ctx` is null.
         pub fn tryFlashAttn(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, ctx: ?*profile.ProfileContext) Error!?profile.FlashExecution {
-            var s = shapeOf(attn);
+            const s = shapeOf(attn) orelse return null;
             // Unsupported shape → defer to PS (not an error).
             if (s.head_dim_q == 0 or s.head_dim_v == 0 or s.n_heads == 0 or s.n_head_kv == 0 or
                 s.n_kv == 0 or s.n_tokens == 0) return null;
             if (!attn.has_mask) return null; // the mask gives kv_hi and feeds the kernel's skip
             if (!s.beatAligned()) return null;
+            if (!std.math.isFinite(attn.scale)) return null;
             if (s.head_dim_q > caps.head_dim_max or s.head_dim_v > caps.head_dim_max) return null;
             if (s.n_heads > caps.max_heads or s.n_head_kv > caps.max_head_kv) return null;
-            if (!s.directDmaCapable()) {
-                // One-shot bring-up diagnostic: if a decode op falls back to PS, this
-                // says which stride assumption missed (no `flash seg` line ⇒ PS path).
-                if (ctx != null and !self.logged_reject) {
-                    self.logged_reject = true;
-                    const h: usize = @sizeOf(f16);
-                    const f: usize = @sizeOf(f32);
-                    std.debug.print("pl flash: directDmaCapable rejected → PS (n_tok={d} k_nb1={d}/exp{d} k_nb2={d}/exp{d} v_nb1={d}/exp{d} v_nb2={d}/exp{d} q_nb2={d}/exp{d})\n", .{
-                        s.n_tokens,
-                        s.k_nb1,
-                        s.n_head_kv * s.head_dim_q * h,
-                        s.k_nb2,
-                        s.head_dim_q * h,
-                        s.v_nb1,
-                        s.n_head_kv * s.head_dim_v * h,
-                        s.v_nb2,
-                        s.head_dim_v * h,
-                        s.q_nb2,
-                        s.head_dim_q * f,
-                    });
-                }
-                return null; // native packed cache + single token only
+            if (s.n_kv > caps.context_max) return null;
+            const spans = feed.requiredSpans(s, true) orelse return null;
+            if (!rangesCover(attn, spans)) return null;
+
+            if (s.n_tokens == 1 and s.directDmaCapable())
+                return try self.runDirect(heap, attn, s, ctx);
+            if (queryBlockedSupported(self.kernel.version, s)) {
+                return try self.runQueryBlocked(heap, attn, s, ctx);
             }
-            if (s.oBytes() > caps.o_staging_bytes) return null;
+
+            if (ctx != null and !self.logged_reject) {
+                self.logged_reject = true;
+                std.debug.print("pl flash: unsupported v{d} shape/layout -> PS (n_tok={d} n_kv={d} q_nb1/2={d}/{d} k_nb1/2={d}/{d} mask_nb1={d} dst_nb1/2={d}/{d})\n", .{
+                    self.kernel.version,
+                    s.n_tokens,
+                    s.n_kv,
+                    s.q_nb1,
+                    s.q_nb2,
+                    s.k_nb1,
+                    s.k_nb2,
+                    s.mask_nb1,
+                    s.dst_nb1,
+                    s.dst_nb2,
+                });
+            }
+            return null;
+        }
+
+        fn runDirect(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, original: feed.Shape, ctx: ?*profile.ProfileContext) Error!profile.FlashExecution {
+            var s = original;
+            if (s.oBytes() > caps.o_staging_bytes) return error.InvalidLength;
 
             const wrapper_start = profile.begin(ctx);
             var last = wrapper_start;
@@ -326,6 +344,7 @@ pub fn Backend(comptime Heap: type) type {
             result.wait_ns +|= profile.lap(ctx, &last);
 
             const counters = if (ctx != null) self.kernel.readCounters() else FlashCounters{};
+            result.setup_ns +|= profile.lap(ctx, &last);
 
             // Make the DMA's O writes visible to the A53, then (only if dst wasn't the
             // DMA target) scatter the packed result into the strided destination.
@@ -348,7 +367,162 @@ pub fn Backend(comptime Heap: type) type {
             result.o_stall_cycles = counters.o_stall;
             return result;
         }
+
+        fn runQueryBlocked(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, s: feed.Shape, ctx: ?*profile.ProfileContext) Error!profile.FlashExecution {
+            const wrapper_start = profile.begin(ctx);
+            var last = wrapper_start;
+            var result = profile.FlashExecution{
+                .path = .staged,
+                .kernel_runs = @intCast(s.tileCount()),
+                .requested_n_kv = attn.n_kv,
+                .requested_qkv_pairs = @as(u64, attn.n_tokens) *| @as(u64, attn.n_kv),
+            };
+
+            const q_data = heap.read(attn.q) catch return error.HeapFailure;
+            const mask_data = heap.read(attn.mask) catch return error.HeapFailure;
+
+            // Determine the largest K/V prefix once, then flush that resident prefix
+            // once. Individual tiles may submit shorter DMA transfers.
+            const max_processed_extent = maxProcessedExtent(s, mask_data);
+            result.prepare_ns +|= profile.lap(ctx, &last);
+
+            const k_sync = srcRange(attn.k, s.kStreamBytes(max_processed_extent));
+            const v_sync = srcRange(attn.v, s.vStreamBytes(max_processed_extent));
+            heap.syncToDevice(k_sync) catch return error.HeapFailure;
+            heap.syncToDevice(v_sync) catch return error.HeapFailure;
+            result.sync_to_ns +|= profile.lap(ctx, &last);
+
+            var tile_index: usize = 0;
+            while (s.queryTile(tile_index)) |tile| : (tile_index += 1) {
+                const q_bytes = s.qTileBytes(tile);
+                const o_bytes = s.oTileBytes(tile);
+                const q_range = subRange(self.q_staging, q_bytes);
+                const q_staged = heap.bytes(q_range) catch return error.HeapFailure;
+                _ = try feed.packQTile(s, q_data, tile, q_staged);
+
+                // Pack the full mask tile to derive its extent, then submit only the
+                // KV prefix the kernel will actually walk.
+                const full_mask_bytes = s.maskTileStreamBytes(tile, s.n_kv);
+                const full_mask_range = subRange(self.mask_staging, full_mask_bytes);
+                const mask_staged = heap.bytes(full_mask_range) catch return error.HeapFailure;
+                const mask_analysis = try feed.packMaskTile(s, mask_data, tile, mask_staged, ctx != null);
+                const kv_hi = mask_analysis.processed_extent;
+                const mask_bytes = s.maskTileStreamBytes(tile, kv_hi);
+                const mask_range = subRange(self.mask_staging, mask_bytes);
+                const k_bytes = s.kStreamBytes(kv_hi);
+                const v_bytes = s.vStreamBytes(kv_hi);
+                const k_range = srcRange(attn.k, k_bytes);
+                const v_range = srcRange(attn.v, v_bytes);
+                const o_range = offsetRange(attn.dst, tile.token_start * s.dst_nb2, o_bytes);
+
+                result.valid_n_kv = @max(result.valid_n_kv, @as(u32, @intCast(mask_analysis.valid_extent)));
+                result.processed_n_kv = @max(result.processed_n_kv, @as(u32, @intCast(kv_hi)));
+                result.valid_qkv_pairs +|= @intCast(mask_analysis.valid_pairs);
+                result.processed_qkv_pairs +|= @as(u64, @intCast(tile.token_count)) *| @as(u64, @intCast(kv_hi));
+                result.q_bytes +|= q_bytes;
+                result.k_bytes +|= k_bytes;
+                result.v_bytes +|= v_bytes;
+                result.mask_bytes +|= mask_bytes;
+                result.o_bytes +|= o_bytes;
+                result.prepare_ns +|= profile.lap(ctx, &last);
+
+                heap.syncToDevice(q_range) catch return error.HeapFailure;
+                heap.syncToDevice(mask_range) catch return error.HeapFailure;
+                result.sync_to_ns +|= profile.lap(ctx, &last);
+
+                const q_phys = heap.deviceAddress(q_range) catch return error.HeapFailure;
+                const k_phys = heap.deviceAddress(k_range) catch return error.HeapFailure;
+                const v_phys = heap.deviceAddress(v_range) catch return error.HeapFailure;
+                const mask_phys = heap.deviceAddress(mask_range) catch return error.HeapFailure;
+                const o_phys = heap.deviceAddress(o_range) catch return error.HeapFailure;
+
+                try self.dma_o.resetS2mm();
+                try self.dma_q.resetMm2s();
+                try self.dma_k.resetMm2s();
+                try self.dma_v.resetMm2s();
+                try self.dma_mask.resetMm2s();
+                try self.dma_o.startWriteToDdr(o_phys, o_bytes);
+                try self.dma_q.startReadFromDdr(q_phys, q_bytes);
+                try self.dma_k.startReadFromDdr(k_phys, k_bytes);
+                try self.dma_v.startReadFromDdr(v_phys, v_bytes);
+                try self.dma_mask.startReadFromDdr(mask_phys, mask_bytes);
+                self.kernel.run(
+                    attn.head_dim_q,
+                    attn.head_dim_v,
+                    attn.n_heads,
+                    attn.n_head_kv,
+                    @intCast(s.headRatio()),
+                    @intCast(kv_hi),
+                    @intCast(tile.token_count),
+                    @bitCast(attn.scale),
+                );
+                result.setup_ns +|= profile.lap(ctx, &last);
+
+                try self.kernel.waitDone();
+                try self.dma_q.waitReadDone();
+                try self.dma_k.waitReadDone();
+                try self.dma_v.waitReadDone();
+                try self.dma_mask.waitReadDone();
+                try self.dma_o.waitWriteDone();
+                result.wait_ns +|= profile.lap(ctx, &last);
+
+                if (ctx != null) addCounters(&result, self.kernel.readCounters());
+                result.setup_ns +|= profile.lap(ctx, &last);
+
+                heap.syncFromDevice(o_range) catch return error.HeapFailure;
+                result.sync_from_ns +|= profile.lap(ctx, &last);
+            }
+
+            if (ctx) |active| result.wrapper_ns = shared.profiling.elapsed(wrapper_start, active.now());
+            return result;
+        }
     };
+}
+
+fn rangesCover(attn: wire.FlashAttnF32, spans: feed.RequiredSpans) bool {
+    return rangeCovers(attn.q, spans.q) and rangeCovers(attn.k, spans.k) and
+        rangeCovers(attn.v, spans.v) and rangeCovers(attn.mask, spans.mask) and
+        rangeCovers(attn.dst, spans.dst);
+}
+
+fn queryBlockedSupported(version: u32, shape: feed.Shape) bool {
+    // Kernel versions are cumulative within this engine ID. A future incompatible
+    // stream contract must use a new ID rather than silently reinterpreting v4.
+    return version >= query_blocked_version and
+        shape.queryBlockedDmaCapable() and shape.packedDst();
+}
+
+fn maxProcessedExtent(shape: feed.Shape, mask_data: []const u8) usize {
+    var max_extent: usize = 0;
+    var tile_index: usize = 0;
+    while (shape.queryTile(tile_index)) |tile| : (tile_index += 1) {
+        var tile_shape = shape;
+        tile_shape.n_tokens = tile.token_count;
+        const mask_offset = tile.token_start * shape.mask_nb1;
+        max_extent = @max(max_extent, feed.analyzeMask(
+            tile_shape,
+            mask_data[mask_offset..],
+            false,
+        ).processed_extent);
+    }
+    return max_extent;
+}
+
+fn rangeCovers(range: wire.TensorRange, required: usize) bool {
+    if (required > range.nbytes) return false;
+    _ = std.math.add(u64, range.offset, range.nbytes) catch return false;
+    return true;
+}
+
+fn addCounters(result: *profile.FlashExecution, counters: FlashCounters) void {
+    result.cycles +|= counters.cycles;
+    result.q_beats +|= counters.q_beats;
+    result.k_beats +|= counters.k_beats;
+    result.k_stall_cycles +|= counters.k_stall;
+    result.v_beats +|= counters.v_beats;
+    result.v_stall_cycles +|= counters.v_stall;
+    result.o_beats +|= counters.o_beats;
+    result.o_stall_cycles +|= counters.o_stall;
 }
 
 fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
@@ -359,4 +533,81 @@ fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
 /// direct DMA reads and what we flush before it.
 fn srcRange(base: wire.TensorRange, nbytes: usize) wire.TensorRange {
     return .{ .handle = base.handle, .offset = base.offset, .nbytes = nbytes };
+}
+
+fn offsetRange(base: wire.TensorRange, relative_offset: usize, nbytes: usize) wire.TensorRange {
+    return .{
+        .handle = base.handle,
+        .offset = base.offset + relative_offset,
+        .nbytes = nbytes,
+    };
+}
+
+test "range preflight checks declared lengths and offset overflow" {
+    const enough = wire.TensorRange{ .handle = 1, .offset = 64, .nbytes = 128 };
+    try std.testing.expect(rangeCovers(enough, 128));
+    try std.testing.expect(!rangeCovers(enough, 129));
+    const overflow = wire.TensorRange{ .handle = 1, .offset = std.math.maxInt(u64) - 7, .nbytes = 8 };
+    try std.testing.expect(!rangeCovers(overflow, 1));
+}
+
+test "query blocking requires v4 while v3 remains decode-only" {
+    const shape = feed.Shape{
+        .head_dim_q = 128,
+        .head_dim_v = 128,
+        .n_heads = 16,
+        .n_head_kv = 8,
+        .n_kv = 256,
+        .n_tokens = 4,
+        .q_nb1 = 128 * @sizeOf(f32),
+        .q_nb2 = 4 * 128 * @sizeOf(f32),
+        .k_nb1 = 8 * 128 * @sizeOf(f16),
+        .k_nb2 = 128 * @sizeOf(f16),
+        .v_nb1 = 8 * 128 * @sizeOf(f16),
+        .v_nb2 = 128 * @sizeOf(f16),
+        .mask_nb1 = 256 * @sizeOf(f16),
+        .dst_nb1 = 128 * @sizeOf(f32),
+        .dst_nb2 = 16 * 128 * @sizeOf(f32),
+    };
+    try std.testing.expect(!queryBlockedSupported(3, shape));
+    try std.testing.expect(queryBlockedSupported(4, shape));
+}
+
+test "K V sync extent covers an all-masked tile" {
+    const s = feed.Shape{
+        .head_dim_q = 8,
+        .head_dim_v = 8,
+        .n_heads = 2,
+        .n_head_kv = 1,
+        .n_kv = 8,
+        .n_tokens = 8,
+        .q_nb1 = 8 * @sizeOf(f32),
+        .q_nb2 = 8 * 8 * @sizeOf(f32),
+        .k_nb1 = 8 * @sizeOf(f16),
+        .k_nb2 = 8 * @sizeOf(f16),
+        .v_nb1 = 8 * @sizeOf(f16),
+        .v_nb2 = 8 * @sizeOf(f16),
+        .mask_nb1 = 8 * @sizeOf(f16),
+        .dst_nb1 = 8 * @sizeOf(f32),
+        .dst_nb2 = 2 * 8 * @sizeOf(f32),
+    };
+    var mask = [_]u16{feed.f16_neg_inf} ** (8 * 8);
+    // The first tile has a short finite prefix; the second is entirely masked and
+    // therefore performs the kernel's defensive full walk.
+    mask[0] = 0;
+    try std.testing.expectEqual(s.n_kv, maxProcessedExtent(s, std.mem.sliceAsBytes(mask[0..])));
+}
+
+test "flash counters aggregate across query tiles" {
+    var execution = profile.FlashExecution{ .path = .staged };
+    addCounters(&execution, .{ .cycles = 100, .q_beats = 8, .k_beats = 16, .k_stall = 1, .v_beats = 16, .v_stall = 2, .o_beats = 8, .o_stall = 3 });
+    addCounters(&execution, .{ .cycles = 200, .q_beats = 4, .k_beats = 16, .v_beats = 16, .o_beats = 4 });
+    try std.testing.expectEqual(@as(u64, 300), execution.cycles);
+    try std.testing.expectEqual(@as(u64, 12), execution.q_beats);
+    try std.testing.expectEqual(@as(u64, 32), execution.k_beats);
+    try std.testing.expectEqual(@as(u64, 32), execution.v_beats);
+    try std.testing.expectEqual(@as(u64, 12), execution.o_beats);
+    try std.testing.expectEqual(@as(u64, 1), execution.k_stall_cycles);
+    try std.testing.expectEqual(@as(u64, 2), execution.v_stall_cycles);
+    try std.testing.expectEqual(@as(u64, 3), execution.o_stall_cycles);
 }
