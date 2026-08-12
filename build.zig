@@ -165,8 +165,8 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(flash_kernel_step);
 }
 
-// Flash-attention numeric leaves. The cosim-only harness wraps exp, reciprocal,
-// and dot so one Verilator model checks them directly against flash_ref.
+// Flash-attention numeric leaves. The cosim-only harness wraps interpolation, exp,
+// reciprocal, and dot so one Verilator model checks them directly against flash_ref.
 const flash_fp_rtl = [_][]const u8{
     "fpga/sim/flash_fp/flash_fp_top.v",
     "fpga/rtl/flash_attn/fp_dot.v",
@@ -303,8 +303,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
     _ = addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
     const decode_top_cosim = addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite GEMM top + four-port zip) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
-    _ = addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: numeric exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
-    _ = addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
+    const flash_fp_cosim = addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: II=1 numeric interp/exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
+    const flash_softmax_cosim = addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: II=1 flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     const flash_kernel_cosim = addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
@@ -313,6 +313,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     const rtl_cosim = b.step("test-rtl", "Cosim the deployable binary/ternary GEMM and flash-attention paths");
     rtl_cosim.dependOn(decode_top_cosim);
+    rtl_cosim.dependOn(flash_fp_cosim);
+    rtl_cosim.dependOn(flash_softmax_cosim);
     rtl_cosim.dependOn(flash_kernel_cosim);
     rtl_cosim.dependOn(flash_top_cosim);
 }

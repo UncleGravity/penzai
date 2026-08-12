@@ -1,7 +1,9 @@
 // numeric/interp - linear interpolation between two fp32 LUT endpoints + an aligned
-// META bus. Composes fadd/fmul/cvt_i2f with delay depths derived from numeric/fmt.vh
-// instead of hand-counted literals. Shared by exp/recip; migration was gated
-// transitively through their differential cosims.
+// META bus. Composes fadd/fmul/cvt_i2f with delay depths derived from numeric/fmt.vh.
+// The +1 terms are the registered-module handoff: a producer's valid/data become
+// visible only after the edge on which the consumer sampled its inputs. Burst cosim
+// checks these sideband depths directly; isolated transactions cannot expose an
+// off-by-one because their payload remains parked on the input wires.
 //
 //   frac = lo + (t/256)·(hi - lo)
 
@@ -24,7 +26,7 @@ module interp #(
     `include "fmt.vh"
     localparam integer ADD_LAT = FP32_ADD_LATENCY;
     localparam integer MUL_LAT = FP32_MUL_LATENCY;
-    localparam integer TOTAL   = ADD_LAT + MUL_LAT + ADD_LAT;
+    localparam integer TOTAL   = ADD_LAT + MUL_LAT + ADD_LAT + 2;
     localparam [31:0]  INV256  = 32'h3B800000; // 2^-8
 
     integer i;
@@ -47,7 +49,7 @@ module interp #(
         .clk(clk), .rst_n(rst_n), .valid_in(valid_in),
         .a(t_f32), .b(INV256), .valid_out(ts_v), .out(t_scaled)
     );
-    localparam integer TS_DLY = ADD_LAT - MUL_LAT;
+    localparam integer TS_DLY = ADD_LAT - MUL_LAT + 1;
     reg [31:0] ts_q [0:TS_DLY-1];
     always @(posedge clk) begin
         ts_q[0] <= t_scaled;
@@ -63,7 +65,7 @@ module interp #(
     );
 
     // lo delayed to meet prod (+ADD_LAT+MUL_LAT)
-    localparam integer LO_DLY = ADD_LAT + MUL_LAT;
+    localparam integer LO_DLY = ADD_LAT + MUL_LAT + 1;
     reg [31:0] lo_q [0:LO_DLY-1];
     always @(posedge clk) begin
         lo_q[0] <= lo;

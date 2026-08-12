@@ -12,7 +12,9 @@
 // `acc *= corr; acc += p·V` (corr=1 is a no-op), so `grew` is only an optional hint
 // to skip the rescale walk.
 //
-// Latency valid_in -> valid_out: L_SUB + L_EXP + L_MUL + L_ADD = 4 + 17 + 3 + 4 = 28.
+// Latency valid_in -> valid_out: subtract4 + handoff1 + exp19 + multiply3 +
+// handoff1 + add4 + output1 = 33 registered stages. The two handoff stages are
+// explicit in the metadata depths below; burst cosim guards their alignment.
 
 `default_nettype none
 
@@ -32,11 +34,11 @@ module flash_softmax (
 );
     `include "fmt.vh"
     localparam integer L_SUB = 4;  // numeric/fadd
-    localparam integer L_EXP = 17; // numeric/exp (mul3 + fx1 + lut1 + interp11 + out1)
+    localparam integer L_EXP = 19; // numeric/exp (mul3 + fx1 + lut1 + interp13 + out1)
     localparam integer L_MUL = 3;  // numeric/fmul
     localparam integer L_ADD = 4;  // numeric/fadd
-    localparam integer D1 = L_SUB + L_EXP;        // 21: input -> exp output
-    localparam integer D2 = L_MUL + L_ADD;        // 7 : exp output -> valid_out
+    localparam integer D1 = L_SUB + 1 + L_EXP;    // 24: input -> exp output
+    localparam integer D2 = L_MUL + 1 + L_ADD;    // 8 : exp output -> valid_out
 
     integer i;
 
@@ -68,7 +70,7 @@ module flash_softmax (
     exp u_ec (.clk(clk), .rst_n(rst_n), .valid_in(dcv), .x(d_corr), .valid_out(cv), .y(corr_e));
     exp u_ep (.clk(clk), .rst_n(rst_n), .valid_in(dpv), .x(d_p),    .valid_out(pv), .y(p_e));
 
-    // ---- carry {m_new, grew, l_in} to the exp output (D1 = 21) ----
+    // ---- carry {m_new, grew, l_in} to the exp output (D1 = 24) ----
     reg [31:0] mnew_pre [0:D1-1];
     reg        grew_pre [0:D1-1];
     reg [31:0] lin_pre  [0:D1-1];
@@ -91,7 +93,7 @@ module flash_softmax (
     wire [31:0] l_mul, l_sum;
     fmul #(.MANT_W(FMT_FP32_MANT)) u_lmul (.clk(clk), .rst_n(rst_n), .valid_in(cv),  .a(l_in_e), .b(corr_e), .valid_out(lmv), .out(l_mul));
 
-    // carry {m_new, grew, corr, p} from the exp output to valid_out (D2 = 7);
+    // carry {m_new, grew, corr, p} from the exp output to valid_out (D2 = 8);
     // p is also tapped at L_MUL (delay 3) to meet l_mul at the adder.
     reg [31:0] mnew_post [0:D2-1];
     reg        grew_post [0:D2-1];
@@ -112,7 +114,7 @@ module flash_softmax (
     wire [31:0] p_lmul = p_post[L_MUL-1]; // p delayed L_MUL, aligned with l_mul
     fadd #(.MANT_W(FMT_FP32_MANT)) u_ladd (.clk(clk), .rst_n(rst_n), .valid_in(lmv), .a(l_mul), .b(p_lmul), .valid_out(lav), .out(l_sum));
 
-    // ---- register outputs (all aligned at +25) ----
+    // ---- register outputs (all aligned at +33) ----
     always @(posedge clk) begin
         if (!rst_n) valid_out <= 1'b0;
         else        valid_out <= lav;

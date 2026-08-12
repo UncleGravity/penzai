@@ -1,6 +1,7 @@
 // numeric/exp - hardware exp for softmax: y ~= exp(x) for x <= 0, output in (0,1].
-// Composes fmul + numeric/interp with guard delay derived from fmt.vh. Migration was
-// gated bit-identical against the former standalone exp leaf.
+// Composes fmul + numeric/interp with guard delay derived from fmt.vh. Effective
+// valid_in -> valid_out pipeline depth is 19 stages (mul3 + fx1 + lut1 + interp13 +
+// out1). Migration was gated bit-identical against the former standalone exp leaf.
 //
 //   a = |x|·log2e ; ai=floor(a), af=a-ai ; 2^-af = lut+lerp(af) ; y = ldexp(2^-af, -ai)
 //   guards: x >= 0 -> 1.0 ; x <= -87 -> 0.

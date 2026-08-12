@@ -1,7 +1,8 @@
-//! Micro-cosim for the migrated numeric leaves: drives exp and recip (wrapped in
-//! flash_fp_top with fp_dot) and checks each RTL result against the validated
-//! `flash_ref` software model (softmaxExp / recip, B=8). The pipes are fixed-latency
-//! and in-order, so the k-th valid_out is the k-th input — collect in order.
+//! Micro-cosim for the migrated numeric leaves: drives interp, exp, and recip
+//! (wrapped in flash_fp_top with fp_dot) and checks each RTL result against the
+//! validated `flash_ref` software model. Besides the original isolated transactions,
+//! it sends a full-rate burst followed by random bubbles. The streamed phase checks
+//! fixed latency, ordering, exact metadata, and output count; this is the II=1 gate.
 //!
 //! ε note: the RTL ranges-reduce on |x| (2^-af) while the model uses the 2^+f
 //! convention; the two are algebraically equal but interpolate at reflected points,
@@ -14,6 +15,10 @@ const ref = @import("flash_ref");
 const c = @cImport(@cInclude("shim.h"));
 
 const N: usize = 512;
+const STREAM_N: usize = 768;
+const INTERP_LATENCY: usize = 13;
+const EXP_LATENCY: usize = 19;
+const RECIP_LATENCY: usize = 16;
 
 const Dut = struct {
     h: *c.Dut,
@@ -44,6 +49,19 @@ fn err(expected: f32, got: f32) struct { abs: f64, rel: f64 } {
     const d = @abs(e - g);
     const rel = if (@abs(e) < 1e-30) 0.0 else d / @abs(e);
     return .{ .abs = d, .rel = rel };
+}
+
+fn reset(dut: *Dut) void {
+    c.dut_set_rst_n(dut.h, 0);
+    c.dut_set_valid(dut.h, 0);
+    c.dut_set_x(dut.h, 0);
+    c.dut_set_l(dut.h, 0);
+    c.dut_set_interp(dut.h, 0, 0, 0, 0);
+    c.dut_set_clk(dut.h, 0);
+    c.dut_eval(dut.h);
+    for (0..6) |_| dut.step();
+    c.dut_set_rst_n(dut.h, 1);
+    dut.step();
 }
 
 pub fn main() !void {
@@ -91,16 +109,7 @@ pub fn main() !void {
     var dut = Dut.init();
     defer dut.deinit();
 
-    // Reset.
-    c.dut_set_rst_n(dut.h, 0);
-    c.dut_set_valid(dut.h, 0);
-    c.dut_set_x(dut.h, 0);
-    c.dut_set_l(dut.h, 0);
-    c.dut_set_clk(dut.h, 0);
-    c.dut_eval(dut.h);
-    for (0..6) |_| dut.step();
-    c.dut_set_rst_n(dut.h, 1);
-    dut.step();
+    reset(&dut);
 
     var ec: usize = 0; // exp outputs captured
     var rc: usize = 0; // recip outputs captured
@@ -118,6 +127,7 @@ pub fn main() !void {
     for (0..N) |k| {
         c.dut_set_x(dut.h, f32bits(xs[k]));
         c.dut_set_l(dut.h, f32bits(ls[k]));
+        c.dut_set_interp(dut.h, f32bits(1.0), f32bits(2.0), @intCast(k & 255), @intCast(k));
         c.dut_set_dq(dut.h, &dq_words[k]);
         c.dut_set_dk(dut.h, &dk_words[k]);
         c.dut_set_valid(dut.h, 1);
@@ -189,5 +199,84 @@ pub fn main() !void {
         std.debug.print("  FAIL: error exceeds threshold\n", .{});
         return error.ResultMismatch;
     }
+
+    // Streamed II=1 contract: 256 consecutive inputs, then randomly bubbled inputs.
+    // Unique metadata makes an input/sideband skew unambiguous even when neighboring
+    // floating-point results happen to be close.
+    reset(&dut);
+    var stream_prng = std.Random.DefaultPrng.init(0x11B0BB1E);
+    const stream_rnd = stream_prng.random();
+    var input_cycle: [STREAM_N]usize = undefined;
+    var stream_exp: [STREAM_N]f32 = undefined;
+    var stream_recip: [STREAM_N]f32 = undefined;
+    var stream_interp: [STREAM_N]f32 = undefined;
+    var stream_meta: [STREAM_N]u32 = undefined;
+    var sent: usize = 0;
+    var exp_got: usize = 0;
+    var recip_got: usize = 0;
+    var interp_got: usize = 0;
+    var stream_exp_rel: f64 = 0;
+    var stream_recip_rel: f64 = 0;
+    var stream_interp_rel: f64 = 0;
+    var cycle: usize = 0;
+
+    while (interp_got < STREAM_N or exp_got < STREAM_N or recip_got < STREAM_N) : (cycle += 1) {
+        if (cycle > STREAM_N * 4) return error.StreamTimeout;
+        const send = sent < STREAM_N and (sent < 256 or stream_rnd.uintLessThan(u8, 4) != 0);
+        if (send) {
+            const frac = @as(f32, @floatFromInt(sent)) / @as(f32, STREAM_N);
+            const x = if (sent % 97 == 0) 0.0 else -86.5 * frac;
+            const l = 1.0 + 16383.0 * frac;
+            const lo = 0.5 + 2.0 * frac;
+            const hi = lo + 0.25 + frac;
+            const t: u8 = @truncate(sent * 73 + 19);
+            const meta: u32 = 0xC0000000 | @as(u32, @intCast(sent));
+
+            input_cycle[sent] = cycle;
+            stream_exp[sent] = ref.softmaxExp(8, x);
+            stream_recip[sent] = ref.recip(8, l);
+            stream_interp[sent] = lo + (@as(f32, @floatFromInt(t)) / 256.0) * (hi - lo);
+            stream_meta[sent] = meta;
+            c.dut_set_x(dut.h, f32bits(x));
+            c.dut_set_l(dut.h, f32bits(l));
+            c.dut_set_interp(dut.h, f32bits(lo), f32bits(hi), t, meta);
+            sent += 1;
+        }
+        c.dut_set_valid(dut.h, @intFromBool(send));
+        dut.step();
+
+        if (c.dut_interp_valid(dut.h) != 0) {
+            if (interp_got >= sent) return error.PhantomOutput;
+            if (cycle + 1 - input_cycle[interp_got] != INTERP_LATENCY) return error.InterpLatencyMismatch;
+            if (c.dut_interp_meta(dut.h) != stream_meta[interp_got]) return error.InterpMetadataMismatch;
+            const e = err(stream_interp[interp_got], bitsf32(c.dut_interp_frac(dut.h)));
+            stream_interp_rel = @max(stream_interp_rel, e.rel);
+            interp_got += 1;
+        }
+        if (c.dut_exp_valid(dut.h) != 0) {
+            if (exp_got >= sent) return error.PhantomOutput;
+            if (cycle + 1 - input_cycle[exp_got] != EXP_LATENCY) return error.ExpLatencyMismatch;
+            const e = err(stream_exp[exp_got], bitsf32(c.dut_exp_y(dut.h)));
+            stream_exp_rel = @max(stream_exp_rel, e.rel);
+            exp_got += 1;
+        }
+        if (c.dut_recip_valid(dut.h) != 0) {
+            if (recip_got >= sent) return error.PhantomOutput;
+            if (cycle + 1 - input_cycle[recip_got] != RECIP_LATENCY) return error.RecipLatencyMismatch;
+            const e = err(stream_recip[recip_got], bitsf32(c.dut_recip_y(dut.h)));
+            stream_recip_rel = @max(stream_recip_rel, e.rel);
+            recip_got += 1;
+        }
+    }
+    c.dut_set_valid(dut.h, 0);
+
+    std.debug.print(
+        "    II=1/bubbles: interp {d}@{d} exp {d}@{d} recip {d}@{d}; max_rel={e:.3}/{e:.3}/{e:.3}\n",
+        .{ interp_got, INTERP_LATENCY, exp_got, EXP_LATENCY, recip_got, RECIP_LATENCY, stream_interp_rel, stream_exp_rel, stream_recip_rel },
+    );
+    if (sent != STREAM_N or interp_got != STREAM_N or exp_got != STREAM_N or recip_got != STREAM_N)
+        return error.MissingOutputs;
+    if (stream_interp_rel > 1e-3 or stream_exp_rel > 1e-3 or stream_recip_rel > 1e-3)
+        return error.ResultMismatch;
     std.debug.print("  all flash fp leaf cosim cases passed\n\n", .{});
 }

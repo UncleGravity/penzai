@@ -2,13 +2,17 @@
 //! (m_out, l_out, p, corr, grew) against a software reference that uses the same
 //! HW-modeled exp (flash_ref.softmaxExp, B=8), over both random (m,l,score) triples
 //! and realistic kv sequences (m starts -inf, l=0; outputs fed forward as the next
-//! step's inputs, closing the recurrence the kernel will own). m_out/grew are exact
-//! (a select / compare); l_out/p/corr are ε (fp truncation + the exp LUT gap).
+//! step's inputs, closing the recurrence the kernel will own). It also sends a
+//! full-rate burst followed by random bubbles and checks the fixed 33-cycle latency,
+//! ordering, output count, and payload. m_out/grew are exact (a select / compare);
+//! l_out/p/corr are ε (fp truncation + the exp LUT gap).
 
 const std = @import("std");
 const ref = @import("flash_ref");
 
 const c = @cImport(@cInclude("shim.h"));
+const STREAM_N: usize = 768;
+const SOFTMAX_LATENCY: usize = 33;
 
 const Dut = struct {
     h: *c.Dut,
@@ -91,11 +95,7 @@ fn rel(e: f32, g: f32) f64 {
     return if (@abs(@as(f64, e)) < 1e-6) d else d / @abs(@as(f64, e));
 }
 
-pub fn main() !void {
-    var dut = Dut.init();
-    defer dut.deinit();
-
-    // Reset.
+fn reset(dut: *Dut) void {
     c.dut_set_rst_n(dut.h, 0);
     c.dut_set_valid(dut.h, 0);
     c.dut_set_m_in(dut.h, 0);
@@ -106,6 +106,13 @@ pub fn main() !void {
     for (0..6) |_| dut.step();
     c.dut_set_rst_n(dut.h, 1);
     dut.step();
+}
+
+pub fn main() !void {
+    var dut = Dut.init();
+    defer dut.deinit();
+
+    reset(&dut);
 
     var acc: Acc = .{};
     var prng = std.Random.DefaultPrng.init(0x50F7);
@@ -148,5 +155,61 @@ pub fn main() !void {
         std.debug.print("  FAIL: fp error exceeds threshold\n", .{});
         return error.ResultMismatch;
     }
+
+    // Stateless inputs represent independent (query, head) slots. A 256-element
+    // no-gap prefix proves consecutive acceptance; the tail proves valid bubbles do
+    // not change association between arithmetic results and sideband state.
+    reset(&dut);
+    var stream_prng = std.Random.DefaultPrng.init(0x50117A6);
+    const stream_rnd = stream_prng.random();
+    var expected: [STREAM_N]Step = undefined;
+    var input_cycle: [STREAM_N]usize = undefined;
+    var sent: usize = 0;
+    var got_count: usize = 0;
+    var cycle: usize = 0;
+    var stream_acc: Acc = .{};
+
+    while (got_count < STREAM_N) : (cycle += 1) {
+        if (cycle > STREAM_N * 4) return error.StreamTimeout;
+        const send = sent < STREAM_N and (sent < 256 or stream_rnd.uintLessThan(u8, 4) != 0);
+        if (send) {
+            const base = @as(f32, @floatFromInt(sent)) / 97.0;
+            const m_in: f32 = if (sent % 113 == 0) -std.math.inf(f32) else -9.0 + base;
+            const l_in: f32 = 0.25 + @as(f32, @floatFromInt((sent * 29) % 1024)) / 32.0;
+            const score: f32 = -8.75 + @as(f32, @floatFromInt((sent * 67) % 1700)) / 100.0;
+            expected[sent] = refStep(m_in, l_in, score);
+            input_cycle[sent] = cycle;
+            c.dut_set_m_in(dut.h, f32bits(m_in));
+            c.dut_set_l_in(dut.h, f32bits(l_in));
+            c.dut_set_score(dut.h, f32bits(score));
+            sent += 1;
+        }
+        c.dut_set_valid(dut.h, @intFromBool(send));
+        dut.step();
+
+        if (c.dut_valid_out(dut.h) != 0) {
+            if (got_count >= sent) return error.PhantomOutput;
+            if (cycle + 1 - input_cycle[got_count] != SOFTMAX_LATENCY)
+                return error.SoftmaxLatencyMismatch;
+            stream_acc.record(.{
+                .m = bitsf32(c.dut_m_out(dut.h)),
+                .l = bitsf32(c.dut_l_out(dut.h)),
+                .p = bitsf32(c.dut_p(dut.h)),
+                .corr = bitsf32(c.dut_corr(dut.h)),
+                .grew = c.dut_grew(dut.h) != 0,
+            }, expected[got_count]);
+            got_count += 1;
+        }
+    }
+    c.dut_set_valid(dut.h, 0);
+
+    std.debug.print(
+        "    II=1/bubbles: {d} outputs at fixed latency {d}; l/p/corr max_rel={e:.3}/{e:.3}/{e:.3}\n",
+        .{ got_count, SOFTMAX_LATENCY, stream_acc.l_rel, stream_acc.p_rel, stream_acc.corr_rel },
+    );
+    if (sent != STREAM_N or got_count != STREAM_N) return error.MissingOutputs;
+    if (stream_acc.m_bad != 0 or stream_acc.grew_bad != 0) return error.ExactMismatch;
+    if (stream_acc.l_rel > 1e-3 or stream_acc.p_rel > 1e-3 or stream_acc.corr_rel > 1e-3)
+        return error.ResultMismatch;
     std.debug.print("  all flash_softmax cosim cases passed\n\n", .{});
 }
