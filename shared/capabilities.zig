@@ -1,7 +1,7 @@
 const std = @import("std");
 
-pub const version: u16 = 1;
-pub const encoded_len: usize = 544;
+pub const version: u16 = 2;
+pub const encoded_len: usize = 552;
 
 const magic: u32 = 0x5041_4350; // "PCAP", little-endian on the wire.
 
@@ -143,6 +143,7 @@ pub const EngineInfo = struct {
     dim1: u32 = 0,
     dim2: u32 = 0,
     dim3: u32 = 0,
+    dim4: u32 = 0,
 };
 
 pub const Report = struct {
@@ -237,7 +238,7 @@ pub fn decode(bytes: []const u8) DecodeError!Report {
 }
 
 fn putEngine(out: []u8, cursor: *usize, info: EngineInfo) void {
-    inline for (.{ info.id, info.version, info.clock_hz, info.dim0, info.dim1, info.dim2, info.dim3 }) |value| putU32(out, cursor, value);
+    inline for (.{ info.id, info.version, info.clock_hz, info.dim0, info.dim1, info.dim2, info.dim3, info.dim4 }) |value| putU32(out, cursor, value);
 }
 
 fn takeEngine(bytes: []const u8, cursor: *usize) EngineInfo {
@@ -249,6 +250,7 @@ fn takeEngine(bytes: []const u8, cursor: *usize) EngineInfo {
         .dim1 = takeU32(bytes, cursor),
         .dim2 = takeU32(bytes, cursor),
         .dim3 = takeU32(bytes, cursor),
+        .dim4 = takeU32(bytes, cursor),
     };
 }
 
@@ -308,7 +310,7 @@ test "capability payload roundtrips exactly" {
         .identity_flags = IdentityFlag.bitstream_hash_verified,
         .manifest_schema = 1,
         .matmul = .{ .id = 0xB05A2000, .version = 11, .clock_hz = 300_000_000, .dim0 = 16, .dim1 = 4, .dim2 = 8, .dim3 = 16384 },
-        .flash = .{ .id = 0xF1A54A00, .version = 3, .clock_hz = 300_000_000, .dim0 = 8, .dim1 = 128, .dim2 = 32, .dim3 = 8 },
+        .flash = .{ .id = 0xF1A54A01, .version = 1, .clock_hz = 300_000_000, .dim0 = 8, .dim1 = 128, .dim2 = 32, .dim3 = 8, .dim4 = 64 },
     };
     try report.run_id.set("20260804T120000Z-deadbeef-w512-p4-f300-clean");
     try report.variant.set("w512-p4-f300");
@@ -320,6 +322,9 @@ test "capability payload roundtrips exactly" {
     var encoded: [encoded_len]u8 = undefined;
     try std.testing.expectEqual(encoded_len, try encode(report, &encoded));
     try std.testing.expectEqualDeep(report, try decode(&encoded));
+
+    std.mem.writeInt(u16, encoded[4..6], 1, .little);
+    try std.testing.expectError(error.UnsupportedVersion, decode(&encoded));
 }
 
 test "deployment receipt requires the existing manifest identity" {

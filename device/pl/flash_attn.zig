@@ -1,11 +1,11 @@
-//! PL flash-attention backend (v4, kv-major): drives the flash_top fabric kernel for a
+//! PL flash-attention backend (adaptive-slot v1, kv-major): drives the flash_top fabric kernel for a
 //! wire flash_attn_f32 command. A tenant on the PL substrate (regwin/dma), beside
 //! pl/matmul.zig.
 //!
-//! Decode retains v3's direct Q/K/V/mask path. For multi-token commands, v4 gathers
-//! Q and transposes the mask in tiles of at most four queries while K/V remain direct
-//! and are each streamed only once per tile. Unsupported layouts defer to the PS oracle
-//! before any DMA starts.
+//! Decode uses direct Q/K/V/mask streams. Multi-token commands gather Q and transpose
+//! the mask in a tile sized from the engine's reported query-head slots while K/V remain
+//! direct and are each streamed only once per tile. Unsupported layouts defer to the PS
+//! oracle before any DMA starts.
 
 const std = @import("std");
 const shared = @import("shared");
@@ -18,7 +18,7 @@ const profile = @import("../profile.zig");
 const wire = shared.wire;
 const capabilities = shared.capabilities;
 
-const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadLanes, BadClock };
+const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadLanes, BadQuerySlots, BadClock };
 pub const Error = dma_mod.Error || KernelError || feed.FeedError || error{ HeapFailure, OutOfMemory };
 
 const addr = flash_regmap.addr;
@@ -27,18 +27,19 @@ const caps = flash_regmap.caps;
 const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 
-/// Oldest kernel VERSION the driver accepts. v3 retains the kv-major v2 datapath and
-/// raises its query-head capacity to 32. Older bitstreams must fall back to PS rather
-/// than let the driver submit shapes that alias their smaller on-chip pools.
-pub const min_version: u32 = 3;
-pub const query_blocked_version: u32 = 4;
+/// The adaptive-slot engine uses a new ID and restarts its version sequence. Older
+/// stream contracts therefore fail the ID check and fall back to PS at backend init.
+pub const min_version: u32 = 1;
+pub const query_blocked_version: u32 = 1;
 pub const expected_id: u32 = flash_regmap.resetOf("ID");
 const expected_lanes: u32 = flash_regmap.resetOf("LANES");
+const expected_query_slots: u32 = flash_regmap.resetOf("QUERY_SLOTS");
 
 comptime {
     std.debug.assert(min_version <= flash_regmap.resetOf("VERSION"));
-    std.debug.assert(feed.QUERY_TILE_MAX == caps.query_tile_max);
+    std.debug.assert(feed.QUERY_TILE_MAX == caps.logical_query_tile_max);
     std.debug.assert(feed.CONTEXT_MAX == caps.context_max);
+    std.debug.assert(expected_query_slots == caps.query_slots);
 }
 
 /// Per-run hardware counters from the flash kernel (Q/K/V/O streams). Read only
@@ -59,6 +60,7 @@ pub const Kernel = struct {
     win: regwin.RegWindow,
     version: u32,
     clk_hz: u32,
+    query_slots: u32,
 
     pub fn open(base: i64) KernelError!Kernel {
         var win = try regwin.RegWindow.mapWindow(base);
@@ -67,9 +69,11 @@ pub const Kernel = struct {
         const version = win.rd(flash_regmap.offsetOf("VERSION"));
         if (version < min_version) return error.BadVersion;
         if (win.rd(flash_regmap.offsetOf("LANES")) != expected_lanes) return error.BadLanes;
+        const query_slots = win.rd(flash_regmap.offsetOf("QUERY_SLOTS"));
+        if (query_slots != expected_query_slots) return error.BadQuerySlots;
         const clk_hz = win.rd(flash_regmap.offsetOf("CLK_HZ"));
         if (clk_hz == 0) return error.BadClock;
-        return .{ .win = win, .version = version, .clk_hz = clk_hz };
+        return .{ .win = win, .version = version, .clk_hz = clk_hz, .query_slots = query_slots };
     }
 
     pub fn deinit(self: *Kernel) void {
@@ -124,6 +128,7 @@ pub fn capabilityInfo(kernel: Kernel) capabilities.EngineInfo {
         .dim1 = caps.head_dim_max,
         .dim2 = @intCast(caps.max_heads),
         .dim3 = @intCast(caps.max_head_kv),
+        .dim4 = kernel.query_slots,
     };
 }
 
@@ -239,8 +244,8 @@ pub fn Backend(comptime Heap: type) type {
 
             if (s.n_tokens == 1 and s.directDmaCapable())
                 return try self.runDirect(heap, attn, s, ctx);
-            if (queryBlockedSupported(self.kernel.version, s)) {
-                return try self.runQueryBlocked(heap, attn, s, ctx);
+            if (queryBlockedTileMax(self.kernel.version, self.kernel.query_slots, s)) |tile_max| {
+                return try self.runQueryBlocked(heap, attn, s, tile_max, ctx);
             }
 
             if (ctx != null and !self.logged_reject) {
@@ -368,12 +373,13 @@ pub fn Backend(comptime Heap: type) type {
             return result;
         }
 
-        fn runQueryBlocked(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, s: feed.Shape, ctx: ?*profile.ProfileContext) Error!profile.FlashExecution {
+        fn runQueryBlocked(self: *Self, heap: *Heap, attn: wire.FlashAttnF32, s: feed.Shape, tile_max: usize, ctx: ?*profile.ProfileContext) Error!profile.FlashExecution {
+            const tile_count = s.tileCount(tile_max) orelse return error.InvalidShape;
             const wrapper_start = profile.begin(ctx);
             var last = wrapper_start;
             var result = profile.FlashExecution{
                 .path = .staged,
-                .kernel_runs = @intCast(s.tileCount()),
+                .kernel_runs = @intCast(tile_count),
                 .requested_n_kv = attn.n_kv,
                 .requested_qkv_pairs = @as(u64, attn.n_tokens) *| @as(u64, attn.n_kv),
             };
@@ -383,7 +389,7 @@ pub fn Backend(comptime Heap: type) type {
 
             // Determine the largest K/V prefix once, then flush that resident prefix
             // once. Individual tiles may submit shorter DMA transfers.
-            const max_processed_extent = maxProcessedExtent(s, mask_data);
+            const max_processed_extent = maxProcessedExtent(s, mask_data, tile_max) orelse return error.InvalidShape;
             result.prepare_ns +|= profile.lap(ctx, &last);
 
             const k_sync = srcRange(attn.k, s.kStreamBytes(max_processed_extent));
@@ -393,19 +399,19 @@ pub fn Backend(comptime Heap: type) type {
             result.sync_to_ns +|= profile.lap(ctx, &last);
 
             var tile_index: usize = 0;
-            while (s.queryTile(tile_index)) |tile| : (tile_index += 1) {
+            while (s.queryTile(tile_index, tile_max)) |tile| : (tile_index += 1) {
                 const q_bytes = s.qTileBytes(tile);
                 const o_bytes = s.oTileBytes(tile);
                 const q_range = subRange(self.q_staging, q_bytes);
                 const q_staged = heap.bytes(q_range) catch return error.HeapFailure;
-                _ = try feed.packQTile(s, q_data, tile, q_staged);
+                _ = try feed.packQTile(s, q_data, tile, tile_max, q_staged);
 
                 // Pack the full mask tile to derive its extent, then submit only the
                 // KV prefix the kernel will actually walk.
                 const full_mask_bytes = s.maskTileStreamBytes(tile, s.n_kv);
                 const full_mask_range = subRange(self.mask_staging, full_mask_bytes);
                 const mask_staged = heap.bytes(full_mask_range) catch return error.HeapFailure;
-                const mask_analysis = try feed.packMaskTile(s, mask_data, tile, mask_staged, ctx != null);
+                const mask_analysis = try feed.packMaskTile(s, mask_data, tile, tile_max, mask_staged, ctx != null);
                 const kv_hi = mask_analysis.processed_extent;
                 const mask_bytes = s.maskTileStreamBytes(tile, kv_hi);
                 const mask_range = subRange(self.mask_staging, mask_bytes);
@@ -485,17 +491,19 @@ fn rangesCover(attn: wire.FlashAttnF32, spans: feed.RequiredSpans) bool {
         rangeCovers(attn.dst, spans.dst);
 }
 
-fn queryBlockedSupported(version: u32, shape: feed.Shape) bool {
+fn queryBlockedTileMax(version: u32, query_slots: u32, shape: feed.Shape) ?usize {
     // Kernel versions are cumulative within this engine ID. A future incompatible
-    // stream contract must use a new ID rather than silently reinterpreting v4.
-    return version >= query_blocked_version and
-        shape.queryBlockedDmaCapable() and shape.packedDst();
+    // stream contract must use another ID rather than silently reinterpreting v1.
+    if (version < query_blocked_version or
+        !shape.queryBlockedDmaCapable() or !shape.packedDst()) return null;
+    return feed.physicalTileMax(shape, caps.max_heads, query_slots);
 }
 
-fn maxProcessedExtent(shape: feed.Shape, mask_data: []const u8) usize {
+fn maxProcessedExtent(shape: feed.Shape, mask_data: []const u8, tile_max: usize) ?usize {
     var max_extent: usize = 0;
     var tile_index: usize = 0;
-    while (shape.queryTile(tile_index)) |tile| : (tile_index += 1) {
+    if (shape.tileCount(tile_max) == null) return null;
+    while (shape.queryTile(tile_index, tile_max)) |tile| : (tile_index += 1) {
         var tile_shape = shape;
         tile_shape.n_tokens = tile.token_count;
         const mask_offset = tile.token_start * shape.mask_nb1;
@@ -551,8 +559,8 @@ test "range preflight checks declared lengths and offset overflow" {
     try std.testing.expect(!rangeCovers(overflow, 1));
 }
 
-test "query blocking requires v4 while v3 remains decode-only" {
-    const shape = feed.Shape{
+test "adaptive-slot v1 enables query blocking with shape-specific tile sizes" {
+    var shape = feed.Shape{
         .head_dim_q = 128,
         .head_dim_v = 128,
         .n_heads = 16,
@@ -569,8 +577,19 @@ test "query blocking requires v4 while v3 remains decode-only" {
         .dst_nb1 = 128 * @sizeOf(f32),
         .dst_nb2 = 16 * 128 * @sizeOf(f32),
     };
-    try std.testing.expect(!queryBlockedSupported(3, shape));
-    try std.testing.expect(queryBlockedSupported(4, shape));
+    try std.testing.expect(queryBlockedTileMax(0, 64, shape) == null);
+    try std.testing.expectEqual(@as(usize, 4), queryBlockedTileMax(1, 64, shape).?);
+
+    shape.n_heads = 32;
+    shape.dst_nb2 = 32 * 128 * @sizeOf(f32);
+    try std.testing.expectEqual(@as(usize, 2), queryBlockedTileMax(1, 64, shape).?);
+
+    shape.n_heads = 18;
+    shape.n_head_kv = 6;
+    shape.k_nb1 = 6 * 128 * @sizeOf(f16);
+    shape.v_nb1 = 6 * 128 * @sizeOf(f16);
+    shape.dst_nb2 = 18 * 128 * @sizeOf(f32);
+    try std.testing.expectEqual(@as(usize, 2), queryBlockedTileMax(1, 64, shape).?);
 }
 
 test "K V sync extent covers an all-masked tile" {
@@ -595,7 +614,7 @@ test "K V sync extent covers an all-masked tile" {
     // The first tile has a short finite prefix; the second is entirely masked and
     // therefore performs the kernel's defensive full walk.
     mask[0] = 0;
-    try std.testing.expectEqual(s.n_kv, maxProcessedExtent(s, std.mem.sliceAsBytes(mask[0..])));
+    try std.testing.expectEqual(s.n_kv, maxProcessedExtent(s, std.mem.sliceAsBytes(mask[0..]), 4).?);
 }
 
 test "flash counters aggregate across query tiles" {

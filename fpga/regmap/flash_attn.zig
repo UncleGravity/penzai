@@ -63,14 +63,17 @@ pub const caps = struct {
     pub const head_dim_max: u32 = 128;
     pub const max_heads: usize = 32;
     pub const max_head_kv: usize = 8;
-    pub const query_tile_max: usize = 4;
+    /// Logical host staging limit. The physical tile submitted to the kernel is
+    /// derived from QUERY_SLOTS and the engine's fixed half/full-width head stride.
+    pub const logical_query_tile_max: usize = 4;
+    pub const query_slots: u32 = 64;
     pub const context_max: usize = 8192;
-    // Decode keeps v3's direct streams and reserves O staging only for a strided
-    // destination. V4 prefill gathers bounded Q/mask tiles; packed tile output DMAs
+    // Decode keeps direct streams and reserves O staging only for a strided
+    // destination. Prefill gathers bounded Q/mask tiles; packed tile output DMAs
     // straight into its final destination subrange.
     pub const o_staging_bytes: usize = 128 * 1024;
-    pub const q_staging_bytes: usize = query_tile_max * max_heads * head_dim_max * @sizeOf(f32);
-    pub const mask_staging_bytes: usize = query_tile_max * context_max * @sizeOf(f16);
+    pub const q_staging_bytes: usize = logical_query_tile_max * max_heads * head_dim_max * @sizeOf(f32);
+    pub const mask_staging_bytes: usize = logical_query_tile_max * context_max * @sizeOf(f16);
 };
 
 comptime {
@@ -78,7 +81,9 @@ comptime {
     std.debug.assert(caps.lanes == resetOf("LANES"));
     // head_dim_max must be a multiple of the lane count.
     std.debug.assert(caps.head_dim_max % caps.lanes == 0);
-    std.debug.assert(caps.query_tile_max == 4);
+    std.debug.assert(caps.logical_query_tile_max == 4);
+    std.debug.assert(caps.query_slots == resetOf("QUERY_SLOTS"));
+    std.debug.assert(caps.query_slots >= caps.max_heads);
 }
 
 fn isDataLine(line: []const u8) bool {
@@ -160,22 +165,26 @@ pub fn emitAddrTcl(buf: []u8) std.fmt.BufPrintError![]const u8 {
 test "regmap parses known offsets and resets" {
     try std.testing.expect(table.len >= 20);
     try std.testing.expectEqual(@as(u32, 0x00), offsetOf("ID"));
-    try std.testing.expectEqual(@as(u32, 0xF1A54A00), resetOf("ID"));
-    try std.testing.expectEqual(@as(u32, 4), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 0xF1A54A01), resetOf("ID"));
+    try std.testing.expectEqual(@as(u32, 1), resetOf("VERSION"));
     try std.testing.expectEqual(@as(u32, 0x08), offsetOf("CTRL"));
     try std.testing.expectEqual(@as(u32, 0x1C), offsetOf("N_HEAD_KV"));
     try std.testing.expectEqual(@as(u32, 0x20), offsetOf("HEAD_RATIO"));
     try std.testing.expectEqual(@as(u32, 0x2C), offsetOf("SCALE"));
     try std.testing.expectEqual(@as(u32, 0x3C), offsetOf("Q_BEATS"));
     try std.testing.expectEqual(@as(u32, 0x54), offsetOf("O_STALL"));
+    try std.testing.expectEqual(@as(u32, 0x58), offsetOf("QUERY_SLOTS"));
     try std.testing.expectEqual(@as(u32, 8), resetOf("LANES"));
+    try std.testing.expectEqual(@as(u32, 64), resetOf("QUERY_SLOTS"));
 }
 
 test "emitVerilog contains offsets and ro reset values" {
     var buf: [4096]u8 = undefined;
     const out = try emitVerilog(&buf);
     try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_OFF_SCALE = 12'h02C;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_ID = 32'hF1A54A00;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_ID = 32'hF1A54A01;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_OFF_QUERY_SLOTS = 12'h058;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_QUERY_SLOTS = 32'h00000040;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_CTRL") == null);
     try std.testing.expect(std.mem.indexOf(u8, out, "FLASH_RST_SCALE") == null);
@@ -187,6 +196,7 @@ test "address map and caps are internally consistent" {
     try std.testing.expectEqual(@as(i64, 0xA015_0000), addr.kernel);
     try std.testing.expectEqual(@as(u32, 8), caps.lanes);
     try std.testing.expectEqual(@as(u32, 0), caps.head_dim_max % caps.lanes);
+    try std.testing.expectEqual(@as(u32, 64), caps.query_slots);
 }
 
 test "emitAddrTcl matches the deployed address map" {

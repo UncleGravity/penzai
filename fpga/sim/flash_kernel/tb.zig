@@ -412,5 +412,8 @@ pub fn main() !void {
     // 32 query heads over 8 kv-heads (GQA r4): exercises the full MAX_HEADS pool and the
     // head-index bits above [3:0] — the aliasing the [3:0] pool index used to cause.
     try runPair(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .mask_kind = .one_interior, .mask_index = 4, .expected_hash = 0xcb4b_8407_4344_2339 }, &dut, 0x32EAD5);
+    // Wide-head adaptive layout: 32 heads use one token bit and all five head bits,
+    // filling the same 64 physical slots with two queries and no aliases.
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 32, .nhkv = 8, .nkv = 4, .ntok = 2, .scale = 0.25, .mask_kind = .causal, .expected_hash = 0x9872_3fec_6c77_fa07 }, &dut, 0x64A07);
     std.debug.print("  all flash_kernel cosim configs passed\n\n", .{});
 }

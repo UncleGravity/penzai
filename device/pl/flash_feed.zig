@@ -10,6 +10,8 @@ const std = @import("std");
 const shared = @import("shared");
 
 pub const LANES: usize = 8;
+/// Logical section/staging limit. A physical kernel launch can be smaller because
+/// query state is indexed with a power-of-two head stride inside QUERY_SLOTS.
 pub const QUERY_TILE_MAX: usize = shared.section.query_tile_max;
 pub const CONTEXT_MAX: usize = shared.section.context_max;
 
@@ -72,7 +74,7 @@ pub const Shape = struct {
             s.q_nb2 == s.head_dim_q * f; // n_tokens=1 ⇒ heads are contiguous
     }
 
-    /// Initial v4 query-blocked eligibility is deliberately exact: accept the
+    /// Query-blocked eligibility is deliberately exact: accept the
     /// layouts emitted by the supported ggml graph and let every padded or unusual
     /// view retain the PS implementation. Q is head-major/token-inner in resident
     /// memory and is gathered into query-major order by `packQTile`; K/V already
@@ -100,14 +102,16 @@ pub const Shape = struct {
         return s.dst_nb1 == row and s.dst_nb2 == token;
     }
 
-    pub fn tileCount(s: Shape) usize {
-        return std.math.divCeil(usize, s.n_tokens, QUERY_TILE_MAX) catch unreachable;
+    pub fn tileCount(s: Shape, tile_max: usize) ?usize {
+        if (!validTileMax(tile_max)) return null;
+        return std.math.divCeil(usize, s.n_tokens, tile_max) catch null;
     }
 
-    pub fn queryTile(s: Shape, index: usize) ?QueryTile {
-        const start = checkedMul(index, QUERY_TILE_MAX) orelse return null;
+    pub fn queryTile(s: Shape, index: usize, tile_max: usize) ?QueryTile {
+        if (!validTileMax(tile_max)) return null;
+        const start = checkedMul(index, tile_max) orelse return null;
         if (start >= s.n_tokens) return null;
-        return .{ .token_start = start, .token_count = @min(QUERY_TILE_MAX, s.n_tokens - start) };
+        return .{ .token_start = start, .token_count = @min(tile_max, s.n_tokens - start) };
     }
 
     // ---- direct-DMA stream byte lengths (kv_hi = the real masked extent) ----
@@ -221,9 +225,10 @@ pub fn analyzeMask(s: Shape, mask_data: ?[]const u8, collect_pairs: bool) MaskAn
 
 /// Gather one Q tile from ggml's packed `[head][token][dimension]` layout into the
 /// kernel stream order `[token][head][dimension]`.
-pub fn packQTile(s: Shape, q_data: []const u8, tile: QueryTile, out: []u8) FeedError!usize {
-    if (tile.token_count == 0 or tile.token_count > QUERY_TILE_MAX or
-        tile.token_start + tile.token_count > s.n_tokens) return error.InvalidShape;
+pub fn packQTile(s: Shape, q_data: []const u8, tile: QueryTile, tile_max: usize, out: []u8) FeedError!usize {
+    const tile_end = checkedAdd(tile.token_start, tile.token_count) orelse return error.InvalidShape;
+    if (!validTileMax(tile_max) or tile.token_count == 0 or tile.token_count > tile_max or
+        tile_end > s.n_tokens) return error.InvalidShape;
     const spans = requiredSpans(s, true) orelse return error.InvalidShape;
     if (q_data.len < spans.q) return error.InvalidLength;
     const row_bytes = checkedMul(s.head_dim_q, @sizeOf(f32)) orelse return error.InvalidShape;
@@ -242,7 +247,7 @@ pub fn packQTile(s: Shape, q_data: []const u8, tile: QueryTile, out: []u8) FeedE
     return cursor;
 }
 
-/// Transpose one F16 mask tile from resident `[query][kv]` rows into the v4
+/// Transpose one F16 mask tile from resident `[query][kv]` rows into the kernel
 /// stream order `[kv][query]`, while deriving the exact tile extent and optional
 /// valid-pair count in the same pass. The full tile is staged so the caller can
 /// DMA only the prefix ending at `processed_extent`.
@@ -250,11 +255,13 @@ pub fn packMaskTile(
     s: Shape,
     mask_data: []const u8,
     tile: QueryTile,
+    tile_max: usize,
     out: []u8,
     collect_pairs: bool,
 ) FeedError!MaskAnalysis {
-    if (tile.token_count == 0 or tile.token_count > QUERY_TILE_MAX or
-        tile.token_start + tile.token_count > s.n_tokens) return error.InvalidShape;
+    const tile_end = checkedAdd(tile.token_start, tile.token_count) orelse return error.InvalidShape;
+    if (!validTileMax(tile_max) or tile.token_count == 0 or tile.token_count > tile_max or
+        tile_end > s.n_tokens) return error.InvalidShape;
     const spans = requiredSpans(s, true) orelse return error.InvalidShape;
     if (mask_data.len < spans.mask) return error.InvalidLength;
     const want = checkedMul(checkedMul(tile.token_count, s.n_kv) orelse return error.InvalidShape, @sizeOf(f16)) orelse return error.InvalidShape;
@@ -296,15 +303,16 @@ pub fn scatterO(s: Shape, o_f32: []const u8, dst: []u8) void {
     };
 }
 
-pub fn scatterOTile(s: Shape, tile: QueryTile, o_f32: []const u8, dst: []u8) FeedError!void {
-    if (tile.token_count == 0 or tile.token_count > QUERY_TILE_MAX or
-        tile.token_start + tile.token_count > s.n_tokens) return error.InvalidShape;
+pub fn scatterOTile(s: Shape, tile: QueryTile, tile_max: usize, o_f32: []const u8, dst: []u8) FeedError!void {
+    const tile_end = checkedAdd(tile.token_start, tile.token_count) orelse return error.InvalidShape;
+    if (!validTileMax(tile_max) or tile.token_count == 0 or tile.token_count > tile_max or
+        tile_end > s.n_tokens) return error.InvalidShape;
     const dst_row = checkedMul(s.head_dim_v, @sizeOf(f32)) orelse return error.InvalidShape;
     const dst_span = dstSpan(s, dst_row) orelse return error.InvalidShape;
     const want = s.oTileBytes(tile);
     if (o_f32.len < want or dst.len < dst_span) return error.InvalidLength;
     var idx: usize = 0;
-    for (tile.token_start..tile.token_start + tile.token_count) |t| for (0..s.n_heads) |h| {
+    for (tile.token_start..tile_end) |t| for (0..s.n_heads) |h| {
         const base = h * s.dst_nb1 + t * s.dst_nb2;
         for (0..s.head_dim_v) |d| {
             @memcpy(dst[base + d * @sizeOf(f32) ..][0..4], o_f32[idx * @sizeOf(f32) ..][0..4]);
@@ -331,6 +339,25 @@ fn checkedAdd(a: usize, b: usize) ?usize {
 
 fn checkedMul(a: usize, b: usize) ?usize {
     return std.math.mul(usize, a, b) catch null;
+}
+
+fn validTileMax(tile_max: usize) bool {
+    return tile_max != 0 and tile_max <= QUERY_TILE_MAX;
+}
+
+/// Maximum queries a physical launch can hold. RTL's multiplier-free slot map uses
+/// a half-width power-of-two head stride for shapes in the lower half of max_heads,
+/// otherwise the full max_heads stride. With 32 heads and 64 slots this is exactly
+/// 4 queries at <=16 heads or 2 queries at 17..32 heads. The logical section contract
+/// remains capped at four queries.
+pub fn physicalTileMax(s: Shape, max_heads: usize, query_slots: usize) ?usize {
+    if (max_heads < 2 or !std.math.isPowerOfTwo(max_heads) or
+        s.n_heads == 0 or s.n_heads > max_heads) return null;
+    const narrow_stride = max_heads / 2;
+    const head_stride = if (s.n_heads <= narrow_stride) narrow_stride else max_heads;
+    const physical = query_slots / head_stride;
+    if (physical == 0) return null;
+    return @min(QUERY_TILE_MAX, physical);
 }
 
 // ---------------------------------------------------------------------------- tests
@@ -417,11 +444,9 @@ test "directDmaCapable accepts the packed Bonsai decode layout, rejects padding/
     try std.testing.expect(!padded.directDmaCapable());
 }
 
-fn blockedTestShape(n_tokens: usize, n_kv: usize) Shape {
+fn blockedTestShapeHeads(n_tokens: usize, n_kv: usize, heads: usize, kv_heads: usize) Shape {
     const hdq: usize = 8;
     const hdv: usize = 8;
-    const heads: usize = 2;
-    const kv_heads: usize = 1;
     return .{
         .head_dim_q = hdq,
         .head_dim_v = hdv,
@@ -441,19 +466,23 @@ fn blockedTestShape(n_tokens: usize, n_kv: usize) Shape {
     };
 }
 
+fn blockedTestShape(n_tokens: usize, n_kv: usize) Shape {
+    return blockedTestShapeHeads(n_tokens, n_kv, 2, 1);
+}
+
 test "query-blocked eligibility and tile plan are bounded and exact" {
     var s = blockedTestShape(16, 256);
     try std.testing.expect(s.queryBlockedDmaCapable());
     try std.testing.expect(s.packedDst());
-    try std.testing.expectEqual(@as(usize, 4), s.tileCount());
-    try std.testing.expectEqualDeep(QueryTile{ .token_start = 0, .token_count = 4 }, s.queryTile(0).?);
-    try std.testing.expectEqualDeep(QueryTile{ .token_start = 12, .token_count = 4 }, s.queryTile(3).?);
-    try std.testing.expect(s.queryTile(4) == null);
+    try std.testing.expectEqual(@as(usize, 4), s.tileCount(4).?);
+    try std.testing.expectEqualDeep(QueryTile{ .token_start = 0, .token_count = 4 }, s.queryTile(0, 4).?);
+    try std.testing.expectEqualDeep(QueryTile{ .token_start = 12, .token_count = 4 }, s.queryTile(3, 4).?);
+    try std.testing.expect(s.queryTile(4, 4) == null);
 
     s.n_tokens = 5;
     s.q_nb2 = s.n_tokens * s.head_dim_q * @sizeOf(f32);
-    try std.testing.expectEqual(@as(usize, 2), s.tileCount());
-    try std.testing.expectEqualDeep(QueryTile{ .token_start = 4, .token_count = 1 }, s.queryTile(1).?);
+    try std.testing.expectEqual(@as(usize, 2), s.tileCount(4).?);
+    try std.testing.expectEqualDeep(QueryTile{ .token_start = 4, .token_count = 1 }, s.queryTile(1, 4).?);
 
     var padded = s;
     padded.q_nb2 += 64;
@@ -474,8 +503,38 @@ test "query-blocked eligibility and tile plan are bounded and exact" {
     };
     for (cases) |case| {
         const shape = blockedTestShape(case.tokens, 256);
-        try std.testing.expectEqual(case.tiles, shape.tileCount());
+        try std.testing.expectEqual(case.tiles, shape.tileCount(4).?);
     }
+}
+
+test "physical query tiles derive from 64 slots and power-of-two head stride" {
+    const h16 = blockedTestShapeHeads(16, 256, 16, 8);
+    try std.testing.expectEqual(@as(usize, 4), physicalTileMax(h16, 32, 64).?);
+    try std.testing.expectEqual(@as(usize, 4), h16.tileCount(4).?);
+
+    const h32 = blockedTestShapeHeads(16, 256, 32, 8);
+    try std.testing.expectEqual(@as(usize, 2), physicalTileMax(h32, 32, 64).?);
+    try std.testing.expectEqual(@as(usize, 8), h32.tileCount(2).?);
+
+    const h3 = blockedTestShapeHeads(16, 256, 3, 1);
+    try std.testing.expect(h3.queryBlockedDmaCapable());
+    try std.testing.expectEqual(@as(usize, 4), physicalTileMax(h3, 32, 64).?);
+    const h18 = blockedTestShapeHeads(16, 256, 18, 6);
+    try std.testing.expect(h18.queryBlockedDmaCapable());
+    try std.testing.expectEqual(@as(usize, 2), physicalTileMax(h18, 32, 64).?);
+}
+
+test "tile planning rejects zero, logical overflow, slot exhaustion, and index overflow" {
+    var s = blockedTestShape(16, 256);
+    try std.testing.expect(s.tileCount(0) == null);
+    try std.testing.expect(s.tileCount(QUERY_TILE_MAX + 1) == null);
+    try std.testing.expect(s.queryTile(0, 0) == null);
+    try std.testing.expect(s.queryTile(std.math.maxInt(usize), 4) == null);
+    try std.testing.expect(physicalTileMax(s, 32, 0) == null);
+    try std.testing.expect(physicalTileMax(s, 0, 64) == null);
+    try std.testing.expect(physicalTileMax(s, 24, 64) == null);
+    s.n_heads = std.math.maxInt(usize);
+    try std.testing.expect(physicalTileMax(s, 32, 64) == null);
 }
 
 test "K and V bytes are independent of query count within a tile" {
@@ -499,9 +558,9 @@ test "Q gather converts head-major source into query-major tile stream" {
         @memset(q[head * s.q_nb2 + token * s.q_nb1 ..][0..row_bytes], @intCast(head * 16 + token));
     };
 
-    const tile = s.queryTile(1).?;
+    const tile = s.queryTile(1, 4).?;
     var staged: [QUERY_TILE_MAX * 2 * 8 * @sizeOf(f32)]u8 = undefined;
-    const n = try packQTile(s, q, tile, &staged);
+    const n = try packQTile(s, q, tile, 4, &staged);
     try std.testing.expectEqual(s.qTileBytes(tile), n);
     // Final partial tile contains token 4, then heads 0 and 1.
     try std.testing.expectEqual(@as(u8, 4), staged[0]);
@@ -518,7 +577,7 @@ test "mask packing is KV-major and preserves causal, holes, and all-masked rows"
     mask[3 * s.n_kv + 1] = f16_neg_inf;
     var staged: [QUERY_TILE_MAX * 6]u16 = undefined;
     const tile = QueryTile{ .token_start = 1, .token_count = 4 };
-    const analysis = try packMaskTile(s, std.mem.sliceAsBytes(mask[0..]), tile, std.mem.sliceAsBytes(staged[0..]), true);
+    const analysis = try packMaskTile(s, std.mem.sliceAsBytes(mask[0..]), tile, 4, std.mem.sliceAsBytes(staged[0..]), true);
     try std.testing.expectEqual(@as(usize, 5), analysis.valid_extent);
     try std.testing.expectEqual(@as(usize, 5), analysis.processed_extent);
     try std.testing.expectEqual(@as(usize, 13), analysis.valid_pairs);
@@ -527,7 +586,7 @@ test "mask packing is KV-major and preserves causal, holes, and all-masked rows"
     };
 
     @memset(mask[0..], f16_neg_inf);
-    const all_masked = try packMaskTile(s, std.mem.sliceAsBytes(mask[0..]), tile, std.mem.sliceAsBytes(staged[0..]), true);
+    const all_masked = try packMaskTile(s, std.mem.sliceAsBytes(mask[0..]), tile, 4, std.mem.sliceAsBytes(staged[0..]), true);
     try std.testing.expectEqualDeep(MaskAnalysis{ .valid_extent = 0, .processed_extent = 6, .valid_pairs = 0 }, all_masked);
 }
 
@@ -537,7 +596,11 @@ test "required spans reject overflow and short staging buffers" {
     const q = try std.testing.allocator.alloc(u8, spans.q);
     defer std.testing.allocator.free(q);
     var short: [1]u8 = undefined;
-    try std.testing.expectError(error.InvalidLength, packQTile(s, q, s.queryTile(0).?, &short));
+    try std.testing.expectError(error.InvalidLength, packQTile(s, q, s.queryTile(0, 4).?, 4, &short));
+    try std.testing.expectError(error.InvalidShape, packQTile(s, q, QueryTile{ .token_start = 0, .token_count = 4 }, 2, &short));
+
+    const overflow_tile = QueryTile{ .token_start = std.math.maxInt(usize), .token_count = 2 };
+    try std.testing.expectError(error.InvalidShape, packQTile(s, q, overflow_tile, 4, &short));
 
     s.q_nb2 = std.math.maxInt(usize);
     try std.testing.expect(requiredSpans(s, true) == null);
@@ -595,7 +658,7 @@ test "scatterOTile applies the token base for a partial tile" {
         const index = head * s.head_dim_v + d;
         std.mem.writeInt(u32, staged[index * 4 ..][0..4], @intCast(1000 + index), .little);
     };
-    try scatterOTile(s, tile, staged, dst);
+    try scatterOTile(s, tile, 4, staged, dst);
     for (0..s.n_heads) |head| for (0..s.head_dim_v) |d| {
         const got = std.mem.readInt(u32, dst[4 * s.dst_nb2 + head * s.dst_nb1 + d * 4 ..][0..4], .little);
         try std.testing.expectEqual(@as(u32, @intCast(1000 + head * s.head_dim_v + d)), got);

@@ -137,6 +137,7 @@ fn writeCapabilities(writer: *std.Io.Writer, device: []const u8, report: capabil
     try writer.print("flash.head_dim_max={d}\n", .{report.flash.dim1});
     try writer.print("flash.heads_max={d}\n", .{report.flash.dim2});
     try writer.print("flash.kv_heads_max={d}\n", .{report.flash.dim3});
+    try writer.print("flash.query_slots={d}\n", .{report.flash.dim4});
 }
 
 fn runLlamaCommand(

@@ -94,7 +94,8 @@ module flash_kernel_ooc (
     wire [31:0]  o_keep;
 
     flash_kernel #(
-        .HEAD_DIM_MAX(128), .MAX_HEADS(32), .MAX_HEAD_KV(8), .LANES(8)
+        .HEAD_DIM_MAX(128), .MAX_HEADS(32), .MAX_HEAD_KV(8),
+        .MAX_TOKENS(4), .MAX_SLOTS(64), .LANES(8)
     ) u_kernel (
         .clk(clk), .rst_n(rst_n),
         .start(start_i),

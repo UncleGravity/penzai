@@ -10,7 +10,8 @@
 
 module flash_top #(
     parameter [31:0]  CLK_HZ       = 32'd0,
-    parameter integer HEAD_DIM_MAX = 128
+    parameter integer HEAD_DIM_MAX = 128,
+    parameter integer MAX_SLOTS    = 64
 ) (
     (* X_INTERFACE_INFO = "xilinx.com:signal:clock:1.0 s_axi_aclk CLK" *)
     (* X_INTERFACE_PARAMETER = "ASSOCIATED_BUSIF S_AXI:S_AXIS_Q:S_AXIS_K:S_AXIS_V:S_AXIS_MASK:M_AXIS_O, ASSOCIATED_RESET s_axi_aresetn" *)
@@ -127,7 +128,9 @@ module flash_top #(
     wire q_tready_w, k_tready_w, v_tready_w, mask_tready_w, o_tvalid_w, o_tlast_w;
     wire [31:0] o_tkeep_w;
 
-    flash_kernel #(.HEAD_DIM_MAX(HEAD_DIM_MAX), .LANES(FLASH_LANES)) u_kernel (
+    flash_kernel #(
+        .HEAD_DIM_MAX(HEAD_DIM_MAX), .MAX_SLOTS(MAX_SLOTS), .LANES(FLASH_LANES)
+    ) u_kernel (
         .clk(clk), .rst_n(rst_n),
         .start(start_strobe),
         .head_dim_q(head_dim_q_q), .head_dim_v(head_dim_v_q),
@@ -258,6 +261,7 @@ module flash_top #(
                     FLASH_OFF_V_STALL[7:0]:    rdata_q <= v_stall_q;
                     FLASH_OFF_O_BEATS[7:0]:    rdata_q <= o_beats_q;
                     FLASH_OFF_O_STALL[7:0]:    rdata_q <= o_stall_q;
+                    FLASH_OFF_QUERY_SLOTS[7:0]: rdata_q <= MAX_SLOTS;
                     default: rdata_q <= 32'd0;
                 endcase
             end else if (rvalid_q && s_axi_rready) begin

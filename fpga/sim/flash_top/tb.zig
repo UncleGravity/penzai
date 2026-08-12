@@ -46,6 +46,18 @@ const query_blocked_cfg = Cfg{
     .expected_hash = 0x07f8_6b6d_92f2_c961,
 };
 
+const wide_heads_cfg = Cfg{
+    .hdq = 8,
+    .hdv = 8,
+    .nh = 32,
+    .nhkv = 8,
+    .nkv = 4,
+    .ntok = 2,
+    .scale = 0.25,
+    .mask_kind = .causal,
+    .expected_hash = 0x595f_47b4_3bdf_df06,
+};
+
 fn f32bits(v: f32) u32 {
     return @bitCast(v);
 }
@@ -316,8 +328,11 @@ fn runOnce(
         std.debug.print("  FAIL {s}: O exceeds tolerance\n", .{name});
         ok = false;
     }
-    if (hdq_rb != @as(u32, @intCast(cfg.hdq)) or id != regmap.resetOf("ID") or version != 4) {
-        std.debug.print("  FAIL {s}: register readback hdq={d}, id=0x{X:0>8}, version={d}\n", .{ name, hdq_rb, id, version });
+    const query_slots = dut.axiRead(regmap.offsetOf("QUERY_SLOTS"));
+    if (hdq_rb != @as(u32, @intCast(cfg.hdq)) or id != regmap.resetOf("ID") or
+        version != regmap.resetOf("VERSION") or query_slots != regmap.resetOf("QUERY_SLOTS"))
+    {
+        std.debug.print("  FAIL {s}: register readback hdq={d}, id=0x{X:0>8}, version={d}, slots={d}\n", .{ name, hdq_rb, id, version, query_slots });
         ok = false;
     }
     if ((status >> 1) & 1 != 1 or status & 1 != 0) {
@@ -482,6 +497,10 @@ pub fn main() !void {
     // catches a query-scaled K/V feed, token-outer mask order, and broken TLAST or
     // performance-counter plumbing that the direct kernel cosim cannot observe.
     _ = try runCfg(query_blocked_cfg, &dut, 0x4B10C, "ntok4-causal-stalled", true);
+
+    // Cross the adaptive wide-head mapping through AXI-Lite as well: two 32-head
+    // queries occupy all 64 reported physical state slots without aliasing.
+    _ = try runCfg(wide_heads_cfg, &dut, 0x64A07, "ntok2-wide-heads", false);
 
     std.debug.print("  all flash_top integration checks passed\n\n", .{});
 }

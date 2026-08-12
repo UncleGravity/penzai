@@ -10,8 +10,8 @@
 # Format: offset  name  access  reset  description... (one register per line)
 #
 # offset  name          access  reset        description
-0x00      ID            ro      0xF1A54A00   flash kernel identifier
-0x04      VERSION       ro      0x00000004   v4 = query-blocked KV-outer schedule, query tile max 4
+0x00      ID            ro      0xF1A54A01   flash kernel identifier (64-slot adaptive query engine)
+0x04      VERSION       ro      0x00000001   v1 = query-blocked KV-outer schedule with reported query slots
 0x08      CTRL          wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS        ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      HEAD_DIM_Q    rw      0x00000000   head dim of Q/K (multiple of LANES)
@@ -36,3 +36,4 @@
 0x4C      V_STALL       ro      0x00000000   cycles busy but V stream starved
 0x50      O_BEATS       ro      0x00000000   O AXIS beats moved last run
 0x54      O_STALL       ro      0x00000000   cycles busy but O sink backpressured
+0x58      QUERY_SLOTS   ro      0x00000040   physical query-head state slots

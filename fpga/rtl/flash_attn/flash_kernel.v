@@ -3,10 +3,11 @@
 // Consumes the KV cache in its NATIVE layout -- kv-position-major, n_head_kv heads,
 // NOT GQA-replicated. K/V therefore DMA directly once per query tile; the driver stages
 // Q query-major and transposes mask values to KV-major/query-inner order. GQA is done
-// here: one kv-head's K/V fans out to its `head_ratio` query heads. Up to four query
-// rows carry independent per-head online-softmax state (m,l,acc). The dot is pipelined
-// (stream head_dim/8 beats through fp_dot into a 16-deep buffer, sum with numeric/reduce
-// -- no per-beat recurrence). O is emitted query-major, 8-wide.
+// here: one kv-head's K/V fans out to its `head_ratio` query heads. A 64-slot adaptive
+// store carries four query rows for up to 16 heads or two rows for up to 32 heads; each
+// slot has independent online-softmax state (m,l,acc). The dot is pipelined (stream
+// head_dim/8 beats through fp_dot into a 16-deep buffer, sum with numeric/reduce -- no
+// per-beat recurrence). O is emitted query-major, 8-wide.
 //
 //   load Q tile (query,head,beat); init every (query,head) m=-inf,l=0,acc=0
 //   for kv:
@@ -28,6 +29,7 @@ module flash_kernel #(
     parameter integer MAX_HEADS    = 32,
     parameter integer MAX_HEAD_KV  = 8,
     parameter integer MAX_TOKENS   = 4,
+    parameter integer MAX_SLOTS    = 64,
     parameter integer LANES        = 8
 ) (
     input  wire        clk,
@@ -64,11 +66,10 @@ module flash_kernel #(
     localparam integer LSH   = $clog2(LANES);                // 3
     localparam integer LMAXB = $clog2(MAXB);                 // 4 (beat occupies the low bits)
     localparam integer TW    = $clog2(MAX_TOKENS);           // query-index width (2)
-    localparam integer SW    = $clog2(MAX_TOKENS*MAX_HEADS); // (query,head) slot width (7)
-    localparam integer AW    = $clog2(MAX_TOKENS*MAX_HEADS*MAXB); // acc/q_buf addr width (11)
+    localparam integer SW    = $clog2(MAX_SLOTS);            // adaptive (query,head) slot width (6)
+    localparam integer AW    = $clog2(MAX_SLOTS*MAXB);       // acc/q_buf addr width (10)
     localparam integer KW    = $clog2(MAX_HEAD_KV * MAXB);   // k_buf/v_buf addr width (7)
-    localparam integer HW    = $clog2(MAX_HEADS);            // head-index width for the per-head pools
-    localparam integer NSLOTS = MAX_TOKENS * MAX_HEADS;
+    localparam integer NSLOTS = MAX_SLOTS;
     localparam [31:0]  NEG_INF = 32'hFF800000;
     localparam [15:0]  F16_NEG_INF = 16'hFC00;
 
@@ -77,22 +78,23 @@ module flash_kernel #(
     reg [15:0] head_dim_q_r, head_dim_v_r, n_heads_r, n_head_kv_r;
     reg [15:0] head_ratio_r, n_kv_r, n_tokens_r;
     reg [31:0] scale_r;
+    reg        wide_heads_r;
     wire [15:0] qbeats = head_dim_q_r >> LSH;
     wire [15:0] vbeats = head_dim_v_r >> LSH;
 
     // ---- resident / pooled storage (indexed [head*MAXB + beat], MAXB a power of 2) ----
     // Lever 2: q/k/v/acc are forced to block RAM (synchronous read below) so they stop
     // burning LUTs as distributed RAM. ram_style=block makes the intent explicit.
-    (* ram_style = "block" *) reg [255:0] q_buf [0:MAX_TOKENS*MAX_HEADS*MAXB-1]; // resident query tile
+    (* ram_style = "block" *) reg [255:0] q_buf [0:MAX_SLOTS*MAXB-1]; // resident query tile
     (* ram_style = "block" *) reg [127:0] k_buf [0:MAX_HEAD_KV*MAXB-1]; // K for the current kv, 8 f16/beat
     (* ram_style = "block" *) reg [127:0] v_buf [0:MAX_HEAD_KV*MAXB-1]; // V for the current kv, 8 f16/beat
-    (* ram_style = "block" *) reg [255:0] acc   [0:MAX_TOKENS*MAX_HEADS*MAXB-1]; // per-(query,head) accumulator
-    // Synchronous read-data registers for the four block RAMs (data lands one cycle
-    // after the address; consumers' valids are delayed one cycle to match).
-    reg [255:0] q_rd;
-    reg [127:0] k_rd;
-    reg [127:0] v_rd;
-    reg [255:0] acc_rd;
+    (* ram_style = "block" *) reg [255:0] acc   [0:MAX_SLOTS*MAXB-1]; // per-(query,head) accumulator
+    // First-stage synchronous BRAM outputs plus a true fabric register boundary.
+    // The second stage isolates the numeric engines from BRAM placement and routing.
+    reg [255:0] q_rd, q_rd_q;
+    reg [127:0] k_rd, k_rd_q;
+    reg [127:0] v_rd, v_rd_q;
+    reg [255:0] acc_rd, acc_rd_q;
     reg [31:0] mpool [0:NSLOTS-1]; // running max per (query,head)
     reg [31:0] lpool [0:NSLOTS-1]; // running denom per (query,head)
     reg [31:0] ppool [0:NSLOTS-1]; // this-kv softmax weight
@@ -157,6 +159,18 @@ module flash_kernel #(
         end
     endfunction
 
+    // At most 64 query/head states are resident.  Small-head models use all four
+    // logical query rows; models above 16 heads use two rows.  Both layouts are
+    // concatenations, so pool and scratch addressing does not infer a multiplier.
+    function automatic [SW-1:0] slotIndex;
+        input [15:0] token;
+        input [15:0] head;
+        begin
+            if (wide_heads_r) slotIndex = {token[0], head[4:0]};
+            else             slotIndex = {token[1:0], head[3:0]};
+        end
+    endfunction
+
     wire [15:0] first_valid_tok = firstValidToken(mask_finite, n_tokens_r);
     wire [15:0] dot_req_next_tok = nextValidToken(dot_req_tok, mask_finite, n_tokens_r);
     wire [15:0] dot_cap_next_tok = nextValidToken(dot_cap_tok, mask_finite, n_tokens_r);
@@ -167,23 +181,24 @@ module flash_kernel #(
     wire [15:0] ax_req_next_tok = nextValidToken(ax_req_tok, mask_finite, n_tokens_r);
     wire [15:0] ax_wb_next_tok = nextValidToken(ax_wb_tok, mask_finite, n_tokens_r);
 
-    wire [SW-1:0] soft_req_slot = {soft_req_tok[TW-1:0], soft_req_head[HW-1:0]};
-    wire [SW-1:0] soft_wb_slot  = {soft_wb_tok[TW-1:0], soft_wb_head[HW-1:0]};
-    wire [SW-1:0] score_slot    = {score_tok[TW-1:0], score_head[HW-1:0]};
-    wire [SW-1:0] ax_req_slot   = {ax_req_tok[TW-1:0], ax_req_head[HW-1:0]};
-    wire [SW-1:0] emit_slot     = {tok_i[TW-1:0], head_i[HW-1:0]};
-    wire [SW-1:0] init_slot     = {ld_tok[TW-1:0], ld_a[HW-1:0]};
+    wire [SW-1:0] soft_req_slot = slotIndex(soft_req_tok, soft_req_head);
+    wire [SW-1:0] soft_wb_slot  = slotIndex(soft_wb_tok, soft_wb_head);
+    wire [SW-1:0] score_slot    = slotIndex(score_tok, score_head);
+    wire [SW-1:0] ax_req_slot   = slotIndex(ax_req_tok, ax_req_head);
+    wire [SW-1:0] ax_wb_slot    = slotIndex(ax_wb_tok, ax_wb_head);
+    wire [SW-1:0] emit_slot     = slotIndex(tok_i, head_i);
+    wire [SW-1:0] init_slot     = slotIndex(ld_tok, ld_a);
+    wire [SW-1:0] dot_req_slot  = slotIndex(dot_req_tok, dot_req_head);
+    wire [SW-1:0] load_slot     = slotIndex(ld_tok, ld_a);
 
-    // Query/head/beat fields concatenate because all compile-time capacities are
-    // powers of two. Runtime dimensions may be smaller; the unused address holes are
-    // intentional and keep every tag/address calculation multiplier-free.
-    wire [AW-1:0] q_dot_addr = {dot_req_tok[TW-1:0], dot_req_head[HW-1:0], dot_req_beat[LMAXB-1:0]};
+    // Slot/beat fields concatenate because both capacities are powers of two.
+    wire [AW-1:0] q_dot_addr = {dot_req_slot, dot_req_beat[LMAXB-1:0]};
     wire [KW-1:0] k_dot_addr = {dot_req_kvh[KW-LMAXB-1:0],  dot_req_beat[LMAXB-1:0]};
-    wire [AW-1:0] q_ld_addr  = {ld_tok[TW-1:0], ld_a[HW-1:0], ld_b[LMAXB-1:0]};
+    wire [AW-1:0] q_ld_addr  = {load_slot, ld_b[LMAXB-1:0]};
     wire [KW-1:0] kv_ld_addr = {ld_a[KW-LMAXB-1:0],   ld_b[LMAXB-1:0]};
-    wire [AW-1:0] acc_ax_rd  = {ax_req_tok[TW-1:0], ax_req_head[HW-1:0], ax_req_beat[LMAXB-1:0]};
-    wire [AW-1:0] acc_ax_wr  = {ax_wb_tok[TW-1:0], ax_wb_head[HW-1:0], ax_wb_beat[LMAXB-1:0]};
-    wire [AW-1:0] acc_em_rd  = {tok_i[TW-1:0], head_i[HW-1:0], bi[LMAXB-1:0]};
+    wire [AW-1:0] acc_ax_rd  = {ax_req_slot, ax_req_beat[LMAXB-1:0]};
+    wire [AW-1:0] acc_ax_wr  = {ax_wb_slot, ax_wb_beat[LMAXB-1:0]};
+    wire [AW-1:0] acc_em_rd  = {emit_slot, bi[LMAXB-1:0]};
     wire [KW-1:0] v_ax_addr  = {ax_req_kvh[KW-LMAXB-1:0], ax_req_beat[LMAXB-1:0]};
 
     // ---- fire pulses + last-beat flags ----
@@ -202,17 +217,16 @@ module flash_kernel #(
     wire last_tok  = (tok_i + 16'd1 == n_tokens_r);
 
     // ---- fp_dot: one beat's Q·K (feed-forward, latency 16). q_buf/k_buf are
-    // synchronous-read BRAMs (q_rd/k_rd land one cycle after the address), so the issue
-    // strobe is delayed one cycle to match. The dot loop is self-timed off dot_v, so the
-    // extra cycle just shifts the whole pipeline by one. ----
-    reg dot_fire_q;
+    // synchronous-read BRAMs followed by a fabric register, so issue is delayed two
+    // cycles to match. The ordered capture cursor makes this latency transparent. ----
+    reg dot_fire_q, dot_fire_qq;
     always @(posedge clk) begin
-        if (!rst_n) dot_fire_q <= 1'b0;
-        else        dot_fire_q <= dot_fire;
+        if (!rst_n) begin dot_fire_q <= 1'b0; dot_fire_qq <= 1'b0; end
+        else begin dot_fire_q <= dot_fire; dot_fire_qq <= dot_fire_q; end
     end
     wire        dot_v;  wire [31:0] dot_beat;
-    fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire_q),
-        .q(q_rd), .k(k_rd), .valid_out(dot_v), .sum(dot_beat));
+    fp_dot u_dot (.clk(clk), .rst_n(rst_n), .valid_in(dot_fire_qq),
+        .q(q_rd_q), .k(k_rd_q), .valid_out(dot_v), .sum(dot_beat));
 
     // ---- reduction tree: sum the per-beat partials (zero-padded, latency 16) ----
     wire [511:0] tree_in;
@@ -246,24 +260,30 @@ module flash_kernel #(
         .l(lpool[emit_slot]), .valid_out(rec_v), .y(rec_out));
 
     // ---- shared 8-wide axpy: acc*corr + p·V (accumulate) OR acc*inv_l (emit) ----
-    // acc and V are now synchronous-read BRAMs (acc_rd / v_rd arrive one cycle after the
-    // address is presented), so the matching control strobes are delayed one cycle to
-    // realign with the data. ax_axpy_q selects v_rd (accumulate) vs zero (emit).
+    // acc and V use the same BRAM-output plus fabric-register boundary as Q/K. Valid,
+    // mode, and scalar operands take two stages to remain cycle-aligned with the data.
     wire [31:0]  ax_s1 = emit_fire ? inv_l_q : cpool[ax_req_slot];
     wire [31:0]  ax_p  = emit_fire ? 32'd0   : ppool[ax_req_slot];
     wire ax_fire = axpy_fire | emit_fire;
-    reg        ax_fire_q, ax_axpy_q;
-    reg [31:0] ax_s1_q, ax_p_q;
+    reg        ax_fire_q, ax_fire_qq, ax_axpy_q, ax_axpy_qq;
+    reg [31:0] ax_s1_q, ax_s1_qq, ax_p_q, ax_p_qq;
     always @(posedge clk) begin
-        if (!rst_n) begin ax_fire_q <= 1'b0; ax_axpy_q <= 1'b0; end
-        else        begin ax_fire_q <= ax_fire; ax_axpy_q <= axpy_fire; end
+        if (!rst_n) begin
+            ax_fire_q <= 1'b0; ax_fire_qq <= 1'b0;
+            ax_axpy_q <= 1'b0; ax_axpy_qq <= 1'b0;
+        end else begin
+            ax_fire_q <= ax_fire; ax_fire_qq <= ax_fire_q;
+            ax_axpy_q <= axpy_fire; ax_axpy_qq <= ax_axpy_q;
+        end
         ax_s1_q <= ax_s1;
+        ax_s1_qq <= ax_s1_q;
         ax_p_q  <= ax_p;
+        ax_p_qq <= ax_p_q;
     end
-    wire [127:0] ax_v_eff = ax_axpy_q ? v_rd : 128'd0;
+    wire [127:0] ax_v_eff = ax_axpy_qq ? v_rd_q : 128'd0;
     wire ax_v;  wire [255:0] ax_out;
-    fp_axpy8 u_axpy (.clk(clk), .rst_n(rst_n), .valid_in(ax_fire_q),
-        .acc(acc_rd), .v(ax_v_eff), .s1(ax_s1_q), .p(ax_p_q), .valid_out(ax_v), .out(ax_out));
+    fp_axpy8 u_axpy (.clk(clk), .rst_n(rst_n), .valid_in(ax_fire_qq),
+        .acc(acc_rd_q), .v(ax_v_eff), .s1(ax_s1_qq), .p(ax_p_qq), .valid_out(ax_v), .out(ax_out));
 
     // ---- block-RAM storage: each array gets one write port + one synchronous read
     // port — the template Vivado maps to BRAM instead of LUTRAM. ----
@@ -271,16 +291,19 @@ module flash_kernel #(
     always @(posedge clk) begin
         if ((state == S_QLOAD) && q_tvalid) q_buf[q_ld_addr] <= q_tdata;
         q_rd <= q_buf[q_dot_addr];
+        q_rd_q <= q_rd;
     end
     // k_buf: written while loading K (S_KLOAD); read during the dot pass.
     always @(posedge clk) begin
         if ((state == S_KLOAD) && k_tvalid) k_buf[kv_ld_addr] <= k_tdata;
         k_rd <= k_buf[k_dot_addr];
+        k_rd_q <= k_rd;
     end
     // v_buf: filled beside the score pipeline, then read by the AXPY sequencer.
     always @(posedge clk) begin
         if ((state == S_PAIR) && v_tvalid && v_tready) v_buf[kv_ld_addr] <= v_tdata;
         v_rd <= v_buf[v_ax_addr];
+        v_rd_q <= v_rd;
     end
     // acc: write port muxes the per-token zero-init (S_TINIT) and the axpy writeback
     // (S_AXPY, on ax_v); read port muxes the axpy and emit addresses. Issue leads
@@ -292,6 +315,7 @@ module flash_kernel #(
     always @(posedge clk) begin
         if (acc_we) acc[acc_waddr] <= acc_wdata;
         acc_rd <= acc[acc_raddr];
+        acc_rd_q <= acc_rd;
     end
 
     wire [31:0] mask_f32_w;
@@ -328,6 +352,7 @@ module flash_kernel #(
                     n_kv_r <= n_kv;
                     n_tokens_r <= n_tokens;
                     scale_r <= scale;
+                    wide_heads_r <= (n_heads > 16'd16);
                     busy <= 1'b1; tok_i <= 0; ld_tok <= 0; ld_a <= 0; ld_b <= 0;
                     state <= S_QLOAD;
                 end

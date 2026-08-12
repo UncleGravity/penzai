@@ -507,7 +507,10 @@
             rtl-cosim = mkZigCheck {
               pname = "penzai-rtl-cosim";
               step = "test-rtl";
-              extraNativeBuildInputs = [ pkgs.verilator ];
+              extraNativeBuildInputs = [
+                pkgs.verilator
+                pkgs.python3
+              ];
             };
             inherit (packages) penzai penzaid;
           };
@@ -517,6 +520,7 @@
               pkgs.zig
               pkgs.zls
               pkgs.verilator
+              pkgs.python3
               pkgs.yosys
               pkgs.sby
               pkgs.boolector
