@@ -1,11 +1,12 @@
 # P2 Section And Scratch Contract
 
-Status: P2a contract v1 with qualified P2b decode scheduler, 2026-08-12
+Status: P2a contract v1 with routed, deployed, and board-qualified P2c adaptive
+attention at f285, 2026-08-12
 
 This document fixes the boundary for P2 implementation. It does not add a wire
-operation. P2b changes the internal attention schedule without changing that
-ABI, and later RTL revisions must preserve this ownership, layout, numerical,
-fallback, and measurement contract.
+operation. P2b and P2c change the internal attention schedule and primitive bridge
+without adding a named section ABI. Later RTL revisions must preserve this
+ownership, layout, numerical, fallback, and measurement contract.
 
 ## Scope
 
@@ -21,7 +22,10 @@ V1 has these caps:
 
 | Item | Cap |
 |---|---:|
-| Query tile | 4 tokens |
+| Logical query tile | 4 tokens |
+| Physical query-head slots | 64 |
+| Effective tile, up to 16 heads | 4 tokens |
+| Effective tile, 17-32 heads | 2 tokens |
 | Model dimension | 4096 |
 | FFN dimension | 12288 |
 | Head dimension | 128 |
@@ -30,8 +34,11 @@ V1 has these caps:
 | Context | 8192 |
 
 A longer prompt is processed as several tiles; scratch never scales with the full
-prompt. The bitstream must advertise these caps. A descriptor outside them uses
-the existing primitive path.
+prompt. The bitstream advertises 64 query-head slots. The implementation uses a
+16-head stride for shapes with up to 16 heads and a 32-head stride above that, so
+the logical four-query cap fits both the Bonsai shape and the supported 32-head
+shape without allocating 128 physical slots. A descriptor outside the advertised
+caps uses the existing primitive path.
 
 The executable form of the address and capacity rules lives in
 `shared/section.zig`.
@@ -133,7 +140,8 @@ Decode and prefill use one core and one numerical oracle:
 
 ```text
 query_count = 1       decode
-query_count = 2..4    prefill tile
+query_count = 1..4    prefill tile with up to 16 heads
+query_count = 1..2    prefill tile with 17-32 heads
 ```
 
 The core holds independent state for every `(query, head)`, walks KV outermost,
@@ -168,23 +176,35 @@ see its own key/value and earlier rows in the same tile without relying on a DDR
 read-after-write. Cache writes must finish before the section reports completion.
 
 P2b pipelines the existing single-query decode path across heads within one KV
-position. It snapshots accepted configuration, tags dot/tree/score/softmax/AXPY
-work by head, and uses a per-head score queue so those stages can overlap. The
+position. P2c extends the tags with a query index, makes the composed softmax path
+II=1, and issues independent `(query, head)` work in consecutive cycles. The
 controller retains a hard KV barrier: it does not advance to the next position
-until every AXPY accumulator writeback for the current position has retired. This
-preserves the `m`, `l`, and output-accumulator recurrence without serializing all
-heads through the complete datapath.
+until every AXPY accumulator writeback for that position has retired. This
+preserves the `m`, `l`, and output-accumulator recurrence while reusing each K/V
+load across all finite queries in the resident tile.
 
-The current composed softmax path is not a general II=1 pipeline. P2b spaces its
-issues by eight cycles, above the proven five-cycle minimum; production head-128
-scores arrive 16 cycles apart, so this does not limit single-query decode. A truly
-II=1 softmax issue path, with explicit tag-alignment and consecutive-burst tests,
-is a prerequisite for query-blocked attention where independent query/head work
-can arrive in bursts.
+The production engine contains 64 physical query-head state slots. A multiplier-
+free map uses a 16-head stride for `n_heads <= 16` and a 32-head stride otherwise.
+The driver derives the legal tile size from the advertised slot count and rejects
+any shape that would alias a slot. Bonsai therefore retains four-query tiles;
+32-head models use two-query tiles. Decode keeps the existing direct single-query
+DMA path and exact output behavior.
 
-The RTL's `n_tokens > 1` mode is still token-outer and rereads all K/V for every
-query. It is not the contract's KV-outer query-blocked algorithm and must not be
-enabled as the prefill hot path.
+P2c also provides a bounded bridge for the generic `flash_attn_f32` operation. It
+copies a Q tile from the supported packed `[token][head][dimension]` layout into
+query-major stream order, transposes and analyzes the mask once, streams K/V
+directly once per tile, and scatters output back into the existing strided tensor.
+For Q, the exact accepted strides are `q_nb1 = n_heads * head_row_bytes` and
+`q_nb2 = head_row_bytes`; padded or transposed views fail closed. Partial, sparse,
+and all-masked tiles are supported. An unknown engine ID/version/slot count or
+unsupported shape, stride, destination, range, or mask layout falls back before PL
+execution.
+
+That bridge accelerates a primitive operation; it is not the named attention
+section described above. Q, mask, and output still cross the primitive boundary,
+and the surrounding GGML graphs, commands, downloads, projections, RoPE, and KV
+append behavior are unchanged. Same-section visibility of newly produced K/V
+remains a requirement for the future named attention section.
 
 ## External Descriptor Boundary
 
@@ -279,11 +299,13 @@ Accounting and token-count checks pass and K/V/O starvation remains zero.
 The complete current flash kernel was also measured through registered OOC
 boundaries at the production 3.333 ns target:
 
-| Probe revision and target | DSP | LUT | FF | WNS | Estimated Fmax |
-|---|---:|---:|---:|---:|---:|
-| P2a diagnostic, 3.333 ns | 60 | 21,623 | 18,276 | -0.157 ns | 286.5 MHz |
-| P2a temporary baseline, 3.600 ns | 60 | 21,623 | 18,276 | +0.110 ns | 286.5 MHz |
-| P2b plus AXPY repair, 3.333 ns | 60 | 22,109 | 18,889 | +0.291 ns | 328.7 MHz |
+| Probe revision and target | DSP | LUT | FF | BRAM tiles | WNS | Estimated Fmax |
+|---|---:|---:|---:|---:|---:|---:|
+| P2a diagnostic, 3.333 ns | 60 | 21,623 | 18,276 | - | -0.157 ns | 286.5 MHz |
+| P2a temporary baseline, 3.600 ns | 60 | 21,623 | 18,276 | - | +0.110 ns | 286.5 MHz |
+| P2b plus AXPY repair, 3.333 ns | 60 | 22,109 | 18,889 | - | +0.291 ns | 328.7 MHz |
+| P2c fixed 128 slots, 3.333 ns | 60 | 23,489 | 19,315 | 33 | +0.215 ns | 320.7 MHz |
+| P2c adaptive 64 slots, 3.333 ns | 60 | 22,657 | 19,216 | 19 | +0.215 ns | 320.7 MHz |
 
 This is a synthesis/OOC diagnostic, not routed signoff. P2b both restores the
 3.333 ns registry target and reduces cycles per update without adding DSPs. The
@@ -291,7 +313,7 @@ small AXPY pipeline repair splits the two-DSP multiply path seen in the first P2
 combined route and preserves all cosim hashes. Its cosim, formal, OOC, and board
 gates pass.
 
-The released clean combined timing run reached setup and hold at +0.033/+0.007 ns
+The released P2b clean combined timing run reached setup and hold at +0.033/+0.007 ns
 after guarded placement and pre-route `AggressiveExplore`. It uses 80,108 LUTs,
 94,587 FFs, 48.5 BRAMs, four URAMs, and 92 DSPs, with 98.25% of CLBs occupied.
 The AXPY cascade is absent. Twelve setup paths remain below the 50 ps target, but
@@ -305,33 +327,91 @@ capabilities, closed accounting, PL execution for GEMM and attention in both
 phases, exact token counts, and zero K/V/O stalls. The 50 ps value remains a
 target rather than a hard architectural boundary.
 
+The first P2c implementation kept four queries for every supported head count,
+which made Q and accumulator storage 128 slots wide. It passed OOC but its clean
+combined f300 run `20260812T112623Z-95b751ff9ac3-w512-p4-f300-clean` failed at
+-0.035 ns setup WNS with 124 failing setup endpoints, 69.5 total BRAM tiles, and
+98.91% CLB occupancy. It produced no deployable bitstream. The adaptive 64-slot
+revision removes 14 flash BRAM tiles while retaining the four-query Bonsai tile.
+
+Adaptive clean f300 run
+`20260812T144901Z-bbeac0c04eff-w512-p4-f300-clean` also failed closed, at
+-0.088 ns WNS with 231 failing setup endpoints and 560 paths below the 50 ps
+target. It was not promoted. Clean f285 run
+`20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean` passes at +0.036/+0.010 ns
+setup/hold, with five paths below 50 ps. It uses 80,837 LUTs, 95,229 FFs, 55.5
+BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. The exact artifact
+was promoted and deployed with matching receipt and bitstream hashes. Live
+capabilities report 284,997,152 Hz, engine `0xF1A54A01` version 1, and 64 query
+slots. The run clears the 25 ps release floor but misses the 50 ps headroom target;
+it is the current qualification point, not evidence that f300 closes.
+
+The first multi-token board smoke fell back to PS because the driver predicate had
+the Q stride axes reversed. That failure was visible in the truthful backend field.
+Commit `0dc91c0` aligned the predicate with the observed token-major layout and
+added a concrete Bonsai-stride regression test; no RTL or bitstream change was
+required.
+
+The repaired bounded board gates pass for both formats. Q1/Q2 32-token (`p32`)
+logit checks had zero token mismatches and maximum absolute differences of
+0.0982/0.1396. Artifact
+`20260812T174257Z-p2c-repaired-p128` records `pl/staged` prefill for 224 calls and
+896 kernel runs, 24.05 cycles per processed query-head/KV update, zero K/V/O stalls,
+closed accounting, and 18.397/25.606 s Q1/Q2 prefill. Artifact
+`20260812T170744Z-characterize-32c539cee6c8` provides the same-f285 PS fallback
+control: repaired prefill wall is lower by 24.51%/21.86%, and flash command time
+fell from about 6.4 s to 0.691 s. Artifact
+`20260812T174506Z-p2c-repaired-c512` records 896 PL prefill calls and 3,584 kernel
+runs at 21.222 cycles per processed update, with exact counters and zero stalls.
+Its Q1/Q2 prefill wall is 79.132/104.541 s, down 50.63%/43.62% from the P2b
+160.300/185.434 s. Decode remains on the direct path at 33.315 cycles per update,
+96.093/119.008 ms/token of device time, and 108.446/137.450 ms/token steady wall.
+The slight device-time increase from P2b is consistent with f285; cycle efficiency
+is unchanged.
+
+Scale artifact `20260812T175007Z-p2c-repaired-c2048` completes the long-context
+gate. All 3,584 prefill calls and 14,336 kernel runs use `pl/staged`, totaling
+19,292,640,695/19,292,626,575 Q1/Q2 cycles at 20.494 cycles per processed
+query-head/KV update. Pair and beat counts are exact, K/V/O stalls are zero, and
+accounting closes. Q1/Q2 prefill wall is 425.994/813.215 s, 76.96%/57.79% below
+artifact `20260804T211805Z-baseline` at 1848.895/1926.439 s. Decode remains
+`pl/direct` at 32.944 cycles per update, 180.560/203.465 ms/token of device time,
+and 193.748/221.127 ms/token steady wall. Relative to P0, decode device time falls
+66.14%/63.33% and the flash scoreboard falls from about 459.1 to 115.7 ms/token.
+Relative to P2b Q1 at f300, cycles per update increase only 0.21% while device time
+increases 3.74%, consistent with f285. The unchanged 5.8/11.6 GiB Q1/Q2 backend
+downloads now expose the section-boundary work that P2c intentionally does not
+remove.
+
 ## Implementation Gates
 
-P2b beats the single-query baseline while preserving two distinct numerical gates:
+P2b and P2c preserve two distinct numerical gates:
 
 1. RTL versus `flash_ref` in hardware-approximation mode.
 2. PL versus the PS/full-model oracle at the established tolerance.
 
-The hardened flash-kernel and wrapper cosims now cover exact output hashes,
-production and non-power-of-two shapes, multiple tokens, randomized stream
-bubbles, output backpressure, stable stalled output, exact beat counts, one
-terminal `TLAST`, and valid `TKEEP`. The flash control proof covers tag ordering,
-addresses, GQA mapping, the KV barrier, accepted-configuration snapshots,
-framing, stream accounting, and minimum softmax issue spacing with arithmetic
-leaves stubbed.
+The hardened flash-kernel and wrapper cosims preserve the exact query-one hashes
+and cover production and non-power-of-two shapes, four-query Bonsai tiles,
+two-query 32-head tiles, partial tiles, randomized stream bubbles, output
+backpressure, stable stalled output, exact beat counts, one terminal `TLAST`, and
+valid `TKEEP`. K/V beat counts are independent of query count within one tile.
+The aggregate RTL suite passes 26/26 targets, alongside all 247 Zig tests.
+
+The formal suite uses the real controller with fixed-latency arithmetic stubs. Its
+compositional tasks prove scheduler tags and ordering, adaptive slot injectivity
+and bounds at both production maxima, two-stage BRAM-read alignment, sparse-mask
+advancement, II=1 softmax ordering, once-per-KV stream accounting, the KV barrier,
+completion, and bounded liveness. All nine wired tasks pass against the same
+production RTL used by cosim and OOC.
 
 The aggregate `zig build test-rtl` target combines those tests with binary and
 ternary GEMM cosim and passes both locally and through the Nix
 `checks.rtl-cosim` check.
 
-Query blocking must add a four-query causal case and consecutive independent
-softmax bursts after the path is truly II=1. K/V beat counts must then be
-independent of query count.
-
 Use the full-kernel OOC probe for resource and isolated-Fmax feedback and the
-combined routed build for timing signoff. P2c query-blocked PL prefill attention
-is the next implementation slice: first make softmax issue truly II=1, then add
-the four-query KV-outer schedule while preserving the query-one hashes and
-barriers. The current context-2048 prefill spends 1544.2 of 1725.8 device seconds
-in PS attention; that is 91.7% of summed profiled op-device time. It therefore
-precedes Q8 ingress, scratch-backed GEMM boundaries, and the FFN section.
+combined routed build for timing signoff. P2c's bounded implementation, route,
+identity, numerical, and profile gates are complete at f285. Do not infer f300
+deployability from the passing OOC result: both P2c f300 implementations failed
+their clean combined routes. The next P2 work is PL Q8 ingress and grouped
+activation reuse, scratch-backed GEMM output layouts, and then the first named FFN
+section.

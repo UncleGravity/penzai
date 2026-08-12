@@ -19,15 +19,30 @@ minutes because Vivado also optimizes the wide accumulator bank and complete
 dual-format control path. `flash-kernel` similarly covers the complete attention
 controller, BRAMs, and composed numeric pipelines; use it as the before/after P2
 resource and isolated-Fmax probe. P2b restored its registry period from the
-temporary P2a 3.600 ns baseline to the 3.333 ns production target. The current
-head-streamed scheduler plus bit-identical AXPY pipeline repair passes at
-`+0.291 ns` WNS with 60 DSPs, 22,109 LUTs, and 18,889 FFs (328.7 MHz estimated
-Fmax). This remains an OOC result. Released clean combined run
-`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` reached
-+0.033/+0.007 ns setup/hold after guarded placement and pre-route physical
-optimization. It clears the 25 ps development floor but remains below the 50 ps
-headroom target. The 12 paths below that target span the sequencer, flash, and
-GEMM, which is why combined routing rather than OOC Fmax remains authoritative.
+temporary P2a 3.600 ns baseline to the 3.333 ns production target.
+
+P2c is a concrete example of the OOC limitation. The fixed 128-slot query-blocked
+kernel passed OOC at `+0.215 ns` with 60 DSPs, 23,489 LUTs, 19,315 FFs, and 33 BRAM
+tiles, but its clean combined f300 route failed at `-0.035 ns` with 124 failing
+setup endpoints, 69.5 total BRAM tiles, and 98.91% CLB occupancy. The adaptive
+64-slot implementation retains four-query tiles for up to 16 heads, uses two-query
+tiles above 16 heads, and reduces flash OOC to 22,657 LUTs, 19,216 FFs, and 19
+BRAM tiles. It retains 60 DSPs and the same `+0.215 ns` WNS (320.7 MHz estimated
+Fmax). The adaptive result is retained in
+`out/runs/20260812T133852Z-95b751ff9ac3`.
+
+That smaller kernel still did not close in the combined design at f300. Adaptive
+run `20260812T144901Z-bbeac0c04eff-w512-p4-f300-clean` failed at `-0.088 ns`
+setup WNS with 231 failing endpoints and 560 paths below 50 ps. Clean f285 run
+`20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean` then passed at
+`+0.036/+0.010 ns` setup/hold with five paths below 50 ps. It uses 80,837 LUTs,
+95,229 FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy,
+and it was promoted, deployed, and board-qualified. It clears the 25 ps release
+floor but remains below the 50 ps headroom target. This is why combined routing,
+not OOC Fmax, remains authoritative; the OOC result did not establish f300
+deployability. Board qualification now extends through Q1/Q2 context 2048; the Q1
+attention schedule remains essentially cycle-neutral relative to P2b despite the
+lower release clock.
 
 ---
 
@@ -52,9 +67,9 @@ fails when there is no setup path or WNS is negative.
 
 Reference numbers (xck26 @ 3.333ns, current carry-save matmul): `gemm_rb_ooc` 398.9 MHz,
 `gemm_emit_ooc` 386.8 MHz, and the issue-ordered dual-format `gemm_kernel_ooc` 368.5 MHz
-(`+0.619 ns`, 38,439 LUTs, 42,796 FFs, 32 DSPs). The current P2b
-`flash_kernel_ooc` is 328.7 MHz (`+0.291 ns`, 22,109 LUTs, 18,889 FFs, 60 DSPs).
-All clear f300 in isolation, but see the caveat.
+(`+0.619 ns`, 38,439 LUTs, 42,796 FFs, 32 DSPs). The current adaptive P2c
+`flash_kernel_ooc` is 320.7 MHz (`+0.215 ns`, 22,657 LUTs, 19,216 FFs, 19 BRAM
+tiles, and 60 DSPs). All clear f300 in isolation, but see the caveat.
 
 ## Writing a new probe
 

@@ -48,15 +48,20 @@ count checks. One context-2048 feasibility run per model is also complete.
 Context-2048 prefill took 30.8/32.1 minutes for Q1/Q2. Each issued 255 graphs
 and 81,550 commands, with 5.8/11.6 GiB of backend downloads. At that context,
 attention is 86%/83% of decode device time. The effective KV rate is only about
-0.5 GB/s, far below the weight-stream bandwidth, so the current attention schedule
-is compute/control limited rather than DDR limited.
+0.5 GB/s, far below the weight-stream bandwidth, so the P0 attention schedule was
+compute/control limited rather than DDR limited.
 
-Prefill GEMMs already run in PL, but multi-token attention falls back to PS.
-Backend downloads grow from roughly 1.4/2.8 GiB for Q1/Q2 at a 512-token prompt;
-these are graph-boundary transfers, not GEMM kernel DMA counters. The measurements
-therefore require both section-level boundary removal and an earlier unified PL
-attention redesign. Old transport tail measurements taken through mixed SSH tunnels
-are not signoff data, but device-clock measurements are stable and trustworthy.
+At the P0 baseline, prefill GEMMs ran in PL but multi-token attention fell back to
+PS. P2c now executes supported primitive multi-token flash operations on PL in
+adaptive query tiles. Its released f285 image and bounded Q1/Q2 board gates are
+described below, including the completed context-2048 scale check.
+
+Backend downloads at the baseline grow from roughly 1.4/2.8 GiB for Q1/Q2 at a
+512-token prompt. Those are graph-boundary transfers, not GEMM-kernel DMA counters,
+and the primitive P2c bridge does not remove them. Section-level boundary removal
+therefore remains necessary. Old transport tail
+measurements taken through mixed SSH tunnels are not signoff data, but device-clock
+measurements are stable and trustworthy.
 
 The canonical unprofiled regression artifact is
 `20260805T001719Z-regression-632dcf611699` (fingerprint prefix
@@ -77,7 +82,7 @@ profiled measurements are compared only against profiled measurements.
 | Rank | Track | Why now | Completion gate |
 |---:|---|---|---|
 | 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
-| 1 | Bounded waste removal | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
+| 1 | Bounded waste removal (complete) | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
 | 2 | Section substrate and unified PL attention | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, faster 512/2K decode |
 | 3 | FFN section pipeline | Contained proof of the P2 scratch and command contracts | Named FFN command retains intermediates on chip and beats the op path |
 | 4 | Attention section pipeline | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | Named attention command with correct same-token KV visibility |
@@ -192,15 +197,17 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
 - [ ] Write GEMM results into banked scratch in the next consumer's layout.
 - [ ] Make prefill token/row layout conversion a scratchpad addressing problem,
   rather than a PS transpose and DDR round trip.
-- [ ] Extend the existing online attention recurrence with a query-tile axis.
-  Decode uses one query; prefill initially tiles 4-8 queries and reuses K/V.
+- [x] Extend the existing online attention recurrence with a query-tile axis.
+  Decode uses one query. The 64-slot implementation tiles four queries for up to
+  16 heads and two queries for 17-32 heads, reusing K/V within each tile.
 - [x] Pipeline single-query QK dot, online softmax update, and `p*V` accumulation
   across heads within each KV position, with a hard recurrence barrier between KV
   positions.
-- [ ] Before query-blocked attention, make the softmax issue path truly II=1 and
-  add alignment and burst tests for consecutive independent query/head updates.
-- [ ] Preserve FP32 softmax and output-accumulator state, and guarantee that newly
-  appended K/V rows are visible to the same causal attention operation.
+- [x] Make the softmax issue path truly II=1 and add alignment and burst tests for
+  consecutive independent query/head updates.
+- [x] Preserve FP32 softmax and output-accumulator state in the unified engine.
+- [ ] Guarantee that newly appended K/V rows are visible to the same causal named
+  attention section.
 - [ ] Require strict shape, layout, RoPE, normalization, mask, and KV-cache matches;
   retain the current PS/op path as the correctness fallback.
 - [ ] Add saturation counters and full-model logits/perplexity gates before replacing
@@ -260,14 +267,87 @@ promoted and deployed with a hash-verified receipt; Q1/Q2 logits checks had zero
 token mismatches, and characterization artifact
 `20260812T072252Z-characterize-ed0a92df72da` passed identity, exact-token,
 accounting, PL-backend, and zero K/V/O-stall checks. P2b is closed. Activation
-boundaries, query-blocked prefill attention, and P2 as a whole remain open.
+boundaries and P2 as a whole remain open; P2c status follows.
 
-P2c query-blocked PL prefill attention is next. In the current context-2048 Q1
-run, prefill took 1805.6 s wall and 1725.8 s device; PS attention alone consumed
-1544.2 s (91.7% of profiled op-device time), across 255 graphs, 67,339 commands,
-and 5.8 GiB of downloads. First make the softmax issue path truly II=1, then add
-the four-query KV-outer schedule and reuse each K/V tile across queries. Q8 ingress,
-scratch-backed GEMM boundaries, and the FFN section follow that measured bottleneck.
+P2c implements the measured attention bottleneck. The softmax issue path is II=1,
+and the primitive `flash_attn_f32` bridge gathers bounded Q/mask tiles, walks K/V
+outermost, streams each K/V tile once, and scatters the output back to the existing
+GGML layout. Decode still uses the direct single-query path. A 64-slot physical
+state contract keeps Bonsai's 16-head tile at four queries while limiting 17-32
+heads to two queries; the bitstream advertises this as flash engine
+`0xF1A54A01`, version 1, `QUERY_SLOTS=64`, through capability schema 2. Unknown
+IDs, versions, slot counts, shapes, strides, or masks fail closed to the PS path.
+
+The hardened kernel and wrapper cosims preserve the exact query-one hashes and
+cover four-query Bonsai tiles, two-query 32-head tiles, partial tiles, sparse and
+all-masked rows, input bubbles, output backpressure, beat counts, and framing.
+The aggregate RTL suite passes 26/26 targets; all 247 Zig tests pass. Compositional
+formal checks cover the adaptive slot map at both maximum shapes, scheduler tags
+and ordering, KV barriers, stream accounting, completion, liveness, and the added
+BRAM-read pipeline boundaries.
+
+The first fixed 128-slot tile-four implementation passed cosim, formal, and OOC
+at +0.215 ns WNS, but used 33 BRAM tiles in flash alone. Its clean combined f300
+route failed at -0.035 ns WNS with 124 failing setup endpoints, 69.5 total BRAM
+tiles, and 98.91% CLB occupancy; it was not deployed. The adaptive 64-slot design
+reduces the flash OOC result to 19 BRAM tiles, 22,657 LUTs, and 19,216 FFs while
+retaining 60 DSPs and +0.215 ns WNS (320.7 MHz estimated Fmax).
+
+The adaptive clean f300 route also failed closed: run
+`20260812T144901Z-bbeac0c04eff-w512-p4-f300-clean` reached -0.088 ns WNS with
+231 failing setup endpoints and 560 paths below 50 ps. No artifact was promoted.
+One deliberate clock qualification then produced clean f285 run
+`20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean`. It passes setup/hold at
++0.036/+0.010 ns, has five setup paths below 50 ps, and uses 80,837 LUTs, 95,229
+FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. It clears
+the 25 ps release floor but not the 50 ps headroom target, so the margin is valid
+but thin. The exact image was promoted and deployed with a hash-verified receipt;
+live capabilities report 284,997,152 Hz, engine `0xF1A54A01` version 1, and 64
+query slots.
+
+The first board prefill smoke truthfully fell back to PS and exposed an integration
+error rather than hiding it: the eligibility predicate had reversed the two Q
+strides. The supported GGML tensor is packed `[token][head][dimension]`, with
+`q_nb1 = n_heads * head_row_bytes` and `q_nb2 = head_row_bytes`. Commit `0dc91c0`
+corrects the predicate and tests the observed Bonsai strides; the RTL and deployed
+bitstream did not change.
+
+After that repair, bounded Q1/Q2 gates passed. The 32-token (`p32`) logit
+comparisons had zero token mismatches and maximum absolute differences of
+0.0982/0.1396. Artifact
+`20260812T174257Z-p2c-repaired-p128` reports multi-token prefill as `pl/staged`
+for all 224 calls and 896 kernel runs, 24.05 cycles per processed query-head/KV
+update, zero K/V/O stalls, closed accounting, and 18.397/25.606 s Q1/Q2 prefill.
+Against the same f285 image before the Q-layout eligibility repair, those walls
+are down 24.51%/21.86%; flash command time fell from about 6.4 s to 0.691 s.
+Artifact `20260812T174506Z-p2c-repaired-c512` reports all 896 prefill calls and
+3,584 kernel runs on the same PL path at 21.222 cycles per processed update with
+zero stalls. Q1/Q2 prefill fell from the P2b 160.300/185.434 s to
+79.132/104.541 s, reductions of 50.63%/43.62%. Decode remains `pl/direct` at
+33.315 cycles per update and
+96.093/119.008 ms/token of device time. The small device-time increase from P2b's
+93.715/115.429 ms/token is consistent with the qualified 285 MHz clock; the cycle
+schedule is essentially unchanged.
+
+The final scale artifact, `20260812T175007Z-p2c-repaired-c2048`, keeps every
+multi-token attention call on `pl/staged`: 3,584 calls, 14,336 kernel runs, and
+19,292,640,695/19,292,626,575 Q1/Q2 cycles. It sustains 20.494 cycles per processed
+query-head/KV update with exact pairs and beats, zero K/V/O stalls, and closed
+accounting. Q1/Q2 prefill is 425.994/813.215 s, 76.96%/57.79% below artifact
+`20260804T211805Z-baseline` at 1848.895/1926.439 s. Decode remains `pl/direct` at
+32.944 cycles per update, 180.560/203.465 ms/token of device time, and
+193.748/221.127 ms/token steady wall. Against P0, decode device time falls
+66.14%/63.33% and the flash scoreboard falls from about 459.1 to 115.7 ms/token.
+Against P2b Q1 at f300, device time is 3.74% higher but cycles per update are only
+0.21% higher, consistent with the f285 qualification clock. P2c is closed.
+
+P2c is deliberately a primitive-op bridge. The context-2048 run still downloads
+5.8/11.6 GiB for Q1/Q2 and retains the surrounding graph and command boundaries;
+that traffic now dominates prefill wall and transport. It also does not yet provide
+same-section K/V visibility. With route and board signoff complete, focus returns
+to PL Q8 ingress, grouped Q/K/V and gate/up activation reuse, banked-scratch GEMM
+output layouts, and then the first named FFN section. P2 as a whole remains open
+until those boundaries and the named section commands exist.
 
 ### P3: FFN section
 
@@ -359,15 +439,16 @@ remain. They are not currently independent roadmap projects:
 - the read-column pair is registered before its final add;
 - the DSP multiply output is already registered before the 104-bit shift result.
 
-The released clean P2b timing run reports +0.033 ns setup and +0.007 ns hold slack,
-with 12 setup paths below the 50 ps target. It uses 80,108 LUTs, 94,587 FFs,
-48.5 BRAMs, four URAMs, and 92 DSPs; 98.25% of CLBs are occupied. Its short tail
-spans the disabled sequencer, flash, and several unrelated GEMM paths. The repaired
-AXPY two-DSP cascade is absent. Two existing critical methodology warnings remain.
-Therefore:
+The released adaptive P2c build is the clean f285 run described above. It reports
++0.036 ns setup and +0.010 ns hold slack, with five setup paths below the 50 ps
+target. The fixed and adaptive designs both failed clean f300 routing despite
+passing OOC; the adaptive f300 failure had -0.088 ns WNS and a mixed
+flash/GEMM/DMA timing tail. This is direct evidence that combined routing, not OOC
+Fmax, remains the release authority. Two existing critical clock methodology
+warnings remain. Therefore:
 
 - keep 25 ps as the hard development release floor and 50 ps as the headroom target;
-- route P2c early because dense placement and heterogeneous path ownership dominate;
+- treat f285 as the current deployed qualification point, not proof of f300 closure;
 - resolve the clock methodology warnings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
 - treat timing locality and reproducible headroom as build requirements for every phase.
