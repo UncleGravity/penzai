@@ -20,6 +20,9 @@ void dut_set_num_rows(Dut *, uint32_t v);
 void dut_set_num_cols(Dut *, int v);
 void dut_set_emin(Dut *, int v);                     /* signed 8-bit window floor */
 void dut_set_weight_fmt(Dut *, int v);
+void dut_set_act_mode(Dut *, int v);
+void dut_set_act_epoch(Dut *, uint32_t v);
+void dut_set_activation_abort(Dut *, int v);
 void dut_set_w(Dut *, const uint32_t *w, int nwords, int valid); /* ROWS*32-bit weight beat */
 void dut_set_a(Dut *, uint64_t data, int valid);     /* 64-bit acts beat */
 void dut_set_m_ready(Dut *, int v);
@@ -33,6 +36,11 @@ uint64_t dut_m_data(Dut *);
 int dut_busy(Dut *);
 int dut_done(Dut *);
 int dut_state(Dut *);
+int dut_activation_error(Dut *);
+int dut_activation_valid(Dut *);
+uint32_t dut_loaded_act_epoch(Dut *);
+int dut_loaded_act_q1_blocks(Dut *);
+int dut_loaded_act_cols(Dut *);
 
 #ifdef __cplusplus
 }

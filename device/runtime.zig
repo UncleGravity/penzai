@@ -22,6 +22,7 @@ pub const seq_smoke = @import("pl/seq_smoke.zig");
 const wire = shared.wire;
 const profiling = shared.profiling;
 const capabilities = shared.capabilities;
+const layout = shared.layout;
 
 pub const RuntimeError = error{
     InvalidRequest,
@@ -411,6 +412,128 @@ pub fn RuntimeFor(comptime Heap: type) type {
                     };
                     return .{ .backend = .ps, .path = .software, .detail = .{ .matmul = .{ .path = .software } } };
                 },
+                .matmul_q1a8_group2 => |group| {
+                    const first = group.projections[0];
+                    const second = group.projections[1];
+                    const rows: usize = first.rows;
+                    const cols: usize = group.cols;
+                    const k: usize = group.k;
+                    if (first.rows == 0 or group.cols == 0 or group.k == 0 or
+                        first.rows != second.rows or first.weight_fmt != second.weight_fmt or
+                        @mod(k, layout.q1_block) != 0)
+                    {
+                        return error.InvalidRequest;
+                    }
+                    const q1_blocks = k / layout.q1_block;
+                    const bytes_per_block = switch (first.weight_fmt) {
+                        .w1a8 => layout.packed_per_q1_block,
+                        .w158a8 => layout.ternary_packed_per_block,
+                    };
+                    const expected_weights = checkedProduct3(layout.rowblocksFor(rows), q1_blocks, bytes_per_block) orelse return error.InvalidRequest;
+                    const expected_acts = checkedProduct3(cols, k, @sizeOf(f32)) orelse return error.InvalidRequest;
+                    const expected_dst = checkedProduct3(rows, cols, @sizeOf(f32)) orelse return error.InvalidRequest;
+                    if (first.weights.nbytes != expected_weights or second.weights.nbytes != expected_weights or
+                        group.acts.nbytes != expected_acts or first.dst.nbytes != expected_dst or second.dst.nbytes != expected_dst or
+                        rangesOverlap(first.dst, second.dst) or
+                        rangesOverlap(first.dst, group.acts) or rangesOverlap(second.dst, group.acts) or
+                        rangesOverlap(first.dst, first.weights) or rangesOverlap(first.dst, second.weights) or
+                        rangesOverlap(second.dst, first.weights) or rangesOverlap(second.dst, second.weights))
+                    {
+                        return error.InvalidRequest;
+                    }
+
+                    const primitives = [2]wire.MatmulQ1A8{
+                        .{
+                            .weights = first.weights,
+                            .acts = group.acts,
+                            .dst = first.dst,
+                            .rows = first.rows,
+                            .cols = group.cols,
+                            .k = group.k,
+                            .weight_fmt = first.weight_fmt,
+                        },
+                        .{
+                            .weights = second.weights,
+                            .acts = group.acts,
+                            .dst = second.dst,
+                            .rows = second.rows,
+                            .cols = group.cols,
+                            .k = group.k,
+                            .weight_fmt = second.weight_fmt,
+                        },
+                    };
+
+                    // Validate every backing range before either projection can
+                    // start. This preserves fail-before-write behavior even on
+                    // the compatibility path that executes two primitive PL
+                    // commands against a pre-v13 bitstream.
+                    _ = self.heap.read(group.acts) catch |err| return mapHeapError(err);
+                    _ = self.heap.read(first.weights) catch |err| return mapHeapError(err);
+                    _ = self.heap.read(second.weights) catch |err| return mapHeapError(err);
+                    _ = self.heap.bytes(first.dst) catch |err| return mapHeapError(err);
+                    _ = self.heap.bytes(second.dst) catch |err| return mapHeapError(err);
+
+                    if (comptime pl_supported) {
+                        if (self.pl) |*backend| {
+                            const maybe = backend.tryMatmulGroup2(&self.heap, group, ctx) catch |err| {
+                                std.debug.print("pl grouped matmul failed: {s}\n", .{@errorName(err)});
+                                return error.BackendFailure;
+                            };
+                            if (maybe) |execution| {
+                                if (self.pl_verify) {
+                                    self.verifyMatmul(primitives[0]);
+                                    self.verifyMatmul(primitives[1]);
+                                }
+                                return .{ .backend = .pl, .path = execution.path, .detail = .{ .matmul = execution } };
+                            }
+
+                            // Preserve PL execution with a pre-reuse bitstream.
+                            // Both descriptors have identical validated shape and
+                            // format, so primitive eligibility is lockstep.
+                            const first_execution = backend.tryMatmul(&self.heap, primitives[0], ctx) catch |err| {
+                                std.debug.print("pl grouped fallback matmul failed: {s}\n", .{@errorName(err)});
+                                return error.BackendFailure;
+                            };
+                            if (first_execution) |first_result| {
+                                const second_execution = backend.tryMatmul(&self.heap, primitives[1], ctx) catch |err| {
+                                    std.debug.print("pl grouped fallback matmul failed: {s}\n", .{@errorName(err)});
+                                    return error.BackendFailure;
+                                };
+                                const second_result = second_execution orelse {
+                                    std.debug.print("pl grouped primitive eligibility diverged after first projection\n", .{});
+                                    return error.BackendFailure;
+                                };
+                                if (self.pl_verify) {
+                                    self.verifyMatmul(primitives[0]);
+                                    self.verifyMatmul(primitives[1]);
+                                }
+                                const execution = combineMatmulExecutions(first_result, second_result);
+                                return .{ .backend = .pl, .path = execution.path, .detail = .{ .matmul = execution } };
+                            }
+                        }
+                    }
+
+                    // The grouped command is the stable hook for PL-resident Q8
+                    // reuse. Until that engine path is enabled, this shared-
+                    // quantization PS oracle preserves the command semantics.
+                    const acts = self.heap.read(group.acts) catch |err| return mapHeapError(err);
+                    const weights = [2][]const u8{
+                        self.heap.read(first.weights) catch |err| return mapHeapError(err),
+                        self.heap.read(second.weights) catch |err| return mapHeapError(err),
+                    };
+                    const dst = [2][]u8{
+                        self.heap.bytes(first.dst) catch |err| return mapHeapError(err),
+                        self.heap.bytes(second.dst) catch |err| return mapHeapError(err),
+                    };
+                    ps_matmul_q1a8.runGroup2(self.allocator, .{
+                        .{ .packed_weights = weights[0], .dst_f32 = dst[0] },
+                        .{ .packed_weights = weights[1], .dst_f32 = dst[1] },
+                    }, acts, first.rows, group.cols, group.k, first.weight_fmt) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        else => return error.InvalidRequest,
+                    };
+                    return .{ .backend = .ps, .path = .software };
+                },
                 .rmsnorm => |rmsnorm| {
                     const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
                     const dst = self.heap.bytes(rmsnorm.dst) catch |err| return mapHeapError(err);
@@ -588,6 +711,52 @@ fn rhsRowBroadcast(mode: wire.BinaryF32Mode) bool {
     };
 }
 
+fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
+    if (a.handle != b.handle or a.nbytes == 0 or b.nbytes == 0) return false;
+    const a_end = std.math.add(u64, a.offset, a.nbytes) catch return true;
+    const b_end = std.math.add(u64, b.offset, b.nbytes) catch return true;
+    return a.offset < b_end and b.offset < a_end;
+}
+
+fn checkedProduct3(a: usize, b: usize, c: usize) ?usize {
+    const ab = std.math.mul(usize, a, b) catch return null;
+    return std.math.mul(usize, ab, c) catch null;
+}
+
+fn combineMatmulExecutions(a: profile.MatmulExecution, b: profile.MatmulExecution) profile.MatmulExecution {
+    return .{
+        .path = if (a.path == .staged or b.path == .staged) .staged else .direct,
+        .kernel_runs = a.kernel_runs +| b.kernel_runs,
+        .wrapper_ns = a.wrapper_ns +| b.wrapper_ns,
+        .quantize_pack_ns = a.quantize_pack_ns +| b.quantize_pack_ns,
+        .sync_to_ns = a.sync_to_ns +| b.sync_to_ns,
+        .setup_ns = a.setup_ns +| b.setup_ns,
+        .wait_ns = a.wait_ns +| b.wait_ns,
+        .sync_from_ns = a.sync_from_ns +| b.sync_from_ns,
+        .result_layout_ns = a.result_layout_ns +| b.result_layout_ns,
+        .cycles = a.cycles +| b.cycles,
+        .w_stall_cycles = a.w_stall_cycles +| b.w_stall_cycles,
+        .a_stall_cycles = a.a_stall_cycles +| b.a_stall_cycles,
+        .r_stall_cycles = a.r_stall_cycles +| b.r_stall_cycles,
+        .w_beats = a.w_beats +| b.w_beats,
+        .a_beats = a.a_beats +| b.a_beats,
+        .r_beats = a.r_beats +| b.r_beats,
+    };
+}
+
+test "matmul execution aggregation preserves staged path and sums counters" {
+    const combined = combineMatmulExecutions(
+        .{ .path = .direct, .kernel_runs = 1, .wrapper_ns = 10, .quantize_pack_ns = 2, .cycles = 20, .a_beats = 5 },
+        .{ .path = .staged, .kernel_runs = 2, .wrapper_ns = 30, .quantize_pack_ns = 3, .cycles = 40, .a_beats = 7 },
+    );
+    try std.testing.expectEqual(profiling.ExecutionPath.staged, combined.path);
+    try std.testing.expectEqual(@as(u32, 3), combined.kernel_runs);
+    try std.testing.expectEqual(@as(u64, 40), combined.wrapper_ns);
+    try std.testing.expectEqual(@as(u64, 5), combined.quantize_pack_ns);
+    try std.testing.expectEqual(@as(u64, 60), combined.cycles);
+    try std.testing.expectEqual(@as(u64, 12), combined.a_beats);
+}
+
 const FlashWork = struct {
     valid_n_kv: u32,
     valid_qkv_pairs: u64,
@@ -695,6 +864,57 @@ fn mapKernelError(err: anyerror) RuntimeError {
         error.OutOfMemory => error.OutOfMemory,
         else => error.InvalidRequest,
     };
+}
+
+test "runtime executes atomic grouped binary matmul and rejects overlapping outputs" {
+    const rows = layout.rows_per_block;
+    const k = layout.q1_block;
+    const packed_len = comptime layout.packedWeightBytes(rows, k) catch unreachable;
+    var runtime = try Runtime.init(std.testing.allocator, 64 * 1024);
+    defer runtime.deinit();
+
+    var positive_bits: [rows]u128 = [_]u128{std.math.maxInt(u128)} ** rows;
+    var negative_bits: [rows]u128 = [_]u128{0} ** rows;
+    var scales: [rows]f16 = [_]f16{1} ** rows;
+    var packed_positive: [packed_len]u8 = undefined;
+    var packed_negative: [packed_len]u8 = undefined;
+    try layout.packWeightsFromLogical(rows, k, &positive_bits, &scales, &packed_positive);
+    try layout.packWeightsFromLogical(rows, k, &negative_bits, &scales, &packed_negative);
+
+    const weights0 = try rawTensor(&runtime, packed_len, 64);
+    const weights1 = try rawTensor(&runtime, packed_len, 64);
+    const acts = try tensor(&runtime, k);
+    const dst0 = try tensor(&runtime, rows);
+    const dst1 = try tensor(&runtime, rows);
+    try runtime.heap.write(weights0, &packed_positive);
+    try runtime.heap.write(weights1, &packed_negative);
+    const acts_bytes = try runtime.heap.bytes(acts);
+    for (0..k) |i| writeF32(acts_bytes, i, 127);
+
+    const group = wire.MatmulQ1A8Group2{
+        .acts = acts,
+        .projections = .{
+            .{ .weights = weights0, .dst = dst0, .rows = rows, .weight_fmt = .w1a8 },
+            .{ .weights = weights1, .dst = dst1, .rows = rows, .weight_fmt = .w1a8 },
+        },
+        .cols = 1,
+        .k = k,
+    };
+    const outcome = try runtime.execute(.{ .matmul_q1a8_group2 = group }, null);
+    try std.testing.expectEqual(profiling.Backend.ps, outcome.backend);
+    try expectTensor(&runtime, dst0, &([_]f32{@floatFromInt(127 * k)} ** rows));
+    try expectTensor(&runtime, dst1, &([_]f32{-@as(f32, @floatFromInt(127 * k))} ** rows));
+
+    var overlapping = group;
+    overlapping.projections[1].dst = dst0;
+    try std.testing.expectError(error.InvalidRequest, runtime.execute(.{ .matmul_q1a8_group2 = overlapping }, null));
+
+    var invalid_second = group;
+    invalid_second.projections[1].weights.handle = std.math.maxInt(u64);
+    try runtime.heap.fill(dst0, 0xA5);
+    try std.testing.expectError(error.UnknownHandle, runtime.execute(.{ .matmul_q1a8_group2 = invalid_second }, null));
+    const untouched = try runtime.heap.read(dst0);
+    for (untouched) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
 }
 
 test "runtime dispatches ps f32 command variants" {

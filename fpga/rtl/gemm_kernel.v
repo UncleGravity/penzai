@@ -33,8 +33,16 @@ module gemm_kernel #(
     input  wire [31:0]           num_rows,
     input  wire [15:0]           num_cols,
     input  wire [1:0]            weight_fmt,
+    input  wire [1:0]            act_mode,
+    input  wire [31:0]           act_epoch,
+    input  wire                  activation_abort,
     input  wire signed [7:0]     emin,            // global window floor (calibration, set once)
     output reg                   kernel_done,
+    output reg                   activation_error,
+    output reg                   activation_valid,
+    output reg  [31:0]           loaded_act_epoch,
+    output reg  [15:0]           loaded_act_q1_blocks,
+    output reg  [15:0]           loaded_act_cols,
     output wire                  busy,
 
     input  wire [ROWS*32-1:0]    s_axis_tdata,
@@ -68,6 +76,11 @@ module gemm_kernel #(
     localparam [3:0] ST_TLOAD       = 4'd9;
     localparam [3:0] ST_TCODE0      = 4'd10;
     localparam [3:0] ST_TCODE1      = 4'd11;
+    localparam [3:0] ST_ERROR       = 4'd12;
+
+    localparam [1:0] ACT_PACKED_LOAD = 2'd0;
+    localparam [1:0] ACT_REUSE       = 2'd1;
+    localparam [1:0] ACT_RAW_LOAD    = 2'd2;
 
     // gemm_rowblock latency input→acc = FE_LAT(4) + fma(5) = 9. Wait this (plus the issue
     // register + margin) after the last issue before reading acc; the cosim drain gates it.
@@ -93,6 +106,8 @@ module gemm_kernel #(
     reg [15:0] run_num_cols;
     reg signed [7:0] run_emin;
     reg [1:0] run_weight_fmt;
+    reg [1:0] run_act_mode;
+    reg [31:0] run_act_epoch;
     reg [15:0] rowblock_remaining;
     reg [13:0] q1_idx;
     reg [1:0]  sub;
@@ -286,6 +301,13 @@ module gemm_kernel #(
             run_num_cols        <= 16'd0;
             run_emin            <= 8'sd0;
             run_weight_fmt      <= 2'd1;
+            run_act_mode        <= ACT_PACKED_LOAD;
+            run_act_epoch       <= 32'd0;
+            activation_error    <= 1'b0;
+            activation_valid    <= 1'b0;
+            loaded_act_epoch    <= 32'd0;
+            loaded_act_q1_blocks <= 16'd0;
+            loaded_act_cols     <= 16'd0;
             rowblock_remaining  <= 16'd0;
             q1_idx              <= 14'd0;
             sub                 <= 2'd0;
@@ -336,12 +358,40 @@ module gemm_kernel #(
                 run_num_cols      <= num_cols;
                 run_emin          <= emin;
                 run_weight_fmt    <= weight_fmt;
+                run_act_mode      <= act_mode;
+                run_act_epoch     <= act_epoch;
+                activation_error  <= 1'b0;
                 acts_load_beat <= 3'd0;
                 acts_load_q1   <= 14'd0;
                 acts_load_sub  <= 2'd0;
                 acts_load_col  <= 16'd0;
-                state          <= ST_LOAD_ACTS;
+                if ((act_mode == ACT_PACKED_LOAD) || (act_mode == ACT_RAW_LOAD)) begin
+                    // A new load owns the native Q8 memories. Do not advertise it as
+                    // reusable until the final scale beat has committed.
+                    activation_valid <= 1'b0;
+                    state <= ST_LOAD_ACTS;
+                end else if ((act_mode == ACT_REUSE) && activation_valid &&
+                             (loaded_act_epoch == act_epoch) &&
+                             (loaded_act_q1_blocks == num_q1_blocks) &&
+                             (loaded_act_cols == num_cols)) begin
+                    rowblock_remaining <= num_rowblocks;
+                    q1_idx             <= 14'd0;
+                    sub                <= 2'd0;
+                    col                <= 16'd0;
+                    state              <= (weight_fmt == 2'd2) ? ST_TLOAD : ST_WSCALE;
+                end else begin
+                    // A bad reuse request must never consume weights or emit results.
+                    // The wrapper reports this run error so the driver can reset any
+                    // already-armed DMA channels instead of accepting stale data.
+                    activation_error <= 1'b1;
+                    state            <= ST_ERROR;
+                end
             end else if (busy_q) begin
+                if (activation_abort && state != ST_ERROR) begin
+                    activation_error <= 1'b1;
+                    activation_valid <= 1'b0;
+                    state            <= ST_ERROR;
+                end else begin
                 case (state)
                     ST_LOAD_ACTS: begin
                         if (acts_beat_accept) begin
@@ -372,6 +422,10 @@ module gemm_kernel #(
                                     acts_load_q1 <= 14'd0;
                                     if (acts_load_col + 16'd1 == run_num_cols) begin
                                         // All columns loaded - begin matmul.
+                                        activation_valid     <= 1'b1;
+                                        loaded_act_epoch     <= run_act_epoch;
+                                        loaded_act_q1_blocks <= run_num_q1_blocks;
+                                        loaded_act_cols      <= run_num_cols;
                                         rowblock_remaining <= run_num_rowblocks;
                                         q1_idx             <= 14'd0;
                                         sub                <= 2'd0;
@@ -521,11 +575,18 @@ module gemm_kernel #(
                         state       <= ST_IDLE;
                     end
 
+                    ST_ERROR: begin
+                        kernel_done <= 1'b1;
+                        busy_q      <= 1'b0;
+                        state       <= ST_IDLE;
+                    end
+
                     default: begin
                         state  <= ST_IDLE;
                         busy_q <= 1'b0;
                     end
                 endcase
+                end
             end
         end
     end

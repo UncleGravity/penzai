@@ -41,6 +41,15 @@ void dut_set_axi_write(Dut *d, uint8_t addr, uint32_t data, int valid) {
     d->t->s_axi_arvalid = 0;
     d->t->s_axi_rready = 1;
 }
+void dut_set_axi_read(Dut *d, uint8_t addr, int valid) {
+    d->t->s_axi_awvalid = 0;
+    d->t->s_axi_wvalid = 0;
+    d->t->s_axi_bready = 1;
+    d->t->s_axi_araddr = addr;
+    d->t->s_axi_arprot = 0;
+    d->t->s_axi_arvalid = valid;
+    d->t->s_axi_rready = 1;
+}
 void dut_set_axi_idle(Dut *d) {
     d->t->s_axi_awvalid = 0;
     d->t->s_axi_wvalid = 0;
@@ -80,11 +89,11 @@ void dut_set_w(Dut *d, int port, const uint32_t *w, int valid) {
     }
 }
 
-void dut_set_a(Dut *d, uint64_t data, int valid) {
+void dut_set_a(Dut *d, uint64_t data, int valid, int last) {
     d->t->s_axis_acts_tdata = data;
     d->t->s_axis_acts_tkeep = 0xff;
     d->t->s_axis_acts_tvalid = valid;
-    d->t->s_axis_acts_tlast = 0;
+    d->t->s_axis_acts_tlast = last;
 }
 void dut_set_m_ready(Dut *d, int v) { d->t->m_axis_tready = v; }
 
@@ -102,4 +111,6 @@ int dut_m_valid(Dut *d) { return d->t->m_axis_tvalid; }
 int dut_m_last(Dut *d) { return d->t->m_axis_tlast; }
 int dut_m_keep(Dut *d) { return d->t->m_axis_tkeep; }
 uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
+int dut_axi_rvalid(Dut *d) { return d->t->s_axi_rvalid; }
+uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }
 }

@@ -1,10 +1,10 @@
 //! PL Q1A8 matmul backend: drives the fabric kernel for a wire matmul command.
 //!
-//! Weights are streamed straight from their resident XRT BO range. Activations
-//! are quantized with the *canonical* quantizer (`shared.layout.quantizeQ8_0`, the
-//! same round-nearest-even the PS oracle uses, so PL and PS feed bit-identical
-//! int8), packed into a staging region, and DMA'd in. Results DMA into a staging
-//! region and copy into the destination range.
+//! Weights are streamed straight from their resident XRT BO range. Primitive
+//! matmuls use the canonical host quantizer and a packed-Q8 staging region. The
+//! atomic group path instead streams FP32 once through the exact PL quantizer,
+//! then reuses the resident native-Q8 activation for its second projection.
+//! Results DMA into a staging region and copy into the destination range.
 //!
 //! The v8 kernel uses four contiguous weight-port streams: port N stores rows
 //! `N*4..N*4+3` of each 16-row block. The RTL zips those
@@ -47,7 +47,7 @@ const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gath
 // Errors this op can raise: the DMA substrate's, this kernel's, plus heap failures.
 // SeqDispatch = the seq.v arm refused or failed a run (details already printed); never
 // silently retried over MMIO — a failed replay means the stream or executor needs looking at.
-const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock };
+const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock, ActivationState, ActivationQuantization };
 pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory, SeqDispatch };
 
 // ---- The matmul kernel AXI-Lite driver (a tenant on the PL substrate) -------
@@ -57,6 +57,14 @@ pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemor
 
 const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
+const ACT_STATE_VALID: u32 = 1 << 0;
+const ACT_STATE_ERROR: u32 = 1 << 1;
+
+const ActivationMode = enum(u32) {
+    packed_load = 0,
+    reuse = 1,
+    raw_f32_load = 2,
+};
 
 /// Minimum kernel VERSION the driver accepts. v9 is the fixed-window gemm kernel (104-bit
 /// accumulator, EMIN baked in as a format constant — no EMIN register). The driver no longer
@@ -71,6 +79,7 @@ pub const version_with_counters: u32 = 5;
 pub const version_with_seq: u32 = 10;
 pub const version_with_ternary: u32 = 11;
 pub const version_with_logical_rows: u32 = 12;
+pub const version_with_activation_reuse: u32 = 13;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -110,6 +119,10 @@ pub const Kernel = struct {
         return self.version >= version_with_counters;
     }
 
+    pub fn hasActivationReuse(self: Kernel) bool {
+        return self.version >= version_with_activation_reuse;
+    }
+
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
     pub fn clkMhz(self: Kernel) f64 {
         return @as(f64, @floatFromInt(self.clk_hz)) / 1_000_000.0;
@@ -128,20 +141,72 @@ pub const Kernel = struct {
         logical_rows: ?u32,
         weight_fmt: wire.WeightFormat,
     ) void {
+        self.runWithActivation(
+            num_q1_blocks,
+            num_rowblocks,
+            num_cols,
+            logical_rows,
+            weight_fmt,
+            .packed_load,
+            0,
+        );
+    }
+
+    pub fn runWithActivation(
+        self: *Kernel,
+        num_q1_blocks: u32,
+        num_rowblocks: u32,
+        num_cols: u32,
+        logical_rows: ?u32,
+        weight_fmt: wire.WeightFormat,
+        activation_mode: ActivationMode,
+        activation_epoch: u32,
+    ) void {
         self.win.wr(regmap.offsetOf("NUM_Q1_BLOCKS"), num_q1_blocks);
         self.win.wr(regmap.offsetOf("NUM_ROWBLOCKS"), num_rowblocks);
         self.win.wr(regmap.offsetOf("NUM_COLS"), num_cols);
         if (logical_rows) |rows| self.win.wr(regmap.offsetOf("NUM_ROWS"), rows);
         self.win.wr(regmap.offsetOf("WEIGHT_FMT"), @intFromEnum(weight_fmt));
+        if (self.hasActivationReuse()) {
+            self.win.wr(regmap.offsetOf("ACT_MODE"), @intFromEnum(activation_mode));
+            self.win.wr(regmap.offsetOf("ACT_EPOCH"), activation_epoch);
+        } else {
+            std.debug.assert(activation_mode == .packed_load);
+        }
         self.win.wr(regmap.offsetOf("CTRL"), CTRL_START);
     }
 
     pub fn waitDone(self: *Kernel) KernelError!void {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
-            if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) return;
+            if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) {
+                if (self.hasActivationReuse() and
+                    self.win.rd(regmap.offsetOf("ACT_STATE")) & ACT_STATE_ERROR != 0)
+                {
+                    if (self.quantStatus() != 0) return error.ActivationQuantization;
+                    return error.ActivationState;
+                }
+                return;
+            }
         }
         return error.KernelTimeout;
+    }
+
+    pub fn residentMatches(self: Kernel, epoch: u32, q1_blocks: u32, cols: u32) bool {
+        if (!self.hasActivationReuse()) return false;
+        if (self.win.rd(regmap.offsetOf("ACT_STATE")) & ACT_STATE_VALID == 0) return false;
+        return self.win.rd(regmap.offsetOf("LOADED_EPOCH")) == epoch and
+            self.win.rd(regmap.offsetOf("LOADED_Q1_BLOCKS")) == q1_blocks and
+            self.win.rd(regmap.offsetOf("LOADED_COLS")) == cols;
+    }
+
+    pub fn quantStatus(self: Kernel) u32 {
+        if (!self.hasActivationReuse()) return 0;
+        return self.win.rd(regmap.offsetOf("QUANT_STATUS"));
+    }
+
+    pub fn selectPackedActivation(self: *Kernel) void {
+        if (self.hasActivationReuse()) self.win.wr(regmap.offsetOf("ACT_MODE"), @intFromEnum(ActivationMode.packed_load));
     }
 
     pub fn cycles(self: Kernel) u32 {
@@ -288,6 +353,7 @@ pub fn Backend(comptime Heap: type) type {
         column: []f32 = &.{},
         quants: []i8 = &.{},
         act_scales: []f16 = &.{},
+        next_activation_epoch: u32 = 1,
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             // The resident weight packing splits each 16-row block across this
@@ -295,6 +361,9 @@ pub fn Backend(comptime Heap: type) type {
             comptime std.debug.assert(dma_w_bases.len == layout.weight_ports);
             var kernel = try Kernel.open(kernel_base);
             errdefer kernel.deinit();
+            // Userspace can restart without reconfiguring PL. Restore the
+            // legacy-safe mode before any optional seq.v command can run.
+            kernel.selectPackedActivation();
 
             // The gemm window floor is baked into the kernel (decode_top.EMIN_FLOOR), so there
             // is nothing to write here — the 104-bit accumulator covers the full f16 range with
@@ -463,7 +532,10 @@ pub fn Backend(comptime Heap: type) type {
                     try self.dma_a.startReadFromDdr(acts_phys, act_total);
                     self.kernel.run(@intCast(q1_blocks), @intCast(num_rb), @intCast(group), result_plan.logical_rows, mm.weight_fmt);
                     result.setup_ns +|= profile.lap(ctx, &last);
-                    try self.kernel.waitDone();
+                    self.kernel.waitDone() catch |err| {
+                        self.abortProjectionDmas();
+                        return err;
+                    };
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
                     try self.dma_a.waitReadDone();
                     try self.dma_w[0].waitWriteDone();
@@ -495,6 +567,161 @@ pub fn Backend(comptime Heap: type) type {
             result.a_beats = counters.a_beats;
             result.r_beats = counters.r_beats;
             return result;
+        }
+
+        /// Execute the atomic gate/up projection group. Each column tile enters
+        /// as raw FP32 and is quantized in PL once; the second projection reuses
+        /// the exact native-Q8 payload already resident in gemm_kernel.
+        pub fn tryMatmulGroup2(
+            self: *Self,
+            heap: *Heap,
+            group_op: wire.MatmulQ1A8Group2,
+            ctx: ?*profile.ProfileContext,
+        ) Error!?profile.MatmulExecution {
+            if (!self.kernel.hasActivationReuse()) return null;
+
+            const first = group_op.projections[0];
+            const second = group_op.projections[1];
+            if (first.rows == 0 or group_op.cols == 0 or group_op.k == 0 or
+                first.rows != second.rows or first.weight_fmt != second.weight_fmt)
+            {
+                return null;
+            }
+            if (groupRangesOverlap(group_op)) return null;
+            if (first.weight_fmt == .w158a8 and self.kernel.version < version_with_ternary) return null;
+
+            const rows: usize = first.rows;
+            const cols: usize = group_op.cols;
+            const k: usize = group_op.k;
+            if (k % layout.q1_block != 0) return null;
+            const q1_blocks = k / layout.q1_block;
+            if (q1_blocks > layout.max_q1_blocks) return null;
+            const num_rb = layout.rowblocksFor(rows);
+            const bytes_per_port_block = switch (first.weight_fmt) {
+                .w1a8 => layout.packed_per_port_q1_block,
+                .w158a8 => layout.ternary_packed_per_port_block,
+            };
+            const weight_port_bytes = num_rb * q1_blocks * bytes_per_port_block;
+            const weight_bytes = weight_port_bytes * layout.weight_ports;
+            const dst_bytes = rows * cols * @sizeOf(f32);
+            if (first.weights.nbytes != weight_bytes or second.weights.nbytes != weight_bytes) return null;
+            if (group_op.acts.nbytes != k * cols * @sizeOf(f32)) return null;
+            if (first.dst.nbytes != dst_bytes or second.dst.nbytes != dst_bytes) return null;
+            if (num_rb * mc_cols_max * result_bytes_per_rb > result_staging_cap) return null;
+
+            const wrapper_start = profile.begin(ctx);
+            const projections = group_op.projections;
+            const dst_bufs = [2][]u8{
+                heap.bytes(first.dst) catch return error.HeapFailure,
+                heap.bytes(second.dst) catch return error.HeapFailure,
+            };
+            var weight_phys: [2][layout.weight_ports]u64 = undefined;
+            for (projections, 0..) |projection, projection_index| {
+                const base = heap.deviceAddress(projection.weights) catch return error.HeapFailure;
+                for (&weight_phys[projection_index], 0..) |*phys, port| {
+                    phys.* = base + @as(u64, @intCast(port * weight_port_bytes));
+                }
+            }
+
+            var counters: Counters = .{};
+            var result = profile.MatmulExecution{ .path = .direct };
+            var last = wrapper_start;
+            // A later primitive seq program assumes the legacy packed-load reset
+            // mode, so restore it even if a grouped DMA or kernel wait fails.
+            defer self.kernel.selectPackedActivation();
+
+            var col0: usize = 0;
+            while (col0 < cols) {
+                const tile_cols = @min(mc_cols_max, cols - col0);
+                const act_total = tile_cols * k * @sizeOf(f32);
+                const result_plan = resultPlan(rows, tile_cols, num_rb, self.kernel.hasLogicalRows());
+                if (!result_plan.direct) result.path = .staged;
+                const acts_dma = offsetRange(group_op.acts, col0 * k * @sizeOf(f32), act_total);
+                heap.syncToDevice(acts_dma) catch return error.HeapFailure;
+                result.sync_to_ns +|= profile.lap(ctx, &last);
+                const acts_phys = heap.deviceAddress(acts_dma) catch return error.HeapFailure;
+                const epoch = self.takeActivationEpoch();
+
+                for (projections, 0..) |projection, projection_index| {
+                    const result_dma = if (result_plan.direct)
+                        offsetRange(projection.dst, col0 * rows * @sizeOf(f32), result_plan.dma_bytes)
+                    else
+                        subRange(self.result_staging, result_plan.dma_bytes);
+                    const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
+                    const activation_mode: ActivationMode = if (projection_index == 0) .raw_f32_load else .reuse;
+
+                    // Check reuse before arming any mover. An impossible resident
+                    // mismatch therefore cannot strand an active DMA channel.
+                    if (activation_mode == .reuse and
+                        !self.kernel.residentMatches(epoch, @intCast(q1_blocks), @intCast(tile_cols)))
+                    {
+                        return error.ActivationState;
+                    }
+
+                    try self.dma_w[0].reset();
+                    for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
+                    if (activation_mode == .raw_f32_load) try self.dma_a.resetMm2s();
+                    var dmas_armed = true;
+                    errdefer if (dmas_armed) self.abortProjectionDmas();
+                    try self.dma_w[0].startWriteToDdr(result_phys, result_plan.dma_bytes);
+                    for (&self.dma_w, 0..) |*dma, port| {
+                        try dma.startReadFromDdr(weight_phys[projection_index][port], weight_port_bytes);
+                    }
+                    if (activation_mode == .raw_f32_load) {
+                        try self.dma_a.startReadFromDdr(acts_phys, act_total);
+                    }
+                    self.kernel.runWithActivation(
+                        @intCast(q1_blocks),
+                        @intCast(num_rb),
+                        @intCast(tile_cols),
+                        result_plan.logical_rows,
+                        projection.weight_fmt,
+                        activation_mode,
+                        epoch,
+                    );
+                    result.setup_ns +|= profile.lap(ctx, &last);
+                    try self.kernel.waitDone();
+                    for (&self.dma_w) |*dma| try dma.waitReadDone();
+                    if (activation_mode == .raw_f32_load) try self.dma_a.waitReadDone();
+                    try self.dma_w[0].waitWriteDone();
+                    dmas_armed = false;
+                    result.wait_ns +|= profile.lap(ctx, &last);
+
+                    result.kernel_runs +|= 1;
+                    if (ctx != null) accumulateCounters(&counters, self.readCounters());
+                    heap.syncFromDevice(result_dma) catch return error.HeapFailure;
+                    result.sync_from_ns +|= profile.lap(ctx, &last);
+                    if (!result_plan.direct) {
+                        const result_buf = heap.bytes(result_dma) catch return error.HeapFailure;
+                        gather.gatherResults(dst_bufs[projection_index], result_buf, rows, tile_cols, col0, num_rb);
+                        result.result_layout_ns +|= profile.lap(ctx, &last);
+                    }
+                }
+                col0 += tile_cols;
+            }
+
+            if (ctx) |active| result.wrapper_ns = shared.profiling.elapsed(wrapper_start, active.now());
+            result.cycles = counters.cycles;
+            result.w_stall_cycles = counters.w_stall;
+            result.a_stall_cycles = counters.a_stall;
+            result.r_stall_cycles = counters.r_stall;
+            result.w_beats = counters.w_beats;
+            result.a_beats = counters.a_beats;
+            result.r_beats = counters.r_beats;
+            return result;
+        }
+
+        fn takeActivationEpoch(self: *Self) u32 {
+            const epoch = if (self.next_activation_epoch == 0) 1 else self.next_activation_epoch;
+            self.next_activation_epoch +%= 1;
+            if (self.next_activation_epoch == 0) self.next_activation_epoch = 1;
+            return epoch;
+        }
+
+        fn abortProjectionDmas(self: *Self) void {
+            self.dma_w[0].reset() catch {};
+            for (self.dma_w[1..]) |*dma| dma.resetMm2s() catch {};
+            self.dma_a.resetMm2s() catch {};
         }
 
         fn readCounters(self: *Self) Counters {
@@ -531,6 +758,22 @@ fn subRange(staging: wire.TensorRange, nbytes: usize) wire.TensorRange {
 
 fn offsetRange(base: wire.TensorRange, offset: usize, nbytes: usize) wire.TensorRange {
     return .{ .handle = base.handle, .offset = base.offset + @as(u64, @intCast(offset)), .nbytes = @intCast(nbytes) };
+}
+
+fn groupRangesOverlap(group: wire.MatmulQ1A8Group2) bool {
+    const first = group.projections[0];
+    const second = group.projections[1];
+    return rangesOverlap(first.dst, second.dst) or
+        rangesOverlap(first.dst, group.acts) or rangesOverlap(second.dst, group.acts) or
+        rangesOverlap(first.dst, first.weights) or rangesOverlap(first.dst, second.weights) or
+        rangesOverlap(second.dst, first.weights) or rangesOverlap(second.dst, second.weights);
+}
+
+fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
+    if (a.handle != b.handle or a.nbytes == 0 or b.nbytes == 0) return false;
+    const a_end = std.math.add(u64, a.offset, a.nbytes) catch return true;
+    const b_end = std.math.add(u64, b.offset, b.nbytes) catch return true;
+    return a.offset < b_end and b.offset < a_end;
 }
 
 /// Sum the per-group hardware counters into the matmul's total.

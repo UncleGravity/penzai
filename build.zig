@@ -124,11 +124,27 @@ fn addFormalSteps(b: *std.Build) void {
         ".zig-cache/sby/gemm_kernel",
         "fpga/formal/gemm_kernel.sby",
     });
+    const gemm_activation_error_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/gemm_activation_error",
+        "fpga/formal/gemm_activation_error.sby",
+    });
+    const gemm_activation_abort_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/gemm_activation_abort",
+        "fpga/formal/gemm_activation_abort.sby",
+    });
     const gemm_kernel_step = b.step(
         "formal-gemm-kernel",
-        "Prove GEMM run configuration, bounds, and AXIS control properties",
+        "Prove GEMM run configuration, resident-activation failures, bounds, and AXIS control",
     );
     gemm_kernel_step.dependOn(&gemm_kernel_run.step);
+    gemm_kernel_step.dependOn(&gemm_activation_error_run.step);
+    gemm_kernel_step.dependOn(&gemm_activation_abort_run.step);
 
     const gemm_ternary_selector_run = b.addSystemCommand(&.{
         "sby",
@@ -251,13 +267,21 @@ const gemm_kernel_rtl = [_][]const u8{
 // weight zip and AXI-Lite configuration.
 const decode_top_rtl = [_][]const u8{
     "fpga/rtl/decode_top.v",
+    "fpga/rtl/q8_ingress.v",
+    "fpga/rtl/q8_quantizer.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
+
+// Exact canonical FP32 -> Q8_0 activation quantizer. Kept standalone until its
+// numerical and routed-cost gates justify attaching it to the GEMM activation RAM.
+const q8_quantizer_rtl = [_][]const u8{
+    "fpga/rtl/q8_quantizer.v",
+};
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
@@ -301,26 +325,29 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
 
     _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
     _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
-    _ = addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
+    const gemm_kernel_cosim = addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
     const decode_top_cosim = addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite GEMM top + four-port zip) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
     const flash_fp_cosim = addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: II=1 numeric interp/exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
     const flash_softmax_cosim = addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: II=1 flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
     const flash_kernel_cosim = addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
+    const q8_quantizer_cosim = addCosim(b, target, optimize, "test-rtl-q8-quantizer", "Verilator cosim: exact-RNE FP32 to Q8_0 quantizer vs shared/layout.zig", "q8_quantizer", "fpga/sim/q8_quantizer", &q8_quantizer_rtl, .q8);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
 
     const rtl_cosim = b.step("test-rtl", "Cosim the deployable binary/ternary GEMM and flash-attention paths");
+    rtl_cosim.dependOn(gemm_kernel_cosim);
     rtl_cosim.dependOn(decode_top_cosim);
     rtl_cosim.dependOn(flash_fp_cosim);
     rtl_cosim.dependOn(flash_softmax_cosim);
     rtl_cosim.dependOn(flash_kernel_cosim);
     rtl_cosim.dependOn(flash_top_cosim);
+    rtl_cosim.dependOn(q8_quantizer_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
-const CosimKind = enum { matmul, flash, seq };
+const CosimKind = enum { matmul, flash, seq, q8 };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -333,6 +360,7 @@ fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.R
     pack.addImport("layout", layout);
     ref.addImport("layout", layout);
     mod.addImport("layout", layout);
+    mod.addImport("shared_layout", shared_layout);
     mod.addImport("pack", pack);
     mod.addImport("matmul_ref", ref);
 }
@@ -373,7 +401,7 @@ fn addCosim(
     switch (kind) {
         .matmul => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/numeric" }),
         .flash => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
-        .seq => {}, // seq_core has no includes
+        .seq, .q8 => {}, // these leaves have no includes
     }
     vcmd.addArgs(rtl);
 
@@ -400,6 +428,11 @@ fn addCosim(
                 .optimize = optimize,
             }));
         },
+        .q8 => tb_mod.addImport("shared_layout", b.createModule(.{
+            .root_source_file = b.path("shared/layout.zig"),
+            .target = target,
+            .optimize = optimize,
+        })),
     }
     tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });

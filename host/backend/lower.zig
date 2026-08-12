@@ -85,6 +85,11 @@ pub fn lowerGraph(
             continue;
         }
         if (supportsMatmulQ1A8(node)) {
+            if (tryLowerMatmulQ1A8Group2(graph, i, lookup)) |group| {
+                try commands.append(allocator, group.command);
+                i = group.last_index;
+                continue;
+            }
             try commands.append(allocator, try lowerMatmulQ1A8(node, lookup));
             continue;
         }
@@ -451,6 +456,79 @@ fn lowerMatmulQ1A8(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.C
         .k = k,
         .weight_fmt = weight_fmt,
     } };
+}
+
+const LoweredMatmulGroup2 = struct {
+    command: wire.Command,
+    last_index: c_int,
+};
+
+fn tryLowerMatmulQ1A8Group2(graph: *c.ggml_cgraph, first_index: c_int, lookup: Lookup) ?LoweredMatmulGroup2 {
+    const first: *const c.ggml_tensor = c.ggml_graph_node(graph, first_index) orelse return null;
+    if (!safeGroupedMatmulNode(first)) return null;
+
+    const n = c.ggml_graph_n_nodes(graph);
+    var second_index = first_index + 1;
+    var second: ?*const c.ggml_tensor = null;
+    while (second_index < n) : (second_index += 1) {
+        const candidate = c.ggml_graph_node(graph, second_index) orelse continue;
+        if (isMetadataOp(candidate.*.op) or tensorElements(candidate) == 0) continue;
+        second = candidate;
+        break;
+    }
+    const second_node = second orelse return null;
+    if (!safeGroupedMatmulNode(second_node)) return null;
+
+    const first_acts: *const c.ggml_tensor = first.*.src[1] orelse return null;
+    if (second_node.*.src[1] != first_acts) return null;
+    if (dim(first, 0) != dim(second_node, 0) or dim(first, 1) != dim(second_node, 1)) return null;
+    const first_weights: *const c.ggml_tensor = first.*.src[0] orelse return null;
+    const second_weights: *const c.ggml_tensor = second_node.*.src[0] orelse return null;
+    if (first_weights.*.type != second_weights.*.type or dim(first_weights, 0) != dim(second_weights, 0) or dim(first_weights, 1) != dim(second_weights, 1)) return null;
+
+    // A view creates an additional alias/lifetime contract which the atomic
+    // grouped command intentionally does not attempt to reconstruct.
+    var graph_index: c_int = 0;
+    while (graph_index < n) : (graph_index += 1) {
+        const node = c.ggml_graph_node(graph, graph_index) orelse continue;
+        if (node.*.view_src == first or node.*.view_src == second_node) return null;
+    }
+
+    const first_cmd = lowerMatmulQ1A8(first, lookup) catch return null;
+    const second_cmd = lowerMatmulQ1A8(second_node, lookup) catch return null;
+    const a = switch (first_cmd) {
+        .matmul_q1a8 => |value| value,
+        else => unreachable,
+    };
+    const b = switch (second_cmd) {
+        .matmul_q1a8 => |value| value,
+        else => unreachable,
+    };
+    if (a.rows != b.rows or a.cols != b.cols or a.k != b.k or a.weight_fmt != b.weight_fmt or !std.meta.eql(a.acts, b.acts)) return null;
+    if (rangesOverlap(a.dst, b.dst) or
+        rangesOverlap(a.dst, a.acts) or rangesOverlap(b.dst, a.acts) or
+        rangesOverlap(a.dst, a.weights) or rangesOverlap(a.dst, b.weights) or
+        rangesOverlap(b.dst, a.weights) or rangesOverlap(b.dst, b.weights)) return null;
+
+    return .{
+        .command = .{ .matmul_q1a8_group2 = .{
+            .acts = a.acts,
+            .projections = .{
+                .{ .weights = a.weights, .dst = a.dst, .rows = a.rows, .weight_fmt = a.weight_fmt },
+                .{ .weights = b.weights, .dst = b.dst, .rows = b.rows, .weight_fmt = b.weight_fmt },
+            },
+            .cols = a.cols,
+            .k = a.k,
+        } },
+        .last_index = second_index,
+    };
+}
+
+fn safeGroupedMatmulNode(node: *const c.ggml_tensor) bool {
+    if (!supportsMatmulQ1A8(node) or node.*.view_src != null) return false;
+    if ((node.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0) return false;
+    const unsafe_flags = c.GGML_TENSOR_FLAG_INPUT | c.GGML_TENSOR_FLAG_OUTPUT | c.GGML_TENSOR_FLAG_PARAM | c.GGML_TENSOR_FLAG_LOSS;
+    return (node.*.flags & unsafe_flags) == 0;
 }
 
 fn lowerBinaryF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
@@ -838,6 +916,13 @@ fn backingRemaining(binding: Binding) LowerError!wire.TensorRange {
     };
 }
 
+fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
+    if (a.handle != b.handle or a.nbytes == 0 or b.nbytes == 0) return false;
+    const a_end = std.math.add(u64, a.offset, a.nbytes) catch return true;
+    const b_end = std.math.add(u64, b.offset, b.nbytes) catch return true;
+    return a.offset < b_end and b.offset < a_end;
+}
+
 fn stridedSpan(row_bytes: usize, ne1: u32, ne2: u32, ne3: u32, nb1: usize, nb2: usize, nb3: usize) LowerError!usize {
     if (row_bytes == 0 or ne1 == 0 or ne2 == 0 or ne3 == 0) return error.InvalidShape;
     var span = row_bytes;
@@ -943,6 +1028,14 @@ const TestRmsNormMul = struct {
     mul: *c.ggml_tensor,
 };
 
+const TestMatmulPair = struct {
+    acts: *c.ggml_tensor,
+    first_weights: *c.ggml_tensor,
+    second_weights: *c.ggml_tensor,
+    first: *c.ggml_tensor,
+    second: *c.ggml_tensor,
+};
+
 fn testContext() !*c.ggml_context {
     return c.ggml_init(.{
         .mem_size = 1024 * 1024,
@@ -964,6 +1057,27 @@ fn testRmsNormMul(ctx: *c.ggml_context, rows: i64, cols: i64, eps: f32, reverse:
     else
         c.ggml_mul(ctx, rmsnorm, weight) orelse return error.OutOfMemory;
     return .{ .input = input, .weight = weight, .rmsnorm = rmsnorm, .mul = mul };
+}
+
+fn testMatmulPair(ctx: *c.ggml_context, rows: i64, cols: i64, second_acts: bool, ternary: bool) !TestMatmulPair {
+    const k: i64 = layout.q1_block;
+    const acts = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, k, cols) orelse return error.OutOfMemory;
+    const other_acts = if (second_acts)
+        c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, k, cols) orelse return error.OutOfMemory
+    else
+        acts;
+    const weight_type: c.enum_ggml_type = @intCast(if (ternary) c.GGML_TYPE_Q2_0 else c.GGML_TYPE_Q1_0);
+    const first_weights = c.ggml_new_tensor_2d(ctx, weight_type, k, rows) orelse return error.OutOfMemory;
+    const second_weights = c.ggml_new_tensor_2d(ctx, weight_type, k, rows) orelse return error.OutOfMemory;
+    const first = c.ggml_mul_mat(ctx, first_weights, acts) orelse return error.OutOfMemory;
+    const second = c.ggml_mul_mat(ctx, second_weights, other_acts) orelse return error.OutOfMemory;
+    return .{
+        .acts = acts,
+        .first_weights = first_weights,
+        .second_weights = second_weights,
+        .first = first,
+        .second = second,
+    };
 }
 
 fn testFindBinding(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
@@ -995,6 +1109,21 @@ const TestMissingBinding = struct {
     }
 };
 
+const TestAliasedBindings = struct {
+    alias: *const c.ggml_tensor,
+    target: *const c.ggml_tensor,
+
+    fn find(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
+        const self: *TestAliasedBindings = @ptrCast(@alignCast(ctx));
+        if (tensor == self.alias) return testFindBinding(ctx, self.target);
+        return testFindBinding(ctx, tensor);
+    }
+
+    fn lookup(self: *TestAliasedBindings) Lookup {
+        return .{ .ctx = self, .findFn = find };
+    }
+};
+
 fn expectStandaloneRmsNormMul(commands: []const wire.Command) !void {
     try std.testing.expectEqual(@as(usize, 2), commands.len);
     switch (commands[0]) {
@@ -1003,6 +1132,149 @@ fn expectStandaloneRmsNormMul(commands: []const wire.Command) !void {
     }
     switch (commands[1]) {
         .mul_f32 => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+fn expectStandaloneMatmulPair(commands: []const wire.Command) !void {
+    try std.testing.expectEqual(@as(usize, 2), commands.len);
+    switch (commands[0]) {
+        .matmul_q1a8 => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commands[1]) {
+        .matmul_q1a8 => {},
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowering groups exact adjacent matmuls with one activation" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 3, false, false);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    switch (commands[0]) {
+        .matmul_q1a8_group2 => |group| {
+            try std.testing.expectEqual(@as(u32, 16), group.projections[0].rows);
+            try std.testing.expectEqual(@as(u32, 16), group.projections[1].rows);
+            try std.testing.expectEqual(@as(u32, 3), group.cols);
+            try std.testing.expectEqual(@as(u32, layout.q1_block), group.k);
+            try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.acts))), group.acts.handle);
+            try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.first_weights))), group.projections[0].weights.handle);
+            try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(pair.second_weights))), group.projections[1].weights.handle);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowering groups adjacent ternary matmuls" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, false, true);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    try std.testing.expectEqual(wire.WeightFormat.w158a8, commands[0].matmul_q1a8_group2.projections[0].weight_fmt);
+    try std.testing.expectEqual(wire.WeightFormat.w158a8, commands[0].matmul_q1a8_group2.projections[1].weight_fmt);
+}
+
+test "matmul grouping rejects different activation tensors" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, true, false);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try expectStandaloneMatmulPair(commands);
+}
+
+test "matmul grouping rejects unsafe output flags" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, false, false);
+    c.ggml_set_output(pair.first);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try expectStandaloneMatmulPair(commands);
+}
+
+test "matmul grouping rejects output views and overlapping bindings" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, false, false);
+    const view = c.ggml_view_2d(ctx, pair.first, 16, 2, 16 * @sizeOf(f32), 0) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+    c.ggml_build_forward_expand(graph, view);
+
+    const view_commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(view_commands);
+    try expectStandaloneMatmulPair(view_commands);
+
+    const clean_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(clean_graph, pair.first);
+    c.ggml_build_forward_expand(clean_graph, pair.second);
+    var aliases = TestAliasedBindings{ .alias = pair.second, .target = pair.first };
+    const alias_commands = try lowerGraph(std.testing.allocator, clean_graph, aliases.lookup());
+    defer std.testing.allocator.free(alias_commands);
+    try expectStandaloneMatmulPair(alias_commands);
+}
+
+test "matmul grouping requires every binding" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, false, false);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    var missing = TestMissingBinding{ .tensor = pair.second_weights };
+    try std.testing.expect(tryLowerMatmulQ1A8Group2(graph, 0, missing.lookup()) == null);
+}
+
+test "matmul grouping rejects intervening compute" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const pair = try testMatmulPair(ctx, 16, 2, false, false);
+    const middle_lhs = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const middle_rhs = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const middle = c.ggml_add(ctx, middle_lhs, middle_rhs) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, pair.first);
+    c.ggml_build_forward_expand(graph, middle);
+    c.ggml_build_forward_expand(graph, pair.second);
+
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 3), commands.len);
+    switch (commands[0]) {
+        .matmul_q1a8 => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commands[1]) {
+        .add_f32 => {},
+        else => return error.TestUnexpectedResult,
+    }
+    switch (commands[2]) {
+        .matmul_q1a8 => {},
         else => return error.TestUnexpectedResult,
     }
 }
@@ -1028,8 +1300,8 @@ test "flash lowering preserves llama token-major Q strides" {
     const mask = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F16, n_kv, n_tokens) orelse return error.OutOfMemory;
     const attn = c.ggml_flash_attn_ext(ctx, q, k, v, mask, 0.08838835, 0, 0) orelse return error.OutOfMemory;
 
-    try std.testing.expectEqual(@as(usize, n_heads * head_dim * @sizeOf(f32)), q.*.nb[1]);
-    try std.testing.expectEqual(@as(usize, head_dim * @sizeOf(f32)), q.*.nb[2]);
+    try std.testing.expectEqual(@as(usize, n_heads * head_dim * @sizeOf(f32)), q[0].nb[1]);
+    try std.testing.expectEqual(@as(usize, head_dim * @sizeOf(f32)), q[0].nb[2]);
     try std.testing.expect(supportsOp(attn));
 
     const graph = try testGraph(ctx);

@@ -139,6 +139,8 @@ module decode_top #(
     reg [31:0] num_rows_q;
     reg [15:0] num_cols_q;
     reg [1:0]  weight_fmt_q;
+    reg [1:0]  act_mode_q;
+    reg [31:0] act_epoch_q;
     reg        start_strobe;
 
     // Fixed-point window floor: a constant of the f16 format (min contribution exponent
@@ -150,6 +152,13 @@ module decode_top #(
 
     wire kernel_busy;
     wire kernel_done;
+    wire activation_error;
+    wire activation_valid;
+    wire [31:0] loaded_act_epoch;
+    wire [15:0] loaded_act_q1_blocks;
+    wire [15:0] loaded_act_cols;
+    wire [3:0] quantizer_status;
+    wire q8_activation_abort;
     wire weight_tready;
     wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid &&
                          s_axis_w2_tvalid && s_axis_w3_tvalid;
@@ -169,6 +178,37 @@ module decode_top #(
     // mc_cols_max reads — never a literal. MAX_SUB_INDEX=512 sizes the acts BRAM for K up to
     // 512/q8_subblocks = 128 q1-blocks = 16384, the exact limit of the 104-bit accumulator
     // window. Must match the host's layout.max_sub_index.
+    wire raw_activation_mode = act_mode_q == 2'd2;
+    wire [31:0] raw_total_blocks = ({16'd0, num_q1_blocks_q} *
+                                    {16'd0, num_cols_q}) << 2;
+    wire [63:0] native_acts_tdata;
+    wire native_acts_tvalid;
+    wire native_acts_tready;
+    wire raw_acts_tready;
+    wire kernel_acts_tready;
+
+    q8_ingress u_q8_ingress (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start(start_strobe),
+        .raw_mode(raw_activation_mode),
+        .total_blocks(raw_total_blocks),
+        .s_axis_tdata(s_axis_acts_tdata),
+        .s_axis_tvalid(s_axis_acts_tvalid),
+        .s_axis_tready(raw_acts_tready),
+        .s_axis_tlast(s_axis_acts_tlast),
+        .m_axis_tdata(native_acts_tdata),
+        .m_axis_tvalid(native_acts_tvalid),
+        .m_axis_tready(native_acts_tready),
+        .activation_abort(q8_activation_abort),
+        .quantizer_status(quantizer_status)
+    );
+
+    wire [63:0] kernel_acts_tdata = raw_activation_mode ? native_acts_tdata : s_axis_acts_tdata;
+    wire kernel_acts_tvalid = raw_activation_mode ? native_acts_tvalid : s_axis_acts_tvalid;
+    assign native_acts_tready = raw_activation_mode && kernel_acts_tready;
+    assign s_axis_acts_tready = raw_activation_mode ? raw_acts_tready : kernel_acts_tready;
+
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(512)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
@@ -178,15 +218,23 @@ module decode_top #(
         .num_rows(num_rows_q),
         .num_cols(num_cols_q),
         .weight_fmt(weight_fmt_q),
+        .act_mode(act_mode_q),
+        .act_epoch(act_epoch_q),
+        .activation_abort(q8_activation_abort),
         .emin(EMIN_FLOOR),
         .kernel_done(kernel_done),
+        .activation_error(activation_error),
+        .activation_valid(activation_valid),
+        .loaded_act_epoch(loaded_act_epoch),
+        .loaded_act_q1_blocks(loaded_act_q1_blocks),
+        .loaded_act_cols(loaded_act_cols),
         .busy(kernel_busy),
         .s_axis_tdata(weight_tdata),
         .s_axis_tvalid(weight_tvalid),
         .s_axis_tready(weight_tready),
-        .s_axis_acts_tdata(s_axis_acts_tdata),
-        .s_axis_acts_tvalid(s_axis_acts_tvalid),
-        .s_axis_acts_tready(s_axis_acts_tready),
+        .s_axis_acts_tdata(kernel_acts_tdata),
+        .s_axis_acts_tvalid(kernel_acts_tvalid),
+        .s_axis_acts_tready(kernel_acts_tready),
         .m_axis_tdata(m_axis_tdata),
         .m_axis_tvalid(m_axis_tvalid),
         .m_axis_tready(m_axis_tready),
@@ -244,6 +292,8 @@ module decode_top #(
             num_rows_q      <= 32'd0;
             num_cols_q      <= 16'd0;
             weight_fmt_q    <= 2'd1;
+            act_mode_q      <= 2'd0;
+            act_epoch_q     <= 32'd0;
             start_strobe    <= 1'b0;
         end else begin
             start_strobe <= 1'b0;
@@ -282,6 +332,15 @@ module decode_top #(
                     MATMUL_OFF_WEIGHT_FMT[7:0]: begin
                         if (s_axi_wstrb[0]) weight_fmt_q <= s_axi_wdata[1:0];
                     end
+                    MATMUL_OFF_ACT_MODE[7:0]: begin
+                        if (s_axi_wstrb[0]) act_mode_q <= s_axi_wdata[1:0];
+                    end
+                    MATMUL_OFF_ACT_EPOCH[7:0]: begin
+                        if (s_axi_wstrb[0]) act_epoch_q[7:0]   <= s_axi_wdata[7:0];
+                        if (s_axi_wstrb[1]) act_epoch_q[15:8]  <= s_axi_wdata[15:8];
+                        if (s_axi_wstrb[2]) act_epoch_q[23:16] <= s_axi_wdata[23:16];
+                        if (s_axi_wstrb[3]) act_epoch_q[31:24] <= s_axi_wdata[31:24];
+                    end
                     default: ;
                 endcase
             end
@@ -311,6 +370,13 @@ module decode_top #(
                     MATMUL_OFF_NUM_COLS[7:0]:      rdata_q <= {16'd0, num_cols_q};
                     MATMUL_OFF_NUM_ROWS[7:0]:      rdata_q <= num_rows_q;
                     MATMUL_OFF_WEIGHT_FMT[7:0]:    rdata_q <= {30'd0, weight_fmt_q};
+                    MATMUL_OFF_ACT_MODE[7:0]:      rdata_q <= {30'd0, act_mode_q};
+                    MATMUL_OFF_ACT_EPOCH[7:0]:     rdata_q <= act_epoch_q;
+                    MATMUL_OFF_ACT_STATE[7:0]:     rdata_q <= {30'd0, activation_error, activation_valid};
+                    MATMUL_OFF_LOADED_EPOCH[7:0]:  rdata_q <= loaded_act_epoch;
+                    MATMUL_OFF_LOADED_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, loaded_act_q1_blocks};
+                    MATMUL_OFF_LOADED_COLS[7:0]:   rdata_q <= {16'd0, loaded_act_cols};
+                    MATMUL_OFF_QUANT_STATUS[7:0]:  rdata_q <= {28'd0, quantizer_status};
                     MATMUL_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
                     MATMUL_OFF_ROWS[7:0]:          rdata_q <= MATMUL_RST_ROWS;
                     MATMUL_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;
@@ -351,7 +417,7 @@ module decode_top #(
         s_axis_w3_tkeep,
         s_axis_w3_tlast,
         s_axis_acts_tkeep,
-        s_axis_acts_tlast
+        1'b0
     };
 
 endmodule

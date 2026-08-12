@@ -7,6 +7,7 @@
     reg [31:0] f_output_beats = 32'd0;
     reg [31:0] f_output_bytes = 32'd0;
     reg [1:0] f_weight_fmt = 2'd1;
+    reg [1:0] f_act_mode = ACT_PACKED_LOAD;
 
     wire [31:0] f_effective_rows = (f_rows == 0) ? f_rowblocks * ROWS : f_rows;
     wire [31:0] f_final_rows = f_effective_rows - ((f_rowblocks - 1'b1) * ROWS);
@@ -28,6 +29,7 @@
             f_output_beats <= 32'd0;
             f_output_bytes <= 32'd0;
             f_weight_fmt <= 2'd1;
+            f_act_mode <= ACT_PACKED_LOAD;
         end else begin
             if (start_pulse) begin
                 f_run_active <= 1'b1;
@@ -38,6 +40,7 @@
                 f_output_beats <= 32'd0;
                 f_output_bytes <= 32'd0;
                 f_weight_fmt <= weight_fmt;
+                f_act_mode <= act_mode;
             end else if (kernel_done) begin
                 f_run_active <= 1'b0;
             end
@@ -53,7 +56,7 @@
         end
 
         if (rst_n) begin
-            assert(state <= ST_TCODE1);
+            assert(state <= ST_ERROR);
             assert(busy_q == (state != ST_IDLE));
             if (busy_q) begin
                 assert(f_run_active);
@@ -62,9 +65,18 @@
                 assert(run_num_rows == f_rows);
                 assert(run_num_cols == f_cols);
                 assert(run_weight_fmt == f_weight_fmt);
+                assert(run_act_mode == f_act_mode);
                 assert(last_q1 == (q1_idx_wide + 16'd1 == f_q1_blocks));
                 assert(last_col == (col + 16'd1 == f_cols));
                 assert(n_total == f_cols * EMIT_BEATS[15:0]);
+            end
+
+            if (state == ST_ERROR) begin
+                assert(activation_error);
+                assert(!s_axis_tready && !s_axis_acts_tready && !m_axis_tvalid);
+            end
+            if (f_run_active && f_act_mode == ACT_REUSE && !activation_error) begin
+                assert(!s_axis_acts_tready);
             end
 
             if (state == ST_LOAD_ACTS || state == ST_LOAD_ASCALE) begin
@@ -91,6 +103,7 @@
             end
 
             if (m_axis_tvalid) begin
+                assert(!activation_error);
                 assert(m_axis_tkeep == 8'hFF || m_axis_tkeep == 8'h0F);
                 assert((m_axis_tkeep == 8'h0F) ==
                     ((rowblock_remaining == 16'd1) && (emit_beat == active_emit_last) && f_rows[0]));
@@ -106,8 +119,13 @@
                 assert(f_output_bytes + f_transfer_bytes == f_expected_bytes);
             end
             if (kernel_done) begin
-                assert(f_output_beats == f_expected_beats);
-                assert(f_output_bytes == f_expected_bytes);
+                if (activation_error) begin
+                    assert(f_output_beats == 0);
+                    assert(f_output_bytes == 0);
+                end else begin
+                    assert(f_output_beats == f_expected_beats);
+                    assert(f_output_bytes == f_expected_bytes);
+                end
             end
 
             if (f_gemm_past_valid && $past(rst_n) &&
@@ -119,10 +137,12 @@
             end
         end
 
+`ifndef GEMM_FORMAL_DISABLE_GENERIC_COVERS
         cover(rst_n && state == ST_EMIT && !m_axis_tready);
         cover(rst_n && f_run_active && f_rows == 0 && m_axis_tlast);
         cover(rst_n && m_axis_tvalid && m_axis_tready && m_axis_tkeep == 8'h0F && m_axis_tlast);
         cover(rst_n && kernel_done);
         cover(rst_n && busy_q &&
               (num_q1_blocks != f_q1_blocks || num_rowblocks != f_rowblocks || num_cols != f_cols));
+`endif
     end

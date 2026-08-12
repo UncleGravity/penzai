@@ -139,35 +139,25 @@ pub const Collector = struct {
                     .matmul => |value| value,
                     else => MatmulExecution{ .path = outcome.path },
                 };
-                const incoming = profiling.MatmulStat{
-                    .backend = outcome.backend,
-                    .path = outcome.path,
-                    .fmt = @intCast(@intFromEnum(mm.weight_fmt)),
-                    .rows = mm.rows,
-                    .cols = mm.cols,
-                    .k = mm.k,
+                self.recordMatmul(mm.rows, mm.cols, mm.k, mm.weight_fmt, 1, command_ns, outcome, detail);
+            },
+            .matmul_q1a8_group2 => |group| {
+                const group_detail = switch (outcome.detail) {
+                    .matmul => |value| value,
+                    else => MatmulExecution{ .path = outcome.path },
                 };
-                const stat = self.matmulBucket(incoming) orelse return;
-                stat.count +|= 1;
-                stat.kernel_runs +|= detail.kernel_runs;
-                stat.macs +|= mul(mul(mm.rows, mm.cols), mm.k);
-                stat.command_ns +|= command_ns;
-                stat.wrapper_ns +|= detail.wrapper_ns;
-                stat.quantize_pack_ns +|= detail.quantize_pack_ns;
-                stat.sync_to_ns +|= detail.sync_to_ns;
-                stat.setup_ns +|= detail.setup_ns;
-                stat.wait_ns +|= detail.wait_ns;
-                stat.sync_from_ns +|= detail.sync_from_ns;
-                stat.result_layout_ns +|= detail.result_layout_ns;
-                stat.cycles +|= detail.cycles;
-                stat.w_stall_cycles +|= detail.w_stall_cycles;
-                stat.a_stall_cycles +|= detail.a_stall_cycles;
-                stat.r_stall_cycles +|= detail.r_stall_cycles;
-                stat.w_beats +|= detail.w_beats;
-                stat.a_beats +|= detail.a_beats;
-                stat.r_beats +|= detail.r_beats;
-                if (detail.wrapper_ns > command_ns or detail.wrapper_ns < wrapperChildrenMatmul(detail))
-                    self.accounting_violations |= profiling.AccountingViolation.wrapper_segments;
+                // The matcher requires identical projection shapes and formats,
+                // so one shape record represents one command and two MAC sets.
+                self.recordMatmul(
+                    group.projections[0].rows,
+                    group.cols,
+                    group.k,
+                    group.projections[0].weight_fmt,
+                    group.projections.len,
+                    command_ns,
+                    outcome,
+                    group_detail,
+                );
             },
             .flash_attn_f32 => |fa| {
                 const detail = switch (outcome.detail) {
@@ -229,6 +219,48 @@ pub const Collector = struct {
             },
             else => {},
         }
+    }
+
+    fn recordMatmul(
+        self: *Collector,
+        rows: u32,
+        cols: u32,
+        k: u32,
+        weight_fmt: wire.WeightFormat,
+        logical_multiplicity: usize,
+        command_ns: u64,
+        outcome: CommandOutcome,
+        detail: MatmulExecution,
+    ) void {
+        const incoming = profiling.MatmulStat{
+            .backend = outcome.backend,
+            .path = outcome.path,
+            .fmt = @intCast(@intFromEnum(weight_fmt)),
+            .rows = rows,
+            .cols = cols,
+            .k = k,
+        };
+        const stat = self.matmulBucket(incoming) orelse return;
+        stat.count +|= 1;
+        stat.kernel_runs +|= detail.kernel_runs;
+        stat.macs +|= mul(mul(mul(rows, cols), k), logical_multiplicity);
+        stat.command_ns +|= command_ns;
+        stat.wrapper_ns +|= detail.wrapper_ns;
+        stat.quantize_pack_ns +|= detail.quantize_pack_ns;
+        stat.sync_to_ns +|= detail.sync_to_ns;
+        stat.setup_ns +|= detail.setup_ns;
+        stat.wait_ns +|= detail.wait_ns;
+        stat.sync_from_ns +|= detail.sync_from_ns;
+        stat.result_layout_ns +|= detail.result_layout_ns;
+        stat.cycles +|= detail.cycles;
+        stat.w_stall_cycles +|= detail.w_stall_cycles;
+        stat.a_stall_cycles +|= detail.a_stall_cycles;
+        stat.r_stall_cycles +|= detail.r_stall_cycles;
+        stat.w_beats +|= detail.w_beats;
+        stat.a_beats +|= detail.a_beats;
+        stat.r_beats +|= detail.r_beats;
+        if (detail.wrapper_ns > command_ns or detail.wrapper_ns < wrapperChildrenMatmul(detail))
+            self.accounting_violations |= profiling.AccountingViolation.wrapper_segments;
     }
 
     fn matmulBucket(self: *Collector, incoming: profiling.MatmulStat) ?*profiling.MatmulStat {
@@ -299,6 +331,7 @@ pub fn commandTag(command: wire.Command) wire.OpTag {
         .copy => .copy,
         .cpy_f32_to_f16 => .cpy_f32_to_f16,
         .matmul_q1a8 => .matmul_q1a8,
+        .matmul_q1a8_group2 => .matmul_q1a8_group2,
         .rmsnorm => .rmsnorm,
         .rope => .rope,
         .softmax => .softmax,
@@ -324,6 +357,9 @@ pub fn commandBytes(command: wire.Command) u64 {
         .cpy_f32_to_f16 => |op| op.src.nbytes +| op.dst.nbytes,
         // Per-op read traffic: weights are persistent but re-read every decode, so count them each call.
         .matmul_q1a8 => |op| op.weights.nbytes +| op.acts.nbytes +| op.dst.nbytes,
+        .matmul_q1a8_group2 => |op| op.acts.nbytes +|
+            op.projections[0].weights.nbytes +| op.projections[0].dst.nbytes +|
+            op.projections[1].weights.nbytes +| op.projections[1].dst.nbytes,
         .rmsnorm => |op| op.input.nbytes +| (if (op.has_weight) op.weight.nbytes else 0) +| op.dst.nbytes,
         .rope => |op| op.input.nbytes +| op.positions.nbytes +| op.dst.nbytes,
         .softmax => |op| op.src.nbytes +| op.dst.nbytes,
@@ -456,6 +492,45 @@ test "profile byte estimate includes optional rmsnorm weight" {
     } };
     try std.testing.expectEqual(@as(u64, 192), commandBytes(standalone));
     try std.testing.expectEqual(@as(u64, 204), commandBytes(fused));
+}
+
+test "grouped matmul accounting counts one activation and two logical projections" {
+    const acts = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 1024 };
+    const weights0 = wire.TensorRange{ .handle = 2, .offset = 0, .nbytes = 256 };
+    const weights1 = wire.TensorRange{ .handle = 3, .offset = 0, .nbytes = 256 };
+    const dst0 = wire.TensorRange{ .handle = 4, .offset = 0, .nbytes = 128 };
+    const dst1 = wire.TensorRange{ .handle = 5, .offset = 0, .nbytes = 128 };
+    const command = wire.Command{ .matmul_q1a8_group2 = .{
+        .acts = acts,
+        .projections = .{
+            .{ .weights = weights0, .dst = dst0, .rows = 16, .weight_fmt = .w1a8 },
+            .{ .weights = weights1, .dst = dst1, .rows = 16, .weight_fmt = .w1a8 },
+        },
+        .cols = 2,
+        .k = 128,
+    } };
+    try std.testing.expectEqual(@as(u64, 1792), commandBytes(command));
+
+    var collector: Collector = .{};
+    collector.record(command, 100, .{
+        .backend = .pl,
+        .path = .direct,
+        .detail = .{ .matmul = .{
+            .path = .direct,
+            .kernel_runs = 2,
+            .wrapper_ns = 90,
+            .quantize_pack_ns = 10,
+            .wait_ns = 80,
+        } },
+    });
+    const aggregate = collector.aggregates[@intFromEnum(wire.OpTag.matmul_q1a8_group2)];
+    try std.testing.expectEqual(@as(u32, 1), aggregate.count);
+    try std.testing.expectEqual(@as(u64, 100), aggregate.total_ns);
+    try std.testing.expectEqual(@as(usize, 1), collector.matmul_count);
+    try std.testing.expectEqual(@as(u32, 1), collector.matmul_stats[0].count);
+    try std.testing.expectEqual(@as(u64, 100), collector.matmul_stats[0].command_ns);
+    try std.testing.expectEqual(@as(u64, 2 * 16 * 2 * 128), collector.matmul_stats[0].macs);
+    try std.testing.expectEqual(@as(u32, 2), collector.matmul_stats[0].kernel_runs);
 }
 
 fn testMatmulCommand(rows: u32) wire.Command {

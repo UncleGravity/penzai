@@ -170,7 +170,9 @@ test "regmap parses known offsets and resets" {
     try std.testing.expectEqual(@as(u32, 0x20), offsetOf("W_STALL"));
     try std.testing.expectEqual(@as(u32, 0x34), offsetOf("R_BEATS"));
     try std.testing.expectEqual(@as(u32, 0x48), offsetOf("NUM_ROWS"));
-    try std.testing.expectEqual(@as(u32, 12), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 13), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 0x4C), offsetOf("ACT_MODE"));
+    try std.testing.expectEqual(@as(u32, 0x60), offsetOf("LOADED_COLS"));
     try std.testing.expectEqual(Access.rw, table[4].access);
 }
 
@@ -180,6 +182,8 @@ test "emitVerilog contains offsets and ro reset values" {
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_W_STALL = 12'h020;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_ID = 32'hB05A2000;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NUM_ROWS = 12'h048;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_ACT_MODE = 12'h04C;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_VERSION = 32'h0000000D;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_CTRL") == null);
     // COLS_MAX flows to the RTL so decode_top can drive the kernel from it.

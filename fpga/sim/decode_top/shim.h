@@ -15,10 +15,13 @@ void dut_set_clk(Dut *, int v);
 void dut_set_rst_n(Dut *, int v);
 
 void dut_set_axi_write(Dut *, uint8_t addr, uint32_t data, int valid);
+void dut_set_axi_read(Dut *, uint8_t addr, int valid);
 void dut_set_axi_idle(Dut *);
+int dut_axi_rvalid(Dut *);
+uint32_t dut_axi_rdata(Dut *);
 
 void dut_set_w(Dut *, int port, const uint32_t *w, int valid); /* 128-bit weight port beat */
-void dut_set_a(Dut *, uint64_t data, int valid);
+void dut_set_a(Dut *, uint64_t data, int valid, int last);
 void dut_set_m_ready(Dut *, int v);
 
 int dut_w_ready(Dut *, int port);

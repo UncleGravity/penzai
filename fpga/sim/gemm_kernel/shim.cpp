@@ -30,6 +30,9 @@ void dut_set_num_rows(Dut *d, uint32_t v) { d->t->num_rows = v; }
 void dut_set_num_cols(Dut *d, int v) { d->t->num_cols = v; }
 void dut_set_emin(Dut *d, int v) { d->t->emin = v; }
 void dut_set_weight_fmt(Dut *d, int v) { d->t->weight_fmt = v; }
+void dut_set_act_mode(Dut *d, int v) { d->t->act_mode = v; }
+void dut_set_act_epoch(Dut *d, uint32_t v) { d->t->act_epoch = v; }
+void dut_set_activation_abort(Dut *d, int v) { d->t->activation_abort = v; }
 void dut_set_w(Dut *d, const uint32_t *w, int nwords, int valid) {
     for (int i = 0; i < nwords; i++) d->t->s_axis_tdata[i] = w[i];
     d->t->s_axis_tvalid = valid;
@@ -49,4 +52,9 @@ uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
 int dut_busy(Dut *d) { return d->t->busy; }
 int dut_done(Dut *d) { return d->t->kernel_done; }
 int dut_state(Dut *d) { return d->t->dbg_state; }
+int dut_activation_error(Dut *d) { return d->t->activation_error; }
+int dut_activation_valid(Dut *d) { return d->t->activation_valid; }
+uint32_t dut_loaded_act_epoch(Dut *d) { return d->t->loaded_act_epoch; }
+int dut_loaded_act_q1_blocks(Dut *d) { return d->t->loaded_act_q1_blocks; }
+int dut_loaded_act_cols(Dut *d) { return d->t->loaded_act_cols; }
 }

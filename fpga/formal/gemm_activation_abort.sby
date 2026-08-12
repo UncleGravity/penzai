@@ -1,0 +1,28 @@
+[tasks]
+prove
+bmc
+cover
+
+[options]
+prove: mode prove
+prove: depth 10
+bmc: mode bmc
+bmc: depth 10
+cover: mode cover
+cover: depth 10
+
+[engines]
+prove: abc pdr
+bmc: smtbmc boolector
+cover: smtbmc boolector
+
+[script]
+read -formal -DFORMAL -DGEMM_FORMAL_DISABLE_GENERIC_COVERS gemm_datapath_stubs.v gemm_ternary_select.v gemm_kernel.v gemm_activation_abort_formal.sv
+prep -top gemm_activation_abort_formal
+
+[files]
+fpga/formal/gemm_datapath_stubs.v
+fpga/rtl/gemm_ternary_select.v
+fpga/rtl/gemm_kernel.v
+fpga/formal/gemm_kernel_properties.vh
+fpga/formal/gemm_activation_abort_formal.sv

@@ -260,6 +260,7 @@ pub fn writeMatmulDetail(
     fclk_hz: u32,
 ) std.Io.Writer.Error!void {
     var any = false;
+    var saw_axis_counters = false;
     for (matmul_stats) |stat| {
         if (stat.count != 0) any = true;
     }
@@ -289,7 +290,7 @@ pub fn writeMatmulDetail(
         });
         if (stat.backend != .pl) continue;
         const max_stall = @max(stat.w_stall_cycles, @max(stat.a_stall_cycles, stat.r_stall_cycles));
-        const util = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
+        const nonstall = if (stat.cycles == 0) 0 else percent(stat.cycles -| max_stall, stat.cycles);
         const weight_bytes = stat.w_beats * layout.weight_beat_bytes;
         const weight_bytes_per_cycle = if (stat.cycles == 0) 0 else @as(f64, @floatFromInt(weight_bytes)) / @as(f64, @floatFromInt(stat.cycles));
         const residual = if (stat.wrapper_ns >= stat.wrapperChildrenNs()) stat.wrapper_ns - stat.wrapperChildrenNs() else 0;
@@ -300,7 +301,7 @@ pub fn writeMatmulDetail(
         var sync_from_buf: [16]u8 = undefined;
         var layout_buf: [16]u8 = undefined;
         var residual_buf: [16]u8 = undefined;
-        try writer.print("      stages quant/pack={s} sync-to={s} setup={s} wait={s} sync-from={s} layout={s} residual={s}\n", .{
+        try writer.print("      stages host-q/pack={s} sync-to={s} setup={s} wait={s} sync-from={s} layout={s} residual={s}\n", .{
             formatDuration(&quant_buf, stat.quantize_pack_ns),
             formatDuration(&sync_to_buf, stat.sync_to_ns),
             formatDuration(&setup_buf, stat.setup_ns),
@@ -310,10 +311,10 @@ pub fn writeMatmulDetail(
             formatDuration(&residual_buf, residual),
         });
         if (stat.cycles != 0 or stat.w_beats != 0 or stat.a_beats != 0 or stat.r_beats != 0) {
-            try writer.print("      kernel runs={d} cycles={d} util={d:.1}% stalls W/A/R={d}/{d}/{d} beats W/A/R={d}/{d}/{d} W={d:.2} B/cyc {d:.2} GB/s\n", .{
+            try writer.print("      kernel runs={d} cycles={d} nonstall={d:.1}% stalls W/A/R={d}/{d}/{d} axis-beats W/A/R={d}/{d}/{d} W={d:.2} B/cyc {d:.2} GB/s\n", .{
                 stat.kernel_runs,
                 stat.cycles,
-                util,
+                nonstall,
                 stat.w_stall_cycles,
                 stat.a_stall_cycles,
                 stat.r_stall_cycles,
@@ -323,6 +324,7 @@ pub fn writeMatmulDetail(
                 weight_bytes_per_cycle,
                 weightGbps(stat, fclk_hz),
             });
+            saw_axis_counters = true;
         }
         if (clockImplausible(stat, fclk_hz)) {
             var busy_buf: [16]u8 = undefined;
@@ -335,6 +337,9 @@ pub fn writeMatmulDetail(
                 formatDuration(&wall_buf, stat.wrapper_ns),
             });
         }
+    }
+    if (saw_axis_counters) {
+        try writer.writeAll("  note: A beats are external 64-bit AXIS transfers; primitive loads use packed Q8, grouped loads use raw F32, and reuse consumes zero\n");
     }
 }
 

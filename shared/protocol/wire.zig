@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 13;
+pub const version: u16 = 14;
 pub const response_meta_len: usize = 64;
 
 pub const RequestTag = enum(u16) {
@@ -32,6 +32,7 @@ pub const OpTag = enum(u16) {
     cpy_f32_to_f16 = 15,
     argmax = 16,
     pad = 17,
+    matmul_q1a8_group2 = 18,
 };
 
 pub const Status = enum(u16) {
@@ -250,6 +251,23 @@ pub const MatmulQ1A8 = struct {
     weight_fmt: WeightFormat = .w1a8,
 };
 
+pub const MatmulQ1A8Projection = struct {
+    weights: TensorRange,
+    dst: TensorRange,
+    rows: u32,
+    weight_fmt: WeightFormat = .w1a8,
+};
+
+/// Two projections which consume one identical F32 activation matrix. The
+/// fixed arity makes activation ownership and reuse explicit; this is not a
+/// variable-length graph-programming interface.
+pub const MatmulQ1A8Group2 = struct {
+    acts: TensorRange,
+    projections: [2]MatmulQ1A8Projection,
+    cols: u32,
+    k: u32,
+};
+
 pub const UnaryF32 = struct {
     src: TensorRange,
     dst: TensorRange,
@@ -407,6 +425,7 @@ pub const Command = union(OpTag) {
     cpy_f32_to_f16: CpyF32ToF16,
     argmax: Argmax,
     pad: UnaryF32,
+    matmul_q1a8_group2: MatmulQ1A8Group2,
 };
 
 pub const ResponseMeta = struct {
@@ -625,6 +644,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .flash_attn_f32 => 4 + rangeLen * 5 + 32 + 72,
             .argmax => 4 + rangeLen * 2 + 8,
             .pad => 4 + rangeLen * 2,
+            .matmul_q1a8_group2 => 4 + rangeLen + 8 + 2 * (rangeLen * 2 + 8),
         };
     }
     return len;
@@ -833,6 +853,19 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
             putRange(out, &cursor, unary.src);
             putRange(out, &cursor, unary.dst);
         },
+        .matmul_q1a8_group2 => |group| {
+            putU16(out, &cursor, @intFromEnum(OpTag.matmul_q1a8_group2));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, group.acts);
+            putU32(out, &cursor, group.cols);
+            putU32(out, &cursor, group.k);
+            for (group.projections) |projection| {
+                putRange(out, &cursor, projection.weights);
+                putRange(out, &cursor, projection.dst);
+                putU32(out, &cursor, projection.rows);
+                putU32(out, &cursor, @intFromEnum(projection.weight_fmt));
+            }
+        },
     };
     return cursor;
 }
@@ -859,6 +892,26 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                 const k = try takeU32(bytes, &cursor);
                 const weight_fmt = enumFromInt(WeightFormat, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
                 break :blk .{ .matmul_q1a8 = .{ .weights = weights, .acts = acts, .dst = dst, .rows = rows, .cols = cols, .k = k, .weight_fmt = weight_fmt } };
+            },
+            .matmul_q1a8_group2 => blk: {
+                const acts = try takeRange(bytes, &cursor);
+                const cols = try takeU32(bytes, &cursor);
+                const k = try takeU32(bytes, &cursor);
+                var projections: [2]MatmulQ1A8Projection = undefined;
+                for (&projections) |*projection| {
+                    projection.* = .{
+                        .weights = try takeRange(bytes, &cursor),
+                        .dst = try takeRange(bytes, &cursor),
+                        .rows = try takeU32(bytes, &cursor),
+                        .weight_fmt = enumFromInt(WeightFormat, try takeU32(bytes, &cursor)) orelse return error.InvalidTag,
+                    };
+                }
+                break :blk .{ .matmul_q1a8_group2 = .{
+                    .acts = acts,
+                    .projections = projections,
+                    .cols = cols,
+                    .k = k,
+                } };
             },
             .rmsnorm => blk: {
                 const input = try takeRange(bytes, &cursor);
@@ -1428,6 +1481,15 @@ test "command buffer roundtrip" {
         } },
         .{ .argmax = .{ .src = a, .dst = b, .rows = 1, .cols = 4 } },
         .{ .pad = .{ .src = a, .dst = c } },
+        .{ .matmul_q1a8_group2 = .{
+            .acts = a,
+            .projections = .{
+                .{ .weights = b, .dst = c, .rows = 16, .weight_fmt = .w1a8 },
+                .{ .weights = c, .dst = b, .rows = 16, .weight_fmt = .w1a8 },
+            },
+            .cols = 2,
+            .k = 128,
+        } },
     };
     var buf: [2048]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
@@ -1465,6 +1527,10 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[15].argmax.dst.handle, got[15].argmax.dst.handle);
     try std.testing.expectEqual(commands[16].pad.src.handle, got[16].pad.src.handle);
     try std.testing.expectEqual(commands[16].pad.dst.offset, got[16].pad.dst.offset);
+    try std.testing.expectEqual(commands[17].matmul_q1a8_group2.acts, got[17].matmul_q1a8_group2.acts);
+    try std.testing.expectEqual(commands[17].matmul_q1a8_group2.cols, got[17].matmul_q1a8_group2.cols);
+    try std.testing.expectEqual(commands[17].matmul_q1a8_group2.projections[1].weights, got[17].matmul_q1a8_group2.projections[1].weights);
+    try std.testing.expectEqual(commands[17].matmul_q1a8_group2.projections[1].weight_fmt, got[17].matmul_q1a8_group2.projections[1].weight_fmt);
 }
 
 test "rmsnorm optional weight encoding is exact and rejects invalid flags" {

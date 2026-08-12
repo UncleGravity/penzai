@@ -21,6 +21,9 @@ module gemm_kernel_ooc #(
     input  wire [31:0] num_rows,
     input  wire [15:0] num_cols,
     input  wire [1:0]  weight_fmt,
+    input  wire [1:0]  act_mode,
+    input  wire [31:0] act_epoch,
+    input  wire        activation_abort,
     input  wire signed [7:0] emin,
     input  wire [ROWS*32-1:0] s_axis_tdata,
     input  wire        s_axis_tvalid,
@@ -34,17 +37,29 @@ module gemm_kernel_ooc #(
     output reg         w_ready_q,
     output reg         a_ready_q,
     output reg         busy_q,
-    output reg         done_q
+    output reg         done_q,
+    output reg         activation_error_q,
+    output reg         activation_valid_q,
+    output reg [31:0]  loaded_act_epoch_q,
+    output reg [15:0]  loaded_act_q1_blocks_q,
+    output reg [15:0]  loaded_act_cols_q
 );
     wire [63:0] m_data;
     wire        m_valid, m_last, w_ready, a_ready, busy, done;
     wire [7:0]  m_keep;
     wire [3:0]  dbg;
+    wire activation_error, activation_valid;
+    wire [31:0] loaded_act_epoch;
+    wire [15:0] loaded_act_q1_blocks, loaded_act_cols;
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(COLS_MAX), .MAX_SUB_INDEX(512)) u ( // 512 = deployed (decode_top)
         .clk(clk), .rst_n(rst_n), .start_kernel(start_kernel),
         .num_q1_blocks(num_q1_blocks), .num_rowblocks(num_rowblocks), .num_rows(num_rows), .num_cols(num_cols),
-        .weight_fmt(weight_fmt),
+        .weight_fmt(weight_fmt), .act_mode(act_mode), .act_epoch(act_epoch),
+        .activation_abort(activation_abort),
         .emin(emin), .kernel_done(done), .busy(busy),
+        .activation_error(activation_error), .activation_valid(activation_valid),
+        .loaded_act_epoch(loaded_act_epoch),
+        .loaded_act_q1_blocks(loaded_act_q1_blocks), .loaded_act_cols(loaded_act_cols),
         .s_axis_tdata(s_axis_tdata), .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(w_ready),
         .s_axis_acts_tdata(s_axis_acts_tdata), .s_axis_acts_tvalid(s_axis_acts_tvalid),
         .s_axis_acts_tready(a_ready),
@@ -60,5 +75,10 @@ module gemm_kernel_ooc #(
         a_ready_q <= a_ready;
         busy_q    <= busy;
         done_q    <= done;
+        activation_error_q <= activation_error;
+        activation_valid_q <= activation_valid;
+        loaded_act_epoch_q <= loaded_act_epoch;
+        loaded_act_q1_blocks_q <= loaded_act_q1_blocks;
+        loaded_act_cols_q <= loaded_act_cols;
     end
 endmodule

@@ -14,6 +14,8 @@ const c = @cImport(@cInclude("shim.h"));
 
 const CYCLE_LIMIT: usize = 8_000_000;
 const ROWS = layout.ROWS;
+const ACT_PACKED_LOAD: u2 = 0;
+const ACT_REUSE: u2 = 1;
 
 const Dut = struct {
     h: *c.Dut,
@@ -31,31 +33,68 @@ const Dut = struct {
     }
 };
 
-fn runKernel(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, program_rows: usize, blocks: usize, num_cols: usize, emin: i32, weight_fmt: u2, w_bytes: []const u8, a_bytes: []const u8) ![]u8 {
-    const num_rb = physical_rows / ROWS;
-    var dut = Dut.init();
-    defer dut.deinit();
+const KernelRun = struct {
+    result: []u8,
+    cycles: usize,
+    weight_beats: usize,
+    act_beats: usize,
+    activation_error: bool,
+    activation_valid: bool,
+    loaded_epoch: u32,
+    loaded_blocks: u16,
+    loaded_cols: u16,
+};
 
-    const a_beats = std.mem.bytesAsSlice(u64, a_bytes);
-    const w_beats = w_bytes.len / pack.WIDE_BEAT_BYTES;
-    const res = try a.alloc(u8, logical_rows * num_cols * @sizeOf(f32));
-
+fn resetKernel(dut: *Dut) void {
     c.dut_set_rst_n(dut.h, 0);
     c.dut_set_start(dut.h, 0);
     c.dut_set_a(dut.h, 0, 0);
     c.dut_set_m_ready(dut.h, 1);
+    c.dut_set_act_mode(dut.h, ACT_PACKED_LOAD);
+    c.dut_set_act_epoch(dut.h, 0);
+    c.dut_set_activation_abort(dut.h, 0);
     var zero = [_]u32{0} ** ROWS;
     c.dut_set_w(dut.h, &zero, @intCast(ROWS), 0);
     c.dut_set_clk(dut.h, 0);
     c.dut_eval(dut.h);
     for (0..4) |_| dut.step();
     c.dut_set_rst_n(dut.h, 1);
+    dut.step();
+}
+
+fn runKernelOp(
+    a: std.mem.Allocator,
+    dut: *Dut,
+    physical_rows: usize,
+    logical_rows: usize,
+    program_rows: usize,
+    blocks: usize,
+    num_cols: usize,
+    emin: i32,
+    weight_fmt: u2,
+    act_mode: u2,
+    act_epoch: u32,
+    w_bytes: []const u8,
+    a_bytes: []const u8,
+    expect_error: bool,
+) !KernelRun {
+    const num_rb = physical_rows / ROWS;
+
+    const a_beats = std.mem.bytesAsSlice(u64, a_bytes);
+    const w_beats = w_bytes.len / pack.WIDE_BEAT_BYTES;
+    const result_len = if (expect_error) 0 else logical_rows * num_cols * @sizeOf(f32);
+    const res = try a.alloc(u8, result_len);
+    errdefer a.free(res);
+
     c.dut_set_num_q1(dut.h, @intCast(blocks));
     c.dut_set_num_rb(dut.h, @intCast(num_rb));
     c.dut_set_num_rows(dut.h, @intCast(program_rows));
     c.dut_set_num_cols(dut.h, @intCast(num_cols));
     c.dut_set_emin(dut.h, @intCast(emin));
     c.dut_set_weight_fmt(dut.h, weight_fmt);
+    c.dut_set_act_mode(dut.h, act_mode);
+    c.dut_set_act_epoch(dut.h, act_epoch);
+    c.dut_set_activation_abort(dut.h, 0);
 
     var wi: usize = 0;
     var ai: usize = 0;
@@ -80,6 +119,8 @@ fn runKernel(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, pr
 
         const w_fire = w_valid and c.dut_w_ready(dut.h) != 0;
         const a_fire = a_valid and c.dut_a_ready(dut.h) != 0;
+        if (act_mode == ACT_REUSE and !expect_error and c.dut_a_ready(dut.h) != 0)
+            return error.ReuseRequestedActivationData;
         if (c.dut_m_valid(dut.h) != 0) {
             const keep: u8 = @intCast(c.dut_m_keep(dut.h));
             const beat_bytes: usize = switch (keep) {
@@ -87,7 +128,7 @@ fn runKernel(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, pr
                 0x0F => 4,
                 else => return error.InvalidTkeep,
             };
-            if (ri + beat_bytes > res.len) return error.TooManyResultBytes;
+            if (ri + beat_bytes > res.len) return error.UnexpectedResultBeat;
             var beat: [8]u8 = undefined;
             std.mem.writeInt(u64, &beat, c.dut_m_data(dut.h), .little);
             @memcpy(res[ri..][0..beat_bytes], beat[0..beat_bytes]);
@@ -104,8 +145,32 @@ fn runKernel(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, pr
         if (c.dut_done(dut.h) != 0) break;
     }
     if (cycle >= CYCLE_LIMIT) return error.KernelTimeout;
-    if (ri != res.len or !saw_last) return error.MissingResultBytes;
-    return res;
+    const activation_error = c.dut_activation_error(dut.h) != 0;
+    if (expect_error) {
+        if (!activation_error or wi != 0 or ai != 0 or ri != 0 or saw_last)
+            return error.InvalidReuseDidNotFailClosed;
+    } else if (activation_error or ri != res.len or !saw_last) {
+        return error.MissingResultBytes;
+    }
+    return .{
+        .result = res,
+        .cycles = cycle + 1,
+        .weight_beats = wi,
+        .act_beats = ai,
+        .activation_error = activation_error,
+        .activation_valid = c.dut_activation_valid(dut.h) != 0,
+        .loaded_epoch = c.dut_loaded_act_epoch(dut.h),
+        .loaded_blocks = @intCast(c.dut_loaded_act_q1_blocks(dut.h)),
+        .loaded_cols = @intCast(c.dut_loaded_act_cols(dut.h)),
+    };
+}
+
+fn runKernel(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, program_rows: usize, blocks: usize, num_cols: usize, emin: i32, weight_fmt: u2, w_bytes: []const u8, a_bytes: []const u8) ![]u8 {
+    var dut = Dut.init();
+    defer dut.deinit();
+    resetKernel(&dut);
+    const run = try runKernelOp(a, &dut, physical_rows, logical_rows, program_rows, blocks, num_cols, emin, weight_fmt, ACT_PACKED_LOAD, 0, w_bytes, a_bytes, false);
+    return run.result;
 }
 
 fn runCase(a: std.mem.Allocator, num_rb: usize, logical_rows_raw: ?usize, program_rows_raw: ?usize, blocks: usize, num_cols: usize, ternary: bool, seed: u64, note: []const u8) !void {
@@ -235,6 +300,139 @@ fn runCase(a: std.mem.Allocator, num_rb: usize, logical_rows_raw: ?usize, progra
     }
 }
 
+fn runResidentReuseCase(a: std.mem.Allocator) !void {
+    const blocks: usize = 2;
+    const cols: usize = 3;
+    const rows: usize = ROWS;
+    const epoch: u32 = 0xA17C_0042;
+    var prng = std.Random.DefaultPrng.init(0xA17C_5EED);
+    const rnd = prng.random();
+
+    const bits_load = try a.alloc(u128, rows * blocks);
+    defer a.free(bits_load);
+    const bits_reuse = try a.alloc(u128, rows * blocks);
+    defer a.free(bits_reuse);
+    const scales_load = try a.alloc(f16, rows * blocks);
+    defer a.free(scales_load);
+    const scales_reuse = try a.alloc(f16, rows * blocks);
+    defer a.free(scales_reuse);
+    for (bits_load, bits_reuse) |*first, *second| {
+        first.* = (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64);
+        second.* = ~first.*;
+    }
+    for (scales_load, scales_reuse) |*first, *second| {
+        const e: u16 = rnd.intRangeAtMost(u16, 13, 17);
+        first.* = @bitCast((e << 10) | rnd.intRangeLessThan(u16, 0, 1024));
+        second.* = @bitCast((e << 10) | rnd.intRangeLessThan(u16, 0, 1024));
+    }
+
+    const weight_len = pack.weightBytesWide(1, blocks);
+    const weights_load = try a.alloc(u8, weight_len);
+    defer a.free(weights_load);
+    const weights_reuse = try a.alloc(u8, weight_len);
+    defer a.free(weights_reuse);
+    pack.packWeightsWide(rows, blocks, bits_load, scales_load, weights_load);
+    pack.packWeightsWide(rows, blocks, bits_reuse, scales_reuse, weights_reuse);
+
+    const aq_per = blocks * layout.Q1_BLOCK;
+    const as_per = blocks * layout.Q8_SUBBLOCKS;
+    const act_bytes = try a.alloc(u8, cols * pack.actBytes(blocks));
+    defer a.free(act_bytes);
+    const aquants = try a.alloc(i8, cols * aq_per);
+    defer a.free(aquants);
+    const ascales = try a.alloc(f16, cols * as_per);
+    defer a.free(ascales);
+    const column = try a.alloc(f32, aq_per);
+    defer a.free(column);
+    for (0..cols) |col| {
+        for (column) |*value| value.* = (rnd.float(f32) - 0.5) * 4.0;
+        const aq = aquants[col * aq_per ..][0..aq_per];
+        const as_ = ascales[col * as_per ..][0..as_per];
+        pack.quantizeActs(column, aq, as_);
+        pack.packActs(blocks, aq, as_, act_bytes[col * pack.actBytes(blocks) ..][0..pack.actBytes(blocks)]);
+    }
+
+    const window = ref.fixedWindow();
+    const expected_load = try a.alloc(f32, cols * rows);
+    defer a.free(expected_load);
+    const expected_reuse = try a.alloc(f32, cols * rows);
+    defer a.free(expected_reuse);
+    var saturations: usize = 0;
+    for (0..cols) |col| {
+        const common = .{
+            .rows = rows,
+            .q1_blocks = blocks,
+            .weight_nonzero = @as(?[]const u128, null),
+            .weight_scales_hi = @as(?[]const f16, null),
+            .act_quants = aquants[col * aq_per ..][0..aq_per],
+            .act_scales = ascales[col * as_per ..][0..as_per],
+        };
+        var sat: usize = 0;
+        ref.windowedFixedOutput(.{
+            .rows = common.rows,
+            .q1_blocks = common.q1_blocks,
+            .weight_bits = bits_load,
+            .weight_nonzero = common.weight_nonzero,
+            .weight_scales = scales_load,
+            .weight_scales_hi = common.weight_scales_hi,
+            .act_quants = common.act_quants,
+            .act_scales = common.act_scales,
+        }, window, expected_load[col * rows ..][0..rows], &sat);
+        saturations += sat;
+        sat = 0;
+        ref.windowedFixedOutput(.{
+            .rows = common.rows,
+            .q1_blocks = common.q1_blocks,
+            .weight_bits = bits_reuse,
+            .weight_nonzero = common.weight_nonzero,
+            .weight_scales = scales_reuse,
+            .weight_scales_hi = common.weight_scales_hi,
+            .act_quants = common.act_quants,
+            .act_scales = common.act_scales,
+        }, window, expected_reuse[col * rows ..][0..rows], &sat);
+        saturations += sat;
+    }
+    if (saturations != 0) return error.WindowTooNarrow;
+
+    var dut = Dut.init();
+    defer dut.deinit();
+    resetKernel(&dut);
+
+    const load = try runKernelOp(a, &dut, rows, rows, rows, blocks, cols, window.emin, 1, ACT_PACKED_LOAD, epoch, weights_load, act_bytes, false);
+    defer a.free(load.result);
+    if (!std.mem.eql(u8, load.result, std.mem.sliceAsBytes(expected_load)) or
+        !load.activation_valid or load.loaded_epoch != epoch or
+        load.loaded_blocks != blocks or load.loaded_cols != cols or
+        load.weight_beats != weight_len / pack.WIDE_BEAT_BYTES or
+        load.act_beats != std.mem.bytesAsSlice(u64, act_bytes).len)
+        return error.ResidentLoadMismatch;
+
+    const reuse = try runKernelOp(a, &dut, rows, rows, rows, blocks, cols, window.emin, 1, ACT_REUSE, epoch, weights_reuse, &.{}, false);
+    defer a.free(reuse.result);
+    if (!std.mem.eql(u8, reuse.result, std.mem.sliceAsBytes(expected_reuse)) or
+        reuse.weight_beats != weight_len / pack.WIDE_BEAT_BYTES or reuse.act_beats != 0 or
+        reuse.activation_error or !reuse.activation_valid or reuse.loaded_epoch != epoch or
+        reuse.loaded_blocks != blocks or reuse.loaded_cols != cols)
+        return error.ResidentReuseMismatch;
+
+    const bad_epoch = try runKernelOp(a, &dut, rows, rows, rows, blocks, cols, window.emin, 1, ACT_REUSE, epoch + 1, weights_reuse, act_bytes, true);
+    defer a.free(bad_epoch.result);
+    const bad_shape = try runKernelOp(a, &dut, rows, rows, rows, blocks, cols - 1, window.emin, 1, ACT_REUSE, epoch, weights_reuse, act_bytes, true);
+    defer a.free(bad_shape.result);
+    if (!bad_epoch.activation_valid or bad_epoch.loaded_epoch != epoch or
+        bad_epoch.loaded_blocks != blocks or bad_epoch.loaded_cols != cols or
+        !bad_shape.activation_valid or
+        bad_shape.loaded_epoch != epoch or bad_shape.loaded_blocks != blocks or
+        bad_shape.loaded_cols != cols)
+        return error.InvalidReuseCorruptedResidentState;
+
+    std.debug.print("  resident activation load/reuse passed: epoch=0x{X:0>8}, cycles={d}/{d}, hashes=0x{X:0>16}/0x{X:0>16}, load A={d}, reuse A={d}, invalid requests consumed W/A=0/0\n", .{
+        epoch,                                load.cycles,                           reuse.cycles,
+        std.hash.Wyhash.hash(0, load.result), std.hash.Wyhash.hash(0, reuse.result), load.act_beats,
+        reuse.act_beats,
+    });
+}
+
 pub fn main() !void {
     var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -256,5 +454,6 @@ pub fn main() !void {
         .{ .num_rb = 2, .logical_rows = 21, .blocks = 2, .cols = 1, .ternary = true, .note = "ternary odd partial final rowblock" },
     };
     for (cases, 0..) |cs, i| try runCase(a, cs.num_rb, cs.logical_rows, cs.program_rows, cs.blocks, cs.cols, cs.ternary, 0x3000 + i, cs.note);
+    try runResidentReuseCase(a);
     std.debug.print("all gemm_kernel cosim cases passed (gemm_kernel === windowedFixedOutput, bit-exact)\n", .{});
 }
