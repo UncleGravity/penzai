@@ -508,10 +508,8 @@ fn packRawF32(values: []const f32, beats: []u64) void {
     }
 }
 
-fn runRawResidentCase(a: std.mem.Allocator, ternary: bool) !void {
+fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: usize) !void {
     const rows: usize = ROWS;
-    const blocks: usize = 1;
-    const cols: usize = 2;
     const epoch: u32 = if (ternary) 0xF320_0158 else 0xF320_0001;
     const weight_fmt: u32 = if (ternary) WEIGHT_FMT_TERNARY else WEIGHT_FMT_BINARY;
     const scalar_count = cols * blocks * layout.Q1_BLOCK;
@@ -573,12 +571,16 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool) !void {
         defer a.free(wide_reuse);
         pack.packTernaryWeightsWide(rows, blocks, bits_load, nonzero_load, scales_load, scales_hi_load, wide_load);
         pack.packTernaryWeightsWide(rows, blocks, bits_reuse, nonzero_reuse, scales_reuse, scales_hi_reuse, wide_reuse);
-        for (0..layout.ternary_beats_per_port_block) |beat| {
-            for (0..PORTS) |port| {
-                const src = beat * pack.WIDE_BEAT_BYTES + port * PORT_BEAT_BYTES;
-                const dst = beat * PORT_BEAT_BYTES;
-                @memcpy(storage_load[port][dst..][0..PORT_BEAT_BYTES], wide_load[src..][0..PORT_BEAT_BYTES]);
-                @memcpy(storage_reuse[port][dst..][0..PORT_BEAT_BYTES], wide_reuse[src..][0..PORT_BEAT_BYTES]);
+        for (0..blocks) |resident_block| {
+            for (0..layout.ternary_beats_per_port_block) |beat| {
+                for (0..PORTS) |port| {
+                    const src = (resident_block * layout.ternary_beats_per_port_block + beat) *
+                        pack.WIDE_BEAT_BYTES + port * PORT_BEAT_BYTES;
+                    const dst = (resident_block * layout.ternary_beats_per_port_block + beat) *
+                        PORT_BEAT_BYTES;
+                    @memcpy(storage_load[port][dst..][0..PORT_BEAT_BYTES], wide_load[src..][0..PORT_BEAT_BYTES]);
+                    @memcpy(storage_reuse[port][dst..][0..PORT_BEAT_BYTES], wide_reuse[src..][0..PORT_BEAT_BYTES]);
+                }
             }
         }
     } else {
@@ -671,19 +673,27 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool) !void {
         malformed.act_state != 2)
         return error.MalformedRawFrameDidNotFailClosed;
 
+    // Exercise the nested end predicate itself: a complete finite stream without
+    // TLAST must be rejected only on the final col/Q1/sub-block input beat.
+    const missing_last = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 2, ports_load, raw_beats, raw_beats.len, .no_last, true);
+    defer a.free(missing_last.result);
+    if (missing_last.act_beats != raw_beats.len or missing_last.quant_status != QUANT_FRAME or
+        missing_last.act_state != 2)
+        return error.MissingRawFrameEndDidNotFailClosed;
+
     var nonfinite_values = [_]f32{0.25} ** shared_layout.q8_block;
     nonfinite_values[7] = std.math.nan(f32);
     var nonfinite_beats: [shared_layout.q8_block / 2]u64 = undefined;
     packRawF32(&nonfinite_values, &nonfinite_beats);
-    const nonfinite = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 2, ports_load, &nonfinite_beats, nonfinite_beats.len, .no_last, true);
+    const nonfinite = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 3, ports_load, &nonfinite_beats, nonfinite_beats.len, .no_last, true);
     defer a.free(nonfinite.result);
     if (nonfinite.act_beats != nonfinite_beats.len or
         nonfinite.quant_status != QUANT_NONFINITE or nonfinite.act_state != 2)
         return error.NonfiniteRawInputDidNotFailClosed;
 
     std.debug.print(
-        "decode_top raw F32 {s} load/reuse passed: epoch=0x{X:0>8}, cycles={d}/{d}, hashes=0x{X:0>16}/0x{X:0>16}, A beats={d}/0; frame/nonfinite errors consumed A={d}/{d}, W/R=0/0\n",
-        .{ if (ternary) "ternary" else "binary", epoch, load.cycles, reuse.cycles, std.hash.Wyhash.hash(0, load.result), std.hash.Wyhash.hash(0, reuse.result), load.act_beats, malformed.act_beats, nonfinite.act_beats },
+        "decode_top raw F32 {s} blocks={d} cols={d} load/reuse passed: epoch=0x{X:0>8}, cycles={d}/{d}, hashes=0x{X:0>16}/0x{X:0>16}, A beats={d}/0; frame early/missing/nonfinite consumed A={d}/{d}/{d}, W/R=0/0\n",
+        .{ if (ternary) "ternary" else "binary", blocks, cols, epoch, load.cycles, reuse.cycles, std.hash.Wyhash.hash(0, load.result), std.hash.Wyhash.hash(0, reuse.result), load.act_beats, malformed.act_beats, missing_last.act_beats, nonfinite.act_beats },
     );
 }
 
@@ -702,7 +712,11 @@ pub fn main() !void {
     try runCase(a, 1, null, 0, 2, 1, false, 0x4108, "legacy zero NUM_ROWS emits full rowblock");
     try runCase(a, 1, 5, null, 2, 1, false, 0x4109, "partial one-column output, odd final TKEEP");
     try runCase(a, 2, 22, null, 2, 1, false, 0x410A, "partial one-column output, even final TKEEP");
-    try runRawResidentCase(a, false);
-    try runRawResidentCase(a, true);
+    // Preserve the original one-Q1/two-column characterization, then cross both
+    // nested ingress boundaries so TLAST/order cannot accidentally flatten Q1/cols.
+    try runRawResidentCase(a, false, 1, 2);
+    try runRawResidentCase(a, true, 1, 2);
+    try runRawResidentCase(a, false, 2, 3);
+    try runRawResidentCase(a, true, 2, 3);
     std.debug.print("all decode_top cosim cases passed (decode_top === windowedFixedOutput, bit-exact)\n", .{});
 }

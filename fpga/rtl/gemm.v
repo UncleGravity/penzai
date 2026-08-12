@@ -176,7 +176,7 @@ module gemm_rowblock #(
     // Σ±a front-end, PIPELINED over FE_LAT register stages (matmul_reducer's 8→4→1
     // balance) so the 32-element add tree closes timing: the combinational version
     // OOC'd at 212 MHz (fails f300; worst path acts→tree→DSP, 13 logic levels). The
-    // fast scale decode + clear/valid/col are delayed FE_LAT to meet the pipelined sub-sum
+    // scale significands + clear/valid/col are delayed FE_LAT to meet the pipelined sub-sum
     // at fma_mulshift. Output is the SAME integer sub-sum (add is associative — bit-exact
     // vs matmul_ref.subSum), just FE_LAT cycles later.
     //
@@ -184,8 +184,8 @@ module gemm_rowblock #(
     // input stage exists because in the full kernel the activations come from a BRAM
     // (acts_mem) whose ~1.2ns clock-to-out, in series with the Σ±a tree, missed f300 by
     // 0.3ns (full-kernel OOC). Registering the quad inputs gives the BRAM read its own
-    // cycle. The small scale-decode tolerates the BRAM delay, so it stays on the raw
-    // inputs (delayed FE_LAT) — keeping every alignment index uniform at FE_LAT-1.
+    // cycle. Scale exponents are registered before their add, then use one fewer delay
+    // stage; this keeps the same FE_LAT alignment while bounding both exponent paths.
     localparam integer FE_LAT       = 4;
     // fma_mulshift's valid_in→shifted/valid_out latency (s0..s3). The column index is
     // delayed FE_LAT+MULSHIFT_LAT so wcol selects the right accumulator when `shifted`
@@ -214,9 +214,11 @@ module gemm_rowblock #(
         end
     endfunction
 
-    // shared act-scale decompose (combinational, once), delayed FE_LAT to align at fma.
+    // Shared act-scale decompose. Register the exponent before the per-lane add so the
+    // activation BRAM clock-to-out and exponent addition do not share a cycle.
     wire signed [SIG_W-1:0] as_sig_c;
     wire signed [EXP_W-1:0] as_e_c;
+    reg  signed [EXP_W-1:0] as_e_q;
     gemm_f16_decompose #(.SIG_W(SIG_W), .EXP_W(EXP_W)) u_as (
         .f16(act_scale), .sig(as_sig_c), .e(as_e_c)
     );
@@ -245,6 +247,7 @@ module gemm_rowblock #(
             clear_sr <= {clear_sr[FE_LAT-2:0], clear};
             valid_sr <= {valid_sr[FE_LAT-2:0], valid_in};
         end
+        as_e_q <= as_e_c;
         as_sig_d[0] <= as_sig_c;
         for (d = 1; d < FE_LAT; d = d + 1) as_sig_d[d] <= as_sig_d[d-1];
     end
@@ -290,23 +293,26 @@ module gemm_rowblock #(
     genvar r, g, cc;
     generate
         for (r = 0; r < ROWS; r = r + 1) begin : gen_lane
-            // per-row weight-scale decompose (combinational), delayed FE_LAT.
+            // Register each decoded exponent before adding it to the shared activation
+            // exponent. The sum then needs FE_LAT-1 stages, preserving FMA alignment.
             wire signed [SIG_W-1:0] ws_sig_c;
             wire signed [EXP_W-1:0] ws_e_c;
             gemm_f16_decompose #(.SIG_W(SIG_W), .EXP_W(EXP_W)) u_ws (
                 .f16(weight_scales_flat[r*16 +: 16]), .sig(ws_sig_c), .e(ws_e_c)
             );
-            wire signed [EXP_W-1:0] p_exp_c = ws_e_c + as_e_c;
+            reg signed [EXP_W-1:0] ws_e_q;
+            wire signed [EXP_W-1:0] p_exp_c = ws_e_q + as_e_q;
             reg signed [SIG_W-1:0] ws_sig_d [0:FE_LAT-1];
-            reg signed [EXP_W-1:0] p_exp_d  [0:FE_LAT-1];
+            reg signed [EXP_W-1:0] p_exp_d  [0:FE_LAT-2];
             integer k;
             always @(posedge clk) begin
+                ws_e_q      <= ws_e_c;
                 ws_sig_d[0] <= ws_sig_c;
                 p_exp_d[0]  <= p_exp_c;
-                for (k = 1; k < FE_LAT; k = k + 1) begin
+                for (k = 1; k < FE_LAT; k = k + 1)
                     ws_sig_d[k] <= ws_sig_d[k-1];
+                for (k = 1; k < FE_LAT-1; k = k + 1)
                     p_exp_d[k]  <= p_exp_d[k-1];
-                end
             end
 
             // quad partials over the REGISTERED inputs (acts_r/wb_r): input reg (stage 0)
@@ -335,7 +341,7 @@ module gemm_rowblock #(
                 .clk(clk), .rst_n(rst_n),
                 .clear(clear_sr[FE_LAT-1]), .valid_in(valid_sr[FE_LAT-1]),
                 .ws_sig(ws_sig_d[FE_LAT-1]), .as_sig(as_sig_d[FE_LAT-1]),
-                .p_exp(p_exp_d[FE_LAT-1]), .emin(emin), .s_sum(s_sum_3),
+                .p_exp(p_exp_d[FE_LAT-2]), .emin(emin), .s_sum(s_sum_3),
                 .valid_out(vout), .clear_out(clr_out), .shifted(shifted)
             );
 

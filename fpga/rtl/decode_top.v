@@ -179,8 +179,6 @@ module decode_top #(
     // 512/q8_subblocks = 128 q1-blocks = 16384, the exact limit of the 104-bit accumulator
     // window. Must match the host's layout.max_sub_index.
     wire raw_activation_mode = act_mode_q == 2'd2;
-    wire [31:0] raw_total_blocks = ({16'd0, num_q1_blocks_q} *
-                                    {16'd0, num_cols_q}) << 2;
     wire [63:0] native_acts_tdata;
     wire native_acts_tvalid;
     wire native_acts_tready;
@@ -192,7 +190,8 @@ module decode_top #(
         .rst_n(rst_n),
         .start(start_strobe),
         .raw_mode(raw_activation_mode),
-        .total_blocks(raw_total_blocks),
+        .num_q1_blocks(num_q1_blocks_q),
+        .num_cols(num_cols_q),
         .s_axis_tdata(s_axis_acts_tdata),
         .s_axis_tvalid(s_axis_acts_tvalid),
         .s_axis_tready(raw_acts_tready),
