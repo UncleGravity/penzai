@@ -57,6 +57,10 @@ module flash_kernel_formal(input wire clk);
         .MAX_HEADS(MAX_HEADS),
         .MAX_HEAD_KV(MAX_HEAD_KV),
         .MAX_TOKENS(4),
+        // Two narrow-layout queries occupy slots 0..1 and 16..17. A 32-slot
+        // instance is the smallest faithful controller proof; the dedicated
+        // max-shape harness proves the production 64-slot map separately.
+        .MAX_SLOTS(32),
         .LANES(LANES)
     ) dut (
         .clk(clk), .rst_n(rst_n), .start(start),
@@ -209,6 +213,7 @@ module flash_kernel_formal(input wire clk);
         end
 
 `ifndef FORMAL_LIVENESS_ONLY
+`ifndef FORMAL_COMPLETION_ONLY
         if (f_past_valid && !$past(rst_n)) begin
             assert(!busy && !done);
             assert(!o_tvalid);
@@ -246,7 +251,6 @@ module flash_kernel_formal(input wire clk);
             if (done) begin
                 assert(f_q_count == EXPECT_Q);
                 assert(f_k_count == EXPECT_K);
-                assert(f_v_count == EXPECT_V);
                 assert(f_mask_count == EXPECT_MASK);
                 assert(f_o_count == EXPECT_O);
             end
@@ -268,10 +272,20 @@ module flash_kernel_formal(input wire clk);
         cover(rst_n && done && f_cover_mixed && f_cover_all_masked);
         cover(rst_n && done && !f_query_ever_finite[0] && f_query_ever_finite[1] &&
               f_o_count == EXPECT_O);
+`else
+        // The seventh late completion property is the external V-stream total.
+        if (rst_n && done)
+            assert(f_v_count == EXPECT_V);
+
+        // Close the harness half of the terminal transition. Controller state and
+        // output closure are asserted beside the internal completion properties.
+        if (f_past_valid && $past(rst_n) && $past(done))
+            assert(!f_run_active);
+`endif
 `endif
 
         // This watchdog is a bounded-liveness property, not an inductive
-        // invariant. The dedicated 272-step BMC exhausts the complete run before
+        // invariant. The dedicated liveness BMC exhausts the complete run before
         // this 10-bit counter could wrap. Its reduced cone contains the real
         // controller plus only the fairness assumptions needed for progress.
 `ifdef FORMAL_BOUNDED_LIVENESS

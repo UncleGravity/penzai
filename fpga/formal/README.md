@@ -34,7 +34,7 @@ suite is also exposed as the `formal-control` flake check.
 | `seq_top` | Control responses, command addressing, active-run snapshots, and abort behavior |
 | `gemm_kernel` | Run-configuration snapshots, index bounds, AXIS stalls, and terminal `TLAST` |
 | `gemm_ternary_select` | Exhaustive mapping of all two-bit ternary selector codes |
-| `flash_kernel` | Run snapshots, query/head tag and address bounds, sparse-mask advancement, II=1 softmax ordering, once-per-KV stream accounting, KV writeback barriers, output stalls, and terminal `TLAST` |
+| `flash_kernel` | Run snapshots, adaptive 64-slot query/head mapping, tag and address bounds, two-stage BRAM-read alignment, sparse-mask advancement, II=1 softmax ordering, once-per-KV stream accounting, KV writeback barriers, output stalls, and terminal `TLAST` |
 
 Each `.sby` file declares its proof, bounded-model, and cover tasks. Files named
 `*_formal.sv` provide the harness and environment assumptions. Files named
@@ -65,5 +65,25 @@ PDR and the short structural BMC omit only that watchdog; the dedicated liveness
 task enables it and checks the full interval against a reduced cone containing the
 real controller and its progress assumptions, without treating it as an inductive
 invariant. The structural assertions remain exclusively in the PDR/BMC tasks.
+
+Seven late aggregate properties use a complementary exhaustive `completion` task.
+The local tag, ordering, and barrier invariants remain in PDR; the completion task
+checks AXPY commit ordering, terminal pipeline totals and readiness, and the final
+V-stream count across the full 272-step interval. It enables the same watchdog and
+fairness assumptions as liveness. Since the only active run completes in fewer than
+256 cycles, and explicit assertions close both its reset boundary and permanent
+post-run idle suffix, this bounded check is exhaustive for the supported run.
+
+The complete controller proof retains its two-query/two-head schedule and uses the
+minimum faithful 32-slot narrow-layout instance (the second query occupies slots
+16 and 17). A separate bounded/unbounded slot-map harness instantiates the exact
+production 64-slot kernel, nondeterministically accepts either maximum command
+shape (four queries by 16 heads or two queries by 32 heads), and proves the
+production `slotIndex` mapping and derived scratch addresses are in range and
+injective. This covers both layouts, all 64 physical slots, and the wide-mode
+two-query limit without putting the full 64-slot state arrays in the controller
+PDR cone. A separate exact-production SMT induction task proves the wide Q/K/V/acc
+and scalar register delays while preserving symbolic memories as arrays; the
+controller PDR proves the matching valid and mode latency.
 
 See `BUGS.md` for production and verification issues found by the suite.
