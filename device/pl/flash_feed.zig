@@ -74,23 +74,23 @@ pub const Shape = struct {
             s.q_nb2 == s.head_dim_q * f; // n_tokens=1 ⇒ heads are contiguous
     }
 
-    /// Query-blocked eligibility is deliberately exact: accept the
-    /// layouts emitted by the supported ggml graph and let every padded or unusual
-    /// view retain the PS implementation. Q is head-major/token-inner in resident
-    /// memory and is gathered into query-major order by `packQTile`; K/V already
-    /// have the KV-major physical order consumed by the kernel.
+    /// Query-blocked eligibility is deliberately exact: accept the layouts emitted
+    /// by the supported ggml graph and let every padded or unusual view retain the
+    /// PS implementation. Q is packed token-major in resident memory and is copied
+    /// into the kernel's query-major stream order by `packQTile`; K/V already have
+    /// the KV-major physical order consumed by the kernel.
     pub fn queryBlockedDmaCapable(s: Shape) bool {
         if (s.n_tokens < 2 or s.n_tokens > CONTEXT_MAX or s.n_kv > CONTEXT_MAX) return false;
         const h = @sizeOf(f16);
         const f = @sizeOf(f32);
         const q_row = checkedMul(s.head_dim_q, f) orelse return false;
-        const q_head = checkedMul(s.n_tokens, q_row) orelse return false;
+        const q_token = checkedMul(s.n_heads, q_row) orelse return false;
         const k_row = checkedMul(s.head_dim_q, h) orelse return false;
         const k_kv = checkedMul(s.n_head_kv, k_row) orelse return false;
         const v_row = checkedMul(s.head_dim_v, h) orelse return false;
         const v_kv = checkedMul(s.n_head_kv, v_row) orelse return false;
         const mask_row = checkedMul(s.n_kv, h) orelse return false;
-        return s.q_nb1 == q_row and s.q_nb2 == q_head and
+        return s.q_nb1 == q_token and s.q_nb2 == q_row and
             s.k_nb2 == k_row and s.k_nb1 == k_kv and
             s.v_nb2 == v_row and s.v_nb1 == v_kv and
             s.mask_nb1 == mask_row;
@@ -223,8 +223,8 @@ pub fn analyzeMask(s: Shape, mask_data: ?[]const u8, collect_pairs: bool) MaskAn
     };
 }
 
-/// Gather one Q tile from ggml's packed `[head][token][dimension]` layout into the
-/// kernel stream order `[token][head][dimension]`.
+/// Copy one Q tile from ggml's packed `[token][head][dimension]` layout into the
+/// kernel stream order with the same logical axis order.
 pub fn packQTile(s: Shape, q_data: []const u8, tile: QueryTile, tile_max: usize, out: []u8) FeedError!usize {
     const tile_end = checkedAdd(tile.token_start, tile.token_count) orelse return error.InvalidShape;
     if (!validTileMax(tile_max) or tile.token_count == 0 or tile.token_count > tile_max or
@@ -454,8 +454,8 @@ fn blockedTestShapeHeads(n_tokens: usize, n_kv: usize, heads: usize, kv_heads: u
         .n_head_kv = kv_heads,
         .n_kv = n_kv,
         .n_tokens = n_tokens,
-        .q_nb1 = hdq * @sizeOf(f32),
-        .q_nb2 = n_tokens * hdq * @sizeOf(f32),
+        .q_nb1 = heads * hdq * @sizeOf(f32),
+        .q_nb2 = hdq * @sizeOf(f32),
         .k_nb1 = kv_heads * hdq * @sizeOf(f16),
         .k_nb2 = hdq * @sizeOf(f16),
         .v_nb1 = kv_heads * hdv * @sizeOf(f16),
@@ -480,12 +480,11 @@ test "query-blocked eligibility and tile plan are bounded and exact" {
     try std.testing.expect(s.queryTile(4, 4) == null);
 
     s.n_tokens = 5;
-    s.q_nb2 = s.n_tokens * s.head_dim_q * @sizeOf(f32);
     try std.testing.expectEqual(@as(usize, 2), s.tileCount(4).?);
     try std.testing.expectEqualDeep(QueryTile{ .token_start = 4, .token_count = 1 }, s.queryTile(1, 4).?);
 
     var padded = s;
-    padded.q_nb2 += 64;
+    padded.q_nb1 += 64;
     try std.testing.expect(!padded.queryBlockedDmaCapable());
     var wrong_mask = s;
     wrong_mask.mask_nb1 += 2;
@@ -505,6 +504,34 @@ test "query-blocked eligibility and tile plan are bounded and exact" {
         const shape = blockedTestShape(case.tokens, 256);
         try std.testing.expectEqual(case.tiles, shape.tileCount(4).?);
     }
+}
+
+test "query-blocked eligibility accepts observed Bonsai prefill strides" {
+    const s: Shape = .{
+        .head_dim_q = 128,
+        .head_dim_v = 128,
+        .n_heads = 16,
+        .n_head_kv = 8,
+        .n_kv = 256,
+        .n_tokens = 16,
+        .q_nb1 = 8192,
+        .q_nb2 = 512,
+        .k_nb1 = 2048,
+        .k_nb2 = 256,
+        .v_nb1 = 2048,
+        .v_nb2 = 256,
+        .mask_nb1 = 512,
+        .dst_nb1 = 512,
+        .dst_nb2 = 8192,
+    };
+    try std.testing.expect(s.queryBlockedDmaCapable());
+    try std.testing.expect(s.packedDst());
+    try std.testing.expectEqual(@as(usize, 4), physicalTileMax(s, 32, 64).?);
+
+    var transposed_q = s;
+    transposed_q.q_nb1 = 512;
+    transposed_q.q_nb2 = 8192;
+    try std.testing.expect(!transposed_q.queryBlockedDmaCapable());
 }
 
 test "physical query tiles derive from 64 slots and power-of-two head stride" {
@@ -547,7 +574,7 @@ test "K and V bytes are independent of query count within a tile" {
     }
 }
 
-test "Q gather converts head-major source into query-major tile stream" {
+test "Q gather preserves packed token-major query and head order" {
     const s = blockedTestShape(5, 6);
     const spans = requiredSpans(s, true).?;
     const q = try std.testing.allocator.alloc(u8, spans.q);

@@ -1007,6 +1007,50 @@ fn expectStandaloneRmsNormMul(commands: []const wire.Command) !void {
     }
 }
 
+test "flash lowering preserves llama token-major Q strides" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+
+    const head_dim: i64 = 128;
+    const n_heads: i64 = 16;
+    const n_head_kv: i64 = 8;
+    const n_tokens: i64 = 16;
+    const n_kv: i64 = 256;
+
+    // llama.cpp builds contiguous [D, H, T], then applies permute(0, 2, 1, 3)
+    // before FLASH_ATTN_EXT, producing logical [D, T, H] with token-major backing.
+    const q_storage = c.ggml_new_tensor_3d(ctx, c.GGML_TYPE_F32, head_dim, n_heads, n_tokens) orelse return error.OutOfMemory;
+    const q = c.ggml_permute(ctx, q_storage, 0, 2, 1, 3) orelse return error.OutOfMemory;
+    const k_storage = c.ggml_new_tensor_3d(ctx, c.GGML_TYPE_F16, head_dim, n_head_kv, n_kv) orelse return error.OutOfMemory;
+    const k = c.ggml_permute(ctx, k_storage, 0, 2, 1, 3) orelse return error.OutOfMemory;
+    const v_storage = c.ggml_new_tensor_3d(ctx, c.GGML_TYPE_F16, head_dim, n_head_kv, n_kv) orelse return error.OutOfMemory;
+    const v = c.ggml_permute(ctx, v_storage, 0, 2, 1, 3) orelse return error.OutOfMemory;
+    const mask = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F16, n_kv, n_tokens) orelse return error.OutOfMemory;
+    const attn = c.ggml_flash_attn_ext(ctx, q, k, v, mask, 0.08838835, 0, 0) orelse return error.OutOfMemory;
+
+    try std.testing.expectEqual(@as(usize, n_heads * head_dim * @sizeOf(f32)), q.*.nb[1]);
+    try std.testing.expectEqual(@as(usize, head_dim * @sizeOf(f32)), q.*.nb[2]);
+    try std.testing.expect(supportsOp(attn));
+
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, attn);
+    const commands = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    switch (commands[0]) {
+        .flash_attn_f32 => |op| {
+            try std.testing.expectEqual(@as(u64, 8192), op.q_nb1);
+            try std.testing.expectEqual(@as(u64, 512), op.q_nb2);
+            try std.testing.expectEqual(@as(u64, 2048), op.k_nb1);
+            try std.testing.expectEqual(@as(u64, 256), op.k_nb2);
+            try std.testing.expectEqual(@as(u64, 512), op.mask_nb1);
+            try std.testing.expectEqual(@as(u64, 512), op.dst_nb1);
+            try std.testing.expectEqual(@as(u64, 8192), op.dst_nb2);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
 test "lowering fuses exact adjacent rmsnorm gamma multiply" {
     const ctx = try testContext();
     defer c.ggml_free(ctx);

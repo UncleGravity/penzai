@@ -567,8 +567,8 @@ test "adaptive-slot v1 enables query blocking with shape-specific tile sizes" {
         .n_head_kv = 8,
         .n_kv = 256,
         .n_tokens = 4,
-        .q_nb1 = 128 * @sizeOf(f32),
-        .q_nb2 = 4 * 128 * @sizeOf(f32),
+        .q_nb1 = 16 * 128 * @sizeOf(f32),
+        .q_nb2 = 128 * @sizeOf(f32),
         .k_nb1 = 8 * 128 * @sizeOf(f16),
         .k_nb2 = 128 * @sizeOf(f16),
         .v_nb1 = 8 * 128 * @sizeOf(f16),
@@ -581,11 +581,13 @@ test "adaptive-slot v1 enables query blocking with shape-specific tile sizes" {
     try std.testing.expectEqual(@as(usize, 4), queryBlockedTileMax(1, 64, shape).?);
 
     shape.n_heads = 32;
+    shape.q_nb1 = 32 * 128 * @sizeOf(f32);
     shape.dst_nb2 = 32 * 128 * @sizeOf(f32);
     try std.testing.expectEqual(@as(usize, 2), queryBlockedTileMax(1, 64, shape).?);
 
     shape.n_heads = 18;
     shape.n_head_kv = 6;
+    shape.q_nb1 = 18 * 128 * @sizeOf(f32);
     shape.k_nb1 = 6 * 128 * @sizeOf(f16);
     shape.v_nb1 = 6 * 128 * @sizeOf(f16);
     shape.dst_nb2 = 18 * 128 * @sizeOf(f32);
@@ -600,8 +602,8 @@ test "K V sync extent covers an all-masked tile" {
         .n_head_kv = 1,
         .n_kv = 8,
         .n_tokens = 8,
-        .q_nb1 = 8 * @sizeOf(f32),
-        .q_nb2 = 8 * 8 * @sizeOf(f32),
+        .q_nb1 = 2 * 8 * @sizeOf(f32),
+        .q_nb2 = 8 * @sizeOf(f32),
         .k_nb1 = 8 * @sizeOf(f16),
         .k_nb2 = 8 * @sizeOf(f16),
         .v_nb1 = 8 * @sizeOf(f16),
