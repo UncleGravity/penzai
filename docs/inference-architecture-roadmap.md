@@ -6,6 +6,11 @@ current Zig/RTL data paths, and one measured Bonsai-1.7B run. Estimates below ar
 explicitly marked; everything else is either measured in that run or derived
 from hardware counters.
 
+The measurement baseline and phase ordering in this detailed document are
+historical. See `docs/accelerator-priorities.md` for the completed P0 baseline and
+current ranking; retain this document for the detailed engine and integration
+rationale.
+
 ## Executive decision
 
 The accelerator does not need a wider GEMM array or a replacement matrix engine.
@@ -32,13 +37,11 @@ The destination architecture is therefore:
 At the present binary weight density and measured bandwidth, the absolute
 weight-stream roof is about 47 tokens/s. A realistic first destination is
 26-30 device tokens/s after removing PS passes, with wall throughput depending
-on the transport work described below. Five-trits-per-byte ternary carries five
-weight payloads where binary carries eight. Ignoring block scales and alignment,
-that reduces the payload-only roof to about 29.5 tokens/s. The physical roof will
-be somewhat higher, roughly 29-34 tokens/s, because scales and padding are already
-part of the measured binary stream; the final packed layout must provide the exact
-number. Every proposed fusion must improve both formats without assuming binary's
-higher roof.
+on the transport work described below. The implemented issue-ordered Q2_0 layout
+uses 36 resident bytes per 128 weights versus binary's 20, including scales and
+alignment. That 1.8x traffic ratio puts the ternary weight-stream roof near
+26 tokens/s before later fusion work. Every proposed fusion must improve both
+formats without assuming binary's higher roof.
 
 ## Measurement baseline
 
@@ -118,7 +121,7 @@ weight-only roof    = 1 / 0.0212             = 47.2 tokens/s
 
 Weight stalls are 6.9%. Eliminating every stall would improve the kernel only by
 about 7%; widening the array cannot remove the 256.3 MiB/token read. GEMM work
-should target its input/output boundaries and ternary decode seam, not more MACs.
+should target its input/output boundaries and ternary selector seam, not more MACs.
 
 Prefill is different: 13 columns reuse each weight beat, the array reaches 99.9%
 utilization, and kernel-busy time is only about 157 ms of the 599 ms matmul total.
@@ -306,8 +309,10 @@ already removed by Phase 1.
 
 Ternary is a format vertical, not a second accelerator:
 
-1. Pack five trits per byte in resident DDR.
-2. Unpack in the GEMM weight front end to `{zero, sign}` controls.
+1. Retain both upstream group-64 scales and reorder the two-bit Q2_0 codes into
+   the GEMM issue sequence during upload.
+2. Stream one dual-scale beat and two code beats per 32-weight sub-block; select
+   `{nonzero, sign}` directly without buffering or decoding a full block.
 3. Reuse the Q8 ingress, fixed-point accumulator, output path, flash kernel, and
    all layer fusions unchanged.
 4. Maintain separate per-format counters and roofline reporting.
@@ -445,7 +450,7 @@ References:
 
 The roadmap is complete when:
 
-1. Binary and five-trits-per-byte ternary run from one timing-clean bitstream.
+1. Binary and issue-ordered two-bit ternary run from one timing-clean bitstream.
 2. Decode profiling shows weight streaming as the largest remaining short-context
    component, with no repeated PS activation quantization or standalone FFN passes.
 3. The binary design sustains at least 26 device tokens/s on the fixed benchmark,

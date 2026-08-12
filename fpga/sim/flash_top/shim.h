@@ -33,6 +33,8 @@ int dut_v_ready(Dut *d);
 int dut_mask_ready(Dut *d);
 int dut_o_valid(Dut *d);
 void dut_o_data(Dut *d, uint32_t *w8); // packed 256-bit O beat: 8 × f32
+uint32_t dut_o_keep(Dut *d);
+int dut_o_last(Dut *d);
 
 #ifdef __cplusplus
 }

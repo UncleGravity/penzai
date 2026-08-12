@@ -56,6 +56,11 @@ set ip_cache   [file join $cache_root ip]
 set checkpoint_dir [file join $cache_root checkpoints]
 set reference_dcp [file join $checkpoint_dir ${bit_name}-routed.dcp]
 set ps_fclk_mhz 99.999001
+set implementation_clock_name clk_out1_design_1_clk_wiz_0
+set setup_release_floor_ns 0.025
+set setup_headroom_target_ns 0.050
+set place_setup_guardband_ns 0.075
+set nominal_setup_uncertainty_ns 0.000
 
 file delete -force $outdir [file normalize ./$proj]
 file mkdir $outdir $ip_cache $checkpoint_dir
@@ -74,7 +79,18 @@ source [file normalize ./metrics.tcl]
     board $board \
     max_threads [get_param general.maxThreads] \
     place_directive AltSpreadLogic_high \
-    route_directive Explore]
+    phys_opt_enabled 1 \
+    phys_opt_directive AggressiveExplore \
+    route_directive Explore \
+    implementation_clock $implementation_clock_name \
+    setup_release_floor_ns $setup_release_floor_ns \
+    setup_headroom_target_ns $setup_headroom_target_ns \
+    place_setup_guardband_ns $place_setup_guardband_ns \
+    nominal_setup_uncertainty_ns $nominal_setup_uncertainty_ns]
+::penzai_analysis::metric_set timing.setup_release_floor_ns $setup_release_floor_ns
+::penzai_analysis::metric_set timing.setup_headroom_target_ns $setup_headroom_target_ns
+::penzai_analysis::metric_set timing.place_setup_guardband_ns $place_setup_guardband_ns
+::penzai_analysis::metric_set timing.nominal_setup_uncertainty_ns $nominal_setup_uncertainty_ns
 
 set build_started [clock milliseconds]
 set phase_times {}
@@ -462,13 +478,81 @@ if {![catch {open_run synth_1 -name synth_1} err]} {
     puts "WARNING: could not open synth_1 for utilization report: $err"
 }
 
-# f300 implementation effort for the remaining routing-sensitive paths:
-#   - PLACE  AltSpreadLogic_high  — spreads logic (cleared the old pc_col congestion); keep.
-#   - ROUTE  Explore             — extra routing effort for the routing-bound DMA-FIFO worst path.
-#   - POST-ROUTE phys_opt AggressiveExplore — run EXPLICITLY in-memory after open_run (the run-step
-#     -to_step token for post-route phys_opt is version-inconsistent), to grab the last ~0.04ns.
+# f300 implementation effort for the remaining routing-sensitive paths. Placement
+# sees an additional setup-only guardband so it optimizes the near-critical tail;
+# the guardband is removed before routing and never weakens the nominal signoff.
 set_property STEPS.PLACE_DESIGN.ARGS.DIRECTIVE AltSpreadLogic_high [get_runs impl_1]
+set_property STEPS.PHYS_OPT_DESIGN.IS_ENABLED true [get_runs impl_1]
+set_property STEPS.PHYS_OPT_DESIGN.ARGS.DIRECTIVE AggressiveExplore [get_runs impl_1]
 set_property STEPS.ROUTE_DESIGN.ARGS.DIRECTIVE Explore [get_runs impl_1]
+
+set apply_margin_hook [file join $outdir apply_setup_margin.tcl]
+set reset_margin_hook [file join $outdir reset_setup_margin.tcl]
+set preroute_margin_report [file join $outdir timing_preroute_margin.tsv]
+
+set fh [open $apply_margin_hook w]
+puts $fh "set penzai_clock_name [list $implementation_clock_name]"
+puts $fh "set penzai_guardband_ns [list $place_setup_guardband_ns]"
+puts $fh "set penzai_nominal_uncertainty_ns [list $nominal_setup_uncertainty_ns]"
+puts $fh {
+set penzai_clocks [get_clocks -quiet $penzai_clock_name]
+if {[llength $penzai_clocks] != 1} {
+    error "expected one implementation clock '$penzai_clock_name', got [llength $penzai_clocks]"
+}
+update_timing
+set penzai_paths [get_timing_paths -quiet -setup -from $penzai_clocks -to $penzai_clocks -max_paths 1]
+if {[llength $penzai_paths] != 1} { error "no initial pre-place path on $penzai_clock_name" }
+set penzai_initial_wns [get_property SLACK [lindex $penzai_paths 0]]
+set_clock_uncertainty -setup $penzai_nominal_uncertainty_ns $penzai_clocks
+update_timing
+set penzai_paths [get_timing_paths -quiet -setup -from $penzai_clocks -to $penzai_clocks -max_paths 1]
+set penzai_nominal_wns [get_property SLACK [lindex $penzai_paths 0]]
+if {abs($penzai_nominal_wns - $penzai_initial_wns) > 0.002} {
+    error "existing setup uncertainty differs from declared nominal ${penzai_nominal_uncertainty_ns}ns"
+}
+set_clock_uncertainty -setup $penzai_guardband_ns $penzai_clocks
+puts "==> placement setup guardband: ${penzai_guardband_ns}ns on $penzai_clock_name"
+}
+close $fh
+
+set fh [open $reset_margin_hook w]
+puts $fh "set penzai_clock_name [list $implementation_clock_name]"
+puts $fh "set penzai_guardband_ns [list $place_setup_guardband_ns]"
+puts $fh "set penzai_nominal_uncertainty_ns [list $nominal_setup_uncertainty_ns]"
+puts $fh "set penzai_margin_report [list $preroute_margin_report]"
+puts $fh {
+set penzai_clocks [get_clocks -quiet $penzai_clock_name]
+if {[llength $penzai_clocks] != 1} {
+    error "expected one implementation clock '$penzai_clock_name', got [llength $penzai_clocks]"
+}
+update_timing
+set penzai_paths [get_timing_paths -quiet -setup -from $penzai_clocks -to $penzai_clocks -max_paths 1]
+if {[llength $penzai_paths] != 1} { error "no constrained pre-route path on $penzai_clock_name" }
+set penzai_constrained_wns [get_property SLACK [lindex $penzai_paths 0]]
+set_clock_uncertainty -setup $penzai_nominal_uncertainty_ns $penzai_clocks
+update_timing
+set penzai_paths [get_timing_paths -quiet -setup -from $penzai_clocks -to $penzai_clocks -max_paths 1]
+if {[llength $penzai_paths] != 1} { error "no nominal pre-route path on $penzai_clock_name" }
+set penzai_nominal_wns [get_property SLACK [lindex $penzai_paths 0]]
+set penzai_delta [expr {$penzai_nominal_wns - $penzai_constrained_wns}]
+if {abs($penzai_delta - $penzai_guardband_ns) > 0.002} {
+    error "setup guardband reset delta ${penzai_delta}ns, expected ${penzai_guardband_ns}ns"
+}
+set penzai_fh [open $penzai_margin_report w]
+puts $penzai_fh "key\tvalue"
+puts $penzai_fh "clock\t$penzai_clock_name"
+puts $penzai_fh "guardband_ns\t$penzai_guardband_ns"
+puts $penzai_fh "nominal_uncertainty_ns\t$penzai_nominal_uncertainty_ns"
+puts $penzai_fh "constrained_wns_ns\t$penzai_constrained_wns"
+puts $penzai_fh "nominal_wns_ns\t$penzai_nominal_wns"
+puts $penzai_fh "observed_delta_ns\t$penzai_delta"
+close $penzai_fh
+puts "==> pre-route setup guardband removed: constrained=${penzai_constrained_wns}ns nominal=${penzai_nominal_wns}ns delta=${penzai_delta}ns"
+}
+close $fh
+
+set_property STEPS.PLACE_DESIGN.TCL.PRE [file normalize $apply_margin_hook] [get_runs impl_1]
+set_property STEPS.ROUTE_DESIGN.TCL.PRE [file normalize $reset_margin_hook] [get_runs impl_1]
 
 set incremental_active 0
 if {$build_mode eq "incremental"} {
@@ -490,21 +574,48 @@ if {[get_property PROGRESS [get_runs impl_1]] != "100%"} { error "implementation
 record_phase implementation_through_route $phase_started
 
 open_run impl_1
-# AggressiveExplore is expensive and only useful when the routed design misses timing.
-# When needed it incrementally reroutes touched nets, leaving the design routed.
-set routed_failing [get_timing_paths -quiet -max_paths 1 -slack_lesser_than 0]
-if {[llength $routed_failing] == 0} {
-    puts "==> routed design is timing-clean; skipping post-route phys_opt_design"
-} else {
-    set routed_wns [get_property SLACK [lindex $routed_failing 0]]
-    puts "==> routed WNS=${routed_wns}ns; running post-route AggressiveExplore"
-    set phase_started [clock milliseconds]
-    if {[catch {phys_opt_design -directive AggressiveExplore} pe]} {
-        puts "WARNING: post-route phys_opt_design failed ($pe) — gating on the routed result as-is"
-    } else {
-        puts "==> post-route phys_opt_design (AggressiveExplore) complete"
-    }
-    record_phase post_route_phys_opt $phase_started
+
+# Prove that the routed checkpoint carries nominal constraints. Reapplying the
+# placement guardband must move setup slack by exactly that amount, and removing
+# it must restore the original result before reports, bitstream, and checkpoint.
+set routed_clocks [get_clocks -quiet $implementation_clock_name]
+if {[llength $routed_clocks] != 1} {
+    error "expected one routed clock '$implementation_clock_name', got [llength $routed_clocks]"
+}
+set routed_paths [get_timing_paths -quiet -setup -from $routed_clocks -to $routed_clocks -max_paths 1]
+if {[llength $routed_paths] != 1} { error "routed design has no setup path on $implementation_clock_name" }
+set routed_nominal_wns [get_property SLACK [lindex $routed_paths 0]]
+set_clock_uncertainty -setup $place_setup_guardband_ns $routed_clocks
+update_timing
+set routed_paths [get_timing_paths -quiet -setup -from $routed_clocks -to $routed_clocks -max_paths 1]
+set routed_constrained_wns [get_property SLACK [lindex $routed_paths 0]]
+set_clock_uncertainty -setup $nominal_setup_uncertainty_ns $routed_clocks
+update_timing
+set routed_paths [get_timing_paths -quiet -setup -from $routed_clocks -to $routed_clocks -max_paths 1]
+set routed_restored_wns [get_property SLACK [lindex $routed_paths 0]]
+set routed_margin_delta [expr {$routed_nominal_wns - $routed_constrained_wns}]
+if {abs($routed_margin_delta - $place_setup_guardband_ns) > 0.002} {
+    error "routed setup guardband delta ${routed_margin_delta}ns, expected ${place_setup_guardband_ns}ns"
+}
+if {abs($routed_restored_wns - $routed_nominal_wns) > 0.001} {
+    error "routed nominal WNS did not restore: before=${routed_nominal_wns}ns after=${routed_restored_wns}ns"
+}
+::penzai_analysis::metric_set timing.routed_guardband_delta_ns $routed_margin_delta
+::penzai_analysis::metric_set timing.routed_nominal_restore_delta_ns \
+    [expr {$routed_restored_wns - $routed_nominal_wns}]
+
+if {![file exists $preroute_margin_report]} { error "missing $preroute_margin_report" }
+set fh [open $preroute_margin_report r]
+set preroute_values [dict create]
+gets $fh
+while {[gets $fh line] >= 0} {
+    set fields [split $line "\t"]
+    if {[llength $fields] == 2} { dict set preroute_values [lindex $fields 0] [lindex $fields 1] }
+}
+close $fh
+foreach key {constrained_wns_ns nominal_wns_ns observed_delta_ns} {
+    if {![dict exists $preroute_values $key]} { error "missing '$key' in $preroute_margin_report" }
+    ::penzai_analysis::metric_set timing.preroute_$key [dict get $preroute_values $key]
 }
 if {$incremental_active} {
     if {[catch {
@@ -514,7 +625,7 @@ if {$incremental_active} {
     }
 }
 set phase_started [clock milliseconds]
-::penzai_analysis::collect_routed 1
+::penzai_analysis::collect_routed 1 $setup_release_floor_ns $setup_headroom_target_ns
 record_phase routed_reports $phase_started
 
 set phase_started [clock milliseconds]

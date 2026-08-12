@@ -203,6 +203,28 @@
             mkdir -p "$ZIG_GLOBAL_CACHE_DIR" "$ZIG_LOCAL_CACHE_DIR"
           '';
 
+          # Source tree for the Zig builds, restricted to what `zig build`
+          # actually reads (per the b.path()/addCosim()/sby references in
+          # build.zig). Using ./. verbatim would snapshot every tracked file —
+          # including ~100 MB of experiments/ logs and fpga/bitstream images —
+          # into the store on every edit, and any change to those would
+          # needlessly rebuild every Zig package. (models/, external/ etc. are
+          # untracked, so the git flake fetcher already keeps them out.)
+          zigSrc = pkgs.lib.fileset.toSource {
+            root = ./.;
+            fileset = pkgs.lib.fileset.unions [
+              ./build.zig
+              ./device
+              ./host
+              ./shared
+              ./test
+              ./fpga/formal
+              ./fpga/regmap
+              ./fpga/rtl
+              ./fpga/sim
+            ];
+          };
+
           mkZigPackage =
             { pname
             , step
@@ -219,7 +241,7 @@
             pkgs.stdenv.mkDerivation {
               inherit pname;
               version = "0.1.0";
-              src = ./.;
+              src = zigSrc;
 
               nativeBuildInputs = [
                 pkgs.zig
@@ -264,7 +286,7 @@
             pkgs.stdenv.mkDerivation {
               inherit pname;
               version = "0.1.0";
-              src = ./.;
+              src = zigSrc;
 
               nativeBuildInputs = [
                 pkgs.zig
@@ -481,6 +503,11 @@
                 pkgs.sby
                 pkgs.boolector
               ];
+            };
+            rtl-cosim = mkZigCheck {
+              pname = "penzai-rtl-cosim";
+              step = "test-rtl";
+              extraNativeBuildInputs = [ pkgs.verilator ];
             };
             inherit (packages) penzai penzaid;
           };

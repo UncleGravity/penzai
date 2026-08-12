@@ -417,7 +417,7 @@ fn writeBenchProfile(writer: *std.Io.Writer, profile: run_mod.BenchProfile) std.
     try writer.writeByte('\n');
     try prof_render.writeOpTable(writer, "device ops", &profile.op_totals, profile.device_execute_ns);
     try prof_render.writeMatmulDetail(writer, "matmul", profile.usedMatmul(), profile.device_fclk_hz);
-    try prof_render.writeFlashDetail(writer, "flash", profile.usedFlash());
+    try prof_render.writeFlashDetail(writer, "flash", profile.usedFlash(), profile.device_fclk_hz);
 }
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {

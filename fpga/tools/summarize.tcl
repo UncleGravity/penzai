@@ -22,6 +22,9 @@ regexp {penzai-combined-v1-(w512-p4-f[0-9]+)-routed\.dcp$} $checkpoint_name -> v
     checkpoint $checkpoint \
     vivado_version [version -short] \
     part [get_property PART [current_design]]]
-::penzai_analysis::collect_routed 1
+# A retained combined-design checkpoint must satisfy the same release gate as a
+# fresh bitstream build. The generic metrics helper keeps a zero-slack default for
+# isolated/OOC callers that do not own this product-level policy.
+::penzai_analysis::collect_routed 1 0.025 0.050
 ::penzai_analysis::finalize complete
 puts "ANALYSIS_DONE $output_dir"

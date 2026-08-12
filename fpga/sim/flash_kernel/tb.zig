@@ -19,7 +19,18 @@ const Cfg = struct {
     ntok: usize,
     scale: f32,
     masked_kv: i32, // a kv index to mask (-inf), or -1 for none
+    expected_hash: u64 = 0,
 };
+
+const Traffic = enum { baseline, stressed };
+
+const RunResult = struct {
+    cycles: usize,
+    hash: u64,
+};
+
+const zero8 = [_]u32{0} ** 8;
+const zero4 = [_]u32{0} ** 4;
 
 fn f32bits(v: f32) u32 {
     return @bitCast(v);
@@ -53,7 +64,19 @@ const Dut = struct {
     }
 };
 
-fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
+fn hashOutputs(values: []const f32) u64 {
+    var hash: u64 = 14695981039346656037;
+    for (values) |value| {
+        const word = f32bits(value);
+        inline for (0..4) |byte_i| {
+            hash ^= @as(u8, @truncate(word >> (byte_i * 8)));
+            hash *%= 1099511628211;
+        }
+    }
+    return hash;
+}
+
+fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64, traffic: Traffic) !RunResult {
     const HDQ = cfg.hdq;
     const HDV = cfg.hdv;
     const NH = cfg.nh;
@@ -71,8 +94,8 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     var v: [NKV * NHKV * HDV]u16 = undefined;
     var mask: [NTOK * NKV]u16 = undefined;
 
-    var prng = std.Random.DefaultPrng.init(seed);
-    const rnd = prng.random();
+    var data_prng = std.Random.DefaultPrng.init(seed);
+    const rnd = data_prng.random();
     for (&q) |*x| x.* = (rnd.float(f32) - 0.5) * 2.0;
     for (&k) |*x| x.* = f16bits((rnd.float(f32) - 0.5) * 2.0);
     for (&v) |*x| x.* = f16bits((rnd.float(f32) - 0.5) * 2.0);
@@ -170,45 +193,113 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
     var vc: usize = 0;
     var mc: usize = 0;
     var oc: usize = 0;
+    var o_beats: usize = 0;
     var o_got: [NTOK * NH * HDV]f32 = undefined;
 
+    // Each source independently decides when to present its next beat. Once TVALID
+    // rises, it stays asserted with the same beat until the DUT accepts it.
+    var q_active = false;
+    var k_active = false;
+    var v_active = false;
+    var mask_active = false;
+    var traffic_prng = std.Random.DefaultPrng.init(seed ^ 0xA519_2F61_7C3D_EB47);
+    const traffic_rnd = traffic_prng.random();
+
+    var stalled_o = false;
+    var stalled_data: [8]u32 = undefined;
+    var stalled_keep: u32 = undefined;
+    var stalled_last = false;
+    var last_count: usize = 0;
+    var saw_done = false;
+
     var cyc: usize = 0;
-    const LIMIT: usize = 200000;
+    const LIMIT: usize = 500000;
     while (cyc < LIMIT) : (cyc += 1) {
-        const qv = qc < q_seq.len;
-        const kv_ = kc < k_seq.len;
-        const vv = vc < v_seq.len;
-        const mv = mc < mask_seq.len;
-        c.dut_set_q(dut.h, if (qv) &q_seq[qc] else &[_]u32{0} ** 8, @intFromBool(qv));
-        c.dut_set_k(dut.h, if (kv_) &k_seq[kc] else &[_]u32{0} ** 4, @intFromBool(kv_));
-        c.dut_set_v(dut.h, if (vv) &v_seq[vc] else &[_]u32{0} ** 4, @intFromBool(vv));
-        c.dut_set_mask(dut.h, if (mv) mask_seq[mc] else 0, @intFromBool(mv));
-        c.dut_set_o_ready(dut.h, 1);
+        if (!q_active and qc < q_seq.len and (traffic == .baseline or traffic_rnd.int(u2) != 0)) q_active = true;
+        if (!k_active and kc < k_seq.len and (traffic == .baseline or traffic_rnd.int(u2) != 0)) k_active = true;
+        if (!v_active and vc < v_seq.len and (traffic == .baseline or traffic_rnd.int(u2) != 0)) v_active = true;
+        if (!mask_active and mc < mask_seq.len and (traffic == .baseline or traffic_rnd.int(u2) != 0)) mask_active = true;
+
+        const q_last = q_active and qc + 1 == q_seq.len;
+        const k_last = k_active and kc + 1 == k_seq.len;
+        const v_last = v_active and vc + 1 == v_seq.len;
+        const mask_last = mask_active and mc + 1 == mask_seq.len;
+        c.dut_set_q(dut.h, if (q_active) &q_seq[qc] else &zero8, @intFromBool(q_active), @intFromBool(q_last));
+        c.dut_set_k(dut.h, if (k_active) &k_seq[kc] else &zero4, @intFromBool(k_active), @intFromBool(k_last));
+        c.dut_set_v(dut.h, if (v_active) &v_seq[vc] else &zero4, @intFromBool(v_active), @intFromBool(v_last));
+        c.dut_set_mask(dut.h, if (mask_active) mask_seq[mc] else 0, @intFromBool(mask_active), @intFromBool(mask_last));
+        const o_ready = traffic == .baseline or traffic_rnd.int(u2) != 0;
+        c.dut_set_o_ready(dut.h, @intFromBool(o_ready));
         dut.eval();
 
-        const qf = qv and c.dut_q_ready(dut.h) != 0;
-        const kf = kv_ and c.dut_k_ready(dut.h) != 0;
-        const vf = vv and c.dut_v_ready(dut.h) != 0;
-        const mf = mv and c.dut_mask_ready(dut.h) != 0;
-        if (c.dut_o_valid(dut.h) != 0 and oc + 8 <= o_got.len) {
+        const qf = q_active and c.dut_q_ready(dut.h) != 0;
+        const kf = k_active and c.dut_k_ready(dut.h) != 0;
+        const vf = v_active and c.dut_v_ready(dut.h) != 0;
+        const mf = mask_active and c.dut_mask_ready(dut.h) != 0;
+        const o_valid = c.dut_o_valid(dut.h) != 0;
+        if (stalled_o and !o_valid) return error.OutputValidDropped;
+        if (o_valid) {
             var beat: [8]u32 = undefined;
             c.dut_o_data(dut.h, &beat);
-            for (0..8) |i| {
-                o_got[oc] = bitsf32(beat[i]);
-                oc += 1;
+            const keep = c.dut_o_keep(dut.h);
+            const last = c.dut_o_last(dut.h) != 0;
+            if (keep != 0xFFFF_FFFF) return error.BadOutputKeep;
+            if (stalled_o and (!std.mem.eql(u32, &beat, &stalled_data) or keep != stalled_keep or last != stalled_last)) {
+                return error.OutputChangedWhileStalled;
+            }
+            if (o_ready) {
+                if (o_beats >= NTOK * NH * VB or oc + 8 > o_got.len) return error.ExtraOutputs;
+                const expect_last = o_beats + 1 == NTOK * NH * VB;
+                if (last != expect_last) return error.BadOutputLast;
+                if (last) last_count += 1;
+                for (0..8) |i| {
+                    o_got[oc] = bitsf32(beat[i]);
+                    oc += 1;
+                }
+                o_beats += 1;
+                stalled_o = false;
+            } else if (!stalled_o) {
+                stalled_data = beat;
+                stalled_keep = keep;
+                stalled_last = last;
+                stalled_o = true;
             }
         }
         const is_done = c.dut_done(dut.h) != 0;
 
+        if (is_done and (qc != q_seq.len or kc != k_seq.len or vc != v_seq.len or mc != mask_seq.len or o_beats != NTOK * NH * VB or stalled_o)) {
+            return error.PrematureDone;
+        }
+
         dut.step();
-        if (qf) qc += 1;
-        if (kf) kc += 1;
-        if (vf) vc += 1;
-        if (mf) mc += 1;
-        if (is_done) break;
+        if (qf) {
+            qc += 1;
+            q_active = false;
+        }
+        if (kf) {
+            kc += 1;
+            k_active = false;
+        }
+        if (vf) {
+            vc += 1;
+            v_active = false;
+        }
+        if (mf) {
+            mc += 1;
+            mask_active = false;
+        }
+        if (is_done) {
+            saw_done = true;
+            break;
+        }
     }
 
-    if (oc != o_got.len) {
+    if (!saw_done) return error.Timeout;
+    dut.eval();
+    if (c.dut_done(dut.h) != 0 or c.dut_busy(dut.h) != 0 or c.dut_o_valid(dut.h) != 0) return error.BadIdleAfterDone;
+
+    if (qc != q_seq.len or kc != k_seq.len or vc != v_seq.len or mc != mask_seq.len) return error.InputCountMismatch;
+    if (oc != o_got.len or o_beats != NTOK * NH * VB or last_count != 1) {
         std.debug.print("  FAIL [{d}x{d} nh{d}/{d} nkv{d} ntok{d}]: expected {d} O, got {d}\n", .{ HDQ, HDV, NH, NHKV, NKV, NTOK, o_got.len, oc });
         return error.MissingOutputs;
     }
@@ -226,11 +317,20 @@ fn runCfg(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
         const dvg = @abs(@as(f64, o_exp[i]) - @as(f64, o_fp32[i])) / @max(@abs(@as(f64, o_fp32[i])), 1.0);
         if (dvg > bf16_vs_fp32) bf16_vs_fp32 = dvg;
     }
-    std.debug.print("    cfg hdq{d} hdv{d} nh{d} nhkv{d} nkv{d} ntok{d} mask{d}: {d} cyc, O {d}, RTL-vs-ref max_rel={e:.3}, bf16-vs-fp32={e:.3}\n", .{ HDQ, HDV, NH, NHKV, NKV, NTOK, cfg.masked_kv, cyc, oc, max_rel, bf16_vs_fp32 });
+    const output_hash = hashOutputs(&o_got);
+    std.debug.print("    {s: <8} hdq{d} hdv{d} nh{d}/{d} nkv{d} ntok{d} mask{d}: {d} cyc, hash={x:0>16}, RTL-ref={e:.3}, bf16-fp32={e:.3}\n", .{ @tagName(traffic), HDQ, HDV, NH, NHKV, NKV, NTOK, cfg.masked_kv, cyc, output_hash, max_rel, bf16_vs_fp32 });
     if (max_rel > 0.02) {
         std.debug.print("  FAIL: O exceeds tolerance (worst i={d} exp={d:.5} got={d:.5})\n", .{ worst, o_exp[worst], o_got[worst] });
         return error.ResultMismatch;
     }
+    if (cfg.expected_hash != 0 and output_hash != cfg.expected_hash) return error.OutputHashMismatch;
+    return .{ .cycles = cyc, .hash = output_hash };
+}
+
+fn runPair(comptime cfg: Cfg, dut: *Dut, seed: u64) !void {
+    const baseline = try runCfg(cfg, dut, seed, .baseline);
+    const stressed = try runCfg(cfg, dut, seed, .stressed);
+    if (stressed.hash != baseline.hash) return error.StressedOutputMismatch;
 }
 
 pub fn main() !void {
@@ -240,10 +340,10 @@ pub fn main() !void {
     // reset once; the kernel returns to IDLE after each run, so configs reuse it.
     c.dut_set_rst_n(dut.h, 0);
     c.dut_set_start(dut.h, 0);
-    c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
-    c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_v(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_mask(dut.h, 0, 0);
+    c.dut_set_q(dut.h, &zero8, 0, 0);
+    c.dut_set_k(dut.h, &zero4, 0, 0);
+    c.dut_set_v(dut.h, &zero4, 0, 0);
+    c.dut_set_mask(dut.h, 0, 0, 0);
     c.dut_set_o_ready(dut.h, 1);
     c.dut_set_clk(dut.h, 0);
     dut.eval();
@@ -252,15 +352,23 @@ pub fn main() !void {
     dut.step();
 
     std.debug.print("\n  flash_kernel cosim (vs flash_ref.attendHead):\n", .{});
-    // GQA r2 + masked kv; hdq!=hdv + n_tok>1 + nhkv>1 + no mask; single head + leading mask.
-    try runCfg(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .masked_kv = 2 }, &dut, 0xF1A54EE7);
-    try runCfg(.{ .hdq = 24, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 3, .ntok = 2, .scale = 0.125, .masked_kv = -1 }, &dut, 0xBEEF01);
-    try runCfg(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .masked_kv = 0 }, &dut, 0xC0FFEE);
+    // GQA r2 + masked kv; fastest one-beat multi-head producer; hdq!=hdv +
+    // n_tok>1 + nhkv>1 + no mask; single head + leading mask.
+    try runPair(.{ .hdq = 16, .hdv = 16, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.25, .masked_kv = 2, .expected_hash = 0x571c_b97c_8fc5_a57a }, &dut, 0xF1A54EE7);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 2, .nhkv = 1, .nkv = 4, .ntok = 1, .scale = 0.35355338, .masked_kv = -1, .expected_hash = 0xe455_4143_ad16_f43c }, &dut, 0x8011);
+    try runPair(.{ .hdq = 24, .hdv = 8, .nh = 4, .nhkv = 2, .nkv = 3, .ntok = 2, .scale = 0.125, .masked_kv = -1, .expected_hash = 0xb5ae_b111_cbf4_8077 }, &dut, 0xBEEF01);
+    try runPair(.{ .hdq = 8, .hdv = 8, .nh = 1, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 1.0, .masked_kv = 0, .expected_hash = 0x7d76_2a47_b5e4_31f3 }, &dut, 0xC0FFEE);
+    // Non-power-of-two head count, q/v widths, and KV extent. The interior mask also
+    // verifies that skip traffic does not disturb ordered head tags or output framing.
+    try runPair(.{ .hdq = 24, .hdv = 16, .nh = 3, .nhkv = 1, .nkv = 5, .ntok = 1, .scale = 0.2, .masked_kv = 2, .expected_hash = 0x14e4_ef7c_e532_1e81 }, &dut, 0x3EAD5);
     // Decode shape: head_dim 128 (qbeats=16, full adder tree, no zero-pad),
     // 16 query heads over 8 kv-heads (GQA r2, half the pool), real 1/sqrt(128) scale.
-    try runCfg(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4 }, &dut, 0xD00D);
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4, .expected_hash = 0x041a_157f_8f65_bcef }, &dut, 0xD00D);
+    // Scheduler benchmark: enough all-valid KV positions to amortize Q load,
+    // accumulator initialization, and final output emission.
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 16, .nhkv = 8, .nkv = 16, .ntok = 1, .scale = 0.08838835, .masked_kv = -1, .expected_hash = 0x8d9f_b8a9_24f4_8301 }, &dut, 0x16BEEF);
     // 32 query heads over 8 kv-heads (GQA r4): exercises the full MAX_HEADS pool and the
     // head-index bits above [3:0] — the aliasing the [3:0] pool index used to cause.
-    try runCfg(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4 }, &dut, 0x32EAD5);
+    try runPair(.{ .hdq = 128, .hdv = 128, .nh = 32, .nhkv = 8, .nkv = 6, .ntok = 1, .scale = 0.08838835, .masked_kv = 4, .expected_hash = 0xcb4b_8407_4344_2339 }, &dut, 0x32EAD5);
     std.debug.print("  all flash_kernel cosim configs passed\n\n", .{});
 }

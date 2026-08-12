@@ -12,8 +12,8 @@ SPEC.loader.exec_module(p0)
 
 def identity() -> dict:
     return {
-        "artifact_schema_version": 1,
-        "suite_version": 1,
+        "artifact_schema_version": p0.ARTIFACT_SCHEMA_VERSION,
+        "suite_version": p0.SUITE_VERSION,
         "suite": "characterize",
         "cases": [
             {
@@ -27,6 +27,27 @@ def identity() -> dict:
         ],
         "runner_sha256": "runner-a",
     }
+
+
+def attention_line(**overrides: object) -> str:
+    fields: dict[str, object] = {name: 0 for name in p0.ATTENTION_INTEGER_FIELDS}
+    fields.update(
+        {
+            "schema": p0.ATTENTION_RESULT_SCHEMA_VERSION,
+            "phase": "decode",
+            "backend": "pl",
+            "path": "direct",
+            "n_heads": 16,
+            "n_head_kv": 8,
+            "head_dim_q": 128,
+            "head_dim_v": 128,
+            "n_tokens": 1,
+            "calls": 1,
+            "fclk_hz": 300_000_000,
+        }
+    )
+    fields.update(overrides)
+    return "attention_result " + " ".join(f"{key}={value}" for key, value in fields.items())
 
 
 def sample(model: str, repeat: int, steady_ms: float) -> dict:
@@ -91,6 +112,62 @@ class SummaryTests(unittest.TestCase):
         self.assertTrue(complete["complete"])
         self.assertTrue(complete["run_validated"])
         self.assertEqual([], complete["missing_sample_keys"])
+
+
+class AttentionResultTests(unittest.TestCase):
+    def test_parser_preserves_shapes_and_metrics_use_only_pl_counters(self) -> None:
+        text = "\n".join(
+            (
+                attention_line(
+                    backend="ps",
+                    path="software",
+                    calls=2,
+                    valid_qkv_pairs=10,
+                    processed_qkv_pairs=12,
+                    valid_qhkv_updates=160,
+                    processed_qhkv_updates=192,
+                ),
+                attention_line(
+                    n_tokens=2,
+                    calls=3,
+                    kernel_runs=3,
+                    cycles=24_000,
+                    valid_qkv_pairs=100,
+                    processed_qkv_pairs=125,
+                    valid_qhkv_updates=1_600,
+                    processed_qhkv_updates=2_000,
+                ),
+            )
+        )
+        records = p0.parse_attention_results(text)
+        self.assertEqual(2, len(records["decode"]))
+        self.assertEqual({"ps", "pl"}, {record["backend"] for record in records["decode"]})
+        self.assertEqual({1, 2}, {record["n_tokens"] for record in records["decode"]})
+
+        metrics = p0.attention_metrics(records)
+        self.assertEqual(60.0, metrics["decode_attention_pl_call_pct"])
+        self.assertEqual(8_000.0, metrics["decode_attention_cycles_per_kernel_run"])
+        self.assertEqual(15.0, metrics["decode_attention_cycles_per_valid_qhkv_update"])
+        self.assertEqual(12.0, metrics["decode_attention_cycles_per_processed_qhkv_update"])
+        self.assertEqual(20.0, metrics["decode_attention_mvalid_qhkv_per_s"])
+        self.assertEqual(80.0, metrics["decode_attention_valid_density_pct"])
+
+    def test_zero_work_does_not_invent_efficiency(self) -> None:
+        records = p0.parse_attention_results(attention_line())
+        metrics = p0.attention_metrics(records)
+        self.assertEqual(100.0, metrics["decode_attention_pl_call_pct"])
+        self.assertNotIn("decode_attention_cycles_per_valid_qhkv_update", metrics)
+        self.assertNotIn("decode_attention_mvalid_qhkv_per_s", metrics)
+
+    def test_duplicate_shape_and_missing_field_are_rejected(self) -> None:
+        line = attention_line()
+        with self.assertRaises(p0.HarnessError):
+            p0.parse_attention_results(f"{line}\n{line}")
+        missing_cycles = " ".join(item for item in line.split() if not item.startswith("cycles="))
+        with self.assertRaises(p0.HarnessError):
+            p0.parse_attention_results(missing_cycles)
+        with self.assertRaises(p0.HarnessError):
+            p0.parse_attention_results(attention_line(path="unknown"))
 
 
 if __name__ == "__main__":

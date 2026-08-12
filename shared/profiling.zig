@@ -109,8 +109,9 @@ pub const MatmulStat = struct {
 };
 
 /// One bounded bucket of like-shaped flash-attention commands. KV extents report
-/// loop bounds; query-KV pairs separately report padded work, finite mask entries,
-/// and the work actually walked by the selected backend.
+/// loop bounds; query-KV pairs separately report padded work, mask entries other
+/// than f16 -inf, and the work actually walked by the selected backend. Pair counts
+/// do not include query heads; use the query-head/KV helpers for engine work.
 pub const FlashStat = struct {
     backend: Backend = .ps,
     path: ExecutionPath = .software,
@@ -162,6 +163,26 @@ pub const FlashStat = struct {
     pub fn wrapperChildrenNs(self: FlashStat) u64 {
         return self.prepare_ns +| self.sync_to_ns +| self.setup_ns +| self.wait_ns +|
             self.sync_from_ns +| self.result_layout_ns;
+    }
+
+    pub fn validQueryHeadKvUpdates(self: FlashStat) u64 {
+        return self.valid_qkv_pairs *| @as(u64, self.n_heads);
+    }
+
+    pub fn processedQueryHeadKvUpdates(self: FlashStat) u64 {
+        return self.processed_qkv_pairs *| @as(u64, self.n_heads);
+    }
+
+    pub fn cyclesPerValidUpdate(self: FlashStat) ?f64 {
+        const updates = self.validQueryHeadKvUpdates();
+        if (self.cycles == 0 or updates == 0) return null;
+        return @as(f64, @floatFromInt(self.cycles)) / @as(f64, @floatFromInt(updates));
+    }
+
+    pub fn cyclesPerProcessedUpdate(self: FlashStat) ?f64 {
+        const updates = self.processedQueryHeadKvUpdates();
+        if (self.cycles == 0 or updates == 0) return null;
+        return @as(f64, @floatFromInt(self.cycles)) / @as(f64, @floatFromInt(updates));
     }
 };
 
@@ -460,6 +481,23 @@ test "profile report roundtrips" {
     try std.testing.expectEqualDeep(view.summary, decoded.summary);
     try std.testing.expectEqualDeep(matmul_stats[0], decoded.matmul_stats[0]);
     try std.testing.expectEqualDeep(flash_stats[0], decoded.flash_stats[0]);
+}
+
+test "flash efficiency counts query-head KV updates and handles empty masks" {
+    const stat = FlashStat{
+        .n_heads = 16,
+        .valid_qkv_pairs = 100,
+        .processed_qkv_pairs = 125,
+        .cycles = 24_000,
+    };
+    try std.testing.expectEqual(@as(u64, 1600), stat.validQueryHeadKvUpdates());
+    try std.testing.expectEqual(@as(u64, 2000), stat.processedQueryHeadKvUpdates());
+    try std.testing.expectApproxEqAbs(@as(f64, 15), stat.cyclesPerValidUpdate().?, 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f64, 12), stat.cyclesPerProcessedUpdate().?, 0.0001);
+
+    const all_masked = FlashStat{ .n_heads = 16, .processed_qkv_pairs = 8, .cycles = 100 };
+    try std.testing.expect(all_masked.cyclesPerValidUpdate() == null);
+    try std.testing.expect(all_masked.cyclesPerProcessedUpdate() != null);
 }
 
 test "profile decoder rejects unknown backend tags" {

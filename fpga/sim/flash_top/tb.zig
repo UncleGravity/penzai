@@ -74,6 +74,246 @@ const Dut = struct {
     }
 };
 
+const QSeq = [NTOK * NH * QB][8]u32;
+const KSeq = [NTOK * NKV * NHKV * QB][4]u32;
+const VSeq = [NTOK * NKV * NHKV * VB][4]u32;
+const MaskSeq = [NTOK * NKV]u16;
+const Output = [NTOK * NH * HDV]f32;
+
+const RunStats = struct {
+    cycles: u32,
+    k_stalls: u32,
+    v_stalls: u32,
+    o_stalls: u32,
+};
+
+fn resetDut(dut: *Dut) void {
+    c.dut_set_rst_n(dut.h, 0);
+    c.dut_axi_idle(dut.h);
+    c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
+    c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
+    c.dut_set_v(dut.h, &[_]u32{0} ** 4, 0);
+    c.dut_set_mask(dut.h, 0, 0);
+    c.dut_set_o_ready(dut.h, 1);
+    c.dut_set_clk(dut.h, 0);
+    dut.eval();
+    for (0..6) |_| dut.step();
+    c.dut_set_rst_n(dut.h, 1);
+    dut.step();
+}
+
+fn runOnce(
+    dut: *Dut,
+    name: []const u8,
+    q_seq: *const QSeq,
+    k_seq: *const KSeq,
+    v_seq: *const VSeq,
+    mask_seq: *const MaskSeq,
+    o_exp: *const Output,
+    inject_stalls: bool,
+) !RunStats {
+    // Reconfigure and start every run. In particular, CTRL.start must clear status
+    // and all performance counters without relying on reset between invocations.
+    dut.axiWrite(regmap.offsetOf("HEAD_DIM_Q"), HDQ);
+    dut.axiWrite(regmap.offsetOf("HEAD_DIM_V"), HDV);
+    dut.axiWrite(regmap.offsetOf("N_HEADS"), NH);
+    dut.axiWrite(regmap.offsetOf("N_HEAD_KV"), NHKV);
+    dut.axiWrite(regmap.offsetOf("HEAD_RATIO"), HEAD_RATIO);
+    dut.axiWrite(regmap.offsetOf("N_KV"), NKV);
+    dut.axiWrite(regmap.offsetOf("N_TOKENS"), NTOK);
+    dut.axiWrite(regmap.offsetOf("SCALE"), f32bits(SCALE));
+    const hdq_rb = dut.axiRead(regmap.offsetOf("HEAD_DIM_Q"));
+    dut.axiWrite(regmap.offsetOf("CTRL"), 1);
+    c.dut_axi_idle(dut.h);
+
+    var qc: usize = 0;
+    var kc: usize = 0;
+    var vc: usize = 0;
+    var mc: usize = 0;
+    var oc: usize = 0;
+    var output_beat: usize = 0;
+    var o_got: Output = undefined;
+
+    // Each selected beat is withheld for exactly one cycle in which the consumer
+    // is ready. This makes the expected K/V/O stall counts independent of the
+    // kernel's internal cycle schedule.
+    const no_beat: usize = std.math.maxInt(usize);
+    var k_bubbled_for: usize = no_beat;
+    var v_bubbled_for: usize = no_beat;
+    var o_stalled_for: usize = no_beat;
+    var observed_k_stalls: u32 = 0;
+    var observed_v_stalls: u32 = 0;
+    var observed_o_stalls: u32 = 0;
+
+    var held_valid = false;
+    var held_data: [8]u32 = undefined;
+    var held_keep: u32 = 0;
+    var held_last = false;
+    var framing_ok = true;
+
+    var loop_cycles: usize = 0;
+    while (loop_cycles < 100000 and oc < o_got.len) : (loop_cycles += 1) {
+        const q_valid = qc < q_seq.len;
+        const k_pending = kc < k_seq.len;
+        const v_pending = vc < v_seq.len;
+        const mask_valid = mc < mask_seq.len;
+        const k_bubble = inject_stalls and k_pending and kc % 2 == 0 and k_bubbled_for != kc;
+        const v_bubble = inject_stalls and v_pending and vc % 2 == 1 and v_bubbled_for != vc;
+        const o_stall = inject_stalls and output_beat % 2 == 0 and o_stalled_for != output_beat;
+        const k_valid = k_pending and !k_bubble;
+        const v_valid = v_pending and !v_bubble;
+        const o_ready = !o_stall;
+
+        c.dut_set_q(dut.h, if (q_valid) &q_seq[qc] else &[_]u32{0} ** 8, @intFromBool(q_valid));
+        c.dut_set_k(dut.h, if (k_valid) &k_seq[kc] else &[_]u32{0} ** 4, @intFromBool(k_valid));
+        c.dut_set_v(dut.h, if (v_valid) &v_seq[vc] else &[_]u32{0} ** 4, @intFromBool(v_valid));
+        c.dut_set_mask(dut.h, if (mask_valid) mask_seq[mc] else 0, @intFromBool(mask_valid));
+        c.dut_set_o_ready(dut.h, @intFromBool(o_ready));
+        dut.eval();
+
+        const q_ready = c.dut_q_ready(dut.h) != 0;
+        const k_ready = c.dut_k_ready(dut.h) != 0;
+        const v_ready = c.dut_v_ready(dut.h) != 0;
+        const mask_ready = c.dut_mask_ready(dut.h) != 0;
+        const o_valid = c.dut_o_valid(dut.h) != 0;
+
+        if (k_ready and !k_valid) {
+            observed_k_stalls += 1;
+            if (k_bubble) k_bubbled_for = kc;
+        }
+        if (v_ready and !v_valid) {
+            observed_v_stalls += 1;
+            if (v_bubble) v_bubbled_for = vc;
+        }
+
+        var beat: [8]u32 = undefined;
+        if (o_valid) c.dut_o_data(dut.h, &beat);
+        const o_keep = c.dut_o_keep(dut.h);
+        const o_last = c.dut_o_last(dut.h) != 0;
+
+        if (held_valid) {
+            if (!o_valid or !std.mem.eql(u32, held_data[0..], beat[0..]) or
+                held_keep != o_keep or held_last != o_last)
+            {
+                std.debug.print("  FAIL {s}: output changed while backpressured\n", .{name});
+                framing_ok = false;
+            }
+        }
+        if (o_valid and !o_ready) {
+            observed_o_stalls += 1;
+            o_stalled_for = output_beat;
+            if (!held_valid) {
+                held_valid = true;
+                held_data = beat;
+                held_keep = o_keep;
+                held_last = o_last;
+            }
+        } else if (o_valid and o_ready) {
+            const expect_last = output_beat + 1 == NTOK * NH * VB;
+            if (o_keep != 0xFFFFFFFF or o_last != expect_last) {
+                std.debug.print("  FAIL {s}: O beat {d} keep=0x{X:0>8} last={any}, expected keep=all last={any}\n", .{ name, output_beat, o_keep, o_last, expect_last });
+                framing_ok = false;
+            }
+            if (oc + 8 > o_got.len) return error.ExtraOutputs;
+            for (0..8) |i| {
+                o_got[oc] = bitsf32(beat[i]);
+                oc += 1;
+            }
+            output_beat += 1;
+            held_valid = false;
+        } else if (held_valid) {
+            std.debug.print("  FAIL {s}: output valid dropped while backpressured\n", .{name});
+            framing_ok = false;
+        }
+
+        dut.step();
+        if (q_valid and q_ready) qc += 1;
+        if (k_valid and k_ready) kc += 1;
+        if (v_valid and v_ready) vc += 1;
+        if (mask_valid and mask_ready) mc += 1;
+    }
+
+    c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
+    c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
+    c.dut_set_v(dut.h, &[_]u32{0} ** 4, 0);
+    c.dut_set_mask(dut.h, 0, 0);
+    c.dut_set_o_ready(dut.h, 1);
+    for (0..8) |_| dut.step();
+
+    const status = dut.axiRead(regmap.offsetOf("STATUS"));
+    const cycles = dut.axiRead(regmap.offsetOf("CYCLES"));
+    const q_beats = dut.axiRead(regmap.offsetOf("Q_BEATS"));
+    const k_beats = dut.axiRead(regmap.offsetOf("K_BEATS"));
+    const k_stalls = dut.axiRead(regmap.offsetOf("K_STALL"));
+    const v_beats = dut.axiRead(regmap.offsetOf("V_BEATS"));
+    const v_stalls = dut.axiRead(regmap.offsetOf("V_STALL"));
+    const o_beats = dut.axiRead(regmap.offsetOf("O_BEATS"));
+    const o_stalls = dut.axiRead(regmap.offsetOf("O_STALL"));
+    const id = dut.axiRead(regmap.offsetOf("ID"));
+
+    var max_rel: f64 = 0;
+    if (oc == o_got.len) {
+        for (0..o_got.len) |i| {
+            const relative = @abs(@as(f64, o_exp[i]) - @as(f64, o_got[i])) /
+                @max(@abs(@as(f64, o_exp[i])), 1.0);
+            max_rel = @max(max_rel, relative);
+        }
+    }
+
+    std.debug.print("\n  flash_top {s}: loop={d} cycles_reg={d}, O {d}/{d}, max_rel={e:.4}\n", .{ name, loop_cycles, cycles, oc, o_got.len, max_rel });
+    std.debug.print("    beats q/k/v/o={d}/{d}/{d}/{d}; stalls k/v/o={d}/{d}/{d}\n", .{ q_beats, k_beats, v_beats, o_beats, k_stalls, v_stalls, o_stalls });
+
+    var ok = framing_ok;
+    if (oc != o_got.len) {
+        std.debug.print("  FAIL {s}: O incomplete ({d}/{d})\n", .{ name, oc, o_got.len });
+        ok = false;
+    }
+    if (qc != q_seq.len or kc != k_seq.len or vc != v_seq.len or mc != mask_seq.len) {
+        std.debug.print("  FAIL {s}: input streams incomplete q/k/v/m={d}/{d}/{d}/{d}\n", .{ name, qc, kc, vc, mc });
+        ok = false;
+    }
+    if (max_rel > 0.02) {
+        std.debug.print("  FAIL {s}: O exceeds tolerance\n", .{name});
+        ok = false;
+    }
+    if (hdq_rb != HDQ or id != regmap.resetOf("ID")) {
+        std.debug.print("  FAIL {s}: register readback hdq={d}, id=0x{X:0>8}\n", .{ name, hdq_rb, id });
+        ok = false;
+    }
+    if ((status >> 1) & 1 != 1 or status & 1 != 0) {
+        std.debug.print("  FAIL {s}: terminal STATUS=0x{X}\n", .{ name, status });
+        ok = false;
+    }
+
+    const exp_q = NTOK * NH * QB;
+    const exp_k = NTOK * NKV * NHKV * QB;
+    const exp_v = NTOK * NKV * NHKV * VB;
+    const exp_o = NTOK * NH * VB;
+    if (q_beats != exp_q or k_beats != exp_k or v_beats != exp_v or o_beats != exp_o) {
+        std.debug.print("  FAIL {s}: beat counters expected q/k/v/o={d}/{d}/{d}/{d}\n", .{ name, exp_q, exp_k, exp_v, exp_o });
+        ok = false;
+    }
+    if (k_stalls != observed_k_stalls or v_stalls != observed_v_stalls or o_stalls != observed_o_stalls) {
+        std.debug.print("  FAIL {s}: observed stalls k/v/o={d}/{d}/{d}\n", .{ name, observed_k_stalls, observed_v_stalls, observed_o_stalls });
+        ok = false;
+    }
+    if (cycles == 0) {
+        std.debug.print("  FAIL {s}: cycle counter is zero\n", .{name});
+        ok = false;
+    }
+    if (inject_stalls and (k_stalls == 0 or v_stalls == 0 or o_stalls == 0)) {
+        std.debug.print("  FAIL {s}: deterministic stalls did not exercise every counted stream\n", .{name});
+        ok = false;
+    }
+    if (!inject_stalls and (k_stalls != 0 or v_stalls != 0 or o_stalls != 0)) {
+        std.debug.print("  FAIL {s}: per-run stall counters were not clear\n", .{name});
+        ok = false;
+    }
+    if (!ok) return error.Failed;
+
+    return .{ .cycles = cycles, .k_stalls = k_stalls, .v_stalls = v_stalls, .o_stalls = o_stalls };
+}
+
 pub fn main() !void {
     // ---- source tensors + reference (mirror flash_ref.attendHead) ----
     var q: [NTOK * NH * HDQ]f32 = undefined;
@@ -118,10 +358,10 @@ pub fn main() !void {
 
     // ---- input streams in the kv-major kernel's consumption order ----
     // Q per (token, head); K/V/mask kv-major, NON-replicated (one per kv-head).
-    var q_seq: [NTOK * NH * QB][8]u32 = undefined;
-    var k_seq: [NTOK * NKV * NHKV * QB][4]u32 = undefined;
-    var v_seq: [NTOK * NKV * NHKV * VB][4]u32 = undefined;
-    var mask_seq: [NTOK * NKV]u16 = undefined;
+    var q_seq: QSeq = undefined;
+    var k_seq: KSeq = undefined;
+    var v_seq: VSeq = undefined;
+    var mask_seq: MaskSeq = undefined;
     var qi: usize = 0;
     var ki: usize = 0;
     var vi: usize = 0;
@@ -155,127 +395,14 @@ pub fn main() !void {
 
     var dut = Dut.init();
     defer dut.deinit();
+    resetDut(&dut);
 
-    // reset
-    c.dut_set_rst_n(dut.h, 0);
-    c.dut_axi_idle(dut.h);
-    c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
-    c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_v(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_mask(dut.h, 0, 0);
-    c.dut_set_o_ready(dut.h, 1);
-    c.dut_set_clk(dut.h, 0);
-    dut.eval();
-    for (0..6) |_| dut.step();
-    c.dut_set_rst_n(dut.h, 1);
-    dut.step();
-
-    // ---- configure via AXI-Lite, then start ----
-    dut.axiWrite(regmap.offsetOf("HEAD_DIM_Q"), HDQ);
-    dut.axiWrite(regmap.offsetOf("HEAD_DIM_V"), HDV);
-    dut.axiWrite(regmap.offsetOf("N_HEADS"), NH);
-    dut.axiWrite(regmap.offsetOf("N_HEAD_KV"), NHKV);
-    dut.axiWrite(regmap.offsetOf("HEAD_RATIO"), HEAD_RATIO);
-    dut.axiWrite(regmap.offsetOf("N_KV"), NKV);
-    dut.axiWrite(regmap.offsetOf("N_TOKENS"), NTOK);
-    dut.axiWrite(regmap.offsetOf("SCALE"), f32bits(SCALE));
-    // readback sanity on one config register
-    const hdq_rb = dut.axiRead(regmap.offsetOf("HEAD_DIM_Q"));
-    dut.axiWrite(regmap.offsetOf("CTRL"), 1); // start strobe
-    c.dut_axi_idle(dut.h);
-
-    // ---- feed streams, collect O ----
-    var qc: usize = 0;
-    var kc: usize = 0;
-    var vc: usize = 0;
-    var mc: usize = 0;
-    var oc: usize = 0;
-    var o_got: [NTOK * NH * HDV]f32 = undefined;
-    var cyc: usize = 0;
-    while (cyc < 100000 and oc < o_got.len) : (cyc += 1) {
-        const qv = qc < q_seq.len;
-        const kv_ = kc < k_seq.len;
-        const vv = vc < v_seq.len;
-        const mv = mc < mask_seq.len;
-        c.dut_set_q(dut.h, if (qv) &q_seq[qc] else &[_]u32{0} ** 8, @intFromBool(qv));
-        c.dut_set_k(dut.h, if (kv_) &k_seq[kc] else &[_]u32{0} ** 4, @intFromBool(kv_));
-        c.dut_set_v(dut.h, if (vv) &v_seq[vc] else &[_]u32{0} ** 4, @intFromBool(vv));
-        c.dut_set_mask(dut.h, if (mv) mask_seq[mc] else 0, @intFromBool(mv));
-        c.dut_set_o_ready(dut.h, 1);
-        dut.eval();
-        const qf = qv and c.dut_q_ready(dut.h) != 0;
-        const kf = kv_ and c.dut_k_ready(dut.h) != 0;
-        const vf = vv and c.dut_v_ready(dut.h) != 0;
-        const mf = mv and c.dut_mask_ready(dut.h) != 0;
-        if (c.dut_o_valid(dut.h) != 0 and oc + 8 <= o_got.len) {
-            var beat: [8]u32 = undefined;
-            c.dut_o_data(dut.h, &beat);
-            for (0..8) |i| {
-                o_got[oc] = bitsf32(beat[i]);
-                oc += 1;
-            }
-        }
-        dut.step();
-        if (qf) qc += 1;
-        if (kf) kc += 1;
-        if (vf) vc += 1;
-        if (mf) mc += 1;
+    const stalled = try runOnce(&dut, "stalled", &q_seq, &k_seq, &v_seq, &mask_seq, &o_exp, true);
+    const clean = try runOnce(&dut, "clean-after-stalled", &q_seq, &k_seq, &v_seq, &mask_seq, &o_exp, false);
+    if (stalled.cycles <= clean.cycles) {
+        std.debug.print("  FAIL: stalled run cycles {d} did not exceed clean run {d}\n", .{ stalled.cycles, clean.cycles });
+        return error.Failed;
     }
-    // streams idle, then let the kernel finish (last O beat → S_TNEXT → S_DONE → IDLE)
-    // before polling status/counters.
-    c.dut_set_q(dut.h, &[_]u32{0} ** 8, 0);
-    c.dut_set_k(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_v(dut.h, &[_]u32{0} ** 4, 0);
-    c.dut_set_mask(dut.h, 0, 0);
-    for (0..8) |_| dut.step();
-
-    const status = dut.axiRead(regmap.offsetOf("STATUS"));
-    const q_beats = dut.axiRead(regmap.offsetOf("Q_BEATS"));
-    const k_beats = dut.axiRead(regmap.offsetOf("K_BEATS"));
-    const v_beats = dut.axiRead(regmap.offsetOf("V_BEATS"));
-    const o_beats = dut.axiRead(regmap.offsetOf("O_BEATS"));
-    const id = dut.axiRead(regmap.offsetOf("ID"));
-
-    std.debug.print("\n  flash_top cosim: {d} cyc, O {d}/{d}\n", .{ cyc, oc, o_got.len });
-    std.debug.print("    config readback HEAD_DIM_Q={d} (exp {d}); ID=0x{X:0>8}\n", .{ hdq_rb, HDQ, id });
-    std.debug.print("    STATUS=0x{X} (done bit {d}); counters q={d} k={d} v={d} o={d}\n", .{ status, (status >> 1) & 1, q_beats, k_beats, v_beats, o_beats });
-
-    if (oc != o_got.len) {
-        std.debug.print("  FAIL: O incomplete ({d}/{d})\n", .{ oc, o_got.len });
-        return error.MissingOutputs;
-    }
-    var max_rel: f64 = 0;
-    for (0..o_got.len) |i| {
-        const r = @abs(@as(f64, o_exp[i]) - @as(f64, o_got[i])) / @max(@abs(@as(f64, o_exp[i])), 1.0);
-        max_rel = @max(max_rel, r);
-    }
-    std.debug.print("    O max_rel={e:.4}\n", .{max_rel});
-
-    var ok = true;
-    if (max_rel > 0.02) {
-        std.debug.print("  FAIL: O exceeds tolerance\n", .{});
-        ok = false;
-    }
-    if (hdq_rb != HDQ) {
-        std.debug.print("  FAIL: config readback {d} != {d}\n", .{ hdq_rb, HDQ });
-        ok = false;
-    }
-    if (id != regmap.resetOf("ID")) {
-        std.debug.print("  FAIL: ID 0x{X} != regmap 0x{X}\n", .{ id, regmap.resetOf("ID") });
-        ok = false;
-    }
-    if ((status >> 1) & 1 != 1) {
-        std.debug.print("  FAIL: STATUS done bit not set\n", .{});
-        ok = false;
-    }
-    const exp_q = NTOK * NH * QB;
-    const exp_o = NTOK * NH * VB; // packed O: VB beats/head (8 f32 each), not HDV
-    const exp_k = NTOK * NKV * NHKV * QB; // kv-major, non-replicated; all kv consumed (incl. masked skip)
-    const exp_v = NTOK * NKV * NHKV * VB;
-    if (q_beats != exp_q or o_beats != exp_o or k_beats != exp_k or v_beats != exp_v) {
-        std.debug.print("  FAIL: counters q={d}(exp {d}) k={d}(exp {d}) v={d}(exp {d}) o={d}(exp {d})\n", .{ q_beats, exp_q, k_beats, exp_k, v_beats, exp_v, o_beats, exp_o });
-        ok = false;
-    }
-    if (!ok) return error.Failed;
-    std.debug.print("  all flash_top cosim cases passed\n\n", .{});
+    if (clean.k_stalls != 0 or clean.v_stalls != 0 or clean.o_stalls != 0) return error.Failed;
+    std.debug.print("  all flash_top integration checks passed\n\n", .{});
 }

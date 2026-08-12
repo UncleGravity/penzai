@@ -17,10 +17,10 @@ void dut_set_config(Dut *d, uint16_t hdq, uint16_t hdv, uint16_t nh, uint16_t nh
 int dut_busy(Dut *d);
 int dut_done(Dut *d);
 
-void dut_set_q(Dut *d, const uint32_t *w8, int valid);
-void dut_set_k(Dut *d, const uint32_t *w4, int valid);
-void dut_set_v(Dut *d, const uint32_t *w4, int valid);
-void dut_set_mask(Dut *d, uint16_t v, int valid);
+void dut_set_q(Dut *d, const uint32_t *w8, int valid, int last);
+void dut_set_k(Dut *d, const uint32_t *w4, int valid, int last);
+void dut_set_v(Dut *d, const uint32_t *w4, int valid, int last);
+void dut_set_mask(Dut *d, uint16_t v, int valid, int last);
 void dut_set_o_ready(Dut *d, int v);
 
 int dut_q_ready(Dut *d);
@@ -29,6 +29,8 @@ int dut_v_ready(Dut *d);
 int dut_mask_ready(Dut *d);
 int dut_o_valid(Dut *d);
 void dut_o_data(Dut *d, uint32_t *w8); // packed 256-bit O beat: 8 × f32
+uint32_t dut_o_keep(Dut *d);
+int dut_o_last(Dut *d);
 
 #ifdef __cplusplus
 }

@@ -345,13 +345,33 @@ pub fn formatLatencyFine(buf: []u8, ns: f64) []const u8 {
     return std.fmt.bufPrint(buf, "{d:.0} ns", .{ns}) catch unreachable;
 }
 
-/// Flash shape/path buckets report the padded request, finite-mask extent, and
-/// backend walk separately. Bytes and counters characterize work; they are not
-/// added to the elapsed-time budget.
+fn formatQuotient(buf: []u8, numerator: u64, denominator: u64) []const u8 {
+    if (denominator == 0) return "n/a";
+    return std.fmt.bufPrint(buf, "{d:.2}", .{
+        @as(f64, @floatFromInt(numerator)) / @as(f64, @floatFromInt(denominator)),
+    }) catch "?";
+}
+
+fn formatDensity(buf: []u8, valid: u64, processed: u64) []const u8 {
+    if (processed == 0) return "n/a";
+    return std.fmt.bufPrint(buf, "{d:.1}%", .{percent(valid, processed)}) catch "?";
+}
+
+fn formatMillionPerSecond(buf: []u8, work: u64, cycles: u64, fclk_hz: u32) []const u8 {
+    if (work == 0 or cycles == 0 or fclk_hz == 0) return "n/a";
+    const rate = @as(f64, @floatFromInt(work)) * @as(f64, @floatFromInt(fclk_hz)) /
+        @as(f64, @floatFromInt(cycles)) / 1_000_000.0;
+    return std.fmt.bufPrint(buf, "{d:.2}", .{rate}) catch "?";
+}
+
+/// Flash shape/path buckets report the padded request, mask entries not equal to
+/// f16 negative infinity, and the backend walk separately. Bytes and counters
+/// characterize work; they are not added to the elapsed-time budget.
 pub fn writeFlashDetail(
     writer: *std.Io.Writer,
     title: []const u8,
     flash_stats: []const profiling.FlashStat,
+    fclk_hz: u32,
 ) std.Io.Writer.Error!void {
     if (flash_stats.len == 0) return;
     try writer.print("{s}\n", .{title});
@@ -415,6 +435,87 @@ pub fn writeFlashDetail(
             flash.o_stall_cycles,
             mibPerSecond(flash.q_bytes +| flash.k_bytes +| flash.v_bytes +| flash.mask_bytes +| flash.o_bytes, flash.wrapper_ns),
         });
+        var cycles_run_buf: [24]u8 = undefined;
+        var cycles_valid_buf: [24]u8 = undefined;
+        var cycles_processed_buf: [24]u8 = undefined;
+        var density_buf: [24]u8 = undefined;
+        var rate_buf: [24]u8 = undefined;
+        try writer.print("      efficiency cyc/run={s} cyc/valid-qhkv={s} cyc/processed-qhkv={s} valid-density={s} Mvalid-qhkv/s={s}\n", .{
+            formatQuotient(&cycles_run_buf, flash.cycles, flash.kernel_runs),
+            formatQuotient(&cycles_valid_buf, flash.cycles, flash.validQueryHeadKvUpdates()),
+            formatQuotient(&cycles_processed_buf, flash.cycles, flash.processedQueryHeadKvUpdates()),
+            formatDensity(&density_buf, flash.validQueryHeadKvUpdates(), flash.processedQueryHeadKvUpdates()),
+            formatMillionPerSecond(&rate_buf, flash.validQueryHeadKvUpdates(), flash.cycles, fclk_hz),
+        });
+    }
+}
+
+const AttentionTotals = struct {
+    cycles: u64 = 0,
+    pl_valid_qhkv_updates: u64 = 0,
+};
+
+fn attentionTotals(stats: []const profiling.FlashStat) AttentionTotals {
+    var out: AttentionTotals = .{};
+    for (stats) |stat| {
+        if (stat.backend != .pl) continue;
+        out.cycles +|= stat.cycles;
+        out.pl_valid_qhkv_updates +|= stat.validQueryHeadKvUpdates();
+    }
+    return out;
+}
+
+/// Stable, integer-only records for benchmark artifacts. Each line preserves an
+/// exact backend/path/shape bucket so consumers never compare unlike head shapes
+/// accidentally. Derived rates remain a consumer concern.
+pub fn writeAttentionResult(
+    writer: *std.Io.Writer,
+    phase: []const u8,
+    stats: []const profiling.FlashStat,
+    fclk_hz: u32,
+) std.Io.Writer.Error!void {
+    for (stats) |stat| {
+        try writer.print(
+            "attention_result schema=1 phase={s} backend={s} path={s}" ++
+                " n_heads={d} n_head_kv={d} head_dim_q={d} head_dim_v={d} n_tokens={d}" ++
+                " calls={d} fclk_hz={d} kernel_runs={d} cycles={d}" ++
+                " requested_qkv_pairs={d} valid_qkv_pairs={d} processed_qkv_pairs={d}" ++
+                " valid_qhkv_updates={d} processed_qhkv_updates={d}" ++
+                " q_bytes={d} k_bytes={d} v_bytes={d} mask_bytes={d} o_bytes={d}" ++
+                " q_beats={d} k_beats={d} v_beats={d} o_beats={d}" ++
+                " k_stall_cycles={d} v_stall_cycles={d} o_stall_cycles={d}\n",
+            .{
+                phase,
+                backendName(stat.backend),
+                pathName(stat.path),
+                stat.n_heads,
+                stat.n_head_kv,
+                stat.head_dim_q,
+                stat.head_dim_v,
+                stat.n_tokens,
+                stat.count,
+                fclk_hz,
+                stat.kernel_runs,
+                stat.cycles,
+                stat.requested_qkv_pairs,
+                stat.valid_qkv_pairs,
+                stat.processed_qkv_pairs,
+                stat.validQueryHeadKvUpdates(),
+                stat.processedQueryHeadKvUpdates(),
+                stat.q_bytes,
+                stat.k_bytes,
+                stat.v_bytes,
+                stat.mask_bytes,
+                stat.o_bytes,
+                stat.q_beats,
+                stat.k_beats,
+                stat.v_beats,
+                stat.o_beats,
+                stat.k_stall_cycles,
+                stat.v_stall_cycles,
+                stat.o_stall_cycles,
+            },
+        );
     }
 }
 
@@ -454,11 +555,16 @@ pub fn writeScoreboard(
     const mac_cyc = if (mm.cycles == 0) 0 else @as(f64, @floatFromInt(mm.macs)) / @as(f64, @floatFromInt(mm.cycles));
     const flash_ns = rg.op_totals[@intFromEnum(wire.OpTag.flash_attn_f32)].total_ns;
     const swiglu_ns = rg.op_totals[@intFromEnum(wire.OpTag.swiglu)].total_ns;
+    const fa = attentionTotals(rg.usedFlash());
+    const flash_cycles_valid = if (fa.pl_valid_qhkv_updates == 0) 0 else @as(f64, @floatFromInt(fa.cycles)) / @as(f64, @floatFromInt(fa.pl_valid_qhkv_updates));
+    const flash_mvalid_s = if (fa.cycles == 0 or rg.device_fclk_hz == 0) 0 else @as(f64, @floatFromInt(fa.pl_valid_qhkv_updates)) * @as(f64, @floatFromInt(rg.device_fclk_hz)) /
+        @as(f64, @floatFromInt(fa.cycles)) / 1_000_000.0;
 
     try writer.print(
         "scoreboard variant={s} tok_s={d:.2} decode_ms={d:.1} device_ms={d:.1} transport_ms={d:.1}" ++
             " matmul_gmac_s={d:.2} matmul_mac_cyc={d:.1} matmul_w_gbps={d:.2} matmul_w_stall_pct={d:.1}" ++
-            " flash_ms_tok={d:.1} swiglu_ms_tok={d:.1}\n",
+            " flash_ms_tok={d:.1} flash_cyc_valid_qhkv={d:.2} flash_mvalid_qhkv_s={d:.2}" ++
+            " swiglu_ms_tok={d:.1}\n",
         .{
             variant,
             perSecond(tokens, decode.wall_ns),
@@ -470,6 +576,8 @@ pub fn writeScoreboard(
             weightGbps(mm, rg.device_fclk_hz),
             percent(mm.w_stall_cycles, mm.cycles),
             nsToMs(flash_ns) / t,
+            flash_cycles_valid,
+            flash_mvalid_s,
             nsToMs(swiglu_ns) / t,
         },
     );
@@ -578,6 +686,7 @@ pub fn writeProfile(
             writer,
             std.fmt.bufPrint(&fa_title, "flash \u{b7} {s}", .{label}) catch "flash",
             phase.rg.usedFlash(),
+            phase.rg.device_fclk_hz,
         );
     }
 
@@ -586,6 +695,13 @@ pub fn writeProfile(
     if (decode.rg.run_graph_count != 0) {
         try writer.writeByte('\n');
         try writeScoreboard(writer, decode, c.generated_tokens);
+    }
+
+    // Raw device-counter records for artifact tooling. These remain valid when
+    // wall and transport latency are distorted by a remote tunnel.
+    for (&c.phases, 0..) |*phase, i| {
+        if (phase.rg.flash_count == 0) continue;
+        try writeAttentionResult(writer, (@as(Phase, @enumFromInt(i))).label(), phase.rg.usedFlash(), phase.rg.device_fclk_hz);
     }
 
     var accounting: AccountingStatus = .ok;
@@ -621,4 +737,36 @@ fn modelName(path: []const u8) []const u8 {
     if (std.mem.lastIndexOfScalar(u8, name, '/')) |i| name = name[i + 1 ..];
     if (std.mem.endsWith(u8, name, ".gguf")) name = name[0 .. name.len - 5];
     return name;
+}
+
+test "flash efficiency renders empty valid work as n/a" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const stats = [_]profiling.FlashStat{.{
+        .backend = .pl,
+        .path = .direct,
+        .n_heads = 16,
+        .count = 1,
+        .kernel_runs = 1,
+        .n_tokens = 1,
+        .processed_qkv_pairs = 8,
+        .cycles = 800,
+    }};
+    try writeFlashDetail(&out.writer, "flash", &stats, 300_000_000);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "cyc/valid-qhkv=n/a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "cyc/processed-qhkv=6.25") != null);
+}
+
+test "attention results retain PS and PL shapes" {
+    var out: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    const stats = [_]profiling.FlashStat{
+        .{ .backend = .ps, .n_heads = 16, .count = 2, .valid_qkv_pairs = 10, .processed_qkv_pairs = 12 },
+        .{ .backend = .pl, .n_heads = 16, .count = 3, .kernel_runs = 3, .cycles = 24_000, .valid_qkv_pairs = 100, .processed_qkv_pairs = 125 },
+    };
+    try writeAttentionResult(&out.writer, "decode", &stats, 300_000_000);
+    try std.testing.expectEqual(@as(usize, 2), std.mem.count(u8, out.written(), "attention_result "));
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "backend=ps path=software") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "backend=pl path=software") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), "valid_qkv_pairs=100 processed_qkv_pairs=125 valid_qhkv_updates=1600") != null);
 }

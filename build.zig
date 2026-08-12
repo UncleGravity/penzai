@@ -143,12 +143,26 @@ fn addFormalSteps(b: *std.Build) void {
     );
     gemm_ternary_selector_step.dependOn(&gemm_ternary_selector_run.step);
 
+    const flash_kernel_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/flash_kernel",
+        "fpga/formal/flash_kernel.sby",
+    });
+    const flash_kernel_step = b.step(
+        "formal-flash-kernel",
+        "Prove flash-kernel stream accounting, bounds, writeback barriers, and framing",
+    );
+    flash_kernel_step.dependOn(&flash_kernel_run.step);
+
     const formal = b.step("formal", "Run formal verification pilots");
     formal.dependOn(seq_reg_master_step);
     formal.dependOn(seq_core_step);
     formal.dependOn(seq_top_step);
     formal.dependOn(gemm_kernel_step);
     formal.dependOn(gemm_ternary_selector_step);
+    formal.dependOn(flash_kernel_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps exp, reciprocal,
@@ -285,17 +299,22 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     });
     b.step("lint-rtl", "Verilator lint the deployable GEMM RTL").dependOn(&lint.step);
 
-    addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite GEMM top + four-port zip) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
-    addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: numeric exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
-    addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
-    addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
-    addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
-    addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
-    addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
-    addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
+    _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
+    _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
+    _ = addCosim(b, target, optimize, "test-rtl-gemm-kernel", "Verilator cosim: gemm_kernel (FSM + banked rowblock + emit) vs matmul_ref.windowedFixedOutput", "gemm_kernel", "fpga/sim/gemm_kernel", &gemm_kernel_rtl, .matmul);
+    const decode_top_cosim = addCosim(b, target, optimize, "test-rtl-decode-top", "Verilator cosim: decode_top (AXI-Lite GEMM top + four-port zip) vs matmul_ref.windowedFixedOutput", "decode_top", "fpga/sim/decode_top", &decode_top_rtl, .matmul);
+    _ = addCosim(b, target, optimize, "test-rtl-flash-fp", "Verilator cosim: numeric exp/recip and flash dot vs flash_ref", "flash_fp_top", "fpga/sim/flash_fp", &flash_fp_rtl, .flash);
+    _ = addCosim(b, target, optimize, "test-rtl-flash-softmax", "Verilator cosim: flash online-softmax step vs flash_ref", "flash_softmax", "fpga/sim/flash_softmax", &flash_softmax_rtl, .flash);
+    const flash_kernel_cosim = addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
+    const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
+    _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
+    _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
+    _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
+
+    const rtl_cosim = b.step("test-rtl", "Cosim the deployable binary/ternary GEMM and flash-attention paths");
+    rtl_cosim.dependOn(decode_top_cosim);
+    rtl_cosim.dependOn(flash_kernel_cosim);
+    rtl_cosim.dependOn(flash_top_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
@@ -328,17 +347,23 @@ fn addCosim(
     dir: []const u8,
     rtl: []const []const u8,
     kind: CosimKind,
-) void {
+) *std.Build.Step {
     const step = b.step(step_name, desc);
     const verilator = b.findProgram(&.{"verilator"}, &.{}) catch {
         const msg = b.addSystemCommand(&.{ "sh", "-c", "echo 'verilator not found — run inside: nix develop' >&2; exit 1" });
         step.dependOn(&msg.step);
-        return;
+        return step;
     };
     const vroot = std.mem.trim(u8, b.run(&.{ verilator, "--getenv", "VERILATOR_ROOT" }), " \n\r");
     const gen = b.fmt("{s}/obj_dir", .{dir});
 
+    // Verilator-generated makefiles and precompiled headers embed VERILATOR_ROOT.
+    // Reusing an obj_dir after a Nix package update otherwise leaves dependencies
+    // on a vanished store path. Each cosim owns a distinct generated directory.
+    const clean_gen = b.addSystemCommand(&.{ "rm", "-rf" });
+    clean_gen.addArg(gen);
     const vcmd = b.addSystemCommand(&.{ verilator, "--cc", "--build", "--lib-create" });
+    vcmd.step.dependOn(&clean_gen.step);
     vcmd.addArg(top);
     vcmd.addArgs(&.{ "-Wno-fatal", "-Wno-WIDTHEXPAND", "-Wno-UNUSEDSIGNAL", "--top-module" });
     vcmd.addArg(top);
@@ -389,6 +414,7 @@ fn addCosim(
     const tb = b.addExecutable(.{ .name = b.fmt("{s}-cosim", .{top}), .root_module = tb_mod });
     tb.step.dependOn(&vcmd.step);
     step.dependOn(&b.addRunArtifact(tb).step);
+    return step;
 }
 
 fn createBuildOptions(
@@ -611,6 +637,7 @@ fn addTests(
     addSharedTest(b, test_step, "shared/protocol/wire.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/profiling.zig", target, optimize, shared);
     addSharedTest(b, test_step, "shared/layout.zig", target, optimize, shared);
+    addSharedTest(b, test_step, "shared/section.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/matmul.zig", target, optimize, shared);
     addSharedTest(b, test_step, "fpga/regmap/flash_attn.zig", target, optimize, shared);
     addSupportTest(b, test_step, "fpga/sim/support/matmul_ref.zig", target, optimize);

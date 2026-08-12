@@ -16,7 +16,18 @@ how fast is this path in isolation?" without paying for place-and-route.
 
 Small leaves usually finish in 1–2 minutes. The full GEMM kernel takes a few
 minutes because Vivado also optimizes the wide accumulator bank and complete
-dual-format control path.
+dual-format control path. `flash-kernel` similarly covers the complete attention
+controller, BRAMs, and composed numeric pipelines; use it as the before/after P2
+resource and isolated-Fmax probe. P2b restored its registry period from the
+temporary P2a 3.600 ns baseline to the 3.333 ns production target. The current
+head-streamed scheduler plus bit-identical AXPY pipeline repair passes at
+`+0.291 ns` WNS with 60 DSPs, 22,109 LUTs, and 18,889 FFs (328.7 MHz estimated
+Fmax). This remains an OOC result. Released clean combined run
+`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` reached
++0.033/+0.007 ns setup/hold after guarded placement and pre-route physical
+optimization. It clears the 25 ps development floor but remains below the 50 ps
+headroom target. The 12 paths below that target span the sequencer, flash, and
+GEMM, which is why combined routing rather than OOC Fmax remains authoritative.
 
 ---
 
@@ -41,7 +52,9 @@ fails when there is no setup path or WNS is negative.
 
 Reference numbers (xck26 @ 3.333ns, current carry-save matmul): `gemm_rb_ooc` 398.9 MHz,
 `gemm_emit_ooc` 386.8 MHz, and the issue-ordered dual-format `gemm_kernel_ooc` 368.5 MHz
-(`+0.619 ns`, 38,439 LUTs, 42,796 FFs, 32 DSPs). All clear f300 in isolation, but see the caveat.
+(`+0.619 ns`, 38,439 LUTs, 42,796 FFs, 32 DSPs). The current P2b
+`flash_kernel_ooc` is 328.7 MHz (`+0.291 ns`, 22,109 LUTs, 18,889 FFs, 60 DSPs).
+All clear f300 in isolation, but see the caveat.
 
 ## Writing a new probe
 

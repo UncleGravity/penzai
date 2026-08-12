@@ -77,11 +77,16 @@ migrated or rewritten.
 
 ## Results And Correctness
 
-The summary aggregates only lower-is-better latency measurements: prefill wall,
-compute and output TTFT, first decode step, steady decode, and decode
-wall/device/transport/residual time per token. Each group reports the conventional
-median and min/max range. Displayed throughput is derived as
-`1000 / median steady latency`; it is not aggregated independently.
+The summary aggregates latency measurements plus device-counter attention metrics.
+Each profiled sample stores one integer-only `attention_result` record per exact
+phase/backend/path/shape bucket: head geometry, query count, call counts, fabric
+clock, cycles, query/KV geometry, bytes, beats, and stalls. Derived metrics include
+cycles per kernel run, cycles per valid and processed query-head/KV update,
+valid-update rate, and valid/processed density. They remain stable when a VPN or
+tunnel changes wall and transport latency, but cycle/update comparisons still
+require the same head dimensions, precision, and shape mix. Each group reports
+the conventional median and min/max range. Displayed token throughput is derived
+as `1000 / median steady latency`; it is not aggregated independently.
 
 The harness validates exact requested prompt and generated token counts. That
 proves workload completion, not numerical correctness. Profiled runs must also

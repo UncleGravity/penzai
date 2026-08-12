@@ -1,6 +1,6 @@
 # Accelerator Priorities
 
-Status date: 2026-08-04
+Status date: 2026-08-12
 
 This is the short, ranked tracker for turning Penzai from an op-at-a-time FPGA
 backend into a robust binary and ternary transformer accelerator. Detailed design
@@ -177,12 +177,16 @@ P1 is closed. Its changes remove about 12 ms/token of measured short-context
 device work but cannot materially change the 533 ms context-2048 device time. Do
 not add more primitive fusion, cross-graph activation caches, or PS-side command
 extensions. Begin P2 with the explicit section/scratch contract and a
-cycle-per-query-KV-pair baseline for the unified attention engine.
+cycle-per-query-head/KV-update baseline for the unified attention engine.
 
 ### P2: section substrate and unified PL attention
 
-- [ ] Define an explicit section/scratch contract: bank ownership, tile lifetime,
-  layouts, bounds, and concrete tensor descriptors. Do not introduce a generic IR.
+- [x] Define the internal section/scratch contract: bank ownership, tile lifetime,
+  layouts, bounds, and the external descriptor ownership boundary. Do not
+  introduce a generic IR.
+- [ ] Freeze concrete versioned FFN/attention descriptors with the first executable
+  section, including DDR ranges, strides, RoPE, normalization, cache, and weight
+  semantics.
 - [ ] Implement a PL FP32-to-Q8_0 quantizer matching the canonical host quantizer.
 - [ ] Store and reuse grouped Q/K/V and gate/up Q8 activations on chip.
 - [ ] Write GEMM results into banked scratch in the next consumer's layout.
@@ -190,8 +194,11 @@ cycle-per-query-KV-pair baseline for the unified attention engine.
   rather than a PS transpose and DDR round trip.
 - [ ] Extend the existing online attention recurrence with a query-tile axis.
   Decode uses one query; prefill initially tiles 4-8 queries and reuses K/V.
-- [ ] Pipeline QK dot, online softmax update, and `p*V` accumulation to reduce
-  cycles per valid query-KV pair for single-query decode as well as prefill.
+- [x] Pipeline single-query QK dot, online softmax update, and `p*V` accumulation
+  across heads within each KV position, with a hard recurrence barrier between KV
+  positions.
+- [ ] Before query-blocked attention, make the softmax issue path truly II=1 and
+  add alignment and burst tests for consecutive independent query/head updates.
 - [ ] Preserve FP32 softmax and output-accumulator state, and guarantee that newly
   appended K/V rows are visible to the same causal attention operation.
 - [ ] Require strict shape, layout, RoPE, normalization, mask, and KV-cache matches;
@@ -203,7 +210,64 @@ P2 must produce one attention engine and ABI, not separate prefill and decode
 kernels. Completion requires PL execution for supported multi-token prefill,
 lower backend downloads and command counts, faster 128/512-token prefill, and
 faster attention at decode contexts 512 and 2048. Query tile size and any spatial
-math replication are selected from OOC/routed timing and measured cycles per pair.
+math replication are selected from OOC/routed timing and measured cycles per
+query-head/KV update.
+
+P2a froze contract v1 in `docs/p2-section-contract.md` and
+`shared/section.zig`: a four-token tile, four fixed F32 scratch roles, native GEMM
+Q8 storage with explicit epoch reuse, local new-K/V storage, KV-outer unified
+attention, and strict pre-execution fallback. It also made cycles per valid and
+processed query-head/KV update first-class profile and benchmark-artifact metrics
+without changing the profile or execution ABI. Its 16-head decode baseline was
+about 143-149 cycles per query-head/KV update; combined K/V starvation at context
+2048 was only about 2.1%, confirming that compute/control scheduling, not DDR
+width, was the immediate limit.
+
+P2b replaces the sequential head loop with a head-streamed, within-KV schedule.
+Tagged dot, score, softmax, and AXPY work overlap across heads, while a hard
+barrier prevents the next KV position from starting until every accumulator
+writeback for the current position has retired. Hardened cosim is bit-exact across
+production, non-power-of-two, multi-token, bubbled-input, and backpressured-output
+cases. Formal checks cover tag/order/address/GQA mapping, configuration snapshots,
+the KV barrier, framing, stream accounting, and the current softmax issue spacing.
+
+The context-512 board A/B isolates the scheduler improvement:
+
+| Metric | Sequential | P2b | Change |
+|---|---:|---:|---:|
+| Cycles/valid query-head/KV update | 142.57 | 33.224 | 4.29x throughput |
+| Flash kernel | 115.93 ms/token | 27.016 ms/token | -76.7% |
+| Q1 device | 182.652 ms/token | 93.715 ms/token | -48.7% |
+| Q2 device | 204.366 ms/token | 115.429 ms/token | -43.5% |
+
+The post-repair context-2048 Q1 run sustained 9.126 million valid updates/s
+(32.874 cycles/update). Flash fell from 451.20 to 102.14 ms/token and total device
+time from 533.28 to 174.06 ms/token, improvements of 77.4% and 67.4%. Both final
+board runs closed accounting, produced exact token counts, and reported zero K/V/O
+stalls. The context-512 artifact is
+`20260812T034043Z-characterize-dfc29ec25d66`.
+
+The AXPY repair is bit-identical and splits the routed two-DSP multiply path. Its
+hardened cosim, formal, OOC, and board gates pass. The registered-boundary OOC
+result is 60 DSPs, 22,109 LUTs, 18,889 FFs, and +0.291 ns WNS at 3.333 ns
+(328.7 MHz estimated Fmax). The clean combined route passes setup and hold at
++0.033/+0.007 ns after guarded placement and pre-route physical optimization.
+Run `20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` clears the 25 ps
+development release floor but remains below the 50 ps headroom target. The
+remaining 12-path tail spans the disabled sequencer, flash, and unrelated GEMM
+structures, so no single narrow RTL repair is justified. The exact run was
+promoted and deployed with a hash-verified receipt; Q1/Q2 logits checks had zero
+token mismatches, and characterization artifact
+`20260812T072252Z-characterize-ed0a92df72da` passed identity, exact-token,
+accounting, PL-backend, and zero K/V/O-stall checks. P2b is closed. Activation
+boundaries, query-blocked prefill attention, and P2 as a whole remain open.
+
+P2c query-blocked PL prefill attention is next. In the current context-2048 Q1
+run, prefill took 1805.6 s wall and 1725.8 s device; PS attention alone consumed
+1544.2 s (91.7% of profiled op-device time), across 255 graphs, 67,339 commands,
+and 5.8 GiB of downloads. First make the softmax issue path truly II=1, then add
+the four-query KV-outer schedule and reuse each K/V tile across queries. Q8 ingress,
+scratch-backed GEMM boundaries, and the FFN section follow that measured bottleneck.
 
 ### P3: FFN section
 
@@ -271,10 +335,15 @@ These are requirements on every priority, not a separate final cleanup phase:
 - `zig build test` and all formal-control targets pass;
 - one aggregate RTL cosim target runs in Nix/CI for binary and ternary paths;
 - changed kernels pass OOC for resource/Fmax feedback;
-- the combined routed build passes with deliberate timing headroom, not rounded-zero WNS;
+- the combined routed build clears the 25 ps development floor, while 50 ps remains
+  the tracked headroom target;
 - Q1 and Q2 model-level logits/perplexity gates pass at short and long contexts;
 - a board smoke run verifies bitstream identity, capabilities, DMA/cache behavior,
   prefill, and decode.
+
+The aggregate `zig build test-rtl` target now covers binary and ternary GEMM plus
+the hardened flash kernel and wrapper cosims. It passes locally and as the Nix
+`checks.rtl-cosim` check.
 
 Formal verification should target control snapshots, bounds, handshakes, TLAST/TKEEP,
 DMA safety, and liveness under explicit fairness assumptions. Approximate floating
@@ -290,13 +359,16 @@ remain. They are not currently independent roadmap projects:
 - the read-column pair is registered before its final add;
 - the DSP multiply output is already registered before the 104-bit shift result.
 
-The latest recorded routed build reports 0.000 ns WNS, 329 setup paths below 50 ps,
-two critical methodology warnings, 79,406 LUTs, and a dirty source manifest. Its top
-reported setup paths include control SmartConnect to a DMA register, a GEMM activation
-reduction path, and flash control. Therefore:
+The released clean P2b timing run reports +0.033 ns setup and +0.007 ns hold slack,
+with 12 setup paths below the 50 ps target. It uses 80,108 LUTs, 94,587 FFs,
+48.5 BRAMs, four URAMs, and 92 DSPs; 98.25% of CLBs are occupied. Its short tail
+spans the disabled sequencer, flash, and several unrelated GEMM paths. The repaired
+AXPY two-DSP cascade is absent. Two existing critical methodology warnings remain.
+Therefore:
 
-- rerun a clean routed build before acting on older path rankings;
-- fix the current report's path owners, not historical path names;
+- keep 25 ps as the hard development release floor and 50 ps as the headroom target;
+- route P2c early because dense placement and heterogeneous path ownership dominate;
+- resolve the clock methodology warnings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
 - treat timing locality and reproducible headroom as build requirements for every phase.
 

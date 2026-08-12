@@ -21,7 +21,7 @@ live in `fpga/sim/`; synthesis harnesses and their declarative registry live in
 The production bitstream build refuses to generate a deployable artifact unless
 all of these hold after routing:
 
-- setup WNS is non-negative;
+- setup WNS is at least the 25 ps development release floor;
 - hold WHS is non-negative;
 - `report_route_status` says the design is fully routed;
 - `check_timing` reports no clockless or unconstrained internal endpoints.
@@ -29,6 +29,10 @@ all of these hold after routing:
 Methodology violations are recorded in every run. They are diagnostic for now,
 not a release gate, so the existing TIMING methodology warnings remain visible
 without silently changing the current acceptance contract.
+
+The combined flow also tracks 50 ps as a nonblocking setup-headroom target. A
+stricter production margin requires resolving the clock methodology warnings and
+deriving the threshold from an explicit clock/PVT budget.
 
 ## Artifact ownership
 

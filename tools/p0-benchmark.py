@@ -17,9 +17,10 @@ from collections import defaultdict
 from typing import Any
 
 
-ARTIFACT_SCHEMA_VERSION = 1
-SUITE_VERSION = 1
+ARTIFACT_SCHEMA_VERSION = 2
+SUITE_VERSION = 2
 RESULT_SCHEMA_VERSION = 1
+ATTENTION_RESULT_SCHEMA_VERSION = 1
 DEFAULT_BATCH = 32
 DEFAULT_UBATCH = 16
 DEFAULT_MODELS = {
@@ -52,6 +53,48 @@ LATENCY_METRICS = (
     "decode_transport_ms_per_token",
     "decode_residual_ms_per_token",
 )
+ATTENTION_INTEGER_FIELDS = {
+    "schema",
+    "calls",
+    "fclk_hz",
+    "kernel_runs",
+    "cycles",
+    "n_heads",
+    "n_head_kv",
+    "head_dim_q",
+    "head_dim_v",
+    "n_tokens",
+    "requested_qkv_pairs",
+    "valid_qkv_pairs",
+    "processed_qkv_pairs",
+    "valid_qhkv_updates",
+    "processed_qhkv_updates",
+    "q_bytes",
+    "k_bytes",
+    "v_bytes",
+    "mask_bytes",
+    "o_bytes",
+    "q_beats",
+    "k_beats",
+    "v_beats",
+    "o_beats",
+    "k_stall_cycles",
+    "v_stall_cycles",
+    "o_stall_cycles",
+}
+ATTENTION_METRICS = tuple(
+    f"{phase}_attention_{metric}"
+    for phase in ("prefill", "decode")
+    for metric in (
+        "pl_call_pct",
+        "cycles_per_kernel_run",
+        "cycles_per_valid_qhkv_update",
+        "cycles_per_processed_qhkv_update",
+        "mvalid_qhkv_per_s",
+        "valid_density_pct",
+    )
+)
+SUMMARY_METRICS = LATENCY_METRICS + ATTENTION_METRICS
 
 
 CASE_CATALOG: dict[str, dict[str, Any]] = {
@@ -255,6 +298,51 @@ def parse_benchmark_result(text: str) -> dict[str, Any]:
     return fields
 
 
+def parse_attention_results(text: str) -> dict[str, list[dict[str, Any]]]:
+    records: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    keys: set[tuple[Any, ...]] = set()
+    for line in text.splitlines():
+        if not line.startswith("attention_result "):
+            continue
+        fields: dict[str, Any] = {}
+        for item in shlex.split(line)[1:]:
+            key, separator, value = item.partition("=")
+            if not separator or key in fields:
+                raise HarnessError(f"malformed attention field: {item}")
+            fields[key] = int(value) if key in ATTENTION_INTEGER_FIELDS else value
+        missing = ATTENTION_INTEGER_FIELDS.difference(fields)
+        string_fields = {"phase", "backend", "path"}
+        if missing or not string_fields.issubset(fields):
+            raise HarnessError(f"missing attention fields: {sorted(missing | (string_fields - fields.keys()))}")
+        if fields["schema"] != ATTENTION_RESULT_SCHEMA_VERSION:
+            raise HarnessError(f"unsupported attention result schema {fields['schema']}")
+        phase = fields["phase"]
+        if (
+            phase not in {"prefill", "decode"}
+            or fields["backend"] not in {"ps", "pl"}
+            or fields["path"] not in {"software", "direct", "staged"}
+        ):
+            raise HarnessError(
+                f"invalid attention phase/backend/path "
+                f"{phase!r}/{fields['backend']!r}/{fields['path']!r}"
+            )
+        key = (
+            phase,
+            fields["backend"],
+            fields["path"],
+            fields["n_heads"],
+            fields["n_head_kv"],
+            fields["head_dim_q"],
+            fields["head_dim_v"],
+            fields["n_tokens"],
+        )
+        if key in keys:
+            raise HarnessError(f"duplicate attention shape record {key!r}")
+        keys.add(key)
+        records[phase].append(fields)
+    return dict(records)
+
+
 def selected_cases(args: argparse.Namespace) -> list[dict[str, Any]]:
     suite = SUITES[args.suite]
     available = dict(suite["cases"] + suite["optional_cases"])
@@ -389,6 +477,33 @@ def latency_metrics(result: dict[str, Any]) -> dict[str, float]:
     return {name: metrics[name] for name in LATENCY_METRICS if name in metrics}
 
 
+def attention_metrics(records: dict[str, list[dict[str, Any]]]) -> dict[str, float]:
+    metrics: dict[str, float] = {}
+    for phase, phase_records in records.items():
+        prefix = f"{phase}_attention_"
+        calls = sum(record["calls"] for record in phase_records)
+        pl_records = [record for record in phase_records if record["backend"] == "pl"]
+        pl_calls = sum(record["calls"] for record in pl_records)
+        cycles = sum(record["cycles"] for record in pl_records)
+        runs = sum(record["kernel_runs"] for record in pl_records)
+        valid = sum(record["valid_qhkv_updates"] for record in pl_records)
+        processed = sum(record["processed_qhkv_updates"] for record in pl_records)
+        if calls:
+            metrics[prefix + "pl_call_pct"] = pl_calls * 100.0 / calls
+        if cycles and runs:
+            metrics[prefix + "cycles_per_kernel_run"] = cycles / runs
+        if cycles and valid:
+            metrics[prefix + "cycles_per_valid_qhkv_update"] = cycles / valid
+            frequencies = {record["fclk_hz"] for record in pl_records}
+            if len(frequencies) == 1:
+                metrics[prefix + "mvalid_qhkv_per_s"] = valid * frequencies.pop() / cycles / 1e6
+        if cycles and processed:
+            metrics[prefix + "cycles_per_processed_qhkv_update"] = cycles / processed
+        if processed:
+            metrics[prefix + "valid_density_pct"] = valid * 100.0 / processed
+    return metrics
+
+
 def summarize_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     groups: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
     for sample in samples:
@@ -397,7 +512,7 @@ def summarize_samples(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
     summaries: list[dict[str, Any]] = []
     for (case_name, model), group in sorted(groups.items()):
         metrics: dict[str, dict[str, float]] = {}
-        for name in LATENCY_METRICS:
+        for name in SUMMARY_METRICS:
             values = [sample["metrics"][name] for sample in group if name in sample["metrics"]]
             if not values:
                 continue
@@ -445,7 +560,13 @@ def build_summary(
     }
 
 
-def validate_result(result: dict[str, Any], case: dict[str, Any], profile_mode: str, raw_file: pathlib.Path) -> None:
+def validate_result(
+    result: dict[str, Any],
+    attention: dict[str, list[dict[str, Any]]],
+    case: dict[str, Any],
+    profile_mode: str,
+    raw_file: pathlib.Path,
+) -> None:
     if result["prompt_tokens"] != case["prompt_tokens"]:
         raise HarnessError(f"prompt token mismatch; see {raw_file}")
     if result["generated_tokens"] != case["max_tokens"]:
@@ -453,6 +574,10 @@ def validate_result(result: dict[str, Any], case: dict[str, Any], profile_mode: 
     expected_accounting = "ok" if profile_mode == "aggregate" else "unprofiled"
     if result["accounting"] != expected_accounting:
         raise HarnessError(f"accounting is {result['accounting']}, expected {expected_accounting}; see {raw_file}")
+    if profile_mode == "aggregate" and set(attention) != {"prefill", "decode"}:
+        raise HarnessError(f"profiled sample lacks prefill/decode attention records; see {raw_file}")
+    if profile_mode == "off" and attention:
+        raise HarnessError(f"unprofiled sample unexpectedly contains attention records; see {raw_file}")
 
 
 def run_sample(
@@ -499,7 +624,10 @@ def run_sample(
     if completed.returncode != 0:
         raise HarnessError(f"benchmark failed ({completed.returncode}); see {raw_file}")
     result = parse_benchmark_result(completed.stdout)
-    validate_result(result, case, identity["profile_mode"], raw_file)
+    attention = parse_attention_results(completed.stdout)
+    validate_result(result, attention, case, identity["profile_mode"], raw_file)
+    metrics = latency_metrics(result)
+    metrics.update(attention_metrics(attention))
     return {
         "artifact_schema_version": ARTIFACT_SCHEMA_VERSION,
         "model": model_name,
@@ -507,7 +635,8 @@ def run_sample(
         "repeat": repeat,
         "raw": str(raw_file.relative_to(raw_dir.parent)),
         "result": result,
-        "metrics": latency_metrics(result),
+        "attention": attention,
+        "metrics": metrics,
     }
 
 

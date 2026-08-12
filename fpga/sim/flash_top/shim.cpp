@@ -99,4 +99,6 @@ int dut_o_valid(Dut *d) { return d->t->m_axis_o_tvalid; }
 void dut_o_data(Dut *d, uint32_t *w8) {
     for (int i = 0; i < 8; i++) w8[i] = d->t->m_axis_o_tdata[i];
 }
+uint32_t dut_o_keep(Dut *d) { return d->t->m_axis_o_tkeep; }
+int dut_o_last(Dut *d) { return d->t->m_axis_o_tlast; }
 }

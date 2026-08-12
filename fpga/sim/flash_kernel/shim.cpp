@@ -44,21 +44,29 @@ void dut_set_config(Dut *d, uint16_t hdq, uint16_t hdv, uint16_t nh, uint16_t nh
 int dut_busy(Dut *d) { return d->t->busy; }
 int dut_done(Dut *d) { return d->t->done; }
 
-void dut_set_q(Dut *d, const uint32_t *w8, int valid) {
+void dut_set_q(Dut *d, const uint32_t *w8, int valid, int last) {
     set_w8(d->t->q_tdata, w8);
     d->t->q_tvalid = valid;
+    d->t->q_tkeep = 0xFFFFFFFFu;
+    d->t->q_tlast = last;
 }
-void dut_set_k(Dut *d, const uint32_t *w4, int valid) {
+void dut_set_k(Dut *d, const uint32_t *w4, int valid, int last) {
     set_w4(d->t->k_tdata, w4);
     d->t->k_tvalid = valid;
+    d->t->k_tkeep = 0xFFFFu;
+    d->t->k_tlast = last;
 }
-void dut_set_v(Dut *d, const uint32_t *w4, int valid) {
+void dut_set_v(Dut *d, const uint32_t *w4, int valid, int last) {
     set_w4(d->t->v_tdata, w4);
     d->t->v_tvalid = valid;
+    d->t->v_tkeep = 0xFFFFu;
+    d->t->v_tlast = last;
 }
-void dut_set_mask(Dut *d, uint16_t v, int valid) {
+void dut_set_mask(Dut *d, uint16_t v, int valid, int last) {
     d->t->mask_tdata = v;
     d->t->mask_tvalid = valid;
+    d->t->mask_tkeep = 0x3u;
+    d->t->mask_tlast = last;
 }
 void dut_set_o_ready(Dut *d, int v) { d->t->o_tready = v; }
 
@@ -70,4 +78,6 @@ int dut_o_valid(Dut *d) { return d->t->o_tvalid; }
 void dut_o_data(Dut *d, uint32_t *w8) {
     for (int i = 0; i < 8; i++) w8[i] = d->t->o_tdata[i];
 }
+uint32_t dut_o_keep(Dut *d) { return d->t->o_tkeep; }
+int dut_o_last(Dut *d) { return d->t->o_tlast; }
 }

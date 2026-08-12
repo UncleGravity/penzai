@@ -4,10 +4,11 @@
 //   scale-only: p = 0                               -> acc[i]*s1 (e.g. emit ·1/l)
 //
 // Feed-forward (no accumulation), 8 lanes in parallel, composed from numeric/ leaves.
-// Latency FP32_MUL_LATENCY + FP32_ADD_LATENCY = 3 + 4 = 7 (fmul is 3 cycles at any
-// MANT_W; the cvt seams are combinational). The kernel streams one acc beat (8
-// elements) per cycle through this and writes the result back. Self-timed: the adder
-// follows the mul's valid.
+// Both multiply branches use MUL_PIPE=1 so their values remain aligned while the
+// 24x24 FP32 product is split across its two-DSP cascade. The composed valid latency
+// is 9 cycles (fmul 4, fadd 5); cvt seams are combinational. The kernel streams one
+// acc beat (8 elements) per cycle through this and writes the result back. Self-timed:
+// the adder follows the mul's valid.
 //
 // Mixed precision (plan-attention-migration §2, industry-standard recipe):
 //   u_m1  acc·s1  (accumulator rescale / emit scale)  fp32  — keeps the accumulator exact
@@ -46,11 +47,11 @@ module fp_axpy8 (
             wire        m1v, m2v;
             cvt_f16_f32 u_w (.in(v[i*16 +: 16]), .out(vf));
             // acc·s1 (accumulator rescale / emit scale) — fp32.
-            fmul #(.MANT_W(FMT_FP32_MANT)) u_m1 (.clk(clk), .rst_n(rst_n), .valid_in(valid_in),
+            fmul #(.MANT_W(FMT_FP32_MANT), .MUL_PIPE(1)) u_m1 (.clk(clk), .rst_n(rst_n), .valid_in(valid_in),
                 .a(acc[i*32 +: 32]), .b(s1), .valid_out(m1v), .out(t1));
             // p·V — bf16 operands, fmul#(7), widen the product back to f32 for the fp32 add.
             cvt_f32_bf16 u_vb (.in(vf), .out(v_b));
-            fmul #(.MANT_W(FMT_BF16_MANT)) u_m2 (.clk(clk), .rst_n(rst_n), .valid_in(valid_in),
+            fmul #(.MANT_W(FMT_BF16_MANT), .MUL_PIPE(1)) u_m2 (.clk(clk), .rst_n(rst_n), .valid_in(valid_in),
                 .a(p_b), .b(v_b), .valid_out(m2v), .out(t2_b)); // m2v unused (synced to m1v)
             cvt_bf16_f32 u_t2w (.in(t2_b), .out(t2));
             fadd #(.MANT_W(FMT_FP32_MANT)) u_a (.clk(clk), .rst_n(rst_n), .valid_in(m1v),

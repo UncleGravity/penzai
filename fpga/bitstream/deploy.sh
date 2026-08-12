@@ -103,14 +103,14 @@ trap 'rm -f "$RECEIPT_TMP"' EXIT
   printf 'deployed_utc\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
   printf 'app\t%s\n' "$APP"
 } > "$RECEIPT_TMP"
-mv "$RECEIPT_TMP" "$RECEIPT"
-trap - EXIT
 
 echo "== copy run $RUN_ID -> $BOARD:$BOARD_TMP =="
 ssh "${SSH_ARGS[@]}" "$BOARD" "rm -rf '$BOARD_TMP' && mkdir -p '$BOARD_TMP'"
-scp "${SSH_ARGS[@]}" "$RUN_BIT" "$DTS_TEMPLATE" "$RECEIPT" "$BOARD:$BOARD_TMP/"
+scp "${SSH_ARGS[@]}" "$RUN_BIT" "$DTS_TEMPLATE" "$BOARD:$BOARD_TMP/"
+scp "${SSH_ARGS[@]}" "$RECEIPT_TMP" "$BOARD:$BOARD_TMP/deployment_receipt.tsv"
 
 echo "== package + load app $APP (variant=$VARIANT) =="
+rm -f "$RECEIPT"
 ssh "${SSH_ARGS[@]}" "$BOARD" "APP='$APP' BOARD_TMP='$BOARD_TMP' BIT_NAME='$BIT_NAME' EXPECTED_BIT_HASH='$BIT_HASH' bash -s" <<'REMOTE'
 set -euo pipefail
 FW="/lib/firmware/xilinx/$APP"
@@ -128,10 +128,39 @@ sudo rm -f "$FW"/*.bit.bin "$FW"/*.dtbo "$FW"/shell.json "$FW"/deployment_receip
 sudo cp "$APP.dtbo" "$FW/$APP.dtbo"
 sudo cp "$BIT_NAME" "$FW/$BIT_NAME"
 printf '{"shell_type":"XRT_FLAT","num_slots":"1"}\n' | sudo tee "$FW/shell.json" >/dev/null
-sudo xmutil unloadapp 2>/dev/null || true
+
+# `xmutil unloadapp` requires a slot argument.  Calling it without one returns an
+# error, while a following load of the same app name can appear successful without
+# replacing the resident image.  This XRT_FLAT package declares one slot; unload
+# that occupied slot and verify it is empty before trusting the new receipt.
+listapps_before="$(sudo xmutil listapps)"
+while read -r slot; do
+  [[ -n "$slot" ]] || continue
+  sudo xmutil unloadapp "$slot"
+done < <(printf '%s\n' "$listapps_before" | awk '
+  $NF ~ /^[0-9]+->[0-9]+,?$/ { split($NF, mapping, "->"); print mapping[1] }
+')
+listapps_after_unload="$(sudo xmutil listapps)"
+if printf '%s\n' "$listapps_after_unload" | awk '
+  $NF ~ /^[0-9]+->[0-9]+,?$/ { found = 1 }
+  END { exit found ? 0 : 1 }
+'; then
+  echo "ERROR: an accelerator slot remained loaded after unload" >&2
+  exit 1
+fi
 sudo xmutil loadapp "$APP"
+listapps_after_load="$(sudo xmutil listapps)"
+if ! printf '%s\n' "$listapps_after_load" | awk -v app="$APP" '
+  $1 == app && $NF ~ /^[0-9]+->[0-9]+,?$/ { found = 1 }
+  END { exit found ? 0 : 1 }
+'; then
+  echo "ERROR: $APP did not acquire an accelerator slot" >&2
+  exit 1
+fi
 sudo cp deployment_receipt.tsv "$FW/deployment_receipt.tsv"
-sudo xmutil listapps
+printf '%s\n' "$listapps_after_load"
 REMOTE
+mv "$RECEIPT_TMP" "$RECEIPT"
+trap - EXIT
 echo "Done. Deployed run=$RUN_ID bitstream_sha256=$BIT_HASH"
 echo "Restart penzaid with PENZAI_PL_OPS=all; query identity with: penzai capabilities --device tcp:<board>:29092"
