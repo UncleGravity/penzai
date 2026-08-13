@@ -80,6 +80,8 @@ module section_f32_scratch_map_formal(input wire clk);
     reg ref_rd_pending = 1'b0;
     reg [13:0] ref_rd_address = 14'd0;
     reg ref_rd_pending_error = 1'b0;
+    reg ref_rd_result_pending = 1'b0;
+    reg ref_rd_result_error = 1'b0;
     reg ref_rsp_expected = 1'b0;
     reg ref_rsp_error = 1'b0;
 
@@ -176,13 +178,18 @@ module section_f32_scratch_map_formal(input wire clk);
             ref_token <= 3'd0;
             ref_pair <= 3'd0;
             ref_rd_pending <= 1'b0;
+            ref_rd_result_pending <= 1'b0;
             ref_rsp_expected <= 1'b0;
         end else begin
-            ref_rsp_expected <= ref_rd_pending;
+            ref_rsp_expected <= ref_rd_result_pending;
+            if (ref_rd_result_pending)
+                ref_rsp_error <= ref_rd_result_error;
+
+            ref_rd_result_pending <= ref_rd_pending;
             if (ref_rd_pending) begin
-                ref_rsp_error <= ref_rd_pending_error ||
-                                 (wr_commit_valid &&
-                                  (ref_rd_address == wr_commit_address));
+                ref_rd_result_error <= ref_rd_pending_error ||
+                                       (wr_commit_valid &&
+                                        (ref_rd_address == wr_commit_address));
             end
 
             ref_rd_pending <= rd_issue_valid;
@@ -283,7 +290,7 @@ module section_f32_scratch_map_formal(input wire clk);
             end
 `endif
 
-            if ($past(rd_issue_valid)) begin
+            if (ref_rd_pending || ref_rd_result_pending) begin
                 assert(!rd_req_ready);
                 assert(!rd_rsp_valid);
             end

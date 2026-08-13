@@ -62,8 +62,6 @@ module q8_ingress (
     reg [63:0] emit_data;
     reg [5:0]  error_status;
     reg        internal_run;
-    reg [31:0] internal_data_q;
-    reg        internal_last_q;
     reg [1:0]  internal_status_q;
     reg        internal_valid_q;
 
@@ -74,20 +72,15 @@ module q8_ingress (
     wire [255:0] q_out_quants;
     wire [15:0] q_out_scale;
     wire [3:0] q_out_status;
-    wire internal_frame_ok = internal_last_q == (scalar_index == 6'd31);
+    wire internal_frame_ok = quant_scalar_last == (scalar_index == 6'd31);
     wire internal_accept = internal_run && (state == ST_INTERNAL) &&
                            internal_valid_q && q_in_ready;
-    wire q_scalar_valid = internal_run ?
-                          ((state == ST_INTERNAL) && internal_valid_q &&
-                           (internal_status_q == 2'd0) && internal_frame_ok) :
-                          quant_scalar_valid;
-    wire [31:0] q_scalar_data = internal_run ? internal_data_q : quant_scalar;
-    wire q_scalar_last = internal_run ? internal_last_q : quant_scalar_last;
     // A diagnosed scalar is consumed by the section controller but is not
     // allowed to mutate the quantizer's partial block before fail-closed abort.
-    // Registering this boundary keeps the SwiGLU arithmetic out of the
-    // quantizer's amax/control cone. There is deliberately no fall-through:
-    // each staged scalar is consumed before the source can replace it.
+    // Both raw and internal modes use the same final scalar registers, keeping
+    // the mode select and SwiGLU arithmetic out of the quantizer's amax/control
+    // cone. There is deliberately no fall-through: each staged scalar is
+    // consumed before the source can replace it.
     assign internal_ready = rst_n && !start && internal_run &&
                             (state == ST_INTERNAL) &&
                             !internal_valid_q;
@@ -106,10 +99,10 @@ module q8_ingress (
     q8_quantizer u_quantizer (
         .clk(clk),
         .rst_n(q_rst_n),
-        .in_valid(q_scalar_valid),
+        .in_valid(quant_scalar_valid),
         .in_ready(q_in_ready),
-        .in_data(q_scalar_data),
-        .in_last(q_scalar_last),
+        .in_data(quant_scalar),
+        .in_last(quant_scalar_last),
         .out_valid(q_out_valid),
         .out_ready(q_out_ready),
         .out_quants(q_out_quants),
@@ -159,8 +152,10 @@ module q8_ingress (
                                   (internal_mode ? ST_INTERNAL : ST_INPUT) : ST_IDLE;
         end else begin
             if (internal_ready && internal_valid) begin
-                internal_data_q   <= internal_data;
-                internal_last_q   <= internal_last;
+                quant_scalar      <= internal_data;
+                quant_scalar_last <= internal_last;
+                quant_scalar_valid <= (internal_status == 2'd0) &&
+                                      (internal_last == (scalar_index == 6'd31));
                 internal_status_q <= internal_status;
                 internal_valid_q  <= 1'b1;
             end
@@ -202,7 +197,9 @@ module q8_ingress (
                 end
 
                 ST_INTERNAL: if (internal_accept) begin
-                    internal_valid_q <= 1'b0;
+                    internal_valid_q   <= 1'b0;
+                    quant_scalar_valid <= 1'b0;
+                    quant_scalar_last  <= 1'b0;
                     if (internal_status_q != 2'd0) begin
                         error_status <= {internal_status_q, 4'd0};
                         state <= ST_ERROR;

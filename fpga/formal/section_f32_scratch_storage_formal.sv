@@ -27,10 +27,13 @@ module section_f32_scratch_storage_formal(input wire clk);
     reg [2:0] read_index = 3'd0;
     reg pending_read_d1 = 1'b0;
     reg pending_read_d2 = 1'b0;
+    reg pending_read_d3 = 1'b0;
     reg pending_role_x1_d1 = 1'b0;
     reg pending_role_x1_d2 = 1'b0;
+    reg pending_role_x1_d3 = 1'b0;
     reg [2:0] pending_index_d1 = 3'd0;
     reg [2:0] pending_index_d2 = 3'd0;
+    reg [2:0] pending_index_d3 = 3'd0;
     reg x0_valid = 1'b0;
     reg x1_valid = 1'b0;
 
@@ -98,13 +101,19 @@ module section_f32_scratch_storage_formal(input wire clk);
             read_index <= 3'd0;
             pending_read_d1 <= 1'b0;
             pending_read_d2 <= 1'b0;
+            pending_read_d3 <= 1'b0;
             pending_role_x1_d1 <= 1'b0;
             pending_role_x1_d2 <= 1'b0;
+            pending_role_x1_d3 <= 1'b0;
             pending_index_d1 <= 3'd0;
             pending_index_d2 <= 3'd0;
+            pending_index_d3 <= 3'd0;
             x0_valid <= 1'b0;
             x1_valid <= 1'b0;
         end else begin
+            pending_read_d3 <= pending_read_d2;
+            pending_role_x1_d3 <= pending_role_x1_d2;
+            pending_index_d3 <= pending_index_d2;
             pending_read_d2 <= pending_read_d1;
             pending_role_x1_d2 <= pending_role_x1_d1;
             pending_index_d2 <= pending_index_d1;
@@ -215,15 +224,20 @@ module section_f32_scratch_storage_formal(input wire clk);
             end
 
             if (pending_read_d2) begin
+                assert(!rd_req_ready);
+                assert(!rd_rsp_valid);
+            end
+
+            if (pending_read_d3) begin
                 assert(rd_rsp_valid);
                 assert(!rd_rsp_error);
                 for (i = 0; i < 4; i = i + 1) begin
-                    if (pending_role_x1_d2)
+                    if (pending_role_x1_d3)
                         assert(rd_rsp_data[i*64 +: 64] ==
-                               expected_x1[{pending_index_d2, 2'b00} + i]);
+                               expected_x1[{pending_index_d3, 2'b00} + i]);
                     else
                         assert(rd_rsp_data[i*64 +: 64] ==
-                               expected_x0[{pending_index_d2, 2'b00} + i]);
+                               expected_x0[{pending_index_d3, 2'b00} + i]);
                 end
             end
 

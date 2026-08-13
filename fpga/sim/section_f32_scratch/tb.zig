@@ -215,6 +215,10 @@ fn readGroup(
     try std.testing.expect(c.dut_read_response_valid(dut.handle) == 0);
     dut.step();
     dut.eval();
+    try std.testing.expect(c.dut_read_request_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_read_response_valid(dut.handle) == 0);
+    dut.step();
+    dut.eval();
 
     try std.testing.expect(c.dut_read_response_valid(dut.handle) != 0);
     var result: ReadResult = .{
@@ -411,6 +415,7 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
     c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
     dut.step();
+    dut.step();
     dut.eval();
     const cross_role = try consumeCurrentRead(dut, 4);
     try std.testing.expect(!cross_role.is_error);
@@ -438,6 +443,7 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     dut.step();
     c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
     c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
+    dut.step();
     dut.step();
     dut.eval();
     const collided = try consumeCurrentRead(dut, 3);
@@ -468,6 +474,7 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     c.dut_set_write_stream(dut.handle, 1, pairWord(8, .x2, 0, 0), 0xff, 0);
     dut.step();
     c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
+    dut.step();
     dut.eval();
     const issue_collided = try consumeCurrentRead(dut, 2);
     try std.testing.expect(issue_collided.is_error);

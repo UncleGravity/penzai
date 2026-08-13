@@ -52,6 +52,9 @@ module q8_fp32_div_rne_pos (
     reg [4:0]  bit_index;
     reg signed [10:0] result_exp;
     reg finalize;
+    reg result_pending;
+    reg [22:0] rounded_frac_q;
+    reg signed [10:0] rounded_exp_q;
 
     wire div_ge = remainder >= {1'b0, divisor};
     wire [24:0] remainder_sub = div_ge ? remainder - {1'b0, divisor} : remainder;
@@ -86,10 +89,13 @@ module q8_fp32_div_rne_pos (
             done    <= 1'b0;
             invalid <= 1'b0;
             finalize <= 1'b0;
+            result_pending <= 1'b0;
         end else begin
             done <= 1'b0;
             if (start && !busy) begin
                 invalid <= !(a_normal && b_normal);
+                finalize <= 1'b0;
+                result_pending <= 1'b0;
                 if (!(a_normal && b_normal)) begin
                     out  <= 32'd0;
                     done <= 1'b1;
@@ -104,7 +110,7 @@ module q8_fp32_div_rne_pos (
                                   $signed({3'b000, b[30:23]}) + 11'sd127 -
                                   (normalize_left ? 11'sd1 : 11'sd0);
                 end
-            end else if (busy && !finalize) begin
+            end else if (busy && !finalize && !result_pending) begin
                 quotient <= quotient_next;
                 if (bit_index == 5'd0) begin
                     remainder <= remainder_sub;
@@ -114,20 +120,28 @@ module q8_fp32_div_rne_pos (
                     bit_index <= bit_index - 5'd1;
                 end
             end else if (busy && finalize) begin
-                    busy <= 1'b0;
-                    done <= 1'b1;
-                    finalize <= 1'b0;
-                    if (rounded_exp <= 11'sd0) begin
-                        // Subnormal division is outside the resident-Q8 contract.
-                        invalid <= 1'b1;
-                        out <= 32'd0;
-                    end else if (rounded_exp >= 11'sd255) begin
-                        invalid <= 1'b1;
-                        out <= 32'h7f80_0000;
-                    end else begin
-                        invalid <= 1'b0;
-                        out <= {1'b0, rounded_exp[7:0], rounded_frac};
-                    end
+                // Register the exact rounded result before range/status decode.
+                // This removes the quotient/remainder carry chain from the
+                // output-register control pins at the cost of one fixed cycle.
+                rounded_frac_q <= rounded_frac;
+                rounded_exp_q <= rounded_exp;
+                finalize <= 1'b0;
+                result_pending <= 1'b1;
+            end else if (busy && result_pending) begin
+                busy <= 1'b0;
+                done <= 1'b1;
+                result_pending <= 1'b0;
+                if (rounded_exp_q <= 11'sd0) begin
+                    // Subnormal division is outside the resident-Q8 contract.
+                    invalid <= 1'b1;
+                    out <= 32'd0;
+                end else if (rounded_exp_q >= 11'sd255) begin
+                    invalid <= 1'b1;
+                    out <= 32'h7f80_0000;
+                end else begin
+                    invalid <= 1'b0;
+                    out <= {1'b0, rounded_exp_q[7:0], rounded_frac_q};
+                end
             end
         end
     end

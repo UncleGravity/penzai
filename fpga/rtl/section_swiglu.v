@@ -1130,6 +1130,34 @@ module section_swiglu #(
     assign in_ready = rst_n && !abort && (reserved_count < RESERVE_DEPTH[6:0]);
     wire input_accept = in_valid && in_ready;
 
+    // Register the complete ROM request before the coefficient memory. This keeps
+    // the section scratch lane selection and segment decode off the BRAM address
+    // pins while retaining one accepted scalar per cycle.
+    reg        request_valid;
+    reg [9:0]  request_segment;
+    reg [31:0] request_gate;
+    reg [31:0] request_up;
+    reg        request_last;
+    reg        request_nonfinite;
+    reg        request_negative_tail;
+    reg        request_positive_tail;
+    always @(posedge clk) begin
+        if (!rst_n || abort) begin
+            request_valid <= 1'b0;
+        end else begin
+            request_valid <= input_accept;
+            if (input_accept) begin
+                request_segment <= input_segment;
+                request_gate <= in_gate;
+                request_up <= in_up;
+                request_last <= in_last;
+                request_nonfinite <= input_nonfinite;
+                request_negative_tail <= input_negative_tail;
+                request_positive_tail <= input_positive_tail;
+            end
+        end
+    end
+
     // Synchronous ROM read plus metadata capture. The tail modes override the
     // fetched coefficient on the following cycle without changing pipeline shape.
     reg        rom_valid;
@@ -1144,15 +1172,15 @@ module section_swiglu #(
         if (!rst_n || abort) begin
             rom_valid <= 1'b0;
         end else begin
-            rom_valid <= input_accept;
-            if (input_accept) begin
-                rom_coeff <= coeff_rom[input_segment];
-                rom_gate <= input_nonfinite ? ZERO_F32 : in_gate;
-                rom_up <= input_nonfinite ? ZERO_F32 : in_up;
-                rom_last <= in_last;
-                rom_nonfinite <= input_nonfinite;
-                rom_negative_tail <= input_negative_tail;
-                rom_positive_tail <= input_positive_tail;
+            rom_valid <= request_valid;
+            if (request_valid) begin
+                rom_coeff <= coeff_rom[request_segment];
+                rom_gate <= request_nonfinite ? ZERO_F32 : request_gate;
+                rom_up <= request_nonfinite ? ZERO_F32 : request_up;
+                rom_last <= request_last;
+                rom_nonfinite <= request_nonfinite;
+                rom_negative_tail <= request_negative_tail;
+                rom_positive_tail <= request_positive_tail;
             end
         end
     end

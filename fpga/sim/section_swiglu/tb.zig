@@ -278,7 +278,7 @@ pub fn main() !void {
     reset(&dut);
 
     const burst = try runStream(&dut, inputs, false, false, 0x1111);
-    if (burst.latency != 14) {
+    if (burst.latency != 15) {
         std.debug.print("unexpected fixed latency: {d}\n", .{burst.latency});
         return error.LatencyMismatch;
     }

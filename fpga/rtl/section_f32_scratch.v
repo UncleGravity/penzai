@@ -199,16 +199,23 @@ module section_f32_scratch (
     reg         rd_pending_q;
     reg [13:0]  rd_address_q;
     reg         rd_pending_error_q;
+    reg         rd_result_pending_q;
+    reg         rd_result_error_q;
     reg         rd_rsp_valid_q;
+    reg [63:0]  rd_mem_bank0_q;
+    reg [63:0]  rd_mem_bank1_q;
+    reg [63:0]  rd_mem_bank2_q;
+    reg [63:0]  rd_mem_bank3_q;
     reg [63:0]  rd_bank0_q;
     reg [63:0]  rd_bank1_q;
     reg [63:0]  rd_bank2_q;
     reg [63:0]  rd_bank3_q;
 
     // The accepted request is registered before it reaches the four-deep URAM
-    // cascades.  Keeping only one request pending also preserves the single
-    // elastic response slot without a response FIFO.
-    assign rd_req_ready = rst_n && !rd_pending_q &&
+    // cascades.  A separate post-URAM group register terminates the hard-cascade
+    // data path before the response crosses into a consumer.  Keeping only one
+    // request in flight preserves the single elastic response slot.
+    assign rd_req_ready = rst_n && !rd_pending_q && !rd_result_pending_q &&
                           (!rd_rsp_valid_q || rd_rsp_ready);
     wire rd_accept = rd_req_valid && rd_req_ready;
     wire rd_accept_collision = rd_accept && !rd_request_bad && wr_mem_write &&
@@ -236,10 +243,17 @@ module section_f32_scratch (
         end
 
         if (rd_pending_q) begin
-            rd_bank0_q <= bank0_mem[rd_address_q];
-            rd_bank1_q <= bank1_mem[rd_address_q];
-            rd_bank2_q <= bank2_mem[rd_address_q];
-            rd_bank3_q <= bank3_mem[rd_address_q];
+            rd_mem_bank0_q <= bank0_mem[rd_address_q];
+            rd_mem_bank1_q <= bank1_mem[rd_address_q];
+            rd_mem_bank2_q <= bank2_mem[rd_address_q];
+            rd_mem_bank3_q <= bank3_mem[rd_address_q];
+        end
+
+        if (rd_result_pending_q) begin
+            rd_bank0_q <= rd_mem_bank0_q;
+            rd_bank1_q <= rd_mem_bank1_q;
+            rd_bank2_q <= rd_mem_bank2_q;
+            rd_bank3_q <= rd_mem_bank3_q;
         end
     end
 
@@ -258,6 +272,7 @@ module section_f32_scratch (
             wr_pair         <= 3'd0;
             wr_address_q    <= 14'd0;
             rd_pending_q    <= 1'b0;
+            rd_result_pending_q <= 1'b0;
             rd_rsp_valid_q  <= 1'b0;
             rd_rsp_error    <= 1'b0;
         end else begin
@@ -329,8 +344,15 @@ module section_f32_scratch (
             end
 
             if (rd_pending_q) begin
+                rd_result_pending_q <= 1'b1;
+                rd_result_error_q   <= rd_pending_error_q || rd_issue_collision;
+            end else if (rd_result_pending_q) begin
+                rd_result_pending_q <= 1'b0;
+            end
+
+            if (rd_result_pending_q) begin
                 rd_rsp_valid_q <= 1'b1;
-                rd_rsp_error   <= rd_pending_error_q || rd_issue_collision;
+                rd_rsp_error   <= rd_result_error_q;
             end else if (rd_rsp_valid_q && rd_rsp_ready) begin
                 rd_rsp_valid_q <= 1'b0;
                 rd_rsp_error   <= 1'b0;
