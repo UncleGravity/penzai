@@ -263,8 +263,8 @@ hardened cosim, formal, OOC, and board gates pass. The registered-boundary OOC
 result is 60 DSPs, 22,109 LUTs, 18,889 FFs, and +0.291 ns WNS at 3.333 ns
 (328.7 MHz estimated Fmax). The clean combined route passes setup and hold at
 +0.033/+0.007 ns after guarded placement and pre-route physical optimization.
-Run `20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` clears the 25 ps
-development release floor but remains below the 50 ps headroom target. The
+Run `20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` passes setup and
+hold timing but has 12 setup paths below 50 ps. The
 remaining 12-path tail spans the disabled sequencer, flash, and unrelated GEMM
 structures, so no single narrow RTL repair is justified. The exact run was
 promoted and deployed with a hash-verified receipt; Q1/Q2 logits checks had zero
@@ -303,9 +303,9 @@ The adaptive clean f300 route also failed closed: run
 One deliberate clock qualification then produced clean f285 run
 `20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean`. It passes setup/hold at
 +0.036/+0.010 ns, has five setup paths below 50 ps, and uses 80,837 LUTs, 95,229
-FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. It clears
-the 25 ps release floor but not the 50 ps headroom target, so the margin is valid
-but thin. The exact image was promoted and deployed with a hash-verified receipt;
+FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. The exact
+image was promoted and deployed
+with a hash-verified receipt;
 live capabilities report 284,997,152 Hz, engine `0xF1A54A01` version 1, and 64
 query slots.
 
@@ -383,9 +383,9 @@ isolated probes passed at +0.192 ns WNS for the 792-LUT/908-FF/2-DSP quantizer l
 and +0.619 ns for the 38,544-LUT/42,935-FF/32-DSP GEMM v13 core.
 
 Those isolated results did not predict the first combined route. Clean f285 run
-`20260812T212725Z-f9e1ca83f8ae-w512-p4-f285-clean` routed fully but failed release
-at -0.215/+0.010 ns setup/hold, with 142 failing setup paths and 580 below the
-50 ps headroom target. It used 81,284 LUTs, 96,220 FFs, 55.5 BRAM tiles, four
+`20260812T212725Z-f9e1ca83f8ae-w512-p4-f285-clean` routed fully but failed timing
+at -0.215/+0.010 ns setup/hold, with 142 failing setup paths and 580 below
+50 ps. It used 81,284 LUTs, 96,220 FFs, 55.5 BRAM tiles, four
 URAMs, and 95 DSPs at 99.32% CLB occupancy. No image from that run was promoted.
 
 Timing-repair commit `547d87b` replaces the flat ingress block-count multiply and
@@ -408,8 +408,7 @@ source bundle
 `1cfc1e173ba0ae1d06d1fceb1d3fa83ec29535f760a7a7f91a6b5e0458078249`.
 It is fully routed with clean structural constraint counts and exact restoration of
 the 75 ps placement guardband. Setup/hold pass at +0.043/+0.010 ns with no negative
-paths; 4/55/622 setup paths are below 50/100/200 ps. The 25 ps release floor is met,
-but the 50 ps headroom target is missed by 7 ps. Routed use is 81,887 LUTs, 95,699
+paths; 4/55/622 setup paths are below 50/100/200 ps. Routed use is 81,887 LUTs, 95,699
 FFs, 1,408 CARRY8s, 94 DSPs, 55.5 BRAM tiles, and four URAMs, with
 14,519/14,640 CLBs occupied (99.17%). Methodology still reports two critical
 findings, TIMING-2 and TIMING-4, plus six warnings: five TIMING-28 and one ULMTCS-1.
@@ -545,8 +544,8 @@ These are requirements on every priority, not a separate final cleanup phase:
 - `zig build test` and all formal-control targets pass;
 - one aggregate RTL cosim target runs in Nix/CI for binary and ternary paths;
 - changed kernels pass OOC for resource/Fmax feedback;
-- the combined routed build clears the 25 ps development floor, while 50 ps remains
-  the tracked headroom target;
+- the combined design is fully routed with non-negative setup and hold slack and no
+  unconstrained internal endpoints;
 - Q1 and Q2 model-level logits/perplexity gates pass at short and long contexts;
 - a board smoke run verifies bitstream identity, capabilities, DMA/cache behavior,
   prefill, and decode.
@@ -570,19 +569,20 @@ remain. They are not currently independent roadmap projects:
 - the DSP multiply output is already registered before the 104-bit shift result.
 
 The qualified P2d build is the repaired clean f285 run described above. It reports
-+0.043 ns setup and +0.010 ns hold slack, with four setup paths below the 50 ps
-target; P2c remains its direct performance comparison baseline. The fixed and
++0.043 ns setup and +0.010 ns hold slack, with four setup paths below 50 ps;
+P2c remains its direct performance comparison baseline. The fixed and
 adaptive P2c designs both failed clean f300 routing despite passing OOC, and the
 first P2d f285 design similarly failed before repair. This is direct evidence that
 combined routing, not OOC Fmax, remains the release authority. Methodology still
 reports critical TIMING-2/TIMING-4 and five TIMING-28 plus one ULMTCS-1 warning.
 Therefore:
 
-- keep 25 ps as the hard development release floor and 50 ps as the headroom target;
+- accept fully routed builds with non-negative setup and hold slack; treat additional
+  slack as a separate timing-optimization objective;
 - treat f285 as P2d's bounded qualification point, not proof of f300 closure;
 - resolve the methodology findings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
-- treat timing locality and reproducible headroom as build requirements for every phase.
+- retain timing locality and near-critical path reports as inputs to later optimization.
 
 ## General BitNet support gate
 

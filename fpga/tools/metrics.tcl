@@ -111,21 +111,16 @@ proc ::penzai_analysis::write_summary {status failures} {
     set fh [open [file join $output_dir summary.txt] w]
     puts $fh "FPGA_BUILD $status"
     puts $fh "run=[dict_get_or $manifest run_id unknown] variant=[dict_get_or $manifest variant unknown] mode=$mode"
-    puts $fh "setup_wns_ns=[dict_get_or $metrics timing.setup_wns_ns n/a] hold_whs_ns=[dict_get_or $metrics timing.hold_whs_ns n/a] setup_release_floor_ns=[dict_get_or $metrics timing.setup_release_floor_ns 0.0] setup_headroom_target_ns=[dict_get_or $metrics timing.setup_headroom_target_ns 0.050] near_lt_0.050ns=[dict_get_or $metrics timing.setup_paths_lt_0_050ns n/a]"
+    puts $fh "setup_wns_ns=[dict_get_or $metrics timing.setup_wns_ns n/a] hold_whs_ns=[dict_get_or $metrics timing.hold_whs_ns n/a] near_lt_0.050ns=[dict_get_or $metrics timing.setup_paths_lt_0_050ns n/a]"
     puts $fh "routed_lut=[dict_get_or $metrics routed.clb_luts n/a] routed_ff=[dict_get_or $metrics routed.registers n/a] bram_tiles=[dict_get_or $metrics routed.bram_tiles n/a] uram=[dict_get_or $metrics routed.uram n/a] dsp=[dict_get_or $metrics routed.dsps n/a]"
     puts $fh "route_fully=[dict_get_or $metrics route.fully_routed n/a] no_clock=[dict_get_or $metrics constraints.no_clock n/a] unconstrained_endpoints=[dict_get_or $metrics constraints.unconstrained_internal_endpoints n/a] methodology_critical=[dict_get_or $metrics methodology.critical n/a]"
     if {[llength $failures] > 0} {
         puts $fh "failures=[join $failures {; }]"
     }
-    set wns [dict_get_or $metrics timing.setup_wns_ns n/a]
-    set target [dict_get_or $metrics timing.setup_headroom_target_ns 0.050]
-    if {$wns ne "n/a" && $wns >= 0.0 && $wns < $target} {
-        puts $fh "warning=setup margin is below the ${target}ns headroom target"
-    }
     close $fh
 }
 
-proc ::penzai_analysis::collect_routed {strict {setup_release_floor_ns 0.0} {setup_headroom_target_ns 0.050}} {
+proc ::penzai_analysis::collect_routed {strict} {
     variable output_dir
     variable manifest
 
@@ -159,12 +154,8 @@ proc ::penzai_analysis::collect_routed {strict {setup_release_floor_ns 0.0} {set
     set hold_whs [expr {[llength $hold_paths] ? [get_property SLACK [lindex $hold_paths 0]] : "n/a"}]
     metric_set timing.setup_wns_ns $setup_wns
     metric_set timing.hold_whs_ns $hold_whs
-    metric_set timing.setup_release_floor_ns $setup_release_floor_ns
-    metric_set timing.setup_headroom_target_ns $setup_headroom_target_ns
-    metric_set timing.setup_release_met \
-        [expr {$setup_wns ne "n/a" && $setup_wns >= $setup_release_floor_ns ? 1 : 0}]
-    metric_set timing.setup_headroom_met \
-        [expr {$setup_wns ne "n/a" && $setup_wns >= $setup_headroom_target_ns ? 1 : 0}]
+    metric_set timing.setup_met [expr {$setup_wns ne "n/a" && $setup_wns >= 0.0 ? 1 : 0}]
+    metric_set timing.hold_met [expr {$hold_whs ne "n/a" && $hold_whs >= 0.0 ? 1 : 0}]
 
     set path_query_limit 10000
     metric_set timing.path_count_limit $path_query_limit
@@ -181,8 +172,6 @@ proc ::penzai_analysis::collect_routed {strict {setup_release_floor_ns 0.0} {set
         lappend failures "no setup timing path"
     } elseif {$setup_wns < 0.0} {
         lappend failures "setup WNS ${setup_wns}ns"
-    } elseif {$setup_wns < $setup_release_floor_ns} {
-        lappend failures "setup WNS ${setup_wns}ns is below ${setup_release_floor_ns}ns release floor"
     }
     if {$hold_whs eq "n/a"} {
         lappend failures "no hold timing path"

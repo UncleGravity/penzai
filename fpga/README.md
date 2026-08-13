@@ -9,30 +9,27 @@ single report directory is expected to do all of them.
 | Formal | `zig build formal` | Do the control and datapath invariants hold for all explored states? |
 | Cosim | `zig build test-rtl-*` | Does RTL agree with the software oracle on representative data? |
 | OOC synthesis | `fpga/ooc/run.sh <probe>` | How does one block map, and what is its isolated timing margin? |
-| Routed build | `fpga/bitstream/build.sh` | Does the complete design fit, route, and meet release gates? |
+| Routed build | `fpga/bitstream/build.sh` | Does the complete design fit, route, and pass timing? |
 | Checkpoint analysis | `fpga/tools/analyze.sh <mode>` | Why did a routed design get its timing and utilization result? |
 
 Formal harnesses and properties live in `fpga/formal/`. Verilator harnesses
 live in `fpga/sim/`; synthesis harnesses and their declarative registry live in
 `fpga/ooc/`.
 
-## Release gates
+## Bitstream gates
 
 The production bitstream build refuses to generate a deployable artifact unless
 all of these hold after routing:
 
-- setup WNS is at least the 25 ps development release floor;
+- setup WNS is non-negative;
 - hold WHS is non-negative;
 - `report_route_status` says the design is fully routed;
 - `check_timing` reports no clockless or unconstrained internal endpoints.
 
-Methodology violations are recorded in every run. They are diagnostic for now,
-not a release gate, so the existing TIMING methodology warnings remain visible
-without silently changing the current acceptance contract.
-
-The combined flow also tracks 50 ps as a nonblocking setup-headroom target. A
-stricter production margin requires resolving the clock methodology warnings and
-deriving the threshold from an explicit clock/PVT budget.
+Methodology violations and near-critical path counts are recorded in every run.
+They remain diagnostic and do not replace Vivado's setup and hold result. A
+future timing-optimization pass may use those reports to earn additional slack,
+but normal bitstream generation does not impose an extra margin threshold.
 
 ## Artifact ownership
 

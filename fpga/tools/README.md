@@ -13,7 +13,7 @@ cd fpga/tools
 
 Results are fetched into `fpga/bitstream/out/analysis/<run-id>/`; `latest` points to the
 most recent local bundle. `summary` uses `metrics.tcl`, the same implementation used by
-the production build and fails if any routed release gate fails. `deep` runs `report.tcl`
+the production build, and fails if any routed timing or structural gate fails. `deep` runs `report.tcl`
 and captures broad diagnostics without imposing new gates. Design-specific structural
 checks remain separate and are invoked only when their invariant is relevant.
 

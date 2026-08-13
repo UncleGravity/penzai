@@ -383,16 +383,16 @@ gates pass.
 The released P2b clean combined timing run reached setup and hold at +0.033/+0.007 ns
 after guarded placement and pre-route `AggressiveExplore`. It uses 80,108 LUTs,
 94,587 FFs, 48.5 BRAMs, four URAMs, and 92 DSPs, with 98.25% of CLBs occupied.
-The AXPY cascade is absent. Twelve setup paths remain below the 50 ps target, but
+The AXPY cascade is absent. Twelve setup paths remain below 50 ps, but
 they span the disabled sequencer, flash, and unrelated GEMM structures rather
-than one repairable path family. Exact-policy run
-`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` clears the 25 ps
-development release floor, was promoted and deployed with matching hashes, and
+than one repairable path family. Run
+`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` passes setup and hold,
+was promoted and deployed with matching hashes, and
 passed bounded Q1/Q2 logits and profile smoke. The smoke artifact is
 `20260812T072252Z-characterize-ed0a92df72da`; it has identical start/end
 capabilities, closed accounting, PL execution for GEMM and attention in both
-phases, exact token counts, and zero K/V/O stalls. The 50 ps value remains a
-target rather than a hard architectural boundary.
+phases, exact token counts, and zero K/V/O stalls. The below-50-ps path bin remains
+diagnostic for a separate timing-optimization pass, not an architectural boundary.
 
 The first P2c implementation kept four queries for every supported head count,
 which made Q and accumulator storage 128 slots wide. It passed OOC but its clean
@@ -403,15 +403,15 @@ revision removes 14 flash BRAM tiles while retaining the four-query Bonsai tile.
 
 Adaptive clean f300 run
 `20260812T144901Z-bbeac0c04eff-w512-p4-f300-clean` also failed closed, at
--0.088 ns WNS with 231 failing setup endpoints and 560 paths below the 50 ps
-target. It was not promoted. Clean f285 run
+-0.088 ns WNS with 231 failing setup endpoints and 560 paths below 50 ps. It was
+not promoted. Clean f285 run
 `20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean` passes at +0.036/+0.010 ns
 setup/hold, with five paths below 50 ps. It uses 80,837 LUTs, 95,229 FFs, 55.5
 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. The exact artifact
 was promoted and deployed with matching receipt and bitstream hashes. Live
 capabilities report 284,997,152 Hz, engine `0xF1A54A01` version 1, and 64 query
-slots. The run clears the 25 ps release floor but misses the 50 ps headroom target;
-it was P2c's qualification point, not evidence that f300 closes.
+slots. The run passes timing with five setup paths below 50 ps; it was P2c's
+qualification point, not evidence that f300 closes.
 
 The first multi-token board smoke fell back to PS because the driver predicate had
 the Q stride axes reversed. That failure was visible in the truthful backend field.
@@ -505,8 +505,7 @@ and source bundle
 It is fully routed, all structural timing counts are zero, and removal of the
 75 ps placement guardband restores exactly 75 ps. Setup/hold pass at
 +0.043/+0.010 ns with no violations; 4/55/622 setup paths are below
-50/100/200 ps. The release floor is met, while the 50 ps headroom target is missed
-by 7 ps. Routed utilization is 81,887 LUTs, 95,699 FFs, 1,408 CARRY8s, 94 DSPs,
+50/100/200 ps. Routed utilization is 81,887 LUTs, 95,699 FFs, 1,408 CARRY8s, 94 DSPs,
 55.5 BRAM tiles, and four URAMs. CLB use is 14,519/14,640 (99.17%). Methodology
 reports two critical findings, TIMING-2 and TIMING-4, and six warnings: five
 TIMING-28 and one ULMTCS-1.

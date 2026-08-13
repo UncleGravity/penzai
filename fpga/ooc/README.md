@@ -37,8 +37,8 @@ setup WNS with 231 failing endpoints and 560 paths below 50 ps. Clean f285 run
 `20260812T155038Z-3ef082b0fe4a-w512-p4-f285-clean` then passed at
 `+0.036/+0.010 ns` setup/hold with five paths below 50 ps. It uses 80,837 LUTs,
 95,229 FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy,
-and it was promoted, deployed, and board-qualified. It clears the 25 ps release
-floor but remains below the 50 ps headroom target. This is why combined routing,
+and it was promoted, deployed, and board-qualified. It passes timing with five
+setup paths below 50 ps. This is why combined routing,
 not OOC Fmax, remains authoritative; the OOC result did not establish f300
 deployability. Board qualification now extends through Q1/Q2 context 2048; the Q1
 attention schedule remains essentially cycle-neutral relative to P2b despite the
@@ -86,8 +86,7 @@ That authority is supplied by replacement clean f285 run
 `20260812T224303Z-547d87b12094-w512-p4-f285-clean`, which uses source bundle
 `1cfc1e173ba0ae1d06d1fceb1d3fa83ec29535f760a7a7f91a6b5e0458078249`.
 It is fully routed and passes at +0.043/+0.010 ns setup/hold with no negative paths
-and 4/55/622 paths below 50/100/200 ps. It meets the 25 ps release floor but misses
-the 50 ps headroom target by 7 ps. Routed use is 81,887 LUTs, 95,699 FFs,
+and 4/55/622 paths below 50/100/200 ps. Routed use is 81,887 LUTs, 95,699 FFs,
 1,408 CARRY8s, 94 DSPs, 55.5 BRAM tiles, and four URAMs at 99.17% CLB occupancy.
 Structural timing counts are clean and the 75 ps guardband restoration is exact;
 methodology reports critical TIMING-2/TIMING-4 plus five TIMING-28 and one ULMTCS-1

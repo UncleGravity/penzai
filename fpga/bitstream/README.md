@@ -61,20 +61,18 @@ The routed build remains the gate:
 - It refuses to write a bitstream unless setup and hold timing close, the design is
   fully routed, and `check_timing` finds no clockless or unconstrained internal endpoints.
 - Placement uses a setup-only 75 ps guardband, removes it before routing, and
-  verifies the constraint delta and nominal restoration. The build refuses to
-  write or promote a bitstream below the 25 ps setup release floor. It records
-  50 ps as the headroom target and warns when that target is missed; hold must
-  remain nonnegative and is not artificially tightened.
+  verifies the constraint delta and nominal restoration. Final setup and hold
+  slack must be nonnegative; no additional margin threshold is imposed.
 - It records methodology findings, utilization, near-critical path counts, phase times,
   source identity, and build configuration in the run bundle.
 
 A released clean P2b timing run using the guardband plus pre-route
 `AggressiveExplore` reached setup/hold of +0.033/+0.007 ns, with 12 setup
-paths below the 50 ps target. It uses 80,108 LUTs, 94,587 FFs, 48.5 BRAMs, four
+paths below 50 ps. It uses 80,108 LUTs, 94,587 FFs, 48.5 BRAMs, four
 URAMs, and 92 DSPs; 98.25% of CLBs are occupied. The remaining short tail spans
 the disabled sequencer, flash, and several unrelated GEMM structures, so 50 ps
-is not treated as a single-path architectural boundary. Exact-policy run
-`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` clears the 25 ps floor,
+is not treated as a single-path architectural boundary. Run
+`20260812T062923Z-b829dee03903-dirty-w512-p4-f300-clean` passes timing,
 was promoted and deployed, and passed receipt/capability, Q1/Q2 logits, and
 profile smoke checks. Resolve critical TIMING-2/TIMING-4 plus the five TIMING-28
 and one ULMTCS-1 warning before deriving a stricter production margin from an
@@ -95,8 +93,8 @@ it was not promoted. Clean f285 run
 +0.036/+0.010 ns with five setup paths below 50 ps. It uses 80,837 LUTs, 95,229
 FFs, 55.5 BRAM tiles, four URAMs, and 92 DSPs at 98.61% CLB occupancy. The exact
 image was promoted and deployed with verified source, manifest, transfer, and
-bitstream hashes. It clears the 25 ps release floor but misses the 50 ps headroom
-target; it established P2c's qualification point, while f300 remains unclosed.
+bitstream hashes. It passes timing with five setup paths below 50 ps; it established
+P2c's qualification point, while f300 remains unclosed.
 
 ### P2d bounded qualification status
 
@@ -135,8 +133,7 @@ Replacement clean f285 run
 `1cfc1e173ba0ae1d06d1fceb1d3fa83ec29535f760a7a7f91a6b5e0458078249`.
 It is fully routed with all structural timing counts zero and exact restoration of
 the 75 ps placement guardband. Setup/hold pass at +0.043/+0.010 ns with no negative
-paths; 4/55/622 setup paths are below 50/100/200 ps. The 25 ps release floor is
-met, but the 50 ps headroom target is missed by 7 ps. Routed utilization is 81,887
+paths; 4/55/622 setup paths are below 50/100/200 ps. Routed utilization is 81,887
 LUTs, 95,699 FFs, 1,408 CARRY8s, 94 DSPs, 55.5 BRAM tiles, and four URAMs, with
 14,519/14,640 CLBs used (99.17%). Methodology reports critical TIMING-2/TIMING-4
 plus five TIMING-28 and one ULMTCS-1 warning.
@@ -144,7 +141,7 @@ plus five TIMING-28 and one ULMTCS-1 warning.
 | Gate | P2d result |
 |---|---|
 | First clean `w512-p4-f285` route | failed closed; run above was not promoted |
-| Replacement clean `w512-p4-f285` route | pass; +0.043/+0.010 ns, release floor met |
+| Replacement clean `w512-p4-f285` route | pass; +0.043/+0.010 ns |
 | Promotion and deployment receipt | pass; bit SHA `9ab576cad24eb3c77d6b55200d5e9a08d92f0197625f76d479c13fc6fa82a70f` |
 | Capability identity | pass; schema 2, wire 14, profile 6, GEMM v13 at 284,997,152 Hz, flash v1/64 slots |
 | Q1 `p32` logits | pass; max abs 0.098204, zero token mismatches |

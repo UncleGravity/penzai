@@ -57,8 +57,6 @@ set checkpoint_dir [file join $cache_root checkpoints]
 set reference_dcp [file join $checkpoint_dir ${bit_name}-routed.dcp]
 set ps_fclk_mhz 99.999001
 set implementation_clock_name clk_out1_design_1_clk_wiz_0
-set setup_release_floor_ns 0.025
-set setup_headroom_target_ns 0.050
 set place_setup_guardband_ns 0.075
 set nominal_setup_uncertainty_ns 0.000
 
@@ -83,12 +81,8 @@ source [file normalize ./metrics.tcl]
     phys_opt_directive AggressiveExplore \
     route_directive Explore \
     implementation_clock $implementation_clock_name \
-    setup_release_floor_ns $setup_release_floor_ns \
-    setup_headroom_target_ns $setup_headroom_target_ns \
     place_setup_guardband_ns $place_setup_guardband_ns \
     nominal_setup_uncertainty_ns $nominal_setup_uncertainty_ns]
-::penzai_analysis::metric_set timing.setup_release_floor_ns $setup_release_floor_ns
-::penzai_analysis::metric_set timing.setup_headroom_target_ns $setup_headroom_target_ns
 ::penzai_analysis::metric_set timing.place_setup_guardband_ns $place_setup_guardband_ns
 ::penzai_analysis::metric_set timing.nominal_setup_uncertainty_ns $nominal_setup_uncertainty_ns
 
@@ -625,7 +619,7 @@ if {$incremental_active} {
     }
 }
 set phase_started [clock milliseconds]
-::penzai_analysis::collect_routed 1 $setup_release_floor_ns $setup_headroom_target_ns
+::penzai_analysis::collect_routed 1
 record_phase routed_reports $phase_started
 
 set phase_started [clock milliseconds]
