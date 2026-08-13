@@ -192,8 +192,12 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
 - [ ] Freeze concrete versioned FFN/attention descriptors with the first executable
   section, including DDR ranges, strides, RoPE, normalization, cache, and weight
   semantics.
-- [ ] Implement a PL FP32-to-Q8_0 quantizer matching the canonical host quantizer.
-- [ ] Store and reuse grouped Q/K/V and gate/up Q8 activations on chip.
+- [x] Implement an exact PL FP32-to-Q8_0 quantizer matching the canonical host
+  quantizer for every supported finite block.
+- [x] Store and reuse the adjacent gate/up Q8 activation in GEMM's existing
+  activation memories, guarded by an explicit epoch and shape.
+- [ ] Reuse grouped Q/K/V activations inside the named attention section; do not
+  force the observed graph ordering into a more general primitive matcher.
 - [ ] Write GEMM results into banked scratch in the next consumer's layout.
 - [ ] Make prefill token/row layout conversion a scratchpad addressing problem,
   rather than a PS transpose and DDR round trip.
@@ -210,8 +214,8 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
   attention section.
 - [ ] Require strict shape, layout, RoPE, normalization, mask, and KV-cache matches;
   retain the current PS/op path as the correctness fallback.
-- [ ] Add saturation counters and full-model logits/perplexity gates before replacing
-  the host quantizer.
+- [ ] Qualify the PL quantizer with full-model board logits/perplexity and its
+  saturation/status counters before extending it beyond the bounded group.
 
 P2 must produce one attention engine and ABI, not separate prefill and decode
 kernels. Completion requires PL execution for supported multi-token prefill,
@@ -344,10 +348,136 @@ Against P2b Q1 at f300, device time is 3.74% higher but cycles per update are on
 P2c is deliberately a primitive-op bridge. The context-2048 run still downloads
 5.8/11.6 GiB for Q1/Q2 and retains the surrounding graph and command boundaries;
 that traffic now dominates prefill wall and transport. It also does not yet provide
-same-section K/V visibility. With route and board signoff complete, focus returns
-to PL Q8 ingress, grouped Q/K/V and gate/up activation reuse, banked-scratch GEMM
-output layouts, and then the first named FFN section. P2 as a whole remains open
-until those boundaries and the named section commands exist.
+same-section K/V visibility. P2d now supplies PL Q8 ingress and bounded gate/up
+activation reuse; banked-scratch GEMM output layouts and named section commands
+remain. P2 as a whole stays open until those boundaries exist.
+
+P2d adds wire ABI 14's fixed-arity `matmul_q1a8_group2`. The matcher is structural,
+not semantic: it can group any adjacent pair with one identical F32 activation
+range, matching shapes and weight format, safe compute flags, complete bindings,
+disjoint destinations, no output views, and no intervening compute operation. In
+the validated Qwen/Bonsai graphs, exactly 28 gate/up pairs satisfy that contract;
+Q/K/V do not. Anything else retains the two primitive matmuls. All ranges are
+validated before either projection can start; a pre-v13 bitstream executes two
+validated primitive PL operations, with the shared-quantization PS implementation
+as the final fallback.
+
+GEMM v13 receives each column tile as raw FP32, quantizes it once with exact
+canonical FP32 division/multiplication and round-to-nearest-even behavior, and
+latches the native Q8 bytes plus F16 scales under `{epoch, K, columns}`. The second
+projection must match that state and consumes zero activation beats. Framing,
+non-finite, scale, or arithmetic faults abort raw ingress and invalidate resident
+state before the kernel consumes weights or emits results. A bad reuse epoch or
+shape also rejects before kernel weight/result consumption, but preserves the
+previous resident record. DMA movers may already be armed on either error path.
+Fake-device full-model Q1 and Q2 runs reduced one-token prefill and decode graphs
+from 537 to 509 commands and reported exactly 28 grouped operations per graph.
+Inspection identifies those operations as gate/up; this validates structural graph
+recognition and accounting, not semantic matching or board throughput.
+
+The exact quantizer cosim covers 1,032 blocks, binary and ternary integration
+cosims cover raw-load/reuse behavior, and focused formal tasks cover invalid reuse
+and activation abort. Standard Zig tests pass 255/255, pinned llama-enabled tests
+278/278, and the aggregate RTL suite passes 36/36 build steps. The initial 3.333 ns
+isolated probes passed at +0.192 ns WNS for the 792-LUT/908-FF/2-DSP quantizer leaf
+and +0.619 ns for the 38,544-LUT/42,935-FF/32-DSP GEMM v13 core.
+
+Those isolated results did not predict the first combined route. Clean f285 run
+`20260812T212725Z-f9e1ca83f8ae-w512-p4-f285-clean` routed fully but failed release
+at -0.215/+0.010 ns setup/hold, with 142 failing setup paths and 580 below the
+50 ps headroom target. It used 81,284 LUTs, 96,220 FFs, 55.5 BRAM tiles, four
+URAMs, and 95 DSPs at 99.32% CLB occupancy. No image from that run was promoted.
+
+Timing-repair commit `547d87b` replaces the flat ingress block-count multiply and
+wide counters with nested column/Q1/sub-block state, registers the scalar boundary,
+uses a compact 64-bit emitter, and retimes the GEMM `FE_LAT` exponent addition.
+It removes 228 state bits and one DSP while preserving the established binary and
+ternary hashes and cycle counts; the expanded cosim also crosses multiple column
+and Q1 boundaries and checks missing terminal framing. Current-source full-decode
+OOC run `20260812T223110Z-547d87b12094-full-decode` passes the 3.333 ns constraint
+at +0.245/+0.039 ns setup/hold with 40,141 LUTs, 44,912 FFs, 775 CARRY8s,
+34 DSPs, two BRAM tiles, and four URAMs. The failed route's ingress bookkeeping
+and exponent-add path families are absent from its reported critical paths. The
+3.333 ns production artifacts pass; the probe driver exited later when its read-
+only, non-production second-period report script attempted to mutate the open
+design. That report failure does not affect the production source or result.
+
+Replacement clean f285 run
+`20260812T224303Z-547d87b12094-w512-p4-f285-clean` is a clean commit build with
+source bundle
+`1cfc1e173ba0ae1d06d1fceb1d3fa83ec29535f760a7a7f91a6b5e0458078249`.
+It is fully routed with clean structural constraint counts and exact restoration of
+the 75 ps placement guardband. Setup/hold pass at +0.043/+0.010 ns with no negative
+paths; 4/55/622 setup paths are below 50/100/200 ps. The 25 ps release floor is met,
+but the 50 ps headroom target is missed by 7 ps. Routed use is 81,887 LUTs, 95,699
+FFs, 1,408 CARRY8s, 94 DSPs, 55.5 BRAM tiles, and four URAMs, with
+14,519/14,640 CLBs occupied (99.17%). Methodology still reports two critical
+findings, TIMING-2 and TIMING-4, plus six warnings: five TIMING-28 and one ULMTCS-1.
+
+The image was promoted and deployed with bitstream SHA-256
+`9ab576cad24eb3c77d6b55200d5e9a08d92f0197625f76d479c13fc6fa82a70f`.
+Live capabilities report schema 2, wire ABI 14, profile ABI 6, GEMM
+`0xB05A2000` v13 at 284,997,152 Hz, and flash v1 with 64 query slots. Q1 `p32`
+logits pass with 0.098204 maximum absolute error and zero token mismatches. Q2
+`p32` also passes: its two step differences are 0.089185/0.131115, maximum
+absolute error is 0.131115, both argmax results are exact, token mismatches are
+zero, and `check=ok`.
+
+Final board artifact `20260812T235644Z-characterize-9bb6d3eb522f` contains all
+six expected Q1/Q2 p128, c0, and c512 samples. It is complete and run-validated,
+every sample closes accounting, and start/end capability responses are identical.
+The full-model structure is exact: p128 prefill emits 15 graphs, 4,002 commands,
+217 grouped and 1,114 primitive matmuls, followed by one 509-command decode graph
+with 28/141 grouped/primitive matmuls. The c0 decode emits 64 graphs, 32,576
+commands, and 1,792/9,024 grouped/primitive matmuls, after its own one-graph,
+509-command, 28/141 grouped/primitive prefill. The c512 prefill emits 63 graphs,
+15,978 commands, and 865/4,450 grouped/primitive matmuls; its decode matches c0
+exactly.
+
+Every group executes on PL: 16-column groups use `pl/staged`, one-column tails and
+decode use `pl/direct`, and no group falls back. Each group raw-loads its activation
+once and reuses it with zero activation beats. The c512 decode
+`6144x1x2048` bucket records 1,792 calls, 3,584 kernel runs, 1,835,008 A beats,
+11,010,048 R beats, and 110,100,480/198,180,864 Q1/Q2 W beats, with zero host
+quantize/pack time. P128's staged main bucket records 216 calls, 864 runs, and
+3,538,944 A beats plus one direct two-run/1,024-beat tail. C512 records 864 staged
+calls, 3,456 runs, and 14,155,776 A beats plus the same direct tail.
+
+Attention remains the exact P2c implementation and uses the expected staged/direct
+PL paths with zero K/V/O stalls; matched cycle deltas are at most 0.01%. The
+approximate-flash verify advisory fired across 12 smoke calls for 40 of 24,576
+values, with maximum absolute/normalized differences of 0.5542/0.0467. This is an
+expected diagnostic from the unchanged approximate flash path, not a P2d failure:
+model logits pass, and there are no GEMM, group, Q8, DMA, kernel, or request errors.
+
+The single-repeat device-time check shows no regression; all four matched P2c
+observations are lower. P128 Q1/Q2 changes
+73.282->73.028 ms/token (-0.35%) and 96.143->94.659 (-1.54%); c512 changes
+96.093->94.773 (-1.37%) and 119.008->117.700 (-1.10%). The new c0 anchor is
+65.716/88.615 ms/token. This occurs even though raw PL quantization raises the
+grouped kernel's cycles versus two primitive gate/up calls by 25.98%/21.87% for
+Q1/Q2 staged columns-16 and 18.28%/8.96% for c512 decode. Fewer commands and zero
+grouped host quantize/pack work are consistent with offsetting that local cost;
+this one-repeat gate does not establish a repeatable speedup.
+
+P128 prefill wall is 47.259/91.355 s and c512 is 224.114/411.642 s. The same Q1
+p128 328.9 MiB download changed from 8.1 s at 40.5 MiB/s to 36.5 s at 9.0 MiB/s;
+Q2's 655.9 MiB changed from 15.3 s at 43.0 MiB/s to 79.9 s at 8.2 MiB/s. At c512,
+Q1's 1.4 GiB changed from 35.0 s at 41.6 MiB/s to 176.5 s at 8.3 MiB/s, and Q2's
+2.8 GiB from 58.5 s at 49.7 MiB/s to 362.4 s at 8.0 MiB/s. The data volume is
+unchanged; this network/transport regression is not attributed to P2d.
+
+P2d is closed at this bounded f285 structural, numerical, and device-regression
+qualification. P2 as a whole remains open: grouped outputs still return through
+DDR and no named FFN or attention section command exists.
+
+The grouped command is atomic only at the scheduling and preflight boundary. A
+hardware error after the first destination is written does not roll it back, and
+the runtime returns an error rather than retrying. Armed DMA channels receive
+best-effort resets on every error path, but a DMA timeout whose reset never clears
+still requires daemon or bitstream recovery. With P2d closed, focus moves to writing
+gate/up results directly into their consumer's banked-scratch layout, then using
+that substrate for the first named FFN section.
 
 ### P3: FFN section
 
@@ -421,9 +551,9 @@ These are requirements on every priority, not a separate final cleanup phase:
 - a board smoke run verifies bitstream identity, capabilities, DMA/cache behavior,
   prefill, and decode.
 
-The aggregate `zig build test-rtl` target now covers binary and ternary GEMM plus
-the hardened flash kernel and wrapper cosims. It passes locally and as the Nix
-`checks.rtl-cosim` check.
+The aggregate `zig build test-rtl` target now covers binary and ternary GEMM,
+the exact Q8 quantizer and grouped activation path, plus the hardened flash kernel
+and wrapper cosims. The committed P2d suite passes all 36 build steps locally.
 
 Formal verification should target control snapshots, bounds, handshakes, TLAST/TKEEP,
 DMA safety, and liveness under explicit fairness assumptions. Approximate floating
@@ -439,17 +569,18 @@ remain. They are not currently independent roadmap projects:
 - the read-column pair is registered before its final add;
 - the DSP multiply output is already registered before the 104-bit shift result.
 
-The released adaptive P2c build is the clean f285 run described above. It reports
-+0.036 ns setup and +0.010 ns hold slack, with five setup paths below the 50 ps
-target. The fixed and adaptive designs both failed clean f300 routing despite
-passing OOC; the adaptive f300 failure had -0.088 ns WNS and a mixed
-flash/GEMM/DMA timing tail. This is direct evidence that combined routing, not OOC
-Fmax, remains the release authority. Two existing critical clock methodology
-warnings remain. Therefore:
+The qualified P2d build is the repaired clean f285 run described above. It reports
++0.043 ns setup and +0.010 ns hold slack, with four setup paths below the 50 ps
+target; P2c remains its direct performance comparison baseline. The fixed and
+adaptive P2c designs both failed clean f300 routing despite passing OOC, and the
+first P2d f285 design similarly failed before repair. This is direct evidence that
+combined routing, not OOC Fmax, remains the release authority. Methodology still
+reports critical TIMING-2/TIMING-4 and five TIMING-28 plus one ULMTCS-1 warning.
+Therefore:
 
 - keep 25 ps as the hard development release floor and 50 ps as the headroom target;
-- treat f285 as the current deployed qualification point, not proof of f300 closure;
-- resolve the clock methodology warnings before defining a stricter production budget;
+- treat f285 as P2d's bounded qualification point, not proof of f300 closure;
+- resolve the methodology findings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
 - treat timing locality and reproducible headroom as build requirements for every phase.
 
