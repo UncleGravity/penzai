@@ -8,13 +8,20 @@ query. Multi-token calls use four-query tiles at up to 16 heads and two-query ti
 at 17-32 heads, so Bonsai retains a four-query physical tile without allocating a
 128-slot state bank.
 
-The deployed P2d image advances GEMM engine `0xB05A2000` to version 13 and wire ABI 14.
-In addition to the existing packed-Q8 primitive input, it can quantize raw F32
+P2d advanced GEMM engine `0xB05A2000` to version 13 and wire ABI 14. In addition
+to the existing packed-Q8 primitive input, it can quantize raw F32
 activations into the resident Q8 store and reuse a validated resident epoch for an
 adjacent second projection. The fixed grouped command structurally accepts any
 adjacent compatible pair; in the validated Qwen/Bonsai graphs, only the 28 FFN
-gate/up pairs per graph match and Q/K/V do not. The deployed f285 image has passed
-the bounded P2d route, identity, Q1/Q2 numerical, structural, and device-time gates.
+gate/up pairs per graph match and Q/K/V do not.
+
+The deployed P2e image advances GEMM to version 14 without changing wire ABI 14.
+It implements 512 KiB of four-bank F32 scratch in exactly 16 URAM288s and adds an
+opt-in atomic DDR+scratch tee plus canonical drain. Normal behavior remains the
+P2d DDR path. `PENZAI_PL_SCRATCH_VERIFY=1` limits grouped tiles to four queries,
+tees Qwen projection 0 (`UP`) to `X1` and projection 1 (`GATE`) to `X0`, then
+byte-compares both drains against their authoritative DDR results. This is a
+diagnostic substrate, not yet a named or scratch-only section command.
 
 The two ops run **sequentially** in the graph, so their DDR feeds are kept independent
 rather than time-shared — each keeps exactly the topology it was tuned/validated with:
@@ -33,10 +40,10 @@ flash `0xA01x_0000` (the flash regmap was allocated in `0xA01x` for exactly this
 ```sh
 cp config.env.example config.env       # edit VM / BOARD (or reuse the committed one)
 (cd ../.. && zig build regmap)          # refresh generated contracts under fpga/regmap/
-./build.sh w512-p4-f285                 # current bounded P2d qualification point
+./build.sh w512-p4-f285                 # current bounded P2e qualification point
 ./build.sh                              # f300 development target; combined route unclosed
 ./build.sh --incremental                # development build; reuse last clean route
-PENZAI_BITSTREAM_RUN_ID=20260812T224303Z-547d87b12094-w512-p4-f285-clean \
+PENZAI_BITSTREAM_RUN_ID=20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize \
   ./deploy.sh w512-p4-f285
 # serve the daemon telling it BOTH ops are on PL:
 (cd ../../.. && nix run .#deploy-penzaid)
@@ -200,8 +207,78 @@ Qualification teardown stopped the daemon and left no buffer objects or serving
 processes. The exact deployed application remains loaded in XRT slot 0 (slot
 0 before and after replacement).
 
-P2d is closed only at this bounded f285 qualification. P2 remains open for
-scratch-backed outputs and the named FFN/attention section commands.
+P2d closed at this bounded f285 qualification. At that checkpoint P2 remained
+open for scratch-backed outputs and the named FFN/attention section commands.
+
+### P2e diagnostic scratch qualification
+
+The scratch implementation is four physical `16384 x 64` banks: 65,536 words,
+512 KiB, and exactly 16 URAM288s. The leaf cosim checks 65,616 input beats,
+16,404 assembled groups, and every physical word, including mapping, bounds,
+framing, backpressure, collisions, abort, and retention. Integrated binary and
+ternary `decode_top` tests tee and drain X1/X0 exactly, retain the first role while
+writing the second, reject bad shapes before consuming W/A/R, reject stale roles,
+and suppress output after drain abort. The aggregate RTL suite passes 41/41 steps.
+Map formal closes 23 PDR assertions plus 34 BMC assertions and five covers at depth
+32; storage formal closes 24 assertions through depth 64 and reaches its terminal
+cover at step 45.
+
+Standalone OOC run `20260813T032516Z-c856d82731dd` passes 3.333 ns at +0.220 ns
+WNS with 99 LUTs, 447 FFs, five CARRY8s, zero DSPs, exactly 16 URAMs, and zero
+BRAM/LUTRAM. Full-decode integration run
+`20260813T040643Z-c856d82731dd-dirty-p2e-groupreg-full-decode` passes at
++0.042/+0.060 ns setup/hold with 40,406 LUTs, 45,522 FFs, 783 CARRY8s, 34 DSPs,
+two BRAM tiles, and exactly 20 URAMs.
+
+The original clean combined run,
+`20260813T042026Z-1e0b9a350d84-w512-p4-f285-clean`, is fully routed and meets
+timing at +0.007/+0.008 ns setup/hold with zero TNS/THS. It has zero clockless
+or unconstrained internal endpoints, and exact restoration of the 75 ps placement
+guardband. It was initially rejected only because the build still imposed a 25 ps
+project floor. Commit `15f3ec3` removed that policy and retained the actual release
+rule: final setup and hold slack must both be nonnegative.
+
+No-reroute run
+`20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize` finalized the exact
+same routed checkpoint under the corrected rule. Provenance is explicit:
+
+| Item | SHA-256 |
+|---|---|
+| Origin routed DCP | `2877ac5a84beb335b99820cc6aae14d94a7b440eef34d56bed74174230845d05` |
+| Origin manifest | `fc75587fc2eb95ce3cf4ccb789076c89db8e397c195320240764200c03975a2d` |
+| Source bundle | `0dac679c47f31932e401e9766205061a50fd703fef8940e8349ce3ff2b2247ff` |
+| Final manifest | `b2b6c1d2d100ba8f4b7bc927ba5eb7840278a878f0ac77cda6cb156656438e17` |
+| `.bit` | `3d7a95d08ad58dcf6ebefa7e9b1d1cdf6e660d0fed220fd1abb89bc2e701b04e` |
+| `.bit.bin` | `ca630e47e7a47fea67b745b754d9f1ccff5d7e0868c1871c86b46e6d2326baed` |
+
+Routed utilization is 82,145 LUTs, 96,755 FFs, 1,416 CARRY8s, 55.5 BRAM tiles,
+20 URAMs, and 94 DSPs. CLB occupancy is 14,594/14,640 (99.69%). There are 127
+setup paths below 50 ps; that count is diagnostic input for a future timing-
+optimization pass, not an additional release threshold. Methodology retains
+TIMING-2/TIMING-4, three TIMING-28 warnings, and ULMTCS-1.
+
+The exact image was promoted and deployed. Scratch-on and scratch-off capabilities
+are byte-identical at schema 2, wire ABI 14, profile ABI 6, GEMM v14 at
+284,997,152 Hz, and flash v1 with 64 slots. Both modes pass the same `p32` logits:
+Q1 step differences 0.098204/0.084137 and Q2 0.089185/0.131115, exact argmax
+25/25 and 220/220, zero token mismatches, and `check=ok`. The enabled run completes
+the full X1 and X0 drains without a byte mismatch.
+
+Profile artifact `20260813T062032Z-characterize-8f96db0c8124` is complete and
+run-validated for all four p128/c512 Q1/Q2 samples. P128 device time is
+71.948/95.031 ms/token and c512 is 94.820/117.732 ms/token. Against P2d, p128 Q1
+is lower, p128 Q2 is +0.39%, and c512 Q1/Q2 are +0.05%/+0.03%; all pass the
+no-regression gate. P128/c512 prefill wall is 16.291/24.796 s and
+70.387/92.653 s; unchanged downloads sustain
+49.6/44.9 and 52.0/59.5 MiB/s. The graph, command, group, primitive, attention,
+and beat structures remain the P2d values and accounting closes. These single
+observations establish no regression, not a speedup.
+
+Unprofiled artifact `20260813T062620Z-regression-7f1de76f4fab` is complete and
+run-validated across six c0 samples. Its three-repeat steady-decode medians are
+87.922 ms/token for Q1 and 109.635 ms/token for Q2. P2e therefore closes the
+diagnostic scratch substrate. P2 remains open for a same-command, scratch-only PL
+consumer: SwiGLU, requantization, down projection, and the first named FFN section.
 
 Builds use all eight Vivado worker threads and a persistent VM-side `cache/` for generated
 AMD IP. Every release-gate-passing build refreshes a routed checkpoint for its variant.
@@ -251,18 +328,22 @@ If it doesn't fit or close at `f200`:
    lines, but remember that this is a smoke comparison: flash uses a 2% normalized
    threshold against the higher-precision PS implementation. The bit-faithful
    structural gate is `zig build test-rtl`, and the model-level logit comparison is
-   the numerical release gate. The local P2d aggregate covers binary and ternary
-   GEMM, exact Q8 ingress and grouped reuse, plus the flash kernel and wrapper; all
-   36 local build steps pass.
+   the numerical release gate. The local P2e aggregate covers binary and ternary
+   GEMM, exact Q8 ingress and grouped reuse, scratch leaf and integrated tee/drain,
+   plus the flash kernel and wrapper; all 41 local build steps pass. For the scratch
+   gate, restart with `PENZAI_PL_VERIFY=0 PENZAI_PL_SCRATCH_VERIFY=1`, require the
+   v14 diagnostic-enabled startup line, and run both Q1/Q2 logit checks before
+   repeating them with `PENZAI_PL_SCRATCH_VERIFY=0`.
 2. **Identity:** query `penzai capabilities` after every deployment and require the
    run ID, source hash, bitstream hash, ABI, clock, engine versions, dimensions, and
    formats to match the selected run bundle. Adaptive P2c requires capability schema
    2 (552 bytes), wire ABI 13, profile ABI 6, flash ID `0xF1A54A01`, flash version 1,
    and `flash.query_slots=64`. A stale daemon or bitstream must fail closed rather
    than reinterpret the engine contract. P2d additionally requires wire ABI 14,
-   matmul ID `0xB05A2000`, and matmul version 13. The current deployment reads back
-   schema 2, wire ABI 14, profile ABI 6, matmul v13 at 284,997,152 Hz, and flash
-   v1 with 64 query slots.
+   matmul ID `0xB05A2000`, and matmul version 13. P2e retains wire ABI 14 and
+   requires matmul version 14. The current deployment reads back schema 2, wire ABI
+   14, profile ABI 6, matmul v14 at 284,997,152 Hz, and flash v1 with 64 query
+   slots.
 3. **Profile invariants:** `--prof` must report PL execution for both GEMM and
    single-query flash plus supported multi-token flash, closed accounting, exact
    requested token counts, and the expected DMA beat counts with no unexplained

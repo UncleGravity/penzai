@@ -131,6 +131,66 @@ download-rate drop from roughly 40.5-49.7 MiB/s to 8.0-9.0 MiB/s at unchanged
 These board results close P2d at the bounded f285 qualification. They do not close
 the larger P2 section and scratch contract.
 
+P2e implements that contract's 512 KiB F32 scratch as four `16384 x 64` banks,
+targeting exactly 16 URAM288s. GEMM v14 can opt into an atomic DDR+scratch result
+tee and later drain a role in canonical `[token][group][bank 0..3]` order. Normal
+wire ABI 14 behavior remains the P2d DDR path. The diagnostic host mode is enabled
+only by `PENZAI_PL_SCRATCH_VERIFY=1`; it caps tiles at four queries, maps Qwen
+projection 0 (`UP`) to `X1` and projection 1 (`GATE`) to `X0`, and byte-compares
+each drain with the authoritative DDR result.
+
+The standalone scratch probe is retained at
+`out/runs/20260813T032516Z-c856d82731dd/section-scratch`. It passes 3.333 ns at
+`+0.220 ns` WNS (321.2 MHz estimated Fmax) with 99 LUTs, 447 FFs, five CARRY8s,
+zero DSPs, exactly 16 URAMs, and zero BRAM/LUTRAM. Its cosim checks 65,616 GEMM
+beats, 16,404 256-bit groups, and all 65,536 physical words with mapping, bounds,
+framing, stalls, collisions, abort, and retention. Map formal closes 23 PDR
+assertions and a depth-32 BMC closes 34 assertions plus five covers; storage formal
+closes 24 assertions through depth 64 and reaches its terminal cover at step 45.
+
+Full-decode integration run
+`out/runs/20260813T040643Z-c856d82731dd-dirty-p2e-groupreg-full-decode/full-decode`
+passes 3.333 ns at `+0.042/+0.060 ns` setup/hold with zero failing endpoints. It
+uses 40,406 LUTs, 45,522 FFs, 783 CARRY8s, 34 DSPs, two BRAM tiles, and exactly
+20 URAMs. Its production source bundle SHA-256 is
+`56094a93b731d7c7a354cc81cf0b498b7d005b8b9c81a7c62a5ead01909d4dc0`.
+The two added no-reset result registers remove the four-URAM cascade and dynamic
+bank mux from the final output timing path; integrated binary/ternary tee/drain
+cosim remains bit-exact. The aggregate RTL suite passes 41/41 build steps.
+
+As always, the combined route is authoritative. Clean P2e f285 run
+`20260813T042026Z-1e0b9a350d84-w512-p4-f285-clean` is fully routed and meets
+setup/hold at `+0.007/+0.008 ns`, with no clockless or unconstrained internal
+endpoints. It was initially classified as failed solely by the former 25 ps
+project floor. After commit `15f3ec3` made nonnegative setup and hold the release
+rule, no-reroute run
+`20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize` qualified that same
+checkpoint. The origin DCP SHA-256 is
+`2877ac5a84beb335b99820cc6aae14d94a7b440eef34d56bed74174230845d05`, origin
+manifest SHA-256 is
+`fc75587fc2eb95ce3cf4ccb789076c89db8e397c195320240764200c03975a2d`, and source
+bundle SHA-256 is
+`0dac679c47f31932e401e9766205061a50fd703fef8940e8349ce3ff2b2247ff`.
+Routed use is 82,145 LUTs, 96,755 FFs, 1,416 CARRY8s, 94 DSPs, 55.5 BRAM tiles,
+and 20 URAMs at 99.69% CLB occupancy. Methodology retains TIMING-2/TIMING-4,
+three TIMING-28 warnings, and ULMTCS-1. The deployed `.bit.bin` SHA-256 is
+`ca630e47e7a47fea67b745b754d9f1ccff5d7e0868c1871c86b46e6d2326baed`.
+
+Scratch-on and scratch-off board runs return identical schema 2/wire 14/profile 6
+capabilities and GEMM v14 at 284,997,152 Hz. Both modes produce the same Q1 step
+differences 0.098204/0.084137 and Q2 differences 0.089185/0.131115, exact argmax
+25/25 and 220/220, zero token mismatches, and `check=ok`. Profile artifact
+`20260813T062032Z-characterize-8f96db0c8124` is complete and run-validated. Its
+single-repeat p128 Q1/Q2 device times are 71.948/95.031 ms/token and c512 times
+are 94.820/117.732 ms/token. Against P2d, p128 Q1 is lower, p128 Q2 is +0.39%,
+and c512 Q1/Q2 are +0.05%/+0.03%; all pass the no-regression gate. Downloads
+sustain 49.6/44.9 and 52.0/59.5 MiB/s at
+the unchanged p128/c512 volumes. Unprofiled artifact
+`20260813T062620Z-regression-7f1de76f4fab` is complete and run-validated, with
+three-repeat c0 steady-decode medians of 87.922/109.635 ms/token for Q1/Q2.
+These results close the diagnostic substrate, not P2: the next P2f gate is a
+scratch-only same-command SwiGLU/requant/down consumer and named FFN section.
+
 ---
 
 ## Run probes
@@ -138,6 +198,7 @@ the larger P2 section and scratch contract.
 ```bash
 cd fpga/ooc
 ./run.sh list
+./run.sh section-scratch
 ./run.sh gemm-rb
 ./run.sh all
 ```
@@ -158,9 +219,12 @@ dual-format `gemm_kernel_ooc` reached 368.5 MHz (`+0.619 ns`, 38,544 LUTs,
 42,935 FFs, 32 DSPs), while the separate exact-Q8 leaf reached 318.4 MHz
 (`+0.192 ns`, 792 LUTs, 908 FFs, 22 CARRY8s, two DSPs). The repaired full-decode
 integration probe closes at `+0.245/+0.039 ns` setup/hold with 40,141 LUTs,
-44,912 FFs, 775 CARRY8s, 34 DSPs, two BRAM tiles, and four URAMs. The current
+44,912 FFs, 775 CARRY8s, 34 DSPs, two BRAM tiles, and four URAMs. P2e's scratch
+leaf reaches 321.2 MHz (`+0.220 ns`, 99 LUTs, 447 FFs, 16 URAMs), while its
+full-decode integration probe closes at `+0.042/+0.060 ns` with 40,406 LUTs,
+45,522 FFs, 783 CARRY8s, 34 DSPs, two BRAM tiles, and 20 URAMs. The current
 adaptive P2c `flash_kernel_ooc` is 320.7 MHz (`+0.215 ns`, 22,657 LUTs, 19,216
-FFs, 19 BRAM tiles, and 60 DSPs). All clear f300 in isolation, but see the caveat.
+FFs, 19 BRAM tiles, and 60 DSPs). These clear f300 in isolation, but see the caveat.
 
 ## Writing a new probe
 

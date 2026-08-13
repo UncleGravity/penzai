@@ -1,6 +1,6 @@
 # Accelerator Priorities
 
-Status date: 2026-08-12
+Status date: 2026-08-13
 
 This is the short, ranked tracker for turning Penzai from an op-at-a-time FPGA
 backend into a robust binary and ternary transformer accelerator. Detailed design
@@ -198,7 +198,8 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
   activation memories, guarded by an explicit epoch and shape.
 - [ ] Reuse grouped Q/K/V activations inside the named attention section; do not
   force the observed graph ordering into a more general primitive matcher.
-- [ ] Write GEMM results into banked scratch in the next consumer's layout.
+- [x] Write GEMM results into banked scratch in the next consumer's layout; P2e
+  proves the layout by diagnostic tee/drain, while consumption remains P2f.
 - [ ] Make prefill token/row layout conversion a scratchpad addressing problem,
   rather than a PS transpose and DDR round trip.
 - [x] Extend the existing online attention recurrence with a query-tile axis.
@@ -348,9 +349,10 @@ Against P2b Q1 at f300, device time is 3.74% higher but cycles per update are on
 P2c is deliberately a primitive-op bridge. The context-2048 run still downloads
 5.8/11.6 GiB for Q1/Q2 and retains the surrounding graph and command boundaries;
 that traffic now dominates prefill wall and transport. It also does not yet provide
-same-section K/V visibility. P2d now supplies PL Q8 ingress and bounded gate/up
-activation reuse; banked-scratch GEMM output layouts and named section commands
-remain. P2 as a whole stays open until those boundaries exist.
+same-section K/V visibility. P2d supplied PL Q8 ingress and bounded gate/up
+activation reuse; at that checkpoint banked-scratch GEMM output layouts and named
+section commands remained. P2e implements the output layout diagnostically, while
+P2 as a whole stays open until a same-command consumer removes the DDR boundary.
 
 P2d adds wire ABI 14's fixed-arity `matmul_q1a8_group2`. The matcher is structural,
 not semantic: it can group any adjacent pair with one identical F32 activation
@@ -467,16 +469,73 @@ Q1's 1.4 GiB changed from 35.0 s at 41.6 MiB/s to 176.5 s at 8.3 MiB/s, and Q2's
 unchanged; this network/transport regression is not attributed to P2d.
 
 P2d is closed at this bounded f285 structural, numerical, and device-regression
-qualification. P2 as a whole remains open: grouped outputs still return through
-DDR and no named FFN or attention section command exists.
+qualification. At that checkpoint grouped outputs still returned only through DDR
+and no named FFN or attention section command existed.
 
 The grouped command is atomic only at the scheduling and preflight boundary. A
 hardware error after the first destination is written does not roll it back, and
 the runtime returns an error rather than retrying. Armed DMA channels receive
 best-effort resets on every error path, but a DMA timeout whose reset never clears
-still requires daemon or bitstream recovery. With P2d closed, focus moves to writing
-gate/up results directly into their consumer's banked-scratch layout, then using
-that substrate for the first named FFN section.
+still requires daemon or bitstream recovery.
+
+P2e implements the physical contract-v1 F32 scratch substrate: four 64-bit banks,
+16,384 words per bank, and 512 KiB total in 16 URAM288s. GEMM v14 can atomically
+tee its normal DDR result stream into one scratch role without changing the normal
+wire ABI 14 command or result semantics. The bounded host diagnostic is opt-in via
+`PENZAI_PL_SCRATCH_VERIFY=1`, limits tiles to four queries, writes projection 0
+(Qwen `UP`) to `X1` and projection 1 (`GATE`) to `X0`, drains each role in canonical
+`[token][group][bank 0..3]` order, and compares every byte with the authoritative
+DDR result. With the option off, the v14 runtime follows the existing P2d path.
+
+The scratch leaf cosim checks 65,616 GEMM beats, 16,404 256-bit groups, and all
+65,536 physical words, including mapping, framing, stalls, collisions, abort, and
+retention. Map formal proves 23 assertions by PDR and 34 assertions plus five
+covers through BMC depth 32; storage formal proves 24 assertions through depth 64
+and reaches its terminal cover at step 45. The aggregate RTL suite passes 41/41
+steps. Standalone OOC run `20260813T032516Z-c856d82731dd` infers exactly 16 URAMs,
+zero BRAM/LUTRAM, 99 LUTs, 447 FFs, five CARRY8s, and no DSPs, with +0.220 ns WNS
+at 3.333 ns. Full-decode integration run
+`20260813T040643Z-c856d82731dd-dirty-p2e-groupreg-full-decode` passes at
++0.042/+0.060 ns setup/hold with 40,406 LUTs, 45,522 FFs, 783 CARRY8s, 34 DSPs,
+two BRAM tiles, and exactly 20 URAMs.
+
+The first clean P2e combined route,
+`20260813T042026Z-1e0b9a350d84-w512-p4-f285-clean`, was fully routed with
++0.007/+0.008 ns setup/hold, no negative paths, and no clockless or unconstrained
+internal endpoints. It was initially rejected only by the former 25 ps project
+floor. Commit `15f3ec3` removed that extra policy. No-reroute finalize run
+`20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize` then qualified the
+same routed checkpoint under the WNS/WHS >= 0 rule: origin DCP SHA-256
+`2877ac5a84beb335b99820cc6aae14d94a7b440eef34d56bed74174230845d05`, origin
+manifest SHA-256
+`fc75587fc2eb95ce3cf4ccb789076c89db8e397c195320240764200c03975a2d`, and source
+bundle SHA-256
+`0dac679c47f31932e401e9766205061a50fd703fef8940e8349ce3ff2b2247ff`.
+Routed use is 82,145 LUTs, 96,755 FFs, 1,416 CARRY8s, 55.5 BRAM tiles, 20 URAMs,
+and 94 DSPs, with 14,594/14,640 CLBs occupied (99.69%). The deployed `.bit.bin`
+SHA-256 is `ca630e47e7a47fea67b745b754d9f1ccff5d7e0868c1871c86b46e6d2326baed`.
+Methodology retains TIMING-2/TIMING-4, three TIMING-28 warnings, and ULMTCS-1.
+
+Board diagnostics pass identically with scratch verification on and off. Q1 `p32`
+reports per-step maximum differences 0.098204/0.084137 and argmax 25/25, 220/220;
+Q2 reports 0.089185/0.131115 with the same exact argmax. Both have zero token
+mismatches and `check=ok`, and the two capability responses are byte-identical:
+schema 2, wire 14, profile 6, GEMM v14 at 284,997,152 Hz, and flash v1/64 slots.
+Artifact `20260813T062032Z-characterize-8f96db0c8124` is complete and validated.
+Its single-repeat p128 Q1/Q2 device times are 71.948/95.031 ms/token and c512
+times are 94.820/117.732 ms/token. Against P2d, p128 Q1 is lower, p128 Q2 is
++0.39%, and c512 Q1/Q2 are +0.05%/+0.03%; all pass the no-regression gate.
+P128/c512 prefill walls are
+16.291/24.796 s and 70.387/92.653 s; unchanged downloads sustain
+49.6/44.9 and 52.0/59.5 MiB/s, respectively. This is a no-regression observation,
+not a speedup claim. Unprofiled artifact
+`20260813T062620Z-regression-7f1de76f4fab` is also complete and validated; its
+three-repeat c0 steady-decode medians are 87.922/109.635 ms/token for Q1/Q2.
+
+P2e closes the diagnostic scratch substrate, not P2. The next P2f work is a
+scratch-only consumer in the same command: PL SwiGLU, requantization, down
+projection, and the first named FFN section. Until that exists, DDR remains the
+authoritative product result and the diagnostic drain is not a section ABI.
 
 ### P3: FFN section
 
@@ -551,8 +610,9 @@ These are requirements on every priority, not a separate final cleanup phase:
   prefill, and decode.
 
 The aggregate `zig build test-rtl` target now covers binary and ternary GEMM,
-the exact Q8 quantizer and grouped activation path, plus the hardened flash kernel
-and wrapper cosims. The committed P2d suite passes all 36 build steps locally.
+the exact Q8 quantizer and grouped activation path, the F32 scratch leaf and
+integrated tee/drain, plus the hardened flash kernel and wrapper cosims. The P2e
+suite passes all 41 build steps locally.
 
 Formal verification should target control snapshots, bounds, handshakes, TLAST/TKEEP,
 DMA safety, and liveness under explicit fairness assumptions. Approximate floating
@@ -568,18 +628,20 @@ remain. They are not currently independent roadmap projects:
 - the read-column pair is registered before its final add;
 - the DSP multiply output is already registered before the 104-bit shift result.
 
-The qualified P2d build is the repaired clean f285 run described above. It reports
-+0.043 ns setup and +0.010 ns hold slack, with four setup paths below 50 ps;
-P2c remains its direct performance comparison baseline. The fixed and
-adaptive P2c designs both failed clean f300 routing despite passing OOC, and the
-first P2d f285 design similarly failed before repair. This is direct evidence that
-combined routing, not OOC Fmax, remains the release authority. Methodology still
-reports critical TIMING-2/TIMING-4 and five TIMING-28 plus one ULMTCS-1 warning.
+The current qualified build is the P2e f285 finalize run described above. It
+reports +0.007 ns setup and +0.008 ns hold slack with 127 setup paths below 50 ps;
+the exact same routed checkpoint had first been rejected only by the removed
+project floor. The fixed and adaptive P2c designs both failed clean f300 routing
+despite passing OOC, and the first P2d f285 design similarly failed before repair.
+This is direct evidence that combined routing, not OOC Fmax, remains the release
+authority. Methodology still reports critical TIMING-2/TIMING-4, three TIMING-28
+warnings, and ULMTCS-1; resolving those findings and earning more slack belong to
+a separate timing-optimization pass.
 Therefore:
 
 - accept fully routed builds with non-negative setup and hold slack; treat additional
   slack as a separate timing-optimization objective;
-- treat f285 as P2d's bounded qualification point, not proof of f300 closure;
+- treat f285 as P2e's bounded qualification point, not proof of f300 closure;
 - resolve the methodology findings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
 - retain timing locality and near-critical path reports as inputs to later optimization.

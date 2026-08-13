@@ -1,14 +1,15 @@
 # P2 Section And Scratch Contract
 
 Status: P2a contract v1 with board-qualified P2c adaptive attention at f285; P2d
-grouped activation reuse is closed at the bounded f285 structural, numerical, and
-device-regression qualification, 2026-08-12
+grouped activation reuse and P2e diagnostic F32 scratch are closed at their
+bounded f285 structural, numerical, route, and board qualifications, 2026-08-13
 
 This document fixes the boundary for P2 implementation. P2a did not add a wire
 operation, and P2b/P2c changed the internal attention schedule and primitive bridge
-without adding a named section ABI. P2d adds one bounded grouped-GEMM operation;
-it is not a named section ABI. Later RTL revisions must preserve this ownership,
-layout, numerical, fallback, and measurement contract.
+without adding a named section ABI. P2d adds one bounded grouped-GEMM operation.
+P2e physically implements contract-v1 F32 scratch and an opt-in DDR+scratch
+tee/drain diagnostic; neither is a named section ABI. Later RTL revisions must
+preserve this ownership, layout, numerical, fallback, and measurement contract.
 
 ## Scope
 
@@ -47,9 +48,12 @@ The executable form of the address and capacity rules lives in
 
 ## Scratch Ownership
 
-Only one atomic section owns scratch in V1. Scratch is invalid before command
-start and after command completion. It is not a `TensorRange`, is not visible to
-the host, and never persists by pointer identity across commands.
+Only one atomic section owns scratch in V1. For a product section command, scratch
+is invalid before command start and after command completion. It is not a
+`TensorRange`, is not visible to graph lowering, and never persists by pointer
+identity across commands. P2e's explicit diagnostic drain temporarily retains
+role-valid metadata after a tee solely to prove storage contents; it does not make
+scratch a host-addressable tensor or relax the product lifetime rule.
 
 Four named F32 roles provide 512 KiB of logical storage:
 
@@ -69,6 +73,11 @@ addr  = token * groups_per_role + group
 word  = {odd row, even row}
 ```
 
+P2e implements those roles in four physical `16384 x 64` memories. The per-bank
+role bases are `R=0`, `X0=2048`, `X1=8192`, and `X2=14336`, giving 65,536 total
+64-bit words, 512 KiB, and an exact target of 16 URAM288s. These constants and the
+local/physical mapping are checked exhaustively in `shared/section.zig`.
+
 The current GEMM emits two F32 rows per beat in
 `[rowblock][token][row-pair]` order. The scratch writer uses the mapping above,
 so that stream becomes a token-addressable 256-bit group without a transpose
@@ -84,7 +93,7 @@ scale   = one f16
 ```
 
 The padded 40-byte DMA stream remains the legacy packed ingress format, not an
-internal scratch type. GEMM v13 exposes three explicit activation modes:
+internal scratch type. GEMM v13 introduced three explicit activation modes:
 
 - `packed_load` retains the existing host-quantized primitive path;
 - `raw_f32_load` accepts two FP32 values per 64-bit beat and writes the exact
@@ -174,14 +183,15 @@ only the 28 gate/up pairs per graph meet that contract; Q/K/V do not. A failed
 condition leaves both primitive matmuls unchanged.
 
 The device validates every activation, weight, and destination range before either
-projection starts. GEMM v13 then uses `raw_f32_load` followed by `reuse`. An older
+projection starts. GEMM v13 and later use `raw_f32_load` followed by `reuse`. An older
 kernel executes the already validated pair as two primitive PL operations when
 both are eligible, then uses the shared-quantization PS oracle if PL is unavailable.
 The grouped command therefore has a strict pre-execution fallback and does not
 silently broaden graph eligibility.
 
-This bridge does not yet write gate/up results into section scratch: both results
-still cross the primitive DDR boundary before SwiGLU. It also does not group Q/K/V;
+The normal product path still sends both gate/up results across the primitive DDR
+boundary before SwiGLU; P2e's opt-in diagnostic mode additionally tees them into
+`X1`/`X0`. The bridge also does not group Q/K/V;
 the observed graph ordering and lifetimes belong in the future named attention
 section rather than a more general primitive matcher. P2d proves the canonical
 PL-Q8 ingress and resident-reuse contract needed by the FFN section while reducing
@@ -199,6 +209,36 @@ Driver error cleanup issues best-effort resets to every armed mover. Bounded ker
 and DMA polls prevent an infinite software wait, but a DMA timeout combined with a
 reset that never clears has no in-command recovery guarantee; daemon or bitstream
 recovery remains the containment boundary.
+
+## P2e Diagnostic Scratch Bridge
+
+GEMM v14 adds control-plane scratch modes without changing wire ABI 14 or the
+normal grouped-operation contract:
+
+- `DDR` is the unchanged P2d result path;
+- `DDR+scratch tee` atomically handshakes each 64-bit result beat with both the
+  existing DDR output and the selected scratch writer;
+- `scratch drain` emits a retained role in canonical
+  `[token][group][bank 0..3]` order through the existing result stream.
+
+The leaf accepts complete eight-row groups. The integrated GEMM tee is stricter:
+it accepts only `X0` or `X1`, 1-4 tokens, 16-row-aligned shapes, and at most
+12,288 rows. It snapshots role, rows, and tokens before starting and
+marks the role valid only after the kernel and writer both complete without error.
+A rejected start consumes zero weight, activation, and result beats. Writer,
+kernel, activation-ingress, or explicit-abort failures invalidate the active role;
+a stale or mismatched drain rejects. Drain backpressure holds data stable, and an
+abort suppresses output immediately. Normal DDR remains authoritative throughout.
+
+The host enables this bridge only when `PENZAI_PL_SCRATCH_VERIFY=1` and live GEMM
+version is at least 14. It reduces diagnostic tiles to at most four queries, tees
+projection 0 (Qwen `UP`) into `X1` and projection 1 (`GATE`) into `X0`, then drains
+and byte-compares both roles against their authoritative DDR result buffers.
+Scratch work is excluded from GEMM stage counters but included in wrapper wall
+time. Cleanup aborts the scratch controller and every armed DMA before restoring
+DDR/packed modes. With
+the environment variable absent or zero, v14 executes the same runtime and profile
+ABI as P2d.
 
 ## Unified Attention
 
@@ -583,13 +623,82 @@ The volume is unchanged, so this wall regression is a degraded-network transport
 measurement and is not attributed to the P2d accelerator change.
 
 These results close P2d only for the bounded Qwen/Bonsai shapes, Q1/Q2 formats,
-f285 image, and structural/numerical/device gates above. They do not close P2:
-group results still cross DDR, and named FFN and attention section commands remain
-future work.
+f285 image, and structural/numerical/device gates above. At P2d close, group
+results still crossed only DDR and named FFN and attention commands remained.
+
+## P2e Qualification
+
+The scratch leaf cosim checks 65,616 GEMM beats, 16,404 assembled 256-bit groups,
+and all 65,536 physical words. It covers X0/X1 mapping without a transpose, all
+role bounds, framing, stalls, read/write collision rejection, abort, and retained
+data. Integrated binary and ternary `decode_top` cases tee the real projection
+streams to X1 then X0, drain them exactly under backpressure, preserve earlier role
+contents, reject incompatible shapes before consuming W/A/R, reject stale drains,
+and suppress post-abort drain output. The complete RTL aggregate passes 41/41
+steps. Zig plus scratch formal builds pass 67/67 steps and 260/260 tests.
+
+The map proof closes 23 assertions with PDR and a depth-32 BMC closes 34 assertions
+and five covers. The independent storage BMC closes 24 assertions through depth 64
+and reaches its terminal cover at step 45. Standalone OOC run
+`20260813T032516Z-c856d82731dd` infers 16 URAMs and zero BRAM/LUTRAM, with 99 LUTs,
+447 FFs, five CARRY8s, zero DSPs, and +0.220 ns WNS at 3.333 ns. Full-decode run
+`20260813T040643Z-c856d82731dd-dirty-p2e-groupreg-full-decode` passes at
++0.042/+0.060 ns setup/hold and uses 40,406 LUTs, 45,522 FFs, 783 CARRY8s,
+34 DSPs, two BRAM tiles, and exactly 20 URAMs. Its production source bundle is
+`56094a93b731d7c7a354cc81cf0b498b7d005b8b9c81a7c62a5ead01909d4dc0`.
+
+Clean source commit `1e0b9a350d84` first routed f285 in run
+`20260813T042026Z-1e0b9a350d84-w512-p4-f285-clean`. Vivado reports
++0.007/+0.008 ns setup/hold, zero TNS/THS, a fully routed design, and zero clockless
+or unconstrained internal endpoints. The run was rejected solely by the
+now-removed 25 ps project floor. Commit `15f3ec3` changed acceptance to nonnegative
+setup and hold. Derived run
+`20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize` then finalized the
+same checkpoint without rerouting. Its origin DCP SHA-256 is
+`2877ac5a84beb335b99820cc6aae14d94a7b440eef34d56bed74174230845d05`, origin
+manifest SHA-256 is
+`fc75587fc2eb95ce3cf4ccb789076c89db8e397c195320240764200c03975a2d`, and source
+bundle SHA-256 is
+`0dac679c47f31932e401e9766205061a50fd703fef8940e8349ce3ff2b2247ff`.
+Routed use is 82,145 LUTs, 96,755 FFs, 1,416 CARRY8s, 55.5 BRAM tiles, 20 URAMs,
+and 94 DSPs; 14,594/14,640 CLBs are occupied (99.69%). The deployed `.bit.bin`
+SHA-256 is `ca630e47e7a47fea67b745b754d9f1ccff5d7e0868c1871c86b46e6d2326baed`.
+Methodology retains TIMING-2/TIMING-4, three TIMING-28 warnings, and ULMTCS-1.
+
+Scratch-on and scratch-off board gates return byte-identical capabilities: schema
+2, wire ABI 14, profile ABI 6, GEMM v14 at 284,997,152 Hz, and flash v1 with 64
+query slots. In both modes Q1 `p32` has step differences 0.098204/0.084137 and Q2
+has 0.089185/0.131115; both produce exact step argmax 25/25 and 220/220, zero token
+mismatches, and `check=ok`. The enabled daemon reports the scratch diagnostic and
+completes every full-size X1/X0 drain comparison without a mismatch.
+
+Artifact `20260813T062032Z-characterize-8f96db0c8124` is complete,
+run-validated, and closes accounting for its four Q1/Q2 p128/c512 samples. Workload
+structure remains P2d-identical: p128 prefill/decode is 15/1 graphs,
+4,002/509 commands, 217/28 groups, and 1,114/141 primitive matmuls; c512 is
+63/64 graphs, 15,978/32,576 commands, 865/1,792 groups, and 4,450/9,024 primitive
+matmuls. Single-repeat p128 Q1/Q2 device time is 71.948/95.031 ms/token; c512 is
+94.820/117.732 ms/token. Against P2d, p128 Q1 is lower, p128 Q2 is +0.39%, and
+c512 Q1/Q2 are +0.05%/+0.03%; all pass the no-regression gate. P128/c512 prefill
+wall is 16.291/24.796 s and
+70.387/92.653 s. At unchanged 328.9 MiB/655.9 MiB and 1.4 GiB/2.8 GiB volumes,
+download rates are 49.6/44.9 MiB/s and 52.0/59.5 MiB/s, confirming that the P2d
+transport slowdown was external. These single observations establish no regression,
+not a repeatable speedup.
+
+Unprofiled artifact `20260813T062620Z-regression-7f1de76f4fab` is complete and
+run-validated across six c0 samples. Three-repeat steady-decode medians are
+87.922 ms/token for Q1 and 109.635 ms/token for Q2, below their historical
+93.025/112.658 ms/token guards.
+
+P2e closes the diagnostic scratch substrate. P2 remains open because no PL stage
+yet consumes these results without a drain/DDR boundary. The next P2f work is a
+same-command scratch-only consumer implementing SwiGLU, requantization, down
+projection, and the first named FFN section.
 
 ## Implementation Gates
 
-P2d preserves the two attention numerical gates established by P2b/P2c:
+P2e preserves the two attention numerical gates established by P2b/P2c:
 
 1. RTL versus `flash_ref` in hardware-approximation mode.
 2. PL versus the PS/full-model oracle at the established tolerance.
@@ -608,16 +717,17 @@ completion, and bounded liveness. All nine wired tasks pass against the same
 production RTL used by cosim and OOC.
 
 The aggregate `zig build test-rtl` target combines those tests with binary and
-ternary GEMM, exact Q8 quantizer, and grouped raw-load/reuse cosim. It passes
-locally; the committed P2d aggregate contains 36 build steps.
+ternary GEMM, exact Q8 quantizer, grouped raw-load/reuse, and scratch tee/drain
+cosim. It passes locally; the P2e aggregate contains 41 build steps.
 
 Use the full-kernel OOC probe for resource and isolated-Fmax feedback and the
 combined routed build for timing signoff. P2c's bounded implementation, route,
 identity, numerical, and profile gates are complete at f285. Do not infer combined
 deployability from P2d's passing OOC results: both P2c f300 implementations and
 the first P2d f285 implementation failed their clean combined routes despite
-passing isolated probes. Repaired P2d now passes its clean f285 route, deployment,
-live identity, Q1/Q2 logit gates, exact structural accounting, and device-regression
-check.
-P2d is closed at that bounded qualification. P2 remains open; the next work is
-scratch-backed GEMM output layouts followed by the first named FFN section.
+passing isolated probes. Repaired P2d passes its clean f285 route, and P2e passes
+its fully routed f285 checkpoint under the nonnegative setup/hold rule, deployment,
+live identity, scratch-on/off Q1/Q2 logit gates, exact diagnostic drains, profile
+accounting, and the unprofiled c0 regression.
+P2e is closed at that bounded qualification. P2 remains open for the scratch-only
+PL consumer and first named FFN section described above.
