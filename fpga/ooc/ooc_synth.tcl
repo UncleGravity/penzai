@@ -48,10 +48,22 @@ proc utilization_used {report label} {
     }
     return $used
 }
+proc utilization_used_or_zero {report label} {
+    set pattern [format {\|[[:space:]]*%s[[:space:]]*\|[[:space:]]*([0-9]+)[[:space:]]*\|} $label]
+    if {![regexp -- $pattern $report -> used]} {
+        return 0
+    }
+    return $used
+}
 set luts   [utilization_used $util_report {CLB LUTs\*?}]
 set carry8 [utilization_used $util_report {CARRY8}]
 set dsps   [utilization_used $util_report {DSPs}]
 set ffs    [utilization_used $util_report {Register as Flip Flop}]
+set bram36 [utilization_used $util_report {RAMB36/FIFO\*}]
+set bram18 [utilization_used $util_report {RAMB18}]
+set uram   [utilization_used $util_report {URAM}]
+# Vivado omits this hierarchy row entirely when no distributed RAM is present.
+set lutram [utilization_used_or_zero $util_report {LUT as Distributed RAM}]
 
 set wns "n/a"
 set fmax "n/a"
@@ -64,23 +76,29 @@ if {[llength $paths] > 0} {
     }
 }
 
-puts "RESULT top=$top dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs wns_ns=$wns fmax_mhz=$fmax (period=${period}ns)"
+puts "RESULT top=$top dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs bram36=$bram36 bram18=$bram18 uram=$uram lutram=$lutram wns_ns=$wns fmax_mhz=$fmax (period=${period}ns)"
 
 set metrics [open ${outpfx}_metrics.tsv w]
 puts $metrics "key\tvalue"
 foreach {key value} [list \
         top $top period_ns $period part $part vivado_version [version -short] \
-        dsp $dsps lut $luts carry8 $carry8 ff $ffs wns_ns $wns fmax_mhz $fmax] {
+        dsp $dsps lut $luts carry8 $carry8 ff $ffs bram36 $bram36 bram18 $bram18 \
+        uram $uram lutram $lutram wns_ns $wns fmax_mhz $fmax] {
     puts $metrics "$key\t$value"
 }
 close $metrics
 
 set summary [open ${outpfx}_summary.txt w]
 set status [expr {$wns ne "n/a" && $wns >= 0.0 ? "PASS" : "FAIL"}]
+if {$top eq "section_f32_scratch_ooc" &&
+    ($uram != 16 || $bram36 != 0 || $bram18 != 0 || $lutram != 0)} {
+    set status "FAIL"
+}
 puts $summary "OOC $status top=$top period_ns=$period wns_ns=$wns fmax_mhz=$fmax"
 puts $summary "dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs"
+puts $summary "bram36=$bram36 bram18=$bram18 uram=$uram lutram=$lutram"
 close $summary
 
 if {$status ne "PASS"} {
-    error "OOC timing gate failed: top=$top period=${period}ns wns=${wns}ns"
+    error "OOC gate failed: top=$top period=${period}ns wns=${wns}ns bram36=$bram36 bram18=$bram18 uram=$uram lutram=$lutram"
 }

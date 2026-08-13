@@ -62,7 +62,7 @@ cp probes.tsv "$LOCAL_RUN/probes.tsv"
 printf 'key\tvalue\nrun_id\t%s\ngit_commit\t%s\ngit_dirty\t%s\nregistry_sha256\t%s\nrequested\t%s\n' \
   "$RUN_ID" "$GIT_COMMIT" "$GIT_DIRTY" "$REGISTRY_SHA256" "$REQUEST" \
   > "$LOCAL_RUN/manifest.tsv"
-printf 'probe\tstatus\texit_code\ttop\tperiod_ns\tdsp\tlut\tcarry8\tff\twns_ns\tfmax_mhz\n' \
+printf 'probe\tstatus\texit_code\ttop\tperiod_ns\tdsp\tlut\tcarry8\tff\tbram36\tbram18\turam\tlutram\twns_ns\tfmax_mhz\n' \
   > "$LOCAL_RUN/summary.tsv"
 
 lookup_probe() {
@@ -144,15 +144,17 @@ for probe in "${PROBES[@]}"; do
   fi
 
   if [[ -f "$metrics" ]]; then
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$probe" "$probe_result" "$probe_status" \
       "$(metric_value "$metrics" top)" "$(metric_value "$metrics" period_ns)" \
       "$(metric_value "$metrics" dsp)" "$(metric_value "$metrics" lut)" \
       "$(metric_value "$metrics" carry8)" "$(metric_value "$metrics" ff)" \
+      "$(metric_value "$metrics" bram36)" "$(metric_value "$metrics" bram18)" \
+      "$(metric_value "$metrics" uram)" "$(metric_value "$metrics" lutram)" \
       "$(metric_value "$metrics" wns_ns)" "$(metric_value "$metrics" fmax_mhz)" \
       >> "$LOCAL_RUN/summary.tsv"
   else
-    printf '%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t-\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t-\t-\t-\t-\t-\t-\t-\t-\t-\t-\n' \
       "$probe" "$probe_result" "$probe_status" "$PROBE_TOP" "$PROBE_PERIOD" \
       >> "$LOCAL_RUN/summary.tsv"
   fi

@@ -22,6 +22,7 @@ const profile = @import("../profile.zig");
 
 const wire = shared.wire;
 const layout = shared.layout;
+const section = shared.section;
 const capabilities = shared.capabilities;
 
 // The AXI-Lite base addresses, staging reservations, and COLS_MAX all come from
@@ -47,8 +48,8 @@ const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gath
 // Errors this op can raise: the DMA substrate's, this kernel's, plus heap failures.
 // SeqDispatch = the seq.v arm refused or failed a run (details already printed); never
 // silently retried over MMIO — a failed replay means the stream or executor needs looking at.
-const KernelError = regwin.Error || error{ KernelTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock, ActivationState, ActivationQuantization };
-pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory, SeqDispatch };
+const KernelError = regwin.Error || error{ KernelTimeout, ScratchTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock, ActivationState, ActivationQuantization, ScratchState };
+pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory, SeqDispatch, ScratchMismatch };
 
 // ---- The matmul kernel AXI-Lite driver (a tenant on the PL substrate) -------
 // Moved out of the former mmio.zig: the run signature, identity/shape checks, and
@@ -59,11 +60,24 @@ const CTRL_START: u32 = 1 << 0;
 const STATUS_DONE: u32 = 1 << 1;
 const ACT_STATE_VALID: u32 = 1 << 0;
 const ACT_STATE_ERROR: u32 = 1 << 1;
+const SCRATCH_CTRL_DRAIN_START: u32 = 1 << 0;
+const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
+const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
+const SCRATCH_WRITER_DONE: u32 = 1 << 1;
+const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
+const SCRATCH_DRAIN_DONE: u32 = 1 << 3;
+const SCRATCH_ANY_ERROR: u32 = 1 << 4;
 
 const ActivationMode = enum(u32) {
     packed_load = 0,
     reuse = 1,
     raw_f32_load = 2,
+};
+
+const ScratchMode = enum(u32) {
+    ddr_only = 0,
+    tee = 1,
+    drain = 2,
 };
 
 /// Minimum kernel VERSION the driver accepts. v9 is the fixed-window gemm kernel (104-bit
@@ -80,6 +94,7 @@ pub const version_with_seq: u32 = 10;
 pub const version_with_ternary: u32 = 11;
 pub const version_with_logical_rows: u32 = 12;
 pub const version_with_activation_reuse: u32 = 13;
+pub const version_with_scratch: u32 = 14;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -121,6 +136,10 @@ pub const Kernel = struct {
 
     pub fn hasActivationReuse(self: Kernel) bool {
         return self.version >= version_with_activation_reuse;
+    }
+
+    pub fn hasScratch(self: Kernel) bool {
+        return self.version >= version_with_scratch;
     }
 
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
@@ -207,6 +226,69 @@ pub const Kernel = struct {
 
     pub fn selectPackedActivation(self: *Kernel) void {
         if (self.hasActivationReuse()) self.win.wr(regmap.offsetOf("ACT_MODE"), @intFromEnum(ActivationMode.packed_load));
+    }
+
+    pub fn selectDdrResult(self: *Kernel) void {
+        if (self.hasScratch()) self.win.wr(regmap.offsetOf("SCRATCH_MODE"), @intFromEnum(ScratchMode.ddr_only));
+    }
+
+    pub fn configureScratchTee(self: *Kernel, role: section.F32Role, rows: u32, tokens: u32) void {
+        std.debug.assert(self.hasScratch());
+        std.debug.assert(role == .x0 or role == .x1);
+        self.configureScratch(.tee, role, rows, tokens);
+    }
+
+    pub fn configureScratchDrain(self: *Kernel, role: section.F32Role, rows: u32, tokens: u32) void {
+        std.debug.assert(self.hasScratch());
+        self.configureScratch(.drain, role, rows, tokens);
+    }
+
+    fn configureScratch(self: *Kernel, mode: ScratchMode, role: section.F32Role, rows: u32, tokens: u32) void {
+        self.win.wr(regmap.offsetOf("SCRATCH_ROLE"), @intFromEnum(role));
+        self.win.wr(regmap.offsetOf("SCRATCH_ROWS"), rows);
+        self.win.wr(regmap.offsetOf("SCRATCH_TOKENS"), tokens);
+        self.win.wr(regmap.offsetOf("SCRATCH_MODE"), @intFromEnum(mode));
+    }
+
+    pub fn startScratchDrain(self: *Kernel) void {
+        std.debug.assert(self.hasScratch());
+        self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_DRAIN_START);
+    }
+
+    pub fn waitScratchWriterDone(self: *Kernel, role: section.F32Role) KernelError!void {
+        try self.waitScratchDone(SCRATCH_WRITER_DONE, scratchRoleValidMask(role));
+    }
+
+    pub fn waitScratchDrainDone(self: *Kernel) KernelError!void {
+        try self.waitScratchDone(SCRATCH_DRAIN_DONE, 0);
+    }
+
+    fn waitScratchDone(self: *Kernel, done_mask: u32, required_valid_mask: u32) KernelError!void {
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            if (status & SCRATCH_ANY_ERROR != 0) {
+                std.debug.print("pl: scratch failed status=0x{x} error=0x{x}\n", .{
+                    status,
+                    self.win.rd(regmap.offsetOf("SCRATCH_ERROR")),
+                });
+                return error.ScratchState;
+            }
+            if (status & done_mask != 0) {
+                if (status & required_valid_mask != required_valid_mask) return error.ScratchState;
+                return;
+            }
+        }
+        return error.ScratchTimeout;
+    }
+
+    pub fn finishScratchDiagnostic(self: *Kernel) void {
+        if (!self.hasScratch()) return;
+        const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+        if (status & (SCRATCH_WRITER_BUSY | SCRATCH_DRAIN_BUSY) != 0) {
+            self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_ABORT);
+        }
+        self.selectDdrResult();
     }
 
     pub fn cycles(self: Kernel) u32 {
@@ -332,6 +414,51 @@ fn resultPlan(rows: usize, group: usize, num_rb: usize, has_logical_rows: bool) 
     };
 }
 
+fn scratchDiagnosticEligible(kernel_version: u32, requested: bool, rows: usize) bool {
+    return requested and
+        kernel_version >= version_with_scratch and
+        rows != 0 and
+        rows <= section.ffn_dim_max and
+        rows % layout.rows_per_block == 0;
+}
+
+fn groupTileCols(remaining: usize, scratch_diagnostic: bool) usize {
+    const limit = if (scratch_diagnostic)
+        @min(mc_cols_max, @as(usize, section.query_tile_max))
+    else
+        mc_cols_max;
+    return @min(limit, remaining);
+}
+
+fn scratchRoleForProjection(projection_index: usize) section.F32Role {
+    std.debug.assert(projection_index < 2);
+    // llama.cpp builds Qwen's UP projection first and GATE second. The section
+    // schedule names those physical roles X1 and X0 respectively.
+    return if (projection_index == 0) .x1 else .x0;
+}
+
+fn scratchRoleValidMask(role: section.F32Role) u32 {
+    return @as(u32, 1) << @intCast(5 + @intFromEnum(role));
+}
+
+fn scratchDrainBytes(rows: usize, tokens: usize) usize {
+    return rows * tokens * @sizeOf(f32);
+}
+
+fn firstByteMismatch(a: []const u8, b: []const u8) ?usize {
+    if (a.len != b.len) return @min(a.len, b.len);
+    for (a, b, 0..) |a_byte, b_byte, i| {
+        if (a_byte != b_byte) return i;
+    }
+    return null;
+}
+
+fn envEnabled(comptime name: [:0]const u8) bool {
+    const raw = std.c.getenv(name.ptr) orelse return false;
+    const value = std.mem.span(raw);
+    return value.len != 0 and !std.mem.eql(u8, value, "0");
+}
+
 /// Generic over the heap so the runtime composes it only for heaps with physical
 /// addressing (XRT); the fake heap never instantiates it.
 pub fn Backend(comptime Heap: type) type {
@@ -354,6 +481,7 @@ pub fn Backend(comptime Heap: type) type {
         quants: []i8 = &.{},
         act_scales: []f16 = &.{},
         next_activation_epoch: u32 = 1,
+        scratch_verify: bool = false,
 
         pub fn init(allocator: std.mem.Allocator, heap: *Heap) Error!Self {
             // The resident weight packing splits each 16-row block across this
@@ -364,6 +492,18 @@ pub fn Backend(comptime Heap: type) type {
             // Userspace can restart without reconfiguring PL. Restore the
             // legacy-safe mode before any optional seq.v command can run.
             kernel.selectPackedActivation();
+            kernel.finishScratchDiagnostic();
+
+            const scratch_requested = envEnabled("PENZAI_PL_SCRATCH_VERIFY");
+            const scratch_verify = scratch_requested and kernel.hasScratch();
+            if (scratch_verify) {
+                std.debug.print("pl: grouped matmul scratch tee verification ENABLED\n", .{});
+            } else if (scratch_requested) {
+                std.debug.print("pl: PENZAI_PL_SCRATCH_VERIFY set but kernel v{d} < v{d}; diagnostic disabled\n", .{
+                    kernel.version,
+                    version_with_scratch,
+                });
+            }
 
             // The gemm window floor is baked into the kernel (decode_top.EMIN_FLOOR), so there
             // is nothing to write here — the 104-bit accumulator covers the full f16 range with
@@ -401,6 +541,7 @@ pub fn Backend(comptime Heap: type) type {
                 .acts_staging = acts_staging,
                 .result_staging = result_staging,
                 .seq_ctrl = sc,
+                .scratch_verify = scratch_verify,
             };
         }
 
@@ -608,6 +749,7 @@ pub fn Backend(comptime Heap: type) type {
             if (group_op.acts.nbytes != k * cols * @sizeOf(f32)) return null;
             if (first.dst.nbytes != dst_bytes or second.dst.nbytes != dst_bytes) return null;
             if (num_rb * mc_cols_max * result_bytes_per_rb > result_staging_cap) return null;
+            const scratch_diagnostic = scratchDiagnosticEligible(self.kernel.version, self.scratch_verify, rows);
 
             const wrapper_start = profile.begin(ctx);
             const projections = group_op.projections;
@@ -626,13 +768,16 @@ pub fn Backend(comptime Heap: type) type {
             var counters: Counters = .{};
             var result = profile.MatmulExecution{ .path = .direct };
             var last = wrapper_start;
-            // A later primitive seq program assumes the legacy packed-load reset
-            // mode, so restore it even if a grouped DMA or kernel wait fails.
-            defer self.kernel.selectPackedActivation();
+            // Later primitive commands assume both legacy modes. Restore them
+            // even if a grouped DMA, scratch drain, or comparison fails.
+            defer {
+                self.kernel.selectPackedActivation();
+                if (scratch_diagnostic) self.kernel.finishScratchDiagnostic();
+            }
 
             var col0: usize = 0;
             while (col0 < cols) {
-                const tile_cols = @min(mc_cols_max, cols - col0);
+                const tile_cols = groupTileCols(cols - col0, scratch_diagnostic);
                 const act_total = tile_cols * k * @sizeOf(f32);
                 const result_plan = resultPlan(rows, tile_cols, num_rb, self.kernel.hasLogicalRows());
                 if (!result_plan.direct) result.path = .staged;
@@ -650,6 +795,14 @@ pub fn Backend(comptime Heap: type) type {
                     const result_phys = heap.deviceAddress(result_dma) catch return error.HeapFailure;
                     const activation_mode: ActivationMode = if (projection_index == 0) .raw_f32_load else .reuse;
 
+                    if (scratch_diagnostic) {
+                        self.kernel.configureScratchTee(
+                            scratchRoleForProjection(projection_index),
+                            @intCast(rows),
+                            @intCast(tile_cols),
+                        );
+                    }
+
                     // Check reuse before arming any mover. An impossible resident
                     // mismatch therefore cannot strand an active DMA channel.
                     if (activation_mode == .reuse and
@@ -662,7 +815,10 @@ pub fn Backend(comptime Heap: type) type {
                     for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
                     if (activation_mode == .raw_f32_load) try self.dma_a.resetMm2s();
                     var dmas_armed = true;
-                    errdefer if (dmas_armed) self.abortProjectionDmas();
+                    errdefer if (dmas_armed) {
+                        if (scratch_diagnostic) self.kernel.finishScratchDiagnostic();
+                        self.abortProjectionDmas();
+                    };
                     try self.dma_w[0].startWriteToDdr(result_phys, result_plan.dma_bytes);
                     for (&self.dma_w, 0..) |*dma, port| {
                         try dma.startReadFromDdr(weight_phys[projection_index][port], weight_port_bytes);
@@ -681,6 +837,9 @@ pub fn Backend(comptime Heap: type) type {
                     );
                     result.setup_ns +|= profile.lap(ctx, &last);
                     try self.kernel.waitDone();
+                    if (scratch_diagnostic) {
+                        try self.kernel.waitScratchWriterDone(scratchRoleForProjection(projection_index));
+                    }
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
                     if (activation_mode == .raw_f32_load) try self.dma_a.waitReadDone();
                     try self.dma_w[0].waitWriteDone();
@@ -697,6 +856,13 @@ pub fn Backend(comptime Heap: type) type {
                         result.result_layout_ns +|= profile.lap(ctx, &last);
                     }
                 }
+                if (scratch_diagnostic) {
+                    try self.verifyScratchTile(heap, dst_bufs, rows, tile_cols, col0);
+                    // The opt-in drain is outside the GEMM profile contract. Keep
+                    // its wall time in wrapper_ns, but do not charge it to the
+                    // next tile's sync_to segment.
+                    _ = profile.lap(ctx, &last);
+                }
                 col0 += tile_cols;
             }
 
@@ -709,6 +875,58 @@ pub fn Backend(comptime Heap: type) type {
             result.a_beats = counters.a_beats;
             result.r_beats = counters.r_beats;
             return result;
+        }
+
+        fn verifyScratchTile(
+            self: *Self,
+            heap: *Heap,
+            dst_bufs: [2][]u8,
+            rows: usize,
+            tile_cols: usize,
+            col0: usize,
+        ) Error!void {
+            const nbytes = scratchDrainBytes(rows, tile_cols);
+            const drain_dma = subRange(self.result_staging, nbytes);
+            const drain_phys = heap.deviceAddress(drain_dma) catch return error.HeapFailure;
+
+            for (dst_bufs, 0..) |dst, projection_index| {
+                self.kernel.configureScratchDrain(
+                    scratchRoleForProjection(projection_index),
+                    @intCast(rows),
+                    @intCast(tile_cols),
+                );
+
+                try self.dma_w[0].resetS2mm();
+                var dma_armed = true;
+                errdefer if (dma_armed) {
+                    self.kernel.finishScratchDiagnostic();
+                    self.dma_w[0].resetS2mm() catch {};
+                };
+                try self.dma_w[0].startWriteToDdr(drain_phys, nbytes);
+                self.kernel.startScratchDrain();
+                try self.kernel.waitScratchDrainDone();
+                try self.dma_w[0].waitWriteDone();
+                dma_armed = false;
+
+                heap.syncFromDevice(drain_dma) catch return error.HeapFailure;
+                const got = heap.bytes(drain_dma) catch return error.HeapFailure;
+                const expected_offset = col0 * rows * @sizeOf(f32);
+                const expected = dst[expected_offset..][0..nbytes];
+                if (firstByteMismatch(expected, got)) |offset| {
+                    std.debug.print(
+                        "pl: scratch mismatch projection={d} role={s} col0={d} byte={d} expected=0x{x:0>2} got=0x{x:0>2}\n",
+                        .{
+                            projection_index,
+                            @tagName(scratchRoleForProjection(projection_index)),
+                            col0,
+                            offset,
+                            if (offset < expected.len) expected[offset] else 0,
+                            if (offset < got.len) got[offset] else 0,
+                        },
+                    );
+                    return error.ScratchMismatch;
+                }
+            }
         }
 
         fn takeActivationEpoch(self: *Self) u32 {
@@ -923,6 +1141,57 @@ test "result plan makes partial single-column outputs direct only on v12" {
     try std.testing.expect(!staged.direct);
     try std.testing.expectEqual(@as(usize, 151_680 * 8 * @sizeOf(f32)), staged.dma_bytes);
     try std.testing.expectEqual(@as(?u32, 151_680), staged.logical_rows);
+}
+
+test "scratch diagnostic is v14-only and requires complete GEMM rowblocks" {
+    try std.testing.expect(!scratchDiagnosticEligible(version_with_scratch - 1, true, 6144));
+    try std.testing.expect(!scratchDiagnosticEligible(version_with_scratch, false, 6144));
+    try std.testing.expect(scratchDiagnosticEligible(version_with_scratch, true, 6144));
+    try std.testing.expect(scratchDiagnosticEligible(version_with_scratch, true, section.ffn_dim_max));
+    try std.testing.expect(!scratchDiagnosticEligible(version_with_scratch, true, 0));
+    try std.testing.expect(!scratchDiagnosticEligible(version_with_scratch, true, 40));
+    try std.testing.expect(!scratchDiagnosticEligible(version_with_scratch, true, section.ffn_dim_max + layout.rows_per_block));
+}
+
+test "scratch group tiles and projection roles match the Qwen FFN schedule" {
+    try std.testing.expectEqual(@as(usize, 8), groupTileCols(12, false));
+    try std.testing.expectEqual(@as(usize, section.query_tile_max), groupTileCols(12, true));
+    try std.testing.expectEqual(@as(usize, 3), groupTileCols(3, true));
+    try std.testing.expectEqual(section.F32Role.x1, scratchRoleForProjection(0));
+    try std.testing.expectEqual(section.F32Role.x0, scratchRoleForProjection(1));
+    try std.testing.expectEqual(@as(u32, 1 << 6), scratchRoleValidMask(.x0));
+    try std.testing.expectEqual(@as(u32, 1 << 7), scratchRoleValidMask(.x1));
+    try std.testing.expectEqual(@as(usize, 6144 * 4 * @sizeOf(f32)), scratchDrainBytes(6144, 4));
+}
+
+test "scratch drain comparison is exact" {
+    const same = [_]u8{ 1, 2, 3, 4, 5 };
+    try std.testing.expectEqual(@as(?usize, null), firstByteMismatch(&same, &same));
+    try std.testing.expectEqual(@as(?usize, 2), firstByteMismatch(&same, &.{ 1, 2, 9, 4, 5 }));
+    try std.testing.expectEqual(@as(?usize, 3), firstByteMismatch(&.{ 1, 2, 3 }, &.{ 1, 2, 3, 4 }));
+}
+
+test "scratch drain stream is byte-identical to a col-major DDR tile" {
+    const rows: usize = 6144;
+    const tokens: usize = section.query_tile_max;
+    const groups = rows / section.f32_rows_per_group;
+    for (0..tokens) |token| {
+        for (0..groups) |group| {
+            for (0..section.f32_banks_per_role) |bank| {
+                const drain_offset = ((token * groups + group) * section.f32_banks_per_role + bank) * section.f32_word_bytes;
+                const even_row = group * section.f32_rows_per_group + bank * section.f32_values_per_word;
+                const ddr_offset = (token * rows + even_row) * @sizeOf(f32);
+                try std.testing.expectEqual(ddr_offset, drain_offset);
+
+                const location = try section.f32Location(.x1, @intCast(token), @intCast(even_row));
+                try std.testing.expectEqual(@as(u2, @intCast(bank)), location.bank);
+                try std.testing.expectEqual(
+                    @as(u32, @intCast(token)) * section.f32GroupsPerToken(.x1) + @as(u32, @intCast(group)),
+                    location.address,
+                );
+            }
+        }
+    }
 }
 
 test "legacy sequencer program omits unsupported logical-row register" {

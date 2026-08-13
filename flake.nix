@@ -386,6 +386,7 @@
                 # bitstream); set PENZAI_PL_OPS=flash for the flash bitstream.
                 PENZAI_PL_OPS="''${PENZAI_PL_OPS:-matmul}"
                 PENZAI_PL_VERIFY="''${PENZAI_PL_VERIFY:-0}"
+                PENZAI_PL_SCRATCH_VERIFY="''${PENZAI_PL_SCRATCH_VERIFY:-0}"
                 # seq.v on-PL descriptor dispatch. The daemon enables this on the
                 # PRESENCE (not the value) of PENZAI_SEQ, so forward it only when the
                 # caller set it — forwarding an empty value would still switch seq.v on.
@@ -398,10 +399,10 @@
                   SEQ_FWD="PENZAI_SEQ='$PENZAI_SEQ' "
                 fi
 
-                echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB pl_ops=$PENZAI_PL_OPS verify=$PENZAI_PL_VERIFY seq=''${PENZAI_SEQ:-off} =="
+                echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB pl_ops=$PENZAI_PL_OPS verify=$PENZAI_PL_VERIFY scratch_verify=$PENZAI_PL_SCRATCH_VERIFY seq=''${PENZAI_SEQ:-off} =="
                 # shellcheck disable=SC2029
                 # Must run as root for PL to work. sudo strips env, so forward via `env`.
-                exec ssh "$BOARD" "sudo env PENZAI_PL_OPS='$PENZAI_PL_OPS' PENZAI_PL_VERIFY='$PENZAI_PL_VERIFY' ''${SEQ_FWD}'$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
+                exec ssh "$BOARD" "sudo env PENZAI_PL_OPS='$PENZAI_PL_OPS' PENZAI_PL_VERIFY='$PENZAI_PL_VERIFY' PENZAI_PL_SCRATCH_VERIFY='$PENZAI_PL_SCRATCH_VERIFY' ''${SEQ_FWD}'$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
               '';
             };
 

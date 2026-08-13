@@ -172,6 +172,27 @@ fn addFormalSteps(b: *std.Build) void {
     );
     flash_kernel_step.dependOn(&flash_kernel_run.step);
 
+    const section_f32_scratch_map_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_f32_scratch_map",
+        "fpga/formal/section_f32_scratch_map.sby",
+    });
+    const section_f32_scratch_storage_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_f32_scratch_storage",
+        "fpga/formal/section_f32_scratch_storage.sby",
+    });
+    const section_f32_scratch_step = b.step(
+        "formal-section-f32-scratch",
+        "Prove section FP32 scratch mapping, control, ownership, and storage lifecycle",
+    );
+    section_f32_scratch_step.dependOn(&section_f32_scratch_map_run.step);
+    section_f32_scratch_step.dependOn(&section_f32_scratch_storage_run.step);
+
     const formal = b.step("formal", "Run formal verification pilots");
     formal.dependOn(seq_reg_master_step);
     formal.dependOn(seq_core_step);
@@ -179,6 +200,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(gemm_kernel_step);
     formal.dependOn(gemm_ternary_selector_step);
     formal.dependOn(flash_kernel_step);
+    formal.dependOn(section_f32_scratch_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps interpolation, exp,
@@ -269,18 +291,25 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/decode_top.v",
     "fpga/rtl/q8_ingress.v",
     "fpga/rtl/q8_quantizer.v",
+    "fpga/rtl/section_f32_scratch.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_f32_scratch.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
 
 // Exact canonical FP32 -> Q8_0 activation quantizer. Kept standalone until its
 // numerical and routed-cost gates justify attaching it to the GEMM activation RAM.
 const q8_quantizer_rtl = [_][]const u8{
     "fpga/rtl/q8_quantizer.v",
+};
+
+// P2 section-local FP32 scratch: four 64-bit UltraRAM banks with a direct GEMM
+// result sink and an elastic 256-bit group read port.
+const section_f32_scratch_rtl = [_][]const u8{
+    "fpga/rtl/section_f32_scratch.v",
 };
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -332,6 +361,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const flash_kernel_cosim = addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
     const q8_quantizer_cosim = addCosim(b, target, optimize, "test-rtl-q8-quantizer", "Verilator cosim: exact-RNE FP32 to Q8_0 quantizer vs shared/layout.zig", "q8_quantizer", "fpga/sim/q8_quantizer", &q8_quantizer_rtl, .q8);
+    const section_f32_scratch_cosim = addCosim(b, target, optimize, "test-rtl-section-f32-scratch", "Verilator cosim: GEMM-order writes into P2 four-bank FP32 section scratch", "section_f32_scratch", "fpga/sim/section_f32_scratch", &section_f32_scratch_rtl, .section);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
@@ -344,10 +374,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(flash_kernel_cosim);
     rtl_cosim.dependOn(flash_top_cosim);
     rtl_cosim.dependOn(q8_quantizer_cosim);
+    rtl_cosim.dependOn(section_f32_scratch_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
-const CosimKind = enum { matmul, flash, seq, q8 };
+const CosimKind = enum { matmul, flash, seq, q8, section };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -401,7 +432,7 @@ fn addCosim(
     switch (kind) {
         .matmul => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/numeric" }),
         .flash => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
-        .seq, .q8 => {}, // these leaves have no includes
+        .seq, .q8, .section => {}, // these leaves have no Verilog includes
     }
     vcmd.addArgs(rtl);
 
@@ -430,6 +461,11 @@ fn addCosim(
         },
         .q8 => tb_mod.addImport("shared_layout", b.createModule(.{
             .root_source_file = b.path("shared/layout.zig"),
+            .target = target,
+            .optimize = optimize,
+        })),
+        .section => tb_mod.addImport("shared_section", b.createModule(.{
+            .root_source_file = b.path("shared/section.zig"),
             .target = target,
             .optimize = optimize,
         })),

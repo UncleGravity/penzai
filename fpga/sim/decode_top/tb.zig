@@ -36,12 +36,38 @@ const REG_LOADED_EPOCH: u8 = 0x58;
 const REG_LOADED_Q1_BLOCKS: u8 = 0x5C;
 const REG_LOADED_COLS: u8 = 0x60;
 const REG_QUANT_STATUS: u8 = 0x64;
+const REG_SCRATCH_MODE: u8 = 0x68;
+const REG_SCRATCH_ROLE: u8 = 0x6C;
+const REG_SCRATCH_ROWS: u8 = 0x70;
+const REG_SCRATCH_TOKENS: u8 = 0x74;
+const REG_SCRATCH_CTRL: u8 = 0x78;
+const REG_SCRATCH_STATUS: u8 = 0x7C;
+const REG_SCRATCH_ERROR: u8 = 0x80;
 
 const ACT_PACKED_LOAD: u32 = 0;
 const ACT_REUSE: u32 = 1;
 const ACT_RAW_LOAD: u32 = 2;
 const QUANT_NONFINITE: u32 = 1 << 0;
 const QUANT_FRAME: u32 = 1 << 2;
+
+const SCRATCH_MODE_DDR: u32 = 0;
+const SCRATCH_MODE_TEE: u32 = 1;
+const SCRATCH_MODE_DRAIN: u32 = 2;
+const SCRATCH_ROLE_X0: u32 = 1;
+const SCRATCH_ROLE_X1: u32 = 2;
+const SCRATCH_CTRL_DRAIN_START: u32 = 1;
+const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
+const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
+const SCRATCH_WRITER_DONE: u32 = 1 << 1;
+const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
+const SCRATCH_DRAIN_DONE: u32 = 1 << 3;
+const SCRATCH_ANY_ERROR: u32 = 1 << 4;
+const SCRATCH_X0_VALID: u32 = 1 << 6;
+const SCRATCH_X1_VALID: u32 = 1 << 7;
+const SCRATCH_ERROR_CONFIG: u32 = 1 << 0;
+const SCRATCH_ERROR_WRITER: u32 = 1 << 1;
+const SCRATCH_ERROR_ABORT: u32 = 1 << 2;
+const SCRATCH_ERROR_STALE: u32 = 1 << 4;
 
 const WEIGHT_FMT_BINARY: u32 = 1;
 const WEIGHT_FMT_TERNARY: u32 = 2;
@@ -181,6 +207,13 @@ fn configureProjection(
     axiWrite(dut, REG_CTRL, 1);
 }
 
+fn configureScratch(dut: *Dut, mode: u32, role: u32, rows: usize, tokens: usize) void {
+    axiWrite(dut, REG_SCRATCH_ROLE, role);
+    axiWrite(dut, REG_SCRATCH_ROWS, @intCast(rows));
+    axiWrite(dut, REG_SCRATCH_TOKENS, @intCast(tokens));
+    axiWrite(dut, REG_SCRATCH_MODE, mode);
+}
+
 fn runProjection(
     a: std.mem.Allocator,
     dut: *Dut,
@@ -195,6 +228,7 @@ fn runProjection(
     activation_beats: []const u64,
     activation_limit: usize,
     raw_fault: RawFault,
+    stall_output: bool,
     expect_error: bool,
 ) !ProjectionRun {
     configureProjection(dut, physical_rows, logical_rows, q1_blocks, num_cols, weight_fmt, act_mode, act_epoch);
@@ -231,6 +265,8 @@ fn runProjection(
             .no_last => false,
         };
         c.dut_set_a(dut.h, if (a_valid) activation_beats[ai] else 0, @intFromBool(a_valid), @intFromBool(a_last));
+        const result_ready = !expect_error and (!stall_output or cycle % 11 < 7);
+        c.dut_set_m_ready(dut.h, @intFromBool(result_ready));
         c.dut_eval(dut.h);
 
         var w_fire = [_]bool{false} ** PORTS;
@@ -239,7 +275,7 @@ fn runProjection(
         if (act_mode == ACT_REUSE and c.dut_a_ready(dut.h) != 0)
             return error.ReuseRequestedActivationInput;
 
-        if (c.dut_m_valid(dut.h) != 0) {
+        if (c.dut_m_valid(dut.h) != 0 and result_ready) {
             if (expect_error) return error.ErrorRunProducedOutput;
             const keep: u8 = @intCast(c.dut_m_keep(dut.h));
             const beat_bytes: usize = switch (keep) {
@@ -306,6 +342,94 @@ fn runProjection(
         return error.ProjectionResultIncomplete;
     }
     return run;
+}
+
+fn drainScratch(a: std.mem.Allocator, dut: *Dut, role: u32, rows: usize, tokens: usize, expected: []const u8) !void {
+    configureScratch(dut, SCRATCH_MODE_DRAIN, role, rows, tokens);
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_DRAIN_START);
+
+    const got = try a.alloc(u8, expected.len);
+    defer a.free(got);
+    var offset: usize = 0;
+    var saw_last = false;
+    var held_valid = false;
+    var held_data: u64 = 0;
+    var held_keep: u8 = 0;
+    var held_last = false;
+
+    for (0..CYCLE_LIMIT) |cycle| {
+        const ready = cycle % 9 < 5;
+        c.dut_set_m_ready(dut.h, @intFromBool(ready));
+        c.dut_eval(dut.h);
+        const valid = c.dut_m_valid(dut.h) != 0;
+        if (held_valid) {
+            if (!valid or c.dut_m_data(dut.h) != held_data or
+                @as(u8, @intCast(c.dut_m_keep(dut.h))) != held_keep or
+                (c.dut_m_last(dut.h) != 0) != held_last)
+                return error.ScratchDrainChangedWhileStalled;
+        }
+        held_valid = valid and !ready;
+        if (held_valid) {
+            held_data = c.dut_m_data(dut.h);
+            held_keep = @intCast(c.dut_m_keep(dut.h));
+            held_last = c.dut_m_last(dut.h) != 0;
+        }
+
+        if (valid and ready) {
+            if (c.dut_m_keep(dut.h) != 0xFF or offset + 8 > got.len)
+                return error.InvalidScratchDrainBeat;
+            std.mem.writeInt(u64, got[offset..][0..8], c.dut_m_data(dut.h), .little);
+            offset += 8;
+            if (c.dut_m_last(dut.h) != 0) {
+                if (saw_last or offset != got.len) return error.InvalidScratchDrainLast;
+                saw_last = true;
+            }
+        }
+        dut.step();
+        if (saw_last) break;
+    } else return error.ScratchDrainTimeout;
+
+    if (!std.mem.eql(u8, expected, got)) return error.ScratchDrainMismatch;
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_DRAIN_BUSY | SCRATCH_ANY_ERROR) != 0 or
+        status & SCRATCH_DRAIN_DONE == 0 or try axiRead(dut, REG_SCRATCH_ERROR) != 0)
+        return error.ScratchDrainStatusMismatch;
+}
+
+fn abortScratchDrain(dut: *Dut, role: u32, rows: usize, tokens: usize) !void {
+    configureScratch(dut, SCRATCH_MODE_DRAIN, role, rows, tokens);
+    c.dut_set_m_ready(dut.h, 0);
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_DRAIN_START);
+
+    var saw_held_beat = false;
+    for (0..64) |_| {
+        c.dut_set_m_ready(dut.h, 0);
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0) {
+            saw_held_beat = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!saw_held_beat) return error.ScratchDrainDidNotReachHeldBeat;
+
+    // Keep the sink closed while the control write commits. Once abort is
+    // observed, the held response must be discarded rather than emitted.
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT);
+    c.dut_set_m_ready(dut.h, 1);
+    for (0..8) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0) return error.ScratchDrainEmittedAfterAbort;
+        dut.step();
+    }
+
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    const err = try axiRead(dut, REG_SCRATCH_ERROR);
+    if (status & SCRATCH_DRAIN_BUSY != 0 or
+        status & (SCRATCH_DRAIN_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_DRAIN_DONE | SCRATCH_ANY_ERROR) or
+        err & SCRATCH_ERROR_ABORT == 0)
+        return error.ScratchDrainAbortStatusMismatch;
 }
 
 fn runTop(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, program_rows: usize, q1_blocks: usize, num_cols: usize, weight_fmt: u32, port_bytes: [PORTS][]const u8, act_bytes: []const u8) ![]u8 {
@@ -647,7 +771,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
     defer dut.deinit();
     reset(&dut);
 
-    const load = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch, ports_load, raw_beats, raw_beats.len, .none, false);
+    const load = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch, ports_load, raw_beats, raw_beats.len, .none, false, false);
     defer a.free(load.result);
     if (!std.mem.eql(u8, load.result, std.mem.sliceAsBytes(expected_load)) or
         load.quant_status != 0 or load.act_beats != raw_beats.len or
@@ -657,7 +781,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
         try axiRead(&dut, REG_LOADED_COLS) != cols)
         return error.RawProjectionMismatch;
 
-    const reuse = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_REUSE, epoch, ports_reuse, &.{}, 0, .none, false);
+    const reuse = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_REUSE, epoch, ports_reuse, &.{}, 0, .none, false, false);
     defer a.free(reuse.result);
     if (!std.mem.eql(u8, reuse.result, std.mem.sliceAsBytes(expected_reuse)) or
         reuse.act_beats != 0 or reuse.weight_beats != port_len / PORT_BEAT_BYTES or
@@ -667,7 +791,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
         try axiRead(&dut, REG_LOADED_COLS) != cols)
         return error.RawReuseMismatch;
 
-    const malformed = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 1, ports_load, raw_beats, 1, .early_last, true);
+    const malformed = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 1, ports_load, raw_beats, 1, .early_last, false, true);
     defer a.free(malformed.result);
     if (malformed.act_beats != 1 or malformed.quant_status != QUANT_FRAME or
         malformed.act_state != 2)
@@ -675,7 +799,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
 
     // Exercise the nested end predicate itself: a complete finite stream without
     // TLAST must be rejected only on the final col/Q1/sub-block input beat.
-    const missing_last = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 2, ports_load, raw_beats, raw_beats.len, .no_last, true);
+    const missing_last = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 2, ports_load, raw_beats, raw_beats.len, .no_last, false, true);
     defer a.free(missing_last.result);
     if (missing_last.act_beats != raw_beats.len or missing_last.quant_status != QUANT_FRAME or
         missing_last.act_state != 2)
@@ -685,11 +809,103 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
     nonfinite_values[7] = std.math.nan(f32);
     var nonfinite_beats: [shared_layout.q8_block / 2]u64 = undefined;
     packRawF32(&nonfinite_values, &nonfinite_beats);
-    const nonfinite = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 3, ports_load, &nonfinite_beats, nonfinite_beats.len, .no_last, true);
+    const nonfinite = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 3, ports_load, &nonfinite_beats, nonfinite_beats.len, .no_last, false, true);
     defer a.free(nonfinite.result);
     if (nonfinite.act_beats != nonfinite_beats.len or
         nonfinite.quant_status != QUANT_NONFINITE or nonfinite.act_state != 2)
         return error.NonfiniteRawInputDidNotFailClosed;
+
+    if (blocks == 2 and cols == 3) {
+        reset(&dut);
+        if (try axiRead(&dut, 0x04) != 14) return error.ScratchVersionMismatch;
+
+        configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X1, rows, cols);
+        const tee_up = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch, ports_load, raw_beats, raw_beats.len, .none, true, false);
+        defer a.free(tee_up.result);
+        if (!std.mem.eql(u8, tee_up.result, std.mem.sliceAsBytes(expected_load)))
+            return error.ScratchTeeUpMismatch;
+        var scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & (SCRATCH_WRITER_DONE | SCRATCH_X1_VALID) !=
+            (SCRATCH_WRITER_DONE | SCRATCH_X1_VALID) or
+            scratch_status & (SCRATCH_ANY_ERROR | SCRATCH_X0_VALID) != 0)
+            return error.ScratchX1CommitMismatch;
+
+        configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X0, rows, cols);
+        const tee_gate = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_REUSE, epoch, ports_reuse, &.{}, 0, .none, true, false);
+        defer a.free(tee_gate.result);
+        if (!std.mem.eql(u8, tee_gate.result, std.mem.sliceAsBytes(expected_reuse)))
+            return error.ScratchTeeGateMismatch;
+        scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & (SCRATCH_WRITER_DONE | SCRATCH_X0_VALID | SCRATCH_X1_VALID) !=
+            (SCRATCH_WRITER_DONE | SCRATCH_X0_VALID | SCRATCH_X1_VALID) or
+            scratch_status & SCRATCH_ANY_ERROR != 0)
+            return error.ScratchX0CommitMismatch;
+
+        try drainScratch(a, &dut, SCRATCH_ROLE_X1, rows, cols, tee_up.result);
+        try drainScratch(a, &dut, SCRATCH_ROLE_X0, rows, cols, tee_gate.result);
+
+        // A reuse-state error terminates the GEMM before output. The coupled
+        // writer must be aborted too, otherwise it would remain busy forever.
+        configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X1, rows, cols);
+        const bad_reuse = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_REUSE, epoch + 99, ports_reuse, &.{}, 0, .none, false, true);
+        defer a.free(bad_reuse.result);
+        scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & SCRATCH_WRITER_BUSY != 0 or
+            scratch_status & (SCRATCH_WRITER_DONE | SCRATCH_ANY_ERROR) !=
+                (SCRATCH_WRITER_DONE | SCRATCH_ANY_ERROR) or
+            try axiRead(&dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_WRITER == 0 or
+            scratch_status & SCRATCH_X1_VALID != 0 or
+            scratch_status & SCRATCH_X0_VALID == 0)
+            return error.BadReuseDidNotAbortScratchWriter;
+
+        try abortScratchDrain(&dut, SCRATCH_ROLE_X0, rows, cols);
+        scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & SCRATCH_X0_VALID == 0)
+            return error.ScratchDrainAbortInvalidatedRole;
+
+        // A mismatched tee must retire immediately without opening any stream.
+        configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X1, rows, cols - 1);
+        configureProjection(&dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch + 1);
+        var zero = [_]u32{0} ** ROWS_PER_PORT;
+        for (0..16) |_| {
+            for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 1);
+            c.dut_set_a(dut.h, raw_beats[0], 1, 0);
+            c.dut_set_m_ready(dut.h, 1);
+            c.dut_eval(dut.h);
+            for (0..PORTS) |port| {
+                if (c.dut_w_ready(dut.h, @intCast(port)) != 0)
+                    return error.RejectedScratchTeeConsumedWeight;
+            }
+            if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+                return error.RejectedScratchTeeOpenedStream;
+            dut.step();
+        }
+        if (try axiRead(&dut, REG_STATUS) & 2 == 0 or
+            try axiRead(&dut, REG_W_BEATS) != 0 or
+            try axiRead(&dut, REG_A_BEATS) != 0 or
+            try axiRead(&dut, REG_R_BEATS) != 0)
+            return error.RejectedScratchTeeDidNotRetire;
+        scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & SCRATCH_ANY_ERROR == 0 or
+            try axiRead(&dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_CONFIG == 0 or
+            scratch_status & SCRATCH_X1_VALID != 0 or
+            scratch_status & SCRATCH_X0_VALID == 0)
+            return error.RejectedScratchTeeOwnershipMismatch;
+
+        configureScratch(&dut, SCRATCH_MODE_DRAIN, SCRATCH_ROLE_X1, rows, cols);
+        axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_DRAIN_START);
+        scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+        if (scratch_status & (SCRATCH_DRAIN_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_DRAIN_DONE | SCRATCH_ANY_ERROR) or
+            try axiRead(&dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_STALE == 0)
+            return error.StaleScratchDrainDidNotFailClosed;
+
+        axiWrite(&dut, REG_SCRATCH_MODE, SCRATCH_MODE_DDR);
+        std.debug.print(
+            "decode_top scratch tee/drain {s}: X1/X0 exact, stalled, retained; rejected shape consumed W/A/R=0/0/0\n",
+            .{if (ternary) "ternary" else "binary"},
+        );
+    }
 
     std.debug.print(
         "decode_top raw F32 {s} blocks={d} cols={d} load/reuse passed: epoch=0x{X:0>8}, cycles={d}/{d}, hashes=0x{X:0>16}/0x{X:0>16}, A beats={d}/0; frame early/missing/nonfinite consumed A={d}/{d}/{d}, W/R=0/0\n",

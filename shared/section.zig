@@ -48,6 +48,32 @@ pub const F32Location = struct {
     address: u32,
 };
 
+/// Number of 256-bit row groups reserved for one token in a role.  Each group
+/// contributes one 64-bit word to every physical bank.
+pub fn f32GroupsPerToken(role: F32Role) u32 {
+    return role.rowCapacity() / f32_rows_per_group;
+}
+
+/// Per-bank address span reserved for a role across the maximum query tile.
+pub fn f32RoleSpan(role: F32Role) u32 {
+    return query_tile_max * f32GroupsPerToken(role);
+}
+
+/// First physical address occupied by a role in each of the four banks.
+pub fn f32RoleBase(role: F32Role) u32 {
+    return switch (role) {
+        .residual => 0,
+        .x0 => f32RoleSpan(.residual),
+        .x1 => f32RoleSpan(.residual) + f32RoleSpan(.x0),
+        .x2 => f32RoleSpan(.residual) + f32RoleSpan(.x0) + f32RoleSpan(.x1),
+    };
+}
+
+/// Physical word depth of each 64-bit bank across all roles.
+pub fn f32BankDepth() u32 {
+    return f32RoleBase(.x2) + f32RoleSpan(.x2);
+}
+
 pub const Error = error{
     InvalidTokenCount,
     InvalidModelDim,
@@ -67,10 +93,18 @@ pub fn f32Location(role: F32Role, token: u32, even_row: u32) Error!F32Location {
     if (token >= query_tile_max) return error.InvalidTokenCount;
     if (even_row >= role.rowCapacity()) return error.InvalidRow;
     if (even_row % f32_values_per_word != 0) return error.InvalidRowPair;
-    const groups_per_token = std.math.divCeil(u32, role.rowCapacity(), f32_rows_per_group) catch unreachable;
     return .{
         .bank = @intCast((even_row % f32_rows_per_group) / f32_values_per_word),
-        .address = token * groups_per_token + even_row / f32_rows_per_group,
+        .address = token * f32GroupsPerToken(role) + even_row / f32_rows_per_group,
+    };
+}
+
+/// Map a row pair to its absolute address in the shared four-bank memory.
+pub fn f32PhysicalLocation(role: F32Role, token: u32, even_row: u32) Error!F32Location {
+    const local = try f32Location(role, token, even_row);
+    return .{
+        .bank = local.bank,
+        .address = f32RoleBase(role) + local.address,
     };
 }
 
@@ -168,6 +202,52 @@ test "f32 mapping accepts GEMM row-pair order without a transpose copy" {
     }
     try std.testing.expectError(error.InvalidRowPair, f32Location(.x0, 0, 1));
     try std.testing.expectError(error.InvalidTokenCount, f32Location(.x0, query_tile_max, 0));
+}
+
+test "physical f32 mapping exhaustively and uniquely fills every bank" {
+    try std.testing.expectEqual(@as(u32, 0), f32RoleBase(.residual));
+    try std.testing.expectEqual(@as(u32, 2048), f32RoleBase(.x0));
+    try std.testing.expectEqual(@as(u32, 8192), f32RoleBase(.x1));
+    try std.testing.expectEqual(@as(u32, 14336), f32RoleBase(.x2));
+    try std.testing.expectEqual(@as(u32, 16384), f32BankDepth());
+
+    const total_words: usize = @as(usize, f32_banks_per_role) * @as(usize, f32BankDepth());
+    const seen = try std.testing.allocator.alloc(bool, total_words);
+    defer std.testing.allocator.free(seen);
+    @memset(seen, false);
+
+    const roles = [_]F32Role{ .residual, .x0, .x1, .x2 };
+    var visited: usize = 0;
+    for (roles) |role| {
+        try std.testing.expectEqual(
+            f32RoleBase(role) + f32RoleSpan(role),
+            if (role == .x2) f32BankDepth() else f32RoleBase(@enumFromInt(@intFromEnum(role) + 1)),
+        );
+
+        for (0..query_tile_max) |token| {
+            for (0..role.rowCapacity() / f32_values_per_word) |pair| {
+                const even_row: u32 = @intCast(pair * f32_values_per_word);
+                const local = try f32Location(role, @intCast(token), even_row);
+                const physical = try f32PhysicalLocation(role, @intCast(token), even_row);
+                try std.testing.expectEqual(local.bank, physical.bank);
+                try std.testing.expectEqual(f32RoleBase(role) + local.address, physical.address);
+                try std.testing.expect(physical.address < f32BankDepth());
+
+                const index = @as(usize, physical.bank) * @as(usize, f32BankDepth()) +
+                    @as(usize, physical.address);
+                try std.testing.expect(!seen[index]);
+                seen[index] = true;
+                visited += 1;
+            }
+        }
+
+        try std.testing.expectError(error.InvalidRow, f32PhysicalLocation(role, 0, role.rowCapacity()));
+        try std.testing.expectError(error.InvalidRowPair, f32PhysicalLocation(role, 0, 1));
+        try std.testing.expectError(error.InvalidTokenCount, f32PhysicalLocation(role, query_tile_max, 0));
+    }
+
+    try std.testing.expectEqual(total_words, visited);
+    for (seen) |word_was_mapped| try std.testing.expect(word_was_mapped);
 }
 
 test "native Q8 addresses preserve token reuse within GEMM storage" {
