@@ -159,10 +159,9 @@ module section_ffn_pairer_formal(input wire clk);
     wire [31:0] out_gate;
     wire [31:0] out_up;
     wire out_last;
-    wire [1:0] formal_gate_count;
-    wire [1:0] formal_pair_count;
     wire formal_read_inflight;
     wire formal_orphan;
+    wire formal_emit_active;
     wire [2:0] formal_emit_lane;
 
     wire start_fire = start_valid && start_ready;
@@ -201,10 +200,9 @@ module section_ffn_pairer_formal(input wire clk);
         .rd_rsp_data(env_rsp_data), .rd_rsp_error(env_rsp_error),
         .out_valid(out_valid), .out_ready(output_ready),
         .out_gate(out_gate), .out_up(out_up), .out_last(out_last),
-        .formal_gate_count(formal_gate_count),
-        .formal_pair_count(formal_pair_count),
         .formal_read_inflight(formal_read_inflight),
         .formal_orphan(formal_orphan),
+        .formal_emit_active(formal_emit_active),
         .formal_emit_lane(formal_emit_lane)
     );
 
@@ -312,8 +310,6 @@ module section_ffn_pairer_formal(input wire clk);
             assert(accepted_requests <= sent_groups);
             assert(accepted_responses <= accepted_requests);
             assert(accepted_scalars <= {accepted_responses, 3'b000});
-            assert(formal_gate_count <= 2'd2);
-            assert(formal_pair_count <= 2'd2);
             assert(formal_emit_lane <= 3'd7);
 
             if (gate_valid) begin
@@ -409,7 +405,8 @@ module section_ffn_pairer_formal(input wire clk);
         end
 
 `ifdef FORMAL_COVER
-        cover(rst_n && formal_pair_count == 2'd2 && saw_output_stall);
+        cover(rst_n && formal_emit_active && env_rsp_valid &&
+              !rd_rsp_ready && saw_output_stall);
         cover(rst_n && saw_abort && formal_orphan && env_rsp_valid);
 `endif
     end

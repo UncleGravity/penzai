@@ -146,7 +146,13 @@ fn startRun(dut: *Dut, tokens: u3, blocks: u9) !void {
     dut.eval();
 }
 
-fn runConfiguredSuccess(dut: *Dut, tokens: u3, blocks: u9, seed: u64) !RunStats {
+fn runConfiguredSuccess(
+    dut: *Dut,
+    tokens: u3,
+    blocks: u9,
+    seed: u64,
+    ideal: bool,
+) !RunStats {
     try startRun(dut, tokens, blocks);
     try std.testing.expect(c.dut_busy(dut.handle) != 0);
     try std.testing.expect(c.dut_error(dut.handle) == 0);
@@ -175,7 +181,7 @@ fn runConfiguredSuccess(dut: *Dut, tokens: u3, blocks: u9, seed: u64) !RunStats 
         if (stats.cycles > scalar_count * 8 + 4096) return error.StreamTimeout;
 
         if (!input_presenting and input_index < group_count)
-            input_presenting = rnd.uintLessThan(u8, 4) != 0;
+            input_presenting = ideal or rnd.uintLessThan(u8, 4) != 0;
         if (input_presenting) {
             const tag = try nativeTagAt(input_index, tokens);
             const lanes = gateGroup(tag);
@@ -192,8 +198,8 @@ fn runConfiguredSuccess(dut: *Dut, tokens: u3, blocks: u9, seed: u64) !RunStats 
             c.dut_set_gate(dut.handle, 0, &zero_lanes, 0, 0, 0, 0);
         }
 
-        const request_ready = rnd.uintLessThan(u8, 4) != 0;
-        const output_ready = rnd.uintLessThan(u8, 3) != 0;
+        const request_ready = ideal or rnd.uintLessThan(u8, 4) != 0;
+        const output_ready = ideal or rnd.uintLessThan(u8, 3) != 0;
         c.dut_set_read_request_ready(dut.handle, @intFromBool(request_ready));
         c.dut_set_output_ready(dut.handle, @intFromBool(output_ready));
 
@@ -238,7 +244,7 @@ fn runConfiguredSuccess(dut: *Dut, tokens: u3, blocks: u9, seed: u64) !RunStats 
                 pending = .{
                     .tag = tag,
                     .lanes = upGroup(tag),
-                    .delay = @intCast(rnd.uintLessThan(u8, 6)),
+                    .delay = if (ideal) 0 else @intCast(rnd.uintLessThan(u8, 6)),
                 };
                 request_index += 1;
                 held_request = null;
@@ -426,7 +432,7 @@ fn exerciseFaultsAndRestart(dut: *Dut) !void {
     try expectClosedFailure(dut);
     dut.step();
 
-    _ = try runConfiguredSuccess(dut, 1, 1, 0x1234);
+    _ = try runConfiguredSuccess(dut, 1, 1, 0x1234, false);
 }
 
 fn exerciseAbortOrphanAndRestart(dut: *Dut) !void {
@@ -460,7 +466,7 @@ fn exerciseAbortOrphanAndRestart(dut: *Dut) !void {
     dut.eval();
     try std.testing.expect(c.dut_start_ready(dut.handle) != 0);
 
-    _ = try runConfiguredSuccess(dut, 2, 2, 0xabcd);
+    _ = try runConfiguredSuccess(dut, 2, 2, 0xabcd, false);
 }
 
 fn exerciseAbortStalledOutput(dut: *Dut) !void {
@@ -502,7 +508,7 @@ fn exerciseAbortStalledOutput(dut: *Dut) !void {
     try expectClosedFailure(dut);
     dut.step();
 
-    _ = try runConfiguredSuccess(dut, 1, 1, 0x5555);
+    _ = try runConfiguredSuccess(dut, 1, 1, 0x5555, false);
 }
 
 pub fn main() !void {
@@ -510,11 +516,15 @@ pub fn main() !void {
     defer dut.deinit();
     dut.reset();
 
+    const ideal = try runConfiguredSuccess(&dut, 4, 8, 0, true);
+    try std.testing.expect(ideal.cycles <= 1168);
+
     const full = try runConfiguredSuccess(
         &dut,
         @intCast(section.q8_buffer_token_capacity),
         @intCast(section.q8_buffer_block_capacity),
         0xf3c0_2026,
+        false,
     );
     try std.testing.expect(full.input_stalls != 0);
     try std.testing.expect(full.request_stalls != 0);
@@ -526,9 +536,11 @@ pub fn main() !void {
     try exerciseAbortStalledOutput(&dut);
 
     std.debug.print(
-        "section FFN pairer: 6144 tagged X1 reads / 49152 ordered scalars, " ++
+        "section FFN pairer: ideal 128 groups / 1024 scalars in {d} cycles; " ++
+            "6144 tagged X1 reads / 49152 ordered scalars, " ++
             "stalls in/req/rsp/out={d}/{d}/{d}/{d}, cycles={d}\n",
         .{
+            ideal.cycles,
             full.input_stalls,
             full.request_stalls,
             full.response_stalls,

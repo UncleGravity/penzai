@@ -11,8 +11,9 @@
 // response is serialized as eight scalar pairs for section_swiglu. Input TLAST is
 // the logical 32-scalar boundary and is therefore required on every group three.
 //
-// The reorder read, scratch request, response FIFO, and scalar output are separate
-// registered elastic boundaries. Payload memories are intentionally not reset.
+// The reorder read, scratch request, response/serializer, and scalar output are
+// separate registered elastic boundaries. Payload memories are intentionally not
+// reset.
 
 `default_nettype none
 
@@ -57,10 +58,9 @@ module section_ffn_pairer (
     output wire [31:0]   out_up,
     output wire          out_last
 `ifdef FORMAL
-    , output wire [1:0]  formal_gate_count
-    , output wire [1:0]  formal_pair_count
     , output wire        formal_read_inflight
     , output wire        formal_orphan
+    , output wire        formal_emit_active
     , output wire [2:0]  formal_emit_lane
 `endif
 );
@@ -118,23 +118,6 @@ module section_ffn_pairer (
     wire input_frame_ok = s_axis_tlast == (s_axis_group == 2'd3);
     wire input_fault = input_accept && (!input_tag_ok || !input_frame_ok);
     wire reorder_write = input_accept && input_tag_ok && input_frame_ok;
-    // ---- Registered two-entry canonical GATE FIFO ----
-
-    reg [255:0] gate_data_mem [0:1];
-    reg [1:0]   gate_token_mem [0:1];
-    reg [8:0]   gate_block_mem [0:1];
-    reg [1:0]   gate_group_mem [0:1];
-    reg gate_wr_ptr_q;
-    reg gate_rd_ptr_q;
-    reg [1:0] gate_count_q;
-
-    wire gate_fifo_slot = gate_count_q < 2'd2;
-    wire gate_fifo_push = reorder_rd_valid_q && gate_fifo_slot;
-    // A consumed reorder result can be replaced by the next synchronous RAM read
-    // on the same edge. No consumer-ready signal reaches the RAM address boundary.
-    wire reorder_read_issue = busy_q && !abort_run && replay_active_q &&
-                              (!reorder_rd_valid_q || gate_fifo_push);
-
     // ---- Registered scratch request and one in-flight read ----
 
     reg req_valid_q;
@@ -144,8 +127,12 @@ module section_ffn_pairer (
     reg [1:0] req_group_q;
     reg read_inflight_q;
 
-    wire gate_fifo_pop = busy_q && !abort_run && !req_valid_q &&
-                         !read_inflight_q && (gate_count_q != 2'd0);
+    wire reorder_to_req = busy_q && !abort_run && reorder_rd_valid_q &&
+                          !req_valid_q && !read_inflight_q;
+    // The synchronous RAM result is an elastic stage: transferring it into the
+    // request register permits the next replay read on the same edge.
+    wire reorder_read_issue = busy_q && !abort_run && replay_active_q &&
+                              (!reorder_rd_valid_q || reorder_to_req);
 
     assign rd_req_valid = busy_q && !abort_run && req_valid_q;
     assign rd_req_role = ROLE_X1;
@@ -153,30 +140,7 @@ module section_ffn_pairer (
     assign rd_req_group = {req_block_q, 2'b00} + {9'd0, req_group_q};
     wire rd_req_accept = rd_req_valid && rd_req_ready;
 
-    // ---- Registered two-entry paired-group FIFO ----
-
-    reg [255:0] pair_gate_mem [0:1];
-    reg [255:0] pair_up_mem [0:1];
-    reg [1:0]   pair_token_mem [0:1];
-    reg [8:0]   pair_block_mem [0:1];
-    reg [1:0]   pair_group_mem [0:1];
-    reg pair_wr_ptr_q;
-    reg pair_rd_ptr_q;
-    reg [1:0] pair_count_q;
-
-    // Orphan/idle responses are drained. A live response is accepted only into
-    // registered storage with a free slot; downstream ready never reaches here.
-    assign rd_rsp_ready = rst_n &&
-                          (abort_run || orphan_q || !busy_q || !read_inflight_q ||
-                           (pair_count_q < 2'd2));
-    wire rd_rsp_accept = rd_rsp_valid && rd_rsp_ready;
-    wire live_rsp_accept = rd_rsp_accept && busy_q && read_inflight_q && !abort_run;
-    wire rsp_fault = live_rsp_accept && rd_rsp_error;
-    wire unexpected_rsp_fault = rd_rsp_accept && busy_q && !read_inflight_q &&
-                                !orphan_q && !abort_run;
-    wire pair_push = live_rsp_accept && !rd_rsp_error;
-
-    // ---- Registered group serializer and registered consumer output ----
+    // ---- Registered response/group serializer and consumer output ----
 
     reg emit_active_q;
     reg [255:0] emit_gate_q;
@@ -186,8 +150,19 @@ module section_ffn_pairer (
     reg [1:0] emit_group_q;
     reg [2:0] emit_lane_q;
 
-    wire pair_pop = busy_q && !abort_run && !emit_active_q &&
-                    (pair_count_q != 2'd0);
+    // Only one scratch read may be outstanding. Its response can wait at the
+    // registered scratch boundary while the current group drains, then land
+    // directly in the otherwise-idle serializer registers. A separate pair FIFO
+    // added prefetch depth but could not improve the eight-cycle scalar cadence.
+    // Orphan/idle responses remain drainable independent of serializer state.
+    assign rd_rsp_ready = rst_n &&
+                          (abort_run || orphan_q || !busy_q || !read_inflight_q ||
+                           !emit_active_q);
+    wire rd_rsp_accept = rd_rsp_valid && rd_rsp_ready;
+    wire live_rsp_accept = rd_rsp_accept && busy_q && read_inflight_q && !abort_run;
+    wire rsp_fault = live_rsp_accept && rd_rsp_error;
+    wire unexpected_rsp_fault = rd_rsp_accept && busy_q && !read_inflight_q &&
+                                !orphan_q && !abort_run;
 
     reg out_valid_q;
     reg [31:0] out_gate_q;
@@ -228,14 +203,8 @@ module section_ffn_pairer (
             reorder_rd_block_q <= 9'd0;
             reorder_rd_token_q <= 2'd0;
             reorder_rd_group_q <= 2'd0;
-            gate_wr_ptr_q <= 1'b0;
-            gate_rd_ptr_q <= 1'b0;
-            gate_count_q <= 2'd0;
             req_valid_q <= 1'b0;
             read_inflight_q <= 1'b0;
-            pair_wr_ptr_q <= 1'b0;
-            pair_rd_ptr_q <= 1'b0;
-            pair_count_q <= 2'd0;
             emit_active_q <= 1'b0;
             emit_lane_q <= 3'd0;
             out_valid_q <= 1'b0;
@@ -258,14 +227,8 @@ module section_ffn_pairer (
                 input_complete_q <= 1'b0;
                 replay_active_q <= 1'b0;
                 reorder_rd_valid_q <= 1'b0;
-                gate_wr_ptr_q <= 1'b0;
-                gate_rd_ptr_q <= 1'b0;
-                gate_count_q <= 2'd0;
                 req_valid_q <= 1'b0;
                 read_inflight_q <= 1'b0;
-                pair_wr_ptr_q <= 1'b0;
-                pair_rd_ptr_q <= 1'b0;
-                pair_count_q <= 2'd0;
                 emit_active_q <= 1'b0;
                 emit_lane_q <= 3'd0;
                 out_valid_q <= 1'b0;
@@ -280,14 +243,8 @@ module section_ffn_pairer (
                 input_complete_q <= 1'b0;
                 replay_active_q <= 1'b0;
                 reorder_rd_valid_q <= 1'b0;
-                gate_wr_ptr_q <= 1'b0;
-                gate_rd_ptr_q <= 1'b0;
-                gate_count_q <= 2'd0;
                 req_valid_q <= 1'b0;
                 read_inflight_q <= 1'b0;
-                pair_wr_ptr_q <= 1'b0;
-                pair_rd_ptr_q <= 1'b0;
-                pair_count_q <= 2'd0;
                 emit_active_q <= 1'b0;
                 emit_lane_q <= 3'd0;
                 out_valid_q <= 1'b0;
@@ -311,14 +268,8 @@ module section_ffn_pairer (
                 replay_token_q <= 2'd0;
                 replay_group_q <= 2'd0;
                 reorder_rd_valid_q <= 1'b0;
-                gate_wr_ptr_q <= 1'b0;
-                gate_rd_ptr_q <= 1'b0;
-                gate_count_q <= 2'd0;
                 req_valid_q <= 1'b0;
                 read_inflight_q <= 1'b0;
-                pair_wr_ptr_q <= 1'b0;
-                pair_rd_ptr_q <= 1'b0;
-                pair_count_q <= 2'd0;
                 emit_active_q <= 1'b0;
                 emit_lane_q <= 3'd0;
                 out_valid_q <= 1'b0;
@@ -372,32 +323,17 @@ module section_ffn_pairer (
                     end else begin
                         replay_group_q <= replay_group_q + 1'b1;
                     end
-                end else if (gate_fifo_push) begin
+                end else if (reorder_to_req) begin
                     reorder_rd_valid_q <= 1'b0;
                 end
 
-                if (gate_fifo_push) begin
-                    gate_data_mem[gate_wr_ptr_q] <= reorder_rd_data_q;
-                    gate_token_mem[gate_wr_ptr_q] <= reorder_rd_token_q;
-                    gate_block_mem[gate_wr_ptr_q] <= reorder_rd_block_q;
-                    gate_group_mem[gate_wr_ptr_q] <= reorder_rd_group_q;
-                    gate_wr_ptr_q <= gate_wr_ptr_q + 1'b1;
-                end
-
-                if (gate_fifo_pop) begin
-                    req_gate_q <= gate_data_mem[gate_rd_ptr_q];
-                    req_token_q <= gate_token_mem[gate_rd_ptr_q];
-                    req_block_q <= gate_block_mem[gate_rd_ptr_q];
-                    req_group_q <= gate_group_mem[gate_rd_ptr_q];
-                    gate_rd_ptr_q <= gate_rd_ptr_q + 1'b1;
+                if (reorder_to_req) begin
+                    req_gate_q <= reorder_rd_data_q;
+                    req_token_q <= reorder_rd_token_q;
+                    req_block_q <= reorder_rd_block_q;
+                    req_group_q <= reorder_rd_group_q;
                     req_valid_q <= 1'b1;
                 end
-
-                case ({gate_fifo_push, gate_fifo_pop})
-                    2'b10: gate_count_q <= gate_count_q + 1'b1;
-                    2'b01: gate_count_q <= gate_count_q - 1'b1;
-                    default: gate_count_q <= gate_count_q;
-                endcase
 
                 if (rd_req_accept) begin
                     req_valid_q <= 1'b0;
@@ -407,31 +343,15 @@ module section_ffn_pairer (
                 if (live_rsp_accept) begin
                     read_inflight_q <= 1'b0;
                     if (!rd_rsp_error) begin
-                        pair_gate_mem[pair_wr_ptr_q] <= req_gate_q;
-                        pair_up_mem[pair_wr_ptr_q] <= rd_rsp_data;
-                        pair_token_mem[pair_wr_ptr_q] <= req_token_q;
-                        pair_block_mem[pair_wr_ptr_q] <= req_block_q;
-                        pair_group_mem[pair_wr_ptr_q] <= req_group_q;
-                        pair_wr_ptr_q <= pair_wr_ptr_q + 1'b1;
+                        emit_gate_q <= req_gate_q;
+                        emit_up_q <= rd_rsp_data;
+                        emit_token_q <= req_token_q;
+                        emit_block_q <= req_block_q;
+                        emit_group_q <= req_group_q;
+                        emit_lane_q <= 3'd0;
+                        emit_active_q <= 1'b1;
                     end
                 end
-
-                if (pair_pop) begin
-                    emit_gate_q <= pair_gate_mem[pair_rd_ptr_q];
-                    emit_up_q <= pair_up_mem[pair_rd_ptr_q];
-                    emit_token_q <= pair_token_mem[pair_rd_ptr_q];
-                    emit_block_q <= pair_block_mem[pair_rd_ptr_q];
-                    emit_group_q <= pair_group_mem[pair_rd_ptr_q];
-                    emit_lane_q <= 3'd0;
-                    emit_active_q <= 1'b1;
-                    pair_rd_ptr_q <= pair_rd_ptr_q + 1'b1;
-                end
-
-                case ({pair_push, pair_pop})
-                    2'b10: pair_count_q <= pair_count_q + 1'b1;
-                    2'b01: pair_count_q <= pair_count_q - 1'b1;
-                    default: pair_count_q <= pair_count_q;
-                endcase
 
                 if (out_slot_open) begin
                     if (emit_active_q) begin
@@ -474,10 +394,9 @@ module section_ffn_pairer (
     end
 
 `ifdef FORMAL
-    assign formal_gate_count = gate_count_q;
-    assign formal_pair_count = pair_count_q;
     assign formal_read_inflight = read_inflight_q;
     assign formal_orphan = orphan_q;
+    assign formal_emit_active = emit_active_q;
     assign formal_emit_lane = emit_lane_q;
 `endif
 
