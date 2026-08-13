@@ -1,8 +1,9 @@
-# penzai combined bitstream (matmul + adaptive flash, both on PL)
+# penzai combined bitstream (GEMM/FFN + adaptive flash on PL)
 
-**One bitstream for compressed GEMM and supported flash operations on PL** — the
-fixed-point four-port GEMM kernel and adaptive query-blocked flash kernel in one
-design. Flash engine `0xF1A54A01`, version 1, operates directly on native KV layout,
+**One bitstream for compressed GEMM, the named FFN section, and supported flash
+operations on PL** - the fixed-point four-port GEMM kernel and adaptive
+query-blocked flash kernel in one design. Flash engine `0xF1A54A01`, version 1,
+operates directly on native KV layout,
 performs GQA in hardware, and exposes 64 physical query-head slots. Decode uses one
 query. Multi-token calls use four-query tiles at up to 16 heads and two-query tiles
 at 17-32 heads, so Bonsai retains a four-query physical tile without allocating a
@@ -23,6 +24,14 @@ tees Qwen projection 0 (`UP`) to `X1` and projection 1 (`GATE`) to `X0`, then
 byte-compares both drains against their authoritative DDR results. This is a
 diagnostic substrate, not yet a named or scratch-only section command.
 
+The deployed P2f image advances wire ABI to 15 and GEMM to version 15. Command
+tag 19 identifies a version-1 named FFN command serialized in 172 bytes. The PS performs
+weighted RMSNorm, PL retains UP/GATE in X1/X0 through a 15-cycle II=1 PWL SwiGLU,
+canonical Q8 requantization, and DOWN, then the PS performs the residual add from
+a private result. This is the first executable section and closes the P2 contract
+and substrate; optimizing its product-path performance is P3, while a named
+attention section remains P4.
+
 The two ops run **sequentially** in the graph, so their DDR feeds are kept independent
 rather than time-shared — each keeps exactly the topology it was tuned/validated with:
 
@@ -40,10 +49,10 @@ flash `0xA01x_0000` (the flash regmap was allocated in `0xA01x` for exactly this
 ```sh
 cp config.env.example config.env       # edit VM / BOARD (or reuse the committed one)
 (cd ../.. && zig build regmap)          # refresh generated contracts under fpga/regmap/
-./build.sh w512-p4-f285                 # current bounded P2e qualification point
+./build.sh w512-p4-f285                 # current bounded P2f qualification point
 ./build.sh                              # f300 development target; combined route unclosed
 ./build.sh --incremental                # development build; reuse last clean route
-PENZAI_BITSTREAM_RUN_ID=20260813T060347Z-1e0b9a350d84-w512-p4-f285-routed-finalize \
+PENZAI_BITSTREAM_RUN_ID=20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean \
   ./deploy.sh w512-p4-f285
 # serve the daemon telling it BOTH ops are on PL:
 (cd ../../.. && nix run .#deploy-penzaid)
@@ -277,8 +286,92 @@ observations establish no regression, not a speedup.
 Unprofiled artifact `20260813T062620Z-regression-7f1de76f4fab` is complete and
 run-validated across six c0 samples. Its three-repeat steady-decode medians are
 87.922 ms/token for Q1 and 109.635 ms/token for Q2. P2e therefore closes the
-diagnostic scratch substrate. P2 remains open for a same-command, scratch-only PL
-consumer: SwiGLU, requantization, down projection, and the first named FFN section.
+diagnostic scratch substrate. The following P2f image consumes it in the first
+named section.
+
+### P2f named FFN qualification
+
+Wire ABI 15 freezes `ffn_section` tag 19, contract version 1 and flags zero. Its
+172-byte command names residual, norm weight, up/gate/down weights, destination,
+dimensions, token count, epsilon, and Q1/Q2 format; a one-command buffer is 176
+bytes including its four-byte count. The strict lowerer requires the exact
+Qwen/Bonsai dataflow, shapes/formats, use and alias safety, complete resident
+bindings, and six pairwise-disjoint external ranges. A mismatch stays on the
+legacy commands before section execution. The pinned one-graph census changes
+from 508 commands, 28 group2, and 141 primitive matmuls to 396 commands, 28 FFN,
+zero group2, and 113 primitive matmuls, exactly 112 commands removed.
+
+The v15 executable path tiles at up to four tokens. Weighted RMSNorm and residual
+add remain on the PS. PL canonical-Q8 ingress feeds UP to scratch-only X1, reuses
+that Q8 record for GATE into X0, applies the 1,024-segment `[-16,16]` PWL SwiGLU,
+requantizes through the canonical ingress, and runs DOWN into a private result.
+Only after a successful tile does the PS add the residual, publish `dst` once,
+and synchronize it. Unsupported pre-start execution may use the whole named PS
+oracle; after PL starts a hardware or DMA error is a backend failure with no
+retry. R and X2 remain contract roles but are not populated by this executable
+subset.
+
+`test-rtl` passes 46/46 steps; `lint-rtl test-rtl` together pass 48/48. The
+normal/pinned Zig suites pass 265/265 and 292/292. The 15-cycle II=1 SwiGLU cosim covers 5,143 scalars and all
+1,024 ROM entries. Normalized PS error is `6.097758e-5`; canonical Q8 drift is
+2/32,768 bytes with maximum delta one and no F16 scale-code delta. SwiGLU and
+internal Q8 ingress have unbounded PDR proofs; decode-FFN has a depth-400 BMC and
+cover, not an unbounded proof.
+
+Standalone SwiGLU OOC run `20260813T082045Z-48c8be5cebaf` passes at +0.336 ns
+WNS with 771 LUTs, 784 FFs, 17 CARRY8s, four DSPs, and 2.5 BRAM tiles. Final
+integrated OOC run
+`20260813T110854Z-90a2dc70c5e8-dirty-p2f-romreq-full-decode` passes at
++0.198/+0.037 ns setup/hold with 41,580 LUTs, 47,235 FFs, 808 CARRY8s, 38 DSPs,
+4.5 BRAM tiles, 20 URAMs, and 94 LUTRAMs. Its production-source and complete-probe
+bundle SHA-256 values are
+`c0bb8d16aceef6343103f7ac66b0c570fbb7a4200972ef07ea6483a6e03050e0` and
+`55024b877f0e3c118d380684914dd229761c7ca5b5439dab60e03d9ecd15fb81`.
+
+The first clean P2f route,
+`20260813T094435Z-90a2dc70c5e8-w512-p4-f285-clean`, was fully routed but failed
+-0.081/+0.007 ns and was not promoted. Commit
+`6e8fae0eb637589cc0d31c0d14e2a53603830c2b` pipelined the scratch, Q8, and
+SwiGLU boundaries. The replacement authority is clean combined run
+`20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean`:
+
+| Gate | P2f result |
+|---|---|
+| Timing | pass; +0.015/+0.010 ns setup/hold, no negative paths, 32 setup paths below 50 ps |
+| Routing/constraints | pass; 161,294/161,294 routable nets, no clockless or unconstrained internal endpoints, exact guardband restoration |
+| Utilization | 83,463 LUTs, 98,323 FFs, 1,441 CARRY8s, 58 BRAM tiles, 20 URAMs, 98 DSPs |
+| Methodology | TIMING-2/TIMING-4, five TIMING-28, and ULMTCS-1 remain |
+| Source bundle | `a4536e2a73b10fb6528019b9b2f0b0b09b659584932da85cda06826c61bf555c` |
+| Manifest | `032b2349380a5b03eee6f9870ece88e87d24ea6cdb3fff557fd55eda582dab26` |
+| Raw `.bit` | `39b89b68f50393f528a95eeee5595ca1182c7a4dc40d27c0e6067a5e0c602283` |
+| Deployed `.bit.bin` | `b8f983b8065a9eeb6eb850dc6d296f613e72f5323a48e733b6260a853c522904` |
+
+Both artifacts were promoted; the exact `.bit.bin` was deployed with a matching
+receipt.
+Consolidated board evidence is `/tmp/p2f-qualification-summary.json`, SHA-256
+`a64175d3379fa545da904da98df57c9899a244b8a74c5bbbf3fc472aa1d1e66a`.
+Start/end capabilities match at schema 2, wire 15, profile 6, GEMM v15 at
+284,997,152 Hz, and flash v1/64 slots. Q1/Q2 `p32` logits pass at maximum absolute
+differences 0.102924/0.107559, exact 25/25 and 220/220 argmax, zero token
+mismatches, and `check=ok`; no fallback or execution error occurs. Each Q1/Q2
+`p32` prefill and decode profile phase reports one graph, 397 commands, 28 FFN,
+zero group2, and 113 primitive matmuls. The extra command versus the pinned census
+is argmax. All FFN buckets execute on PL and close their run and W/A/R beat
+formulas.
+
+Characterization artifact
+`p2f-characterize-20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` is complete
+and run-validated with fingerprint
+`20928b3c636dbe0504900a9c3adb40033bd7820d2069a640ba667d8e8e5bcf33`.
+Its single-repeat profiled device times improve from P2e by 4.59-7.53%: p128
+Q1/Q2 is 66.533089/89.390916 ms/token and c512 is
+89.438339/112.333491 ms/token. This is not a blanket speedup claim. Complete,
+run-validated six-sample artifact
+`p2f-regression-20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean`, fingerprint
+`0e61f6f63bd558e5692a4428cc2ac2b04958c747c1e9d030fd1f2bd47950f35e`,
+instead records unprofiled c0 medians of 90.364345/112.856650 ms/token for Q1/Q2:
+regressions of 2.7773%/2.9388% that pass the +15% guard. P2f closes P2 and
+establishes the P3 baseline; P3 remains open for repeatable product-path gain.
 
 Builds use all eight Vivado worker threads and a persistent VM-side `cache/` for generated
 AMD IP. Every release-gate-passing build refreshes a routed checkpoint for its variant.
@@ -328,12 +421,12 @@ If it doesn't fit or close at `f200`:
    lines, but remember that this is a smoke comparison: flash uses a 2% normalized
    threshold against the higher-precision PS implementation. The bit-faithful
    structural gate is `zig build test-rtl`, and the model-level logit comparison is
-   the numerical release gate. The local P2e aggregate covers binary and ternary
-   GEMM, exact Q8 ingress and grouped reuse, scratch leaf and integrated tee/drain,
-   plus the flash kernel and wrapper; all 41 local build steps pass. For the scratch
-   gate, restart with `PENZAI_PL_VERIFY=0 PENZAI_PL_SCRATCH_VERIFY=1`, require the
-   v14 diagnostic-enabled startup line, and run both Q1/Q2 logit checks before
-   repeating them with `PENZAI_PL_SCRATCH_VERIFY=0`.
+   the numerical release gate. The local P2f aggregate covers binary and ternary
+   GEMM, exact Q8 ingress and grouped reuse, scratch, named FFN/SwiGLU execution,
+   and the flash kernel/wrapper; all 46 `test-rtl` steps pass, and the combined
+   `lint-rtl test-rtl` invocation passes 48/48. A current P2f smoke
+   must report 28 `ffn_section` commands on PL, zero group2 commands, exact
+   run/beat accounting, and no fallback or execution error.
 2. **Identity:** query `penzai capabilities` after every deployment and require the
    run ID, source hash, bitstream hash, ABI, clock, engine versions, dimensions, and
    formats to match the selected run bundle. Adaptive P2c requires capability schema
@@ -341,14 +434,18 @@ If it doesn't fit or close at `f200`:
    and `flash.query_slots=64`. A stale daemon or bitstream must fail closed rather
    than reinterpret the engine contract. P2d additionally requires wire ABI 14,
    matmul ID `0xB05A2000`, and matmul version 13. P2e retains wire ABI 14 and
-   requires matmul version 14. The current deployment reads back schema 2, wire ABI
-   14, profile ABI 6, matmul v14 at 284,997,152 Hz, and flash v1 with 64 query
-   slots.
+   requires matmul version 14. P2f requires wire ABI 15, matmul version 15, and
+   command tag 19 with contract version 1/flags zero. The current deployment reads
+   back schema 2, wire ABI 15, profile ABI 6, matmul v15 at 284,997,152 Hz, and
+   flash v1 with 64 query slots.
 3. **Profile invariants:** `--prof` must report PL execution for both GEMM and
    single-query flash plus supported multi-token flash, closed accounting, exact
    requested token counts, and the expected DMA beat counts with no unexplained
-   stalls. Within a query tile, K/V beat counts are independent of query count.
-   Compare device counters, not VPN-sensitive wall or transport time.
+   stalls. Named FFN profiling must report one aggregate wall time plus exact
+   logical gate/up and down bucket accounting; `swiglu_ns=0` means it is fused
+   into the down wait, not independently free. Within a query tile, K/V beat
+   counts are independent of query count. Compare device counters, not
+   VPN-sensitive wall or transport time.
 
 The initial f285 multi-token smoke truthfully reported a PS fallback. The driver
 had modeled Q as head-major, while the supported GGML prefill tensor is packed

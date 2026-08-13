@@ -1,15 +1,17 @@
 # P2 Section And Scratch Contract
 
-Status: P2a contract v1 with board-qualified P2c adaptive attention at f285; P2d
-grouped activation reuse and P2e diagnostic F32 scratch are closed at their
-bounded f285 structural, numerical, route, and board qualifications, 2026-08-13
+Status: P2 contract v1 and its substrate are closed through P2f's board-qualified
+wire-ABI-15 named FFN section at f285; this is the P3 performance baseline, while
+the named attention section remains P4 work, 2026-08-13
 
 This document fixes the boundary for P2 implementation. P2a did not add a wire
 operation, and P2b/P2c changed the internal attention schedule and primitive bridge
 without adding a named section ABI. P2d adds one bounded grouped-GEMM operation.
 P2e physically implements contract-v1 F32 scratch and an opt-in DDR+scratch
-tee/drain diagnostic; neither is a named section ABI. Later RTL revisions must
-preserve this ownership, layout, numerical, fallback, and measurement contract.
+tee/drain diagnostic. P2f freezes and executes the first named section ABI,
+retaining gate/up intermediates through PL SwiGLU, canonical Q8 requantization,
+and the down projection. Later RTL revisions must preserve this ownership,
+layout, numerical, fallback, and measurement contract.
 
 ## Scope
 
@@ -17,9 +19,10 @@ P2 turns the existing GEMM and attention kernels into reusable engines behind a
 fixed layer-local substrate. It is not a generic graph compiler, scratch allocator,
 or device-side GGML interpreter.
 
-The host will eventually issue two explicit section commands. Their external
-descriptors name DDR tensors and model semantics. The PL controller alone owns
-scratch addresses and stage sequencing.
+Wire ABI 15 issues one explicit `ffn_section` command. Its external descriptor
+names DDR tensors and model semantics; scratch addresses and stage sequencing
+remain private. The second named command, attention, is intentionally deferred
+until its P4 implementation freezes the descriptor and same-section KV behavior.
 
 V1 has these caps:
 
@@ -53,7 +56,8 @@ is invalid before command start and after command completion. It is not a
 `TensorRange`, is not visible to graph lowering, and never persists by pointer
 identity across commands. P2e's explicit diagnostic drain temporarily retains
 role-valid metadata after a tee solely to prove storage contents; it does not make
-scratch a host-addressable tensor or relax the product lifetime rule.
+scratch a host-addressable tensor or relax the product lifetime rule. P2f's FFN
+command is the first product path to exercise this lifetime.
 
 Four named F32 roles provide 512 KiB of logical storage:
 
@@ -73,7 +77,8 @@ addr  = token * groups_per_role + group
 word  = {odd row, even row}
 ```
 
-P2e implements those roles in four physical `16384 x 64` memories. The per-bank
+P2e implements those roles in four physical `16384 x 64` memories, and P2f
+consumes that same storage. The per-bank
 role bases are `R=0`, `X0=2048`, `X1=8192`, and `X2=14336`, giving 65,536 total
 64-bit words, 512 KiB, and an exact target of 16 URAM288s. These constants and the
 local/physical mapping are checked exhaustively in `shared/section.zig`.
@@ -168,6 +173,11 @@ Q8 + Wdown -> X2
 R + X2 -> DDR output
 ```
 
+This is the target contract schedule, not a claim that every stage was moved in
+P2f. The wire-ABI-15 executable subset keeps weighted RMSNorm and residual add on
+the PS, uses X0/X1 for gate/up and SwiGLU, and does not populate R or X2. DOWN
+writes a private command-sized result before the PS publishes the destination.
+
 Weights, historical/persistent KV, section input/output residuals, positions, and
 parameter vectors remain in DDR. Temporary projections, Q8 activations, SwiGLU
 values, and attention state do not.
@@ -239,6 +249,49 @@ time. Cleanup aborts the scratch controller and every armed DMA before restoring
 DDR/packed modes. With
 the environment variable absent or zero, v14 executes the same runtime and profile
 ABI as P2d.
+
+## P2f Executable FFN
+
+Wire ABI 15 assigns tag 19 to the version-1 `ffn_section`; GEMM engine
+`0xB05A2000` advances to version 15 while capability schema 2 and profile ABI 6
+remain unchanged. The serialized command is 172 bytes, or 176 bytes when it is
+the sole entry in a command buffer including the four-byte command count. The
+runtime enables it only when live capabilities report wire ABI 15, the matmul
+engine, and GEMM v15.
+
+The lowerer matches the complete Qwen/Bonsai RMSNorm/gamma -> gate/up -> SwiGLU
+-> down -> residual-add dataflow. Shapes and weight formats, exact use counts,
+views and metadata aliases, complete resident bindings, and all six pairwise-
+disjoint external ranges must match. Any mismatch leaves the legacy operations
+unchanged before section start. In the pinned one-graph census, disabled lowering
+emits 508 total commands, 28 group2 commands, and 141 primitive matmuls; enabled
+lowering emits 396, 28 named FFN commands, zero group2 commands, and 113 primitive
+matmuls. Replacing five legacy commands per layer with one named command removes
+exactly 112 commands over 28 layers.
+
+The executable schedule tiles at no more than four tokens:
+
+```text
+PS weighted RMSNorm -> normalized F32 synchronized to PL
+PL canonical Q8 load -> UP into scratch-only X1
+resident-Q8 reuse -> GATE into X0
+PWL SwiGLU(X0, X1) -> canonical Q8 ingress
+resident-Q8 DOWN -> private F32 result
+PS residual add -> publish dst once -> sync dst to device
+```
+
+The 1,024-segment SwiGLU approximation covers `[-16,16]`; the negative tail is
+zero, the positive tail is the gate value, and non-finite input fails closed. Its
+final pipeline latency is 15 cycles at II=1, with 64-result reservation and BRAM
+elasticity. Only the gate/up and SwiGLU intermediate boundary is eliminated:
+RMSNorm, residual add, and destination publication remain PS work.
+
+All external ranges and capacities are resolved before mutation. A request found
+unsupported before PL starts may execute the whole named-section PS oracle. Once
+PL execution begins, a kernel or DMA error returns `BackendFailure` without retry
+or fallback. Cleanup aborts the section controller before resetting armed DMA.
+DOWN writes into a private result allocation, so a failed tile cannot partially
+publish the externally visible destination.
 
 ## Unified Attention
 
@@ -314,18 +367,23 @@ remains a requirement for the future named attention section.
 
 ## External Descriptor Boundary
 
-The future wire ABI will contain two concrete versioned operations, with no
-scratch addresses or arbitrary stage list. The following lists semantic fields,
-not frozen wire structs:
+Wire ABI 15 freezes the concrete versioned FFN operation with no scratch address
+or arbitrary stage list:
 
 ```text
 ffn_section_v1 {
-  input, output, norm_gamma,
-  gate_weights, up_weights, down_weights,
+  residual, norm_weight,
+  up_weights, gate_weights, down_weights, dst,
   model_dim, ffn_dim, token_count,
-  norm_eps, weight_format
+  eps, weight_format, contract_version=1, flags=0
 }
+```
 
+All six ranges, dimensions, epsilon, supported Q1/Q2 weight format, version, and
+zero flags are validated before execution. The attention descriptor remains a
+semantic sketch rather than a frozen wire structure:
+
+```text
 attention_section_v1 {
   input, output, norm_gamma,
   q_weights, k_weights, v_weights, output_weights,
@@ -344,10 +402,9 @@ section execution begins; a failure after start is an execution error, not a
 partial retry.
 
 P2a deliberately did not assign section wire tags or serialize these fields. Wire
-ABI 14's fixed `matmul_q1a8_group2` is a bounded primitive operation and does not
-freeze either section descriptor. Concrete range, stride, RoPE, and weight-format
-types are frozen with the first executable section so that ABI describes an
-implemented controller rather than a speculative one.
+ABI 14's fixed `matmul_q1a8_group2` is a bounded primitive operation and did not
+freeze either section descriptor. P2f freezes only the implemented FFN structure;
+attention range, stride, RoPE, cache, and mask semantics remain unfrozen until P4.
 
 ## Measurement Contract
 
@@ -356,6 +413,12 @@ Existing profile fields retain their meaning:
 - `valid_qkv_pairs` is query tokens times mask entries other than F16 `-inf`;
 - `processed_qkv_pairs` is the query/KV space actually walked;
 - neither count includes query heads.
+
+One FFN command emits one aggregate authoritative wall time. Existing matmul
+buckets receive logical gate/up work (two kernel runs per tile) and down work (one
+run per tile), while stage attribution reports norm, gate/up, down, and residual.
+SwiGLU is fused into the down wait and therefore reports `swiglu_ns=0`, not an
+independently measured zero-cost stage. This requires no profile ABI change.
 
 Engine work is reported as:
 
@@ -691,14 +754,92 @@ run-validated across six c0 samples. Three-repeat steady-decode medians are
 87.922 ms/token for Q1 and 109.635 ms/token for Q2, below their historical
 93.025/112.658 ms/token guards.
 
-P2e closes the diagnostic scratch substrate. P2 remains open because no PL stage
-yet consumes these results without a drain/DDR boundary. The next P2f work is a
-same-command scratch-only consumer implementing SwiGLU, requantization, down
-projection, and the first named FFN section.
+P2e closes the diagnostic scratch substrate at this historical checkpoint. P2f
+then consumes it without the diagnostic drain/DDR boundary described below.
+
+## P2f Qualification
+
+The PWL SwiGLU cosim agrees with its exact bit model over 5,143 scalars and all
+1,024 coefficient entries, including stable stalled output, randomized
+backpressure, abort, and non-finite handling. Maximum normalized error against the
+PS function is `6.097758e-5`. The canonical Q8 comparison differs in 2/32,768
+bytes by at most one and has zero F16 scale-code differences. SwiGLU formal closes
+PDR, BMC, and cover; internal Q8 ingress closes unbounded PDR, depth-80 BMC, and
+cover. Decode-FFN closes depth-400 BMC and cover, not an unbounded proof. Scratch
+map closes PDR plus depth-32 BMC/cover, and scratch storage closes depth-64
+BMC/cover. `test-rtl` passes 46/46 steps; `lint-rtl test-rtl` together pass 48/48.
+Normal and pinned Zig suites pass 265/265 and 292/292.
+
+Standalone SwiGLU OOC run `20260813T082045Z-48c8be5cebaf` passes the 3.333 ns
+target with +0.336 ns WNS, 771 LUTs, 784 FFs, 17 CARRY8s, four DSPs, two BRAM36s,
+and one BRAM18 (2.5 BRAM tiles). Final integrated OOC run
+`20260813T110854Z-90a2dc70c5e8-dirty-p2f-romreq-full-decode` passes at
++0.198/+0.037 ns setup/hold with 41,580 LUTs, 47,235 FFs, 808 CARRY8s, 38 DSPs,
+four BRAM36s plus one BRAM18 (4.5 tiles), 20 URAMs, and 94 LUTRAMs. Its production
+source bundle SHA-256 is
+`c0bb8d16aceef6343103f7ac66b0c570fbb7a4200972ef07ea6483a6e03050e0`; the
+complete probe bundle is
+`55024b877f0e3c118d380684914dd229761c7ca5b5439dab60e03d9ecd15fb81`.
+
+The first clean combined P2f run,
+`20260813T094435Z-90a2dc70c5e8-w512-p4-f285-clean`, routed fully but failed at
+-0.081/+0.007 ns and was not promoted. Commit
+`6e8fae0eb637589cc0d31c0d14e2a53603830c2b` pipelined scratch, Q8, and SwiGLU
+timing boundaries. Clean f285 run
+`20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` then passes at
++0.015/+0.010 ns with no negative setup/hold paths, 32 setup paths below 50 ps,
+161,294/161,294 routable nets routed, no clockless or unconstrained internal
+endpoints, and exact 75 ps guardband restoration. It uses 83,463 LUTs, 98,323
+FFs, 1,441 CARRY8s, 58 BRAM tiles, 20 URAMs, and 98 DSPs. Methodology retains
+critical TIMING-2/TIMING-4, five TIMING-28 warnings, and ULMTCS-1.
+
+The route's source bundle, manifest, raw `.bit`, and deployed `.bit.bin` SHA-256
+values are respectively:
+
+```text
+a4536e2a73b10fb6528019b9b2f0b0b09b659584932da85cda06826c61bf555c
+032b2349380a5b03eee6f9870ece88e87d24ea6cdb3fff557fd55eda582dab26
+39b89b68f50393f528a95eeee5595ca1182c7a4dc40d27c0e6067a5e0c602283
+b8f983b8065a9eeb6eb850dc6d296f613e72f5323a48e733b6260a853c522904
+```
+
+Board evidence is consolidated in `/tmp/p2f-qualification-summary.json`, SHA-256
+`a64175d3379fa545da904da98df57c9899a244b8a74c5bbbf3fc472aa1d1e66a`.
+Start and end capabilities match at schema 2, wire 15, profile 6, GEMM v15 at
+284,997,152 Hz, and flash v1 with 64 slots; the capabilities evidence hash is
+`3d8c918f14665bcf3e6ef03bef676a8ad1b4325f780e2d3fdc27e26692d14760`.
+Q1/Q2 `p32` logit checks pass with maximum absolute differences
+0.102924/0.107559, exact 25/25 and 220/220 argmax, zero token mismatches, and
+`check=ok`. Twelve FFN comparison advisories reach 0.0431 absolute/0.0327
+normalized difference, while 20 unchanged-flash advisories reach 0.6347/0.0384.
+They remain quantified diagnostics: model logits pass and no fallback, DMA,
+kernel, or request error occurs.
+
+Each Q1/Q2 `p32` prefill and decode profile phase emits one graph with 397
+commands, 28 named FFN sections, zero group2 commands, and 113 primitive matmuls.
+All FFN buckets execute on PL and close their exact per-bucket run, W/A/R beat,
+and aggregate wall accounting. This artifact includes one argmax command not
+present in the pinned 396-command lowering census. Characterization artifact
+`p2f-characterize-20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` is complete
+and run-validated across four samples with fingerprint
+`20928b3c636dbe0504900a9c3adb40033bd7820d2069a640ba667d8e8e5bcf33`.
+P128 Q1/Q2 device time is 66.533089/89.390916 ms/token, improvements of
+7.5266%/5.9349% from P2e; c512 is 89.438339/112.333491 ms/token, improvements of
+5.6760%/4.5853%. These are single-repeat profiled device observations, not a
+blanket speedup claim.
+
+Unprofiled artifact
+`p2f-regression-20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` is complete and
+run-validated across six samples with fingerprint
+`0e61f6f63bd558e5692a4428cc2ac2b04958c747c1e9d030fd1f2bd47950f35e`.
+Its c0 Q1/Q2 steady medians are 90.364345/112.856650 ms/token, regressions of
+2.7773%/2.9388% from P2e that pass the +15% guard. P2f closes the P2 contract and
+substrate and establishes the P3 baseline. P3 remains open until the named FFN
+path demonstrates a repeatable product-path gain; named attention remains P4.
 
 ## Implementation Gates
 
-P2e preserves the two attention numerical gates established by P2b/P2c:
+P2f preserves the two attention numerical gates established by P2b/P2c:
 
 1. RTL versus `flash_ref` in hardware-approximation mode.
 2. PL versus the PS/full-model oracle at the established tolerance.
@@ -717,8 +858,11 @@ completion, and bounded liveness. All nine wired tasks pass against the same
 production RTL used by cosim and OOC.
 
 The aggregate `zig build test-rtl` target combines those tests with binary and
-ternary GEMM, exact Q8 quantizer, grouped raw-load/reuse, and scratch tee/drain
-cosim. It passes locally; the P2e aggregate contains 41 build steps.
+ternary GEMM, exact Q8 quantization, grouped raw-load/reuse, scratch, and the
+named FFN/SwiGLU execution path. It passes locally; the P2f `test-rtl` aggregate
+contains 46 build steps, while `lint-rtl test-rtl` passes 48/48. The FFN formal
+boundary is the depth-400 BMC and cover recorded
+above, while SwiGLU and internal Q8 ingress carry the unbounded PDR claims.
 
 Use the full-kernel OOC probe for resource and isolated-Fmax feedback and the
 combined routed build for timing signoff. P2c's bounded implementation, route,
@@ -728,6 +872,8 @@ the first P2d f285 implementation failed their clean combined routes despite
 passing isolated probes. Repaired P2d passes its clean f285 route, and P2e passes
 its fully routed f285 checkpoint under the nonnegative setup/hold rule, deployment,
 live identity, scratch-on/off Q1/Q2 logit gates, exact diagnostic drains, profile
-accounting, and the unprofiled c0 regression.
-P2e is closed at that bounded qualification. P2 remains open for the scratch-only
-PL consumer and first named FFN section described above.
+accounting, and the unprofiled c0 regression. P2f then passes its repaired clean
+f285 route, immutable identity, live wire-15/GEMM-v15 capability checks, Q1/Q2
+logits, exact named-section accounting, and bounded regression gate. P2 is closed
+at that qualification; optimization of the FFN product path is P3 and the named
+attention section is P4.

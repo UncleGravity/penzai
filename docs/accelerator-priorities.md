@@ -83,8 +83,8 @@ profiled measurements are compared only against profiled measurements.
 |---:|---|---|---|
 | 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
 | 1 | Bounded waste removal (complete) | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
-| 2 | Section substrate and unified PL attention | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, faster 512/2K decode |
-| 3 | FFN section pipeline | Contained proof of the P2 scratch and command contracts | Named FFN command retains intermediates on chip and beats the op path |
+| 2 | Section substrate and unified PL attention (complete) | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, first executable section |
+| 3 | FFN section optimization | Turn the qualified P2f section into a product gain | Named FFN command retains intermediates on chip and beats the op path |
 | 4 | Attention section pipeline | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | Named attention command with correct same-token KV visibility |
 | 5 | Ternary weight and KV memory efficiency | Raises the Q2 bandwidth roof and enables larger contexts/models | Lossless format adapter, routed decoder, quality and bandwidth A/B |
 | 6 | Control, DMA, and transport consolidation | Useful after section commands reduce operation count | Fewer movers/control targets and lower wall residual without device regression |
@@ -189,18 +189,24 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
 - [x] Define the internal section/scratch contract: bank ownership, tile lifetime,
   layouts, bounds, and the external descriptor ownership boundary. Do not
   introduce a generic IR.
-- [ ] Freeze concrete versioned FFN/attention descriptors with the first executable
-  section, including DDR ranges, strides, RoPE, normalization, cache, and weight
-  semantics.
+- [x] Freeze the concrete versioned FFN descriptor with the first executable
+  section: external DDR ranges, dimensions, normalization, weight format, contract
+  version, and flags.
+- [ ] **P4:** Freeze the attention descriptor with its first executable section, including
+  strides, RoPE, mask, cache, and same-section KV semantics.
 - [x] Implement an exact PL FP32-to-Q8_0 quantizer matching the canonical host
   quantizer for every supported finite block.
 - [x] Store and reuse the adjacent gate/up Q8 activation in GEMM's existing
   activation memories, guarded by an explicit epoch and shape.
-- [ ] Reuse grouped Q/K/V activations inside the named attention section; do not
+- [ ] **P4:** Reuse grouped Q/K/V activations inside the named attention section; do not
   force the observed graph ordering into a more general primitive matcher.
-- [x] Write GEMM results into banked scratch in the next consumer's layout; P2e
-  proves the layout by diagnostic tee/drain, while consumption remains P2f.
-- [ ] Make prefill token/row layout conversion a scratchpad addressing problem,
+- [x] Write GEMM results into banked scratch in the next consumer's layout. P2e
+  proves it by diagnostic tee/drain; P2f consumes X0/X1 directly through
+  SwiGLU, canonical Q8 requantization, and the down projection.
+- [x] Require the named FFN lowerer to match the complete Qwen/Bonsai dataflow,
+  shapes, formats, uses, views, aliases, bindings, and external-range separation;
+  otherwise retain the legacy operations before section start.
+- [ ] **P4:** Make prefill token/row layout conversion a scratchpad addressing problem,
   rather than a PS transpose and DDR round trip.
 - [x] Extend the existing online attention recurrence with a query-tile axis.
   Decode uses one query. The 64-slot implementation tiles four queries for up to
@@ -211,19 +217,17 @@ cycle-per-query-head/KV-update baseline for the unified attention engine.
 - [x] Make the softmax issue path truly II=1 and add alignment and burst tests for
   consecutive independent query/head updates.
 - [x] Preserve FP32 softmax and output-accumulator state in the unified engine.
-- [ ] Guarantee that newly appended K/V rows are visible to the same causal named
+- [ ] **P4:** Guarantee that newly appended K/V rows are visible to the same causal named
   attention section.
-- [ ] Require strict shape, layout, RoPE, normalization, mask, and KV-cache matches;
+- [ ] **P4:** Require strict shape, layout, RoPE, normalization, mask, and KV-cache matches;
   retain the current PS/op path as the correctness fallback.
-- [ ] Qualify the PL quantizer with full-model board logits/perplexity and its
-  saturation/status counters before extending it beyond the bounded group.
+- [x] Qualify the PL quantizer and bounded PWL SwiGLU in the named FFN path with
+  full-model Q1/Q2 board logits, exact stream accounting, and fail-closed status.
 
-P2 must produce one attention engine and ABI, not separate prefill and decode
-kernels. Completion requires PL execution for supported multi-token prefill,
-lower backend downloads and command counts, faster 128/512-token prefill, and
-faster attention at decode contexts 512 and 2048. Query tile size and any spatial
-math replication are selected from OOC/routed timing and measured cycles per
-query-head/KV update.
+P2 is complete at P2f's bounded f285 qualification. It produced one adaptive
+attention engine for decode and prefill, the fixed scratch/Q8 substrate, and the
+first executable section ABI. It did not complete the named attention section:
+same-section QKV/RoPE/KV ownership and its concrete descriptor remain P4 work.
 
 P2a froze contract v1 in `docs/p2-section-contract.md` and
 `shared/section.zig`: a four-token tile, four fixed F32 scratch roles, native GEMM
@@ -532,23 +536,95 @@ not a speedup claim. Unprofiled artifact
 `20260813T062620Z-regression-7f1de76f4fab` is also complete and validated; its
 three-repeat c0 steady-decode medians are 87.922/109.635 ms/token for Q1/Q2.
 
-P2e closes the diagnostic scratch substrate, not P2. The next P2f work is a
-scratch-only consumer in the same command: PL SwiGLU, requantization, down
-projection, and the first named FFN section. Until that exists, DDR remains the
-authoritative product result and the diagnostic drain is not a section ABI.
+P2f closes P2 with wire ABI 15, GEMM v15, and the v1 `ffn_section` command (tag
+19). The command is 172 bytes, or 176 bytes in a one-command buffer including
+the four-byte count. Its descriptor names residual, norm-weight, gate/up/down
+weight, and destination DDR ranges plus model/FFN dimensions, token count,
+epsilon, weight format, contract version, and flags. The feature gate requires
+live wire ABI 15, the matmul engine, and GEMM v15. A strict Qwen/Bonsai matcher
+requires the entire RMSNorm/gamma -> gate/up -> SwiGLU -> down -> residual graph,
+recognized shapes/formats and uses, safe views/aliases, complete resident
+bindings, and six pairwise-disjoint external ranges. A mismatch retains all
+legacy operations before section start. The pinned lowering census changes from
+508 commands with 28 groups and 141 primitive matmuls to 396 commands with 28
+named FFN sections, no groups, and 113 primitive matmuls: exactly 112 commands
+removed across 28 layers.
 
-### P3: FFN section
+The executable v15 subset tiles at up to four tokens. The PS computes weighted
+RMSNorm and synchronizes normalized F32 to PL. PL quantizes once, writes UP to
+scratch-only X1, reuses the resident Q8 activation for GATE into X0, consumes
+X0/X1 through the 1,024-segment `[-16,16]` PWL SwiGLU and canonical Q8 ingress,
+then runs DOWN. A private command-sized result receives DOWN; the PS performs the
+residual add and publishes the destination once. Contract roles R and X2 are not
+populated by this executable subset. Therefore P2f eliminates the gate/up and
+SwiGLU intermediate DDR boundaries, but does not claim PL RMSNorm/residual or the
+complete target schedule. Unsupported requests may use the named PS oracle only
+before PL execution begins. A hardware or DMA error after that boundary is a
+backend failure with no retry; private result storage prevents partial tile
+publication.
 
-The first named pipeline should be FFN because it avoids attention and KV-cache
-ordering while exercising the new scratch and Q8 contracts:
+P2f's 15-cycle, II=1 SwiGLU passes bit-exact cosim over 5,143 scalars and all
+1,024 ROM entries, with backpressure, abort, and non-finite coverage. Normalized
+PS error is `6.097758e-5`; canonical Q8 differs in 2/32,768 bytes by at most one,
+with no F16 scale-code difference. SwiGLU and Q8-ingress formal close unbounded
+PDR plus bounded/cover checks; decode-FFN closes BMC through depth 400 plus cover,
+not an unbounded proof. Scratch map/storage proofs remain closed. The aggregate
+`test-rtl` passes 46/46 steps; `lint-rtl test-rtl` together pass 48/48. Normal
+and pinned Zig suites pass 265/265 and 292/292.
+
+Standalone SwiGLU OOC run `20260813T082045Z-48c8be5cebaf` passes 3.333 ns at
++0.336 ns with 771 LUTs, 784 FFs, 17 CARRY8s, four DSPs, and 2.5 BRAM tiles.
+Final integrated OOC run
+`20260813T110854Z-90a2dc70c5e8-dirty-p2f-romreq-full-decode` passes at
++0.198/+0.037 ns with 41,580 LUTs, 47,235 FFs, 808 CARRY8s, 38 DSPs, 4.5 BRAM
+tiles, 20 URAMs, and 94 LUTRAMs. Its production and complete-probe bundle hashes
+are `c0bb8d16aceef6343103f7ac66b0c570fbb7a4200972ef07ea6483a6e03050e0` and
+`55024b877f0e3c118d380684914dd229761c7ca5b5439dab60e03d9ecd15fb81`.
+
+Clean combined run `20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` at commit
+`6e8fae0eb637589cc0d31c0d14e2a53603830c2b` is fully routed at
++0.015/+0.010 ns setup/hold, with 161,294/161,294 routable nets, no negative or
+unconstrained internal endpoints, and exact guardband restoration. It uses
+83,463 LUTs, 98,323 FFs, 1,441 CARRY8s, 58 BRAM tiles, 20 URAMs, and 98 DSPs.
+Source, manifest, raw-bit, and deployed-bit hashes are respectively
+`a4536e2a73b10fb6528019b9b2f0b0b09b659584932da85cda06826c61bf555c`,
+`032b2349380a5b03eee6f9870ece88e87d24ea6cdb3fff557fd55eda582dab26`,
+`39b89b68f50393f528a95eeee5595ca1182c7a4dc40d27c0e6067a5e0c602283`, and
+`b8f983b8065a9eeb6eb850dc6d296f613e72f5323a48e733b6260a853c522904`.
+
+Board qualification is consolidated in `/tmp/p2f-qualification-summary.json`
+(SHA-256 `a64175d3379fa545da904da98df57c9899a244b8a74c5bbbf3fc472aa1d1e66a`).
+Start/end capabilities match at schema 2, wire 15, profile 6, GEMM v15 at
+284,997,152 Hz, and flash v1/64 slots. Q1/Q2 `p32` logits pass at maximum absolute
+differences 0.102924/0.107559 with exact 25/25 and 220/220 argmax, zero token
+mismatches, and no fallback or execution errors. Each Q1/Q2 `p32` prefill and
+decode profile phase has one 397-command graph with 28 FFN commands, no group2
+commands, and 113 primitive matmuls; all FFN buckets execute on PL and close
+run/beat accounting. The extra command versus the pinned 396-command census is
+the artifact graph's argmax.
+
+The four single-repeat profiled device observations improve against P2e by
+4.59-7.53%: p128 Q1/Q2 are 66.533/89.391 ms/token and c512 Q1/Q2 are
+89.438/112.333 ms/token. This does not establish a blanket speedup. The six-sample
+unprofiled regression artifact instead records c0 Q1/Q2 medians of
+90.364/112.857 ms/token, regressions of 2.78%/2.94% from P2e that pass the +15%
+guard. P2f therefore closes the P2 contract and substrate and establishes the P3
+baseline; P3 remains open for a repeatable product-path improvement. The named
+attention section remains P4.
+
+### P3: FFN section optimization
+
+P2f established the first named FFN pipeline and its strict fallback boundary:
 
 `residual -> norm*gamma -> Q8 -> gate/up GEMM -> SwiGLU -> Q8 -> down GEMM -> residual`
 
-Keep gate/up outputs in separate scratch banks so SwiGLU can consume them without
-DDR materialization. The section lowerer must require recognized shapes, strides,
-activation, normalization parameters, and resident weight formats; otherwise it
-must use the existing op path. This is an integration proof for P2, not a reason
-to postpone the P2 attention engine.
+P3 must turn that qualified substrate into a repeatable product gain. Profiled
+device time improved, but the unprofiled c0 medians regressed by roughly 2.8%; the
+completion gate remains a named FFN path that beats the legacy operation path
+under the fixed unprofiled regression contract. Optimization may target the PS
+normalization/residual boundaries, tile orchestration, or measured kernel/DMA
+costs without weakening the strict matcher, fail-before-start fallback, numerical
+gate, or one-command profiling contract.
 
 ### P4: attention section
 
@@ -610,9 +686,11 @@ These are requirements on every priority, not a separate final cleanup phase:
   prefill, and decode.
 
 The aggregate `zig build test-rtl` target now covers binary and ternary GEMM,
-the exact Q8 quantizer and grouped activation path, the F32 scratch leaf and
-integrated tee/drain, plus the hardened flash kernel and wrapper cosims. The P2e
-suite passes all 41 build steps locally.
+exact Q8 ingress and grouped reuse, scratch, the P2f FFN/SwiGLU path, and the
+hardened flash kernel and wrapper cosims. The P2f `test-rtl` aggregate passes all
+46 build steps locally, and `lint-rtl test-rtl` passes 48/48. SwiGLU and internal
+Q8 ingress have unbounded PDR proofs; decode-FFN has
+a depth-400 BMC and cover, which must not be represented as an unbounded proof.
 
 Formal verification should target control snapshots, bounds, handshakes, TLAST/TKEEP,
 DMA safety, and liveness under explicit fairness assumptions. Approximate floating
@@ -628,20 +706,23 @@ remain. They are not currently independent roadmap projects:
 - the read-column pair is registered before its final add;
 - the DSP multiply output is already registered before the 104-bit shift result.
 
-The current qualified build is the P2e f285 finalize run described above. It
-reports +0.007 ns setup and +0.008 ns hold slack with 127 setup paths below 50 ps;
-the exact same routed checkpoint had first been rejected only by the removed
-project floor. The fixed and adaptive P2c designs both failed clean f300 routing
-despite passing OOC, and the first P2d f285 design similarly failed before repair.
+The current qualified build is the P2f clean f285 run described above. It reports
++0.015 ns setup and +0.010 ns hold slack with 32 setup paths below 50 ps. The
+first clean P2f route
+`20260813T094435Z-90a2dc70c5e8-w512-p4-f285-clean` was fully routed but failed at
+-0.081/+0.007 ns; commit `6e8fae0` pipelined scratch, Q8, and SwiGLU timing
+boundaries without changing the established behavior. The fixed and adaptive P2c
+designs both failed clean f300 routing despite passing OOC, and the first P2d f285
+design similarly failed before repair.
 This is direct evidence that combined routing, not OOC Fmax, remains the release
-authority. Methodology still reports critical TIMING-2/TIMING-4, three TIMING-28
+authority. Methodology still reports critical TIMING-2/TIMING-4, five TIMING-28
 warnings, and ULMTCS-1; resolving those findings and earning more slack belong to
 a separate timing-optimization pass.
 Therefore:
 
 - accept fully routed builds with non-negative setup and hold slack; treat additional
   slack as a separate timing-optimization objective;
-- treat f285 as P2e's bounded qualification point, not proof of f300 closure;
+- treat f285 as P2f's bounded qualification point, not proof of f300 closure;
 - resolve the methodology findings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
 - retain timing locality and near-critical path reports as inputs to later optimization.

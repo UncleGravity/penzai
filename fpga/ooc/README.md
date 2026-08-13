@@ -188,8 +188,56 @@ sustain 49.6/44.9 and 52.0/59.5 MiB/s at
 the unchanged p128/c512 volumes. Unprofiled artifact
 `20260813T062620Z-regression-7f1de76f4fab` is complete and run-validated, with
 three-repeat c0 steady-decode medians of 87.922/109.635 ms/token for Q1/Q2.
-These results close the diagnostic substrate, not P2: the next P2f gate is a
-scratch-only same-command SwiGLU/requant/down consumer and named FFN section.
+At the P2e checkpoint these results closed the diagnostic substrate, while the
+scratch-only same-command SwiGLU/requant/down consumer and named FFN section still
+remained. The following P2f results complete that gate.
+
+P2f advances wire ABI to 15 and GEMM to v15 with named `ffn_section` tag 19. The
+executable four-token-or-smaller path keeps UP/GATE in X1/X0 through the
+1,024-segment PWL SwiGLU, canonical Q8 ingress, and DOWN. Weighted RMSNorm and
+residual add remain on the PS; R/X2 are not populated by this v15 subset. The
+15-cycle, II=1 SwiGLU cosim checks 5,143 scalars and every ROM entry, including
+backpressure, held output, abort, and non-finite failure. Normalized PS error is
+`6.097758e-5`, while canonical Q8 differs in 2/32,768 bytes by at most one with
+zero F16 scale-code drift. SwiGLU and internal Q8 ingress close unbounded PDR plus
+bounded/cover checks; decode-FFN closes BMC through depth 400 plus cover and is
+not an unbounded proof. `test-rtl` passes 46/46 steps; `lint-rtl test-rtl`
+together pass 48/48.
+
+Standalone run `out/runs/20260813T082045Z-48c8be5cebaf/section-swiglu` passes
+3.333 ns at +0.336 ns WNS with 771 LUTs, 784 FFs, 17 CARRY8s, four DSPs, two
+BRAM36s, and one BRAM18 (2.5 BRAM tiles). Final integrated run
+`out/runs/20260813T110854Z-90a2dc70c5e8-dirty-p2f-romreq-full-decode/full-decode`
+passes at +0.198/+0.037 ns setup/hold with 41,580 LUTs, 47,235 FFs, 808 CARRY8s,
+38 DSPs, four BRAM36s plus one BRAM18 (4.5 tiles), 20 URAMs, and 94 LUTRAMs. Its
+production source bundle SHA-256 is
+`c0bb8d16aceef6343103f7ac66b0c570fbb7a4200972ef07ea6483a6e03050e0`, and the
+complete probe bundle SHA-256 is
+`55024b877f0e3c118d380684914dd229761c7ca5b5439dab60e03d9ecd15fb81`.
+
+OOC again did not predict combined closure. First clean f285 run
+`20260813T094435Z-90a2dc70c5e8-w512-p4-f285-clean` was fully routed but failed at
+-0.081/+0.007 ns with 122 negative setup endpoints. It used 83,362 LUTs, 98,360
+FFs, 1,439 CARRY8s, 58 BRAM tiles, 20 URAMs, and 98 DSPs and was not promoted.
+Commit `6e8fae0` pipelined the scratch, Q8, and SwiGLU boundaries. Clean combined
+authority `20260813T112328Z-6e8fae0eb637-w512-p4-f285-clean` then passes at
++0.015/+0.010 ns with 32 setup paths below 50 ps, all 161,294 routable nets
+routed, and no clockless or unconstrained internal endpoints. It uses 83,463
+LUTs, 98,323 FFs, 1,441 CARRY8s, 58 BRAM tiles, 20 URAMs, and 98 DSPs. The full
+commit is `6e8fae0eb637589cc0d31c0d14e2a53603830c2b`; source, manifest, raw-bit, and
+deployed-bit SHA-256 values are
+`a4536e2a73b10fb6528019b9b2f0b0b09b659584932da85cda06826c61bf555c`,
+`032b2349380a5b03eee6f9870ece88e87d24ea6cdb3fff557fd55eda582dab26`,
+`39b89b68f50393f528a95eeee5595ca1182c7a4dc40d27c0e6067a5e0c602283`, and
+`b8f983b8065a9eeb6eb850dc6d296f613e72f5323a48e733b6260a853c522904`.
+
+The exact image is deployed and board-qualified. Each Q1/Q2 `p32` prefill and
+decode profile phase has one 397-command graph, 28 named FFN sections, no group2
+commands, 113 primitive matmuls, PL execution for every FFN bucket, and closed
+accounting. Single-repeat profiled device time improves 4.59-7.53% from P2e, but
+unprofiled c0 Q1/Q2 medians regress 2.78%/2.94% and pass the +15% guard. This
+closes P2 and establishes the P3 baseline; it is not a blanket speedup claim, and
+P3 remains open.
 
 ---
 
@@ -199,6 +247,7 @@ scratch-only same-command SwiGLU/requant/down consumer and named FFN section.
 cd fpga/ooc
 ./run.sh list
 ./run.sh section-scratch
+./run.sh section-swiglu
 ./run.sh gemm-rb
 ./run.sh all
 ```
@@ -222,8 +271,11 @@ integration probe closes at `+0.245/+0.039 ns` setup/hold with 40,141 LUTs,
 44,912 FFs, 775 CARRY8s, 34 DSPs, two BRAM tiles, and four URAMs. P2e's scratch
 leaf reaches 321.2 MHz (`+0.220 ns`, 99 LUTs, 447 FFs, 16 URAMs), while its
 full-decode integration probe closes at `+0.042/+0.060 ns` with 40,406 LUTs,
-45,522 FFs, 783 CARRY8s, 34 DSPs, two BRAM tiles, and 20 URAMs. The current
-adaptive P2c `flash_kernel_ooc` is 320.7 MHz (`+0.215 ns`, 22,657 LUTs, 19,216
+45,522 FFs, 783 CARRY8s, 34 DSPs, two BRAM tiles, and 20 URAMs. P2f's SwiGLU
+leaf reaches +0.336 ns with 771 LUTs, 784 FFs, 17 CARRY8s, four DSPs, and 2.5
+BRAM tiles; its final full-decode probe reaches +0.198/+0.037 ns with 41,580 LUTs,
+47,235 FFs, 808 CARRY8s, 38 DSPs, 4.5 BRAM tiles, 20 URAMs, and 94 LUTRAMs. The
+current adaptive P2c `flash_kernel_ooc` is 320.7 MHz (`+0.215 ns`, 22,657 LUTs, 19,216
 FFs, 19 BRAM tiles, and 60 DSPs). These clear f300 in isolation, but see the caveat.
 
 ## Writing a new probe
