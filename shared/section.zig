@@ -131,6 +131,55 @@ pub const q8_buffer_records_per_bank: u32 =
 pub const q8_buffer_record_capacity: u32 =
     q8_buffer_bank_count * q8_buffer_records_per_bank;
 
+// The streaming FFN pairer consumes one 32-value Q8 block as four adjacent
+// eight-value FP32 scratch groups. Its GATE tag maps directly to the resident
+// X1/UP role's role-local read group.
+pub const ffn_pair_groups_per_block: u32 = layout.q8_block / f32_rows_per_group;
+
+pub const FfnPairTag = struct {
+    block: u32,
+    token: u32,
+    group: u32,
+};
+
+/// Decode the native GEMM arrival order. Each 32-row block arrives as a lower
+/// 16-row sweep across all tokens followed by the corresponding upper sweep.
+pub fn ffnPairNativeTag(tokens: u32, ordinal: u32) Error!FfnPairTag {
+    if (tokens == 0 or tokens > query_tile_max) return error.InvalidTokenCount;
+    const groups_per_block = tokens * ffn_pair_groups_per_block;
+    const block = ordinal / groups_per_block;
+    if (block >= q8_buffer_block_capacity) return error.InvalidSubblock;
+    const local = ordinal % groups_per_block;
+    const half_span = tokens * 2;
+    const half = local / half_span;
+    const within_half = local % half_span;
+    return .{
+        .block = block,
+        .token = within_half / 2,
+        .group = half * 2 + within_half % 2,
+    };
+}
+
+/// Decode the canonical consumer order used for X1 reads and SwiGLU output.
+pub fn ffnPairCanonicalTag(tokens: u32, ordinal: u32) Error!FfnPairTag {
+    if (tokens == 0 or tokens > query_tile_max) return error.InvalidTokenCount;
+    const groups_per_block = tokens * ffn_pair_groups_per_block;
+    const block = ordinal / groups_per_block;
+    if (block >= q8_buffer_block_capacity) return error.InvalidSubblock;
+    const local = ordinal % groups_per_block;
+    return .{
+        .block = block,
+        .token = local / ffn_pair_groups_per_block,
+        .group = local % ffn_pair_groups_per_block,
+    };
+}
+
+pub fn ffnPairScratchGroup(block: u32, group: u32) Error!u32 {
+    if (block >= q8_buffer_block_capacity) return error.InvalidSubblock;
+    if (group >= ffn_pair_groups_per_block) return error.InvalidRow;
+    return block * ffn_pair_groups_per_block + group;
+}
+
 pub const Q8BufferLocation = struct {
     address: u32,
 };
@@ -330,6 +379,69 @@ test "P3 Q8 buffer mapping is block-major, exhaustive, and ping-ponged" {
     try std.testing.expectError(error.InvalidBank, q8BufferLocation(2, 0, 0));
     try std.testing.expectError(error.InvalidTokenCount, q8BufferLocation(0, 4, 0));
     try std.testing.expectError(error.InvalidSubblock, q8BufferLocation(0, 0, 384));
+}
+
+test "P3 FFN pair tags map exhaustively onto X1 scratch groups" {
+    try std.testing.expectEqual(@as(u32, 4), ffn_pair_groups_per_block);
+
+    for (0..q8_buffer_block_capacity) |block| {
+        for (0..ffn_pair_groups_per_block) |group| {
+            const got = try ffnPairScratchGroup(@intCast(block), @intCast(group));
+            try std.testing.expectEqual(
+                @as(u32, @intCast(block * ffn_pair_groups_per_block + group)),
+                got,
+            );
+            try std.testing.expect(got < f32GroupsPerToken(.x1));
+        }
+    }
+
+    try std.testing.expectError(
+        error.InvalidSubblock,
+        ffnPairScratchGroup(q8_buffer_block_capacity, 0),
+    );
+    try std.testing.expectError(
+        error.InvalidRow,
+        ffnPairScratchGroup(0, ffn_pair_groups_per_block),
+    );
+}
+
+test "P3 FFN pair native ingress reorders into canonical token blocks" {
+    for (1..query_tile_max + 1) |tokens| {
+        const groups_per_block = tokens * ffn_pair_groups_per_block;
+        for (0..q8_buffer_block_capacity) |block| {
+            for (0..groups_per_block) |local| {
+                const ordinal: u32 = @intCast(block * groups_per_block + local);
+                const native = try ffnPairNativeTag(@intCast(tokens), ordinal);
+                const canonical = try ffnPairCanonicalTag(@intCast(tokens), ordinal);
+                const half_span = tokens * 2;
+                const half = local / half_span;
+                const within_half = local % half_span;
+
+                try std.testing.expectEqual(@as(u32, @intCast(block)), native.block);
+                try std.testing.expectEqual(@as(u32, @intCast(within_half / 2)), native.token);
+                try std.testing.expectEqual(
+                    @as(u32, @intCast(half * 2 + within_half % 2)),
+                    native.group,
+                );
+                try std.testing.expectEqual(@as(u32, @intCast(block)), canonical.block);
+                try std.testing.expectEqual(
+                    @as(u32, @intCast(local / ffn_pair_groups_per_block)),
+                    canonical.token,
+                );
+                try std.testing.expectEqual(
+                    @as(u32, @intCast(local % ffn_pair_groups_per_block)),
+                    canonical.group,
+                );
+            }
+        }
+    }
+
+    try std.testing.expectError(error.InvalidTokenCount, ffnPairNativeTag(0, 0));
+    try std.testing.expectError(error.InvalidTokenCount, ffnPairCanonicalTag(5, 0));
+    try std.testing.expectError(
+        error.InvalidSubblock,
+        ffnPairNativeTag(4, q8_buffer_block_capacity * 4 * ffn_pair_groups_per_block),
+    );
 }
 
 test "v1 Bonsai section shapes and capacities are explicit" {

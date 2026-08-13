@@ -235,6 +235,19 @@ fn addFormalSteps(b: *std.Build) void {
     );
     section_swiglu_step.dependOn(&section_swiglu_run.step);
 
+    const section_ffn_pairer_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_ffn_pairer",
+        "fpga/formal/section_ffn_pairer.sby",
+    });
+    const section_ffn_pairer_step = b.step(
+        "formal-section-ffn-pairer",
+        "Prove streamed FFN pair ordering, elasticity, framing, abort, and restart control",
+    );
+    section_ffn_pairer_step.dependOn(&section_ffn_pairer_run.step);
+
     const q8_internal_ingress_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -271,6 +284,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_f32_scratch_step);
     formal.dependOn(section_q8_buffer_step);
     formal.dependOn(section_swiglu_step);
+    formal.dependOn(section_ffn_pairer_step);
     formal.dependOn(q8_internal_ingress_step);
     formal.dependOn(decode_ffn_step);
 }
@@ -393,6 +407,12 @@ const section_q8_buffer_rtl = [_][]const u8{
     "fpga/rtl/section_q8_buffer.v",
 };
 
+// P3 streamed GATE/resident-UP pairer. Tagged 256-bit GATE groups drive
+// registered X1 scratch reads and ordered scalar pairs for section_swiglu.
+const section_ffn_pairer_rtl = [_][]const u8{
+    "fpga/rtl/section_ffn_pairer.v",
+};
+
 const section_swiglu_rtl = [_][]const u8{
     "fpga/rtl/section_swiglu.v",
     "fpga/rtl/numeric/fmul.v",
@@ -442,9 +462,15 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",            "-Wno-UNUSEDPARAM", "--top-module", "section_q8_buffer",
         "fpga/rtl/section_q8_buffer.v",
     });
+    const section_ffn_pairer_lint = b.addSystemCommand(&.{
+        "verilator",                     "--lint-only",      "-Wall",        "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",             "-Wno-UNUSEDPARAM", "--top-module", "section_ffn_pairer",
+        "fpga/rtl/section_ffn_pairer.v",
+    });
     const lint_step = b.step("lint-rtl", "Verilator lint the deployable GEMM RTL and section leaves");
     lint_step.dependOn(&lint.step);
     lint_step.dependOn(&section_q8_buffer_lint.step);
+    lint_step.dependOn(&section_ffn_pairer_lint.step);
 
     _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
     _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
@@ -457,6 +483,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const q8_quantizer_cosim = addCosim(b, target, optimize, "test-rtl-q8-quantizer", "Verilator cosim: exact-RNE FP32 to Q8_0 quantizer vs shared/layout.zig", "q8_quantizer", "fpga/sim/q8_quantizer", &q8_quantizer_rtl, .q8);
     const section_f32_scratch_cosim = addCosim(b, target, optimize, "test-rtl-section-f32-scratch", "Verilator cosim: GEMM-order writes into P2 four-bank FP32 section scratch", "section_f32_scratch", "fpga/sim/section_f32_scratch", &section_f32_scratch_rtl, .section);
     const section_q8_buffer_cosim = addCosim(b, target, optimize, "test-rtl-section-q8-buffer", "Verilator cosim: tagged native-Q8 ping-pong capture, seal, and token-major replay", "section_q8_buffer", "fpga/sim/section_q8_buffer", &section_q8_buffer_rtl, .section);
+    const section_ffn_pairer_cosim = addCosim(b, target, optimize, "test-rtl-section-ffn-pairer", "Verilator cosim: tagged streamed GATE groups paired with resident X1/UP", "section_ffn_pairer", "fpga/sim/section_ffn_pairer", &section_ffn_pairer_rtl, .section);
     const section_swiglu_cosim = addCosim(b, target, optimize, "test-rtl-section-swiglu", "Verilator cosim: bit-exact PWL section SwiGLU with elastic stream", "section_swiglu", "fpga/sim/section_swiglu", &section_swiglu_rtl, .swiglu);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
@@ -472,6 +499,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(q8_quantizer_cosim);
     rtl_cosim.dependOn(section_f32_scratch_cosim);
     rtl_cosim.dependOn(section_q8_buffer_cosim);
+    rtl_cosim.dependOn(section_ffn_pairer_cosim);
     rtl_cosim.dependOn(section_swiglu_cosim);
 }
 
