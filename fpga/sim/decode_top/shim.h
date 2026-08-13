@@ -31,6 +31,13 @@ int dut_m_last(Dut *);
 int dut_m_keep(Dut *);
 uint64_t dut_m_data(Dut *);
 
+int dut_dbg_scratch_read_fire(Dut *);
+int dut_dbg_swiglu_input_fire(Dut *);
+int dut_dbg_internal_record_done(Dut *);
+int dut_dbg_scratch_consumer_state(Dut *);
+uint32_t dut_dbg_scratch_total_blocks(Dut *);
+void dut_dbg_seed_scratch_roles(Dut *, uint32_t rows, uint32_t tokens);
+
 #ifdef __cplusplus
 }
 #endif

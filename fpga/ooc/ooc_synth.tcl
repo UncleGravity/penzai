@@ -94,6 +94,11 @@ if {$top eq "section_f32_scratch_ooc" &&
     ($uram != 16 || $bram36 != 0 || $bram18 != 0 || $lutram != 0)} {
     set status "FAIL"
 }
+if {$top eq "section_swiglu_ooc" &&
+    ($dsps > 4 || $luts > 2000 || $ffs > 2000 ||
+     (2 * $bram36 + $bram18) > 6 || $lutram != 0)} {
+    set status "FAIL"
+}
 puts $summary "OOC $status top=$top period_ns=$period wns_ns=$wns fmax_mhz=$fmax"
 puts $summary "dsp=$dsps lut=$luts carry8=$carry8 ff=$ffs"
 puts $summary "bram36=$bram36 bram18=$bram18 uram=$uram lutram=$lutram"

@@ -142,18 +142,24 @@ module decode_top #(
     reg [1:0]  act_mode_q;
     reg [31:0] act_epoch_q;
     reg        start_strobe;
+    reg        kernel_start_q;
+    reg        scratch_tee_start_q;
+    reg        scratch_only_start_q;
+    reg        scratch_consumer_start_q;
     reg [1:0]  scratch_mode_q;
     reg [1:0]  scratch_role_q;
     reg [13:0] scratch_rows_q;
     reg [2:0]  scratch_tokens_q;
     reg        scratch_drain_start_strobe;
     reg        scratch_abort_strobe;
+    reg        scratch_section_begin_strobe;
     reg        scratch_tee_run_q;
+    reg        scratch_only_run_q;
     reg [1:0]  scratch_write_role_q;
     reg [13:0] scratch_write_rows_q;
     reg [2:0]  scratch_write_tokens_q;
     reg        scratch_writer_done_q;
-    reg [4:0]  scratch_error_q;
+    reg [6:0]  scratch_error_q;
     reg [3:0]  scratch_valid_q;
     reg [13:0] scratch_valid_rows_q [0:3];
     reg [2:0]  scratch_valid_tokens_q [0:3];
@@ -173,6 +179,27 @@ module decode_top #(
     reg [63:0] scratch_drain_emit_data_q;
     reg [10:0] scratch_drain_groups_q;
 
+    localparam [3:0] CONSUMER_IDLE      = 4'd0;
+    localparam [3:0] CONSUMER_REQ_GATE  = 4'd1;
+    localparam [3:0] CONSUMER_WAIT_GATE = 4'd2;
+    localparam [3:0] CONSUMER_REQ_UP    = 4'd3;
+    localparam [3:0] CONSUMER_WAIT_UP   = 4'd4;
+    localparam [3:0] CONSUMER_ISSUE     = 4'd5;
+    localparam [3:0] CONSUMER_DRAIN     = 4'd6;
+    reg        scratch_section_active_q;
+    reg        scratch_section_done_q;
+    reg        scratch_consumer_busy_q;
+    reg        scratch_consumer_done_q;
+    reg [3:0]  scratch_consumer_state_q;
+    reg [2:0]  scratch_consumer_token_q;
+    reg [10:0] scratch_consumer_group_q;
+    reg [10:0] scratch_consumer_groups_q;
+    reg [2:0]  scratch_consumer_lane_q;
+    reg [15:0] scratch_consumer_blocks_q;
+    reg [15:0] scratch_consumer_total_blocks_q;
+    reg [255:0] scratch_consumer_gate_q;
+    reg [255:0] scratch_consumer_up_q;
+
     // Fixed-point window floor: a constant of the f16 format (min contribution exponent
     // e_ws+e_as = -24 + -24), NOT a runtime register. Wired straight to the kernel; the
     // 104-bit accumulator (gemm_kernel ACC_W) covers the full f16 range with no calibration.
@@ -187,7 +214,7 @@ module decode_top #(
     wire [31:0] loaded_act_epoch;
     wire [15:0] loaded_act_q1_blocks;
     wire [15:0] loaded_act_cols;
-    wire [3:0] quantizer_status;
+    wire [5:0] quantizer_status;
     wire q8_activation_abort;
     wire kernel_start;
     wire weight_tready;
@@ -209,24 +236,43 @@ module decode_top #(
     // mc_cols_max reads — never a literal. MAX_SUB_INDEX=512 sizes the acts BRAM for K up to
     // 512/q8_subblocks = 128 q1-blocks = 16384, the exact limit of the 104-bit accumulator
     // window. Must match the host's layout.max_sub_index.
-    wire raw_activation_mode = act_mode_q == 2'd2;
+    wire internal_activation_mode = act_mode_q == 2'd3;
+    wire raw_activation_mode = (act_mode_q == 2'd2) || internal_activation_mode;
     wire [63:0] native_acts_tdata;
     wire native_acts_tvalid;
     wire native_acts_tready;
     wire raw_acts_tready;
     wire kernel_acts_tready;
+    wire swiglu_in_valid;
+    wire swiglu_in_ready;
+    wire [31:0] swiglu_in_gate;
+    wire [31:0] swiglu_in_up;
+    wire swiglu_in_last;
+    wire swiglu_out_valid;
+    wire swiglu_out_ready;
+    wire q8_internal_record_done;
+    wire [31:0] swiglu_out_data;
+    wire swiglu_out_last;
+    wire [1:0] swiglu_out_status;
 
     q8_ingress u_q8_ingress (
         .clk(clk),
         .rst_n(rst_n),
         .start(kernel_start),
         .raw_mode(raw_activation_mode),
+        .internal_mode(internal_activation_mode),
         .num_q1_blocks(num_q1_blocks_q),
         .num_cols(num_cols_q),
         .s_axis_tdata(s_axis_acts_tdata),
         .s_axis_tvalid(s_axis_acts_tvalid),
         .s_axis_tready(raw_acts_tready),
         .s_axis_tlast(s_axis_acts_tlast),
+        .internal_data(swiglu_out_data),
+        .internal_last(swiglu_out_last),
+        .internal_status(swiglu_out_status),
+        .internal_valid(swiglu_out_valid),
+        .internal_ready(swiglu_out_ready),
+        .internal_record_done(q8_internal_record_done),
         .m_axis_tdata(native_acts_tdata),
         .m_axis_tvalid(native_acts_tvalid),
         .m_axis_tready(native_acts_tready),
@@ -237,7 +283,8 @@ module decode_top #(
     wire [63:0] kernel_acts_tdata = raw_activation_mode ? native_acts_tdata : s_axis_acts_tdata;
     wire kernel_acts_tvalid = raw_activation_mode ? native_acts_tvalid : s_axis_acts_tvalid;
     assign native_acts_tready = raw_activation_mode && kernel_acts_tready;
-    assign s_axis_acts_tready = raw_activation_mode ? raw_acts_tready : kernel_acts_tready;
+    assign s_axis_acts_tready = internal_activation_mode ? 1'b0 :
+                                (raw_activation_mode ? raw_acts_tready : kernel_acts_tready);
 
     wire [63:0] kernel_m_axis_tdata;
     wire        kernel_m_axis_tvalid;
@@ -248,6 +295,7 @@ module decode_top #(
     localparam [1:0] SCRATCH_MODE_DDR   = 2'd0;
     localparam [1:0] SCRATCH_MODE_TEE   = 2'd1;
     localparam [1:0] SCRATCH_MODE_DRAIN = 2'd2;
+    localparam [1:0] SCRATCH_MODE_ONLY  = 2'd3;
 
     // Tee preflight is deliberately stricter than the leaf.  The current staged
     // result plan materializes complete 16-row GEMM rowblocks, so accepting an
@@ -262,6 +310,21 @@ module decode_top #(
                                 (num_rows_q == {18'd0, scratch_rows_q}) &&
                                 (num_cols_q == {13'd0, scratch_tokens_q}) &&
                                 (num_rowblocks_q == {6'd0, scratch_rows_q[13:4]});
+    wire scratch_only_order_ok = ((scratch_role_q == 2'd2) &&
+                                  !scratch_valid_q[2] && !scratch_valid_q[1]) ||
+                                 ((scratch_role_q == 2'd1) &&
+                                  scratch_valid_q[2] && !scratch_valid_q[1]);
+    wire scratch_only_shape_ok = (scratch_mode_q == SCRATCH_MODE_ONLY) &&
+                                 scratch_section_active_q && scratch_only_order_ok &&
+                                 ((scratch_role_q == 2'd1) || (scratch_role_q == 2'd2)) &&
+                                 (scratch_rows_q != 14'd0) &&
+                                 (scratch_rows_q <= 14'd12288) &&
+                                 (scratch_rows_q[3:0] == 4'd0) &&
+                                 (scratch_tokens_q != 3'd0) &&
+                                 (scratch_tokens_q <= 3'd4) &&
+                                 (num_rows_q == {18'd0, scratch_rows_q}) &&
+                                 (num_cols_q == {13'd0, scratch_tokens_q}) &&
+                                 (num_rowblocks_q == {6'd0, scratch_rows_q[13:4]});
     wire scratch_wr_cfg_ready;
     wire scratch_wr_busy;
     wire scratch_wr_done;
@@ -282,34 +345,90 @@ module decode_top #(
     wire [255:0] scratch_rd_rsp_data;
     wire scratch_rd_rsp_error;
 
-    wire scratch_idle = !kernel_busy && !scratch_tee_run_q &&
-                        !scratch_wr_busy && !scratch_drain_busy_q;
-    wire scratch_ddr_preflight_ok = (scratch_mode_q == SCRATCH_MODE_DDR) && scratch_idle;
-    wire scratch_tee_preflight_ok = scratch_tee_shape_ok && scratch_wr_cfg_ready && scratch_idle;
-    wire scratch_tee_start = start_strobe && scratch_tee_preflight_ok;
-    assign kernel_start = start_strobe &&
-                          (scratch_ddr_preflight_ok || scratch_tee_preflight_ok);
-    wire scratch_start_rejected = start_strobe && !kernel_start;
+    wire scratch_idle = !kernel_busy && !kernel_start_q &&
+                        !scratch_tee_run_q && !scratch_only_run_q &&
+                        !scratch_wr_busy && !scratch_drain_busy_q &&
+                        !scratch_consumer_busy_q && !scratch_rd_rsp_valid &&
+                        scratch_rd_req_ready;
+    wire scratch_consumer_metadata_ok = scratch_valid_q[1] && scratch_valid_q[2] &&
+                                        (scratch_valid_rows_q[1] == scratch_rows_q) &&
+                                        (scratch_valid_rows_q[2] == scratch_rows_q) &&
+                                        (scratch_valid_tokens_q[1] == scratch_tokens_q) &&
+                                        (scratch_valid_tokens_q[2] == scratch_tokens_q);
+    wire scratch_consumer_shape_ok = internal_activation_mode &&
+                                     (scratch_mode_q == SCRATCH_MODE_DDR) &&
+                                     scratch_section_active_q &&
+                                     scratch_consumer_metadata_ok &&
+                                     (scratch_rows_q != 14'd0) &&
+                                     (scratch_rows_q <= 14'd12288) &&
+                                     (scratch_rows_q[6:0] == 7'd0) &&
+                                     (scratch_tokens_q != 3'd0) &&
+                                     (scratch_tokens_q <= 3'd4) &&
+                                     (num_q1_blocks_q == {9'd0, scratch_rows_q[13:7]}) &&
+                                     (num_cols_q == {13'd0, scratch_tokens_q});
+    wire scratch_ddr_preflight_ok = (scratch_mode_q == SCRATCH_MODE_DDR) &&
+                                    scratch_idle &&
+                                    (internal_activation_mode ? scratch_consumer_shape_ok :
+                                     !scratch_section_active_q);
+    wire scratch_tee_preflight_ok = scratch_tee_shape_ok && scratch_wr_cfg_ready &&
+                                    scratch_idle && !scratch_section_active_q;
+    wire scratch_only_preflight_ok = scratch_only_shape_ok && scratch_wr_cfg_ready && scratch_idle;
+    wire scratch_launch_ok = scratch_ddr_preflight_ok ||
+                             scratch_tee_preflight_ok ||
+                             scratch_only_preflight_ok;
+    wire scratch_tee_start = scratch_tee_start_q;
+    wire scratch_only_start = scratch_only_start_q;
+    wire scratch_consumer_start = scratch_consumer_start_q;
+    assign kernel_start = kernel_start_q;
+    wire scratch_start_rejected = start_strobe && !scratch_launch_ok;
+    wire scratch_section_begin_ok = scratch_section_begin_strobe &&
+                                    (scratch_mode_q == SCRATCH_MODE_DDR) &&
+                                    scratch_idle && !scratch_section_active_q;
+    wire scratch_section_begin_bad = scratch_section_begin_strobe &&
+                                     !scratch_section_begin_ok;
+
+    // Complete shape/ownership preflight before presenting a launch to GEMM.
+    // The accepted mode pulses move together one cycle later, breaking the
+    // scratch-dimension compare cone before the kernel's high-fanout start CEs.
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            kernel_start_q           <= 1'b0;
+            scratch_tee_start_q      <= 1'b0;
+            scratch_only_start_q     <= 1'b0;
+            scratch_consumer_start_q <= 1'b0;
+        end else begin
+            kernel_start_q <= start_strobe && scratch_launch_ok;
+            scratch_tee_start_q <= start_strobe && scratch_tee_preflight_ok;
+            scratch_only_start_q <= start_strobe && scratch_only_preflight_ok;
+            scratch_consumer_start_q <= start_strobe &&
+                                        scratch_ddr_preflight_ok &&
+                                        internal_activation_mode;
+        end
+    end
 
     // Atomic fork: neither downstream observes TVALID unless the other is
     // ready, and the kernel advances only when both accept on the same edge.
     wire scratch_tee_active = scratch_tee_run_q;
-    wire scratch_sink_valid = scratch_tee_active && kernel_m_axis_tvalid && m_axis_tready;
-    wire ddr_kernel_valid = kernel_m_axis_tvalid &&
+    wire scratch_only_active = scratch_only_run_q;
+    wire scratch_writer_active = scratch_tee_active || scratch_only_active;
+    wire scratch_sink_valid = scratch_writer_active && kernel_m_axis_tvalid &&
+                              (scratch_only_active || m_axis_tready);
+    wire ddr_kernel_valid = kernel_m_axis_tvalid && !scratch_only_active &&
                             (!scratch_tee_active || scratch_wr_tready);
-    assign kernel_m_axis_tready = scratch_tee_active ?
-                                  (m_axis_tready && scratch_wr_tready) :
-                                  (scratch_drain_busy_q ? 1'b0 : m_axis_tready);
+    assign kernel_m_axis_tready = scratch_only_active ? scratch_wr_tready :
+                                  (scratch_tee_active ?
+                                   (m_axis_tready && scratch_wr_tready) :
+                                   (scratch_drain_busy_q ? 1'b0 : m_axis_tready));
 
     wire scratch_writer_abort = scratch_abort_strobe ||
-                                (scratch_tee_run_q &&
+                                (scratch_writer_active &&
                                  (q8_activation_abort || activation_error ||
                                   (kernel_done && scratch_wr_busy)));
 
     section_f32_scratch u_section_scratch (
         .clk(clk),
         .rst_n(rst_n),
-        .wr_cfg_valid(scratch_tee_start),
+        .wr_cfg_valid(scratch_tee_start || scratch_only_start),
         .wr_cfg_ready(scratch_wr_cfg_ready),
         .wr_cfg_role(scratch_role_q),
         .wr_cfg_rows(scratch_rows_q),
@@ -355,21 +474,60 @@ module decode_top #(
                                     (scratch_valid_tokens_q[scratch_role_q] == scratch_tokens_q);
     wire scratch_drain_start_ok = scratch_drain_start_strobe &&
                                   scratch_drain_shape_ok && scratch_role_metadata_ok &&
-                                  scratch_idle;
+                                  scratch_idle && !scratch_section_active_q;
     wire scratch_drain_start_bad = scratch_drain_start_strobe && !scratch_drain_start_ok;
 
-    assign scratch_rd_req_valid = scratch_drain_busy_q && !scratch_drain_have_group_q;
-    assign scratch_rd_req_role  = scratch_drain_role_q;
-    assign scratch_rd_req_token = scratch_drain_token_q;
-    assign scratch_rd_req_group = scratch_drain_group_q;
+    wire scratch_consumer_req_gate = scratch_consumer_busy_q &&
+                                     (scratch_consumer_state_q == CONSUMER_REQ_GATE);
+    wire scratch_consumer_req_up = scratch_consumer_busy_q &&
+                                   (scratch_consumer_state_q == CONSUMER_REQ_UP);
+    wire scratch_consumer_req_valid = scratch_consumer_req_gate || scratch_consumer_req_up;
+    assign scratch_rd_req_valid = scratch_consumer_req_valid ||
+                                  (scratch_drain_busy_q && !scratch_drain_have_group_q);
+    assign scratch_rd_req_role  = scratch_consumer_req_gate ? 2'd1 :
+                                  (scratch_consumer_req_up ? 2'd2 : scratch_drain_role_q);
+    assign scratch_rd_req_token = scratch_consumer_req_valid ?
+                                  scratch_consumer_token_q : scratch_drain_token_q;
+    assign scratch_rd_req_group = scratch_consumer_req_valid ?
+                                  scratch_consumer_group_q : scratch_drain_group_q;
     // Consume an orphaned response while idle (possible after abort), and consume
     // an errored response without exposing its zero payload on M_AXIS.
-    assign scratch_rd_rsp_ready = (!scratch_drain_busy_q && scratch_rd_rsp_valid) ||
+    wire scratch_consumer_wait_rsp = scratch_consumer_busy_q &&
+                                     ((scratch_consumer_state_q == CONSUMER_WAIT_GATE) ||
+                                      (scratch_consumer_state_q == CONSUMER_WAIT_UP));
+    assign scratch_rd_rsp_ready = scratch_consumer_wait_rsp ||
+                                  ((!scratch_consumer_busy_q && !scratch_drain_busy_q) &&
+                                   scratch_rd_rsp_valid) ||
                                   (scratch_drain_have_group_q &&
                                    (scratch_rd_rsp_error ||
                                     (scratch_drain_emit_valid_q &&
                                      (scratch_drain_bank_q == 2'd3) &&
                                      m_axis_tready)));
+
+    assign swiglu_in_valid = scratch_consumer_busy_q &&
+                             (scratch_consumer_state_q == CONSUMER_ISSUE);
+    assign swiglu_in_gate = scratch_consumer_gate_q[
+                             {scratch_consumer_lane_q, 5'b00000} +: 32];
+    assign swiglu_in_up = scratch_consumer_up_q[
+                           {scratch_consumer_lane_q, 5'b00000} +: 32];
+    assign swiglu_in_last = (scratch_consumer_group_q[1:0] == 2'd3) &&
+                            (scratch_consumer_lane_q == 3'd7);
+
+    section_swiglu u_section_swiglu (
+        .clk(clk),
+        .rst_n(rst_n),
+        .abort(scratch_abort_strobe || q8_activation_abort || scratch_error_q[5]),
+        .in_valid(swiglu_in_valid),
+        .in_ready(swiglu_in_ready),
+        .in_gate(swiglu_in_gate),
+        .in_up(swiglu_in_up),
+        .in_last(swiglu_in_last),
+        .out_valid(swiglu_out_valid),
+        .out_ready(swiglu_out_ready),
+        .out_data(swiglu_out_data),
+        .out_last(swiglu_out_last),
+        .out_status(swiglu_out_status)
+    );
 
     wire scratch_drain_tvalid = scratch_drain_busy_q && !scratch_abort_strobe &&
                                 scratch_drain_have_group_q &&
@@ -397,10 +555,12 @@ module decode_top #(
         .num_rows(num_rows_q),
         .num_cols(num_cols_q),
         .weight_fmt(weight_fmt_q),
-        .act_mode(act_mode_q),
+        .act_mode(internal_activation_mode ? 2'd2 : act_mode_q),
         .act_epoch(act_epoch_q),
         .activation_abort(q8_activation_abort ||
-                          (scratch_tee_run_q && scratch_abort_strobe)),
+                          (scratch_writer_active && scratch_abort_strobe) ||
+                          (scratch_consumer_busy_q && scratch_abort_strobe) ||
+                          (internal_activation_mode && |scratch_error_q[6:5])),
         .emin(EMIN_FLOOR),
         .kernel_done(kernel_done),
         .activation_error(activation_error),
@@ -428,12 +588,24 @@ module decode_top #(
     always @(posedge clk) begin
         if (!rst_n) begin
             scratch_tee_run_q          <= 1'b0;
+            scratch_only_run_q         <= 1'b0;
             scratch_write_role_q       <= 2'd0;
             scratch_write_rows_q       <= 14'd0;
             scratch_write_tokens_q     <= 3'd0;
             scratch_writer_done_q      <= 1'b0;
-            scratch_error_q            <= 5'd0;
+            scratch_error_q            <= 7'd0;
             scratch_valid_q            <= 4'd0;
+            scratch_section_active_q   <= 1'b0;
+            scratch_section_done_q     <= 1'b0;
+            scratch_consumer_busy_q    <= 1'b0;
+            scratch_consumer_done_q    <= 1'b0;
+            scratch_consumer_state_q   <= CONSUMER_IDLE;
+            scratch_consumer_token_q   <= 3'd0;
+            scratch_consumer_group_q   <= 11'd0;
+            scratch_consumer_groups_q  <= 11'd0;
+            scratch_consumer_lane_q    <= 3'd0;
+            scratch_consumer_blocks_q  <= 16'd0;
+            scratch_consumer_total_blocks_q <= 16'd0;
             scratch_drain_busy_q       <= 1'b0;
             scratch_drain_done_q       <= 1'b0;
             scratch_drain_role_q       <= 2'd0;
@@ -450,31 +622,47 @@ module decode_top #(
                 scratch_valid_tokens_q[scratch_role_i] <= 3'd0;
             end
         end else begin
-            if (scratch_tee_start) begin
-                scratch_tee_run_q      <= 1'b1;
+            if (scratch_section_begin_ok) begin
+                scratch_section_active_q <= 1'b1;
+                scratch_section_done_q   <= 1'b0;
+                scratch_consumer_done_q  <= 1'b0;
+                scratch_writer_done_q    <= 1'b0;
+                scratch_drain_done_q     <= 1'b0;
+                scratch_error_q          <= 7'd0;
+                scratch_valid_q          <= 4'd0;
+            end else if (scratch_section_begin_bad) begin
+                scratch_section_done_q <= 1'b1;
+                scratch_error_q[0] <= 1'b1;
+            end
+
+            if (scratch_tee_start || scratch_only_start) begin
+                scratch_tee_run_q      <= scratch_tee_start;
+                scratch_only_run_q     <= scratch_only_start;
                 scratch_write_role_q   <= scratch_role_q;
                 scratch_write_rows_q   <= scratch_rows_q;
                 scratch_write_tokens_q <= scratch_tokens_q;
                 scratch_writer_done_q  <= 1'b0;
-                scratch_error_q        <= 5'd0;
+                if (scratch_tee_start)
+                    scratch_error_q    <= 7'd0;
                 scratch_valid_q[scratch_role_q] <= 1'b0;
             end else if (scratch_start_rejected) begin
                 // Includes invalid/busy tee, DRAIN/unknown-mode CTRL.START, and
                 // a DDR start attempted while either scratch direction is active.
                 scratch_error_q[0] <= 1'b1;
-                if (scratch_mode_q == SCRATCH_MODE_TEE) begin
+                if ((scratch_mode_q == SCRATCH_MODE_TEE) ||
+                    (scratch_mode_q == SCRATCH_MODE_ONLY)) begin
                     scratch_writer_done_q <= 1'b0;
                     scratch_valid_q[scratch_role_q] <= 1'b0;
                 end
             end
 
-            if (scratch_tee_run_q && scratch_wr_error) begin
+            if (scratch_writer_active && scratch_wr_error) begin
                 scratch_error_q[1] <= 1'b1;
                 scratch_valid_q[scratch_write_role_q] <= 1'b0;
             end
             if (scratch_wr_done) begin
                 scratch_writer_done_q <= 1'b1;
-                if (scratch_tee_run_q && !scratch_wr_error && !scratch_error_q[2]) begin
+                if (scratch_writer_active && !scratch_wr_error && !scratch_error_q[2]) begin
                     scratch_valid_q[scratch_write_role_q] <= 1'b1;
                     scratch_valid_rows_q[scratch_write_role_q] <= scratch_write_rows_q;
                     scratch_valid_tokens_q[scratch_write_role_q] <= scratch_write_tokens_q;
@@ -483,8 +671,15 @@ module decode_top #(
                     scratch_error_q[1] <= 1'b1;
                 end
             end
-            if (kernel_done)
+            if (kernel_done) begin
                 scratch_tee_run_q <= 1'b0;
+                scratch_only_run_q <= 1'b0;
+                if (internal_activation_mode && scratch_section_active_q) begin
+                    scratch_section_active_q <= 1'b0;
+                    scratch_section_done_q <= 1'b1;
+                    scratch_valid_q <= 4'd0;
+                end
+            end
 
             if (scratch_drain_start_ok) begin
                 scratch_drain_busy_q       <= 1'b1;
@@ -498,13 +693,112 @@ module decode_top #(
                 scratch_drain_group_valid_q <= 1'b0;
                 scratch_drain_emit_valid_q <= 1'b0;
                 scratch_drain_groups_q     <= scratch_rows_q[13:3];
-                scratch_error_q            <= 5'd0;
+                scratch_error_q            <= 7'd0;
             end else if (scratch_drain_start_bad) begin
                 scratch_drain_done_q <= 1'b1;
                 if (!scratch_drain_shape_ok || !scratch_idle)
                     scratch_error_q[0] <= 1'b1;
                 if (scratch_drain_shape_ok && !scratch_role_metadata_ok)
                     scratch_error_q[4] <= 1'b1;
+            end
+
+            if (scratch_consumer_start) begin
+                scratch_consumer_busy_q   <= 1'b1;
+                scratch_consumer_done_q   <= 1'b0;
+                scratch_consumer_state_q  <= CONSUMER_REQ_GATE;
+                scratch_consumer_token_q  <= 3'd0;
+                scratch_consumer_group_q  <= 11'd0;
+                scratch_consumer_groups_q <= scratch_rows_q[13:3];
+                scratch_consumer_lane_q   <= 3'd0;
+                scratch_consumer_blocks_q <= 16'd0;
+                // Keep both operands explicitly widened.  The maximum section
+                // consumes (12288 / 32) * 4 = 1536 native Q8 records; an
+                // operand-sized multiply would silently truncate that result.
+                scratch_consumer_total_blocks_q <=
+                    {7'd0, scratch_rows_q[13:5]} * {13'd0, scratch_tokens_q};
+            end else if (scratch_consumer_busy_q && !scratch_abort_strobe &&
+                         !q8_activation_abort) begin
+                case (scratch_consumer_state_q)
+                    CONSUMER_REQ_GATE: if (scratch_rd_req_ready)
+                        scratch_consumer_state_q <= CONSUMER_WAIT_GATE;
+
+                    CONSUMER_WAIT_GATE: if (scratch_rd_rsp_valid) begin
+                        if (scratch_rd_rsp_error) begin
+                            scratch_consumer_busy_q  <= 1'b0;
+                            scratch_consumer_done_q  <= 1'b1;
+                            scratch_consumer_state_q <= CONSUMER_IDLE;
+                            scratch_error_q[5]       <= 1'b1;
+                        end else begin
+                            scratch_consumer_gate_q  <= scratch_rd_rsp_data;
+                            scratch_consumer_state_q <= CONSUMER_REQ_UP;
+                        end
+                    end
+
+                    CONSUMER_REQ_UP: if (scratch_rd_req_ready)
+                        scratch_consumer_state_q <= CONSUMER_WAIT_UP;
+
+                    CONSUMER_WAIT_UP: if (scratch_rd_rsp_valid) begin
+                        if (scratch_rd_rsp_error) begin
+                            scratch_consumer_busy_q  <= 1'b0;
+                            scratch_consumer_done_q  <= 1'b1;
+                            scratch_consumer_state_q <= CONSUMER_IDLE;
+                            scratch_error_q[5]       <= 1'b1;
+                        end else begin
+                            scratch_consumer_up_q    <= scratch_rd_rsp_data;
+                            scratch_consumer_lane_q  <= 3'd0;
+                            scratch_consumer_state_q <= CONSUMER_ISSUE;
+                        end
+                    end
+
+                    CONSUMER_ISSUE: if (swiglu_in_ready) begin
+                        if (scratch_consumer_lane_q == 3'd7) begin
+                            scratch_consumer_lane_q <= 3'd0;
+                            if (scratch_consumer_group_q[1:0] == 2'd3) begin
+                                scratch_consumer_blocks_q <= scratch_consumer_blocks_q + 1'b1;
+                                scratch_consumer_state_q <= CONSUMER_DRAIN;
+                            end else begin
+                                scratch_consumer_group_q <= scratch_consumer_group_q + 1'b1;
+                                scratch_consumer_state_q <= CONSUMER_REQ_GATE;
+                            end
+                        end else begin
+                            scratch_consumer_lane_q <= scratch_consumer_lane_q + 1'b1;
+                        end
+                    end
+
+                    CONSUMER_DRAIN: if (q8_internal_record_done) begin
+                        if ((scratch_consumer_group_q + 1'b1 == scratch_consumer_groups_q) &&
+                            (scratch_consumer_token_q + 1'b1 == scratch_tokens_q)) begin
+                            scratch_consumer_busy_q  <= 1'b0;
+                            scratch_consumer_done_q  <= 1'b1;
+                            scratch_consumer_state_q <= CONSUMER_IDLE;
+                            if (scratch_consumer_blocks_q != scratch_consumer_total_blocks_q)
+                                scratch_error_q[5] <= 1'b1;
+                        end else begin
+                            if (scratch_consumer_group_q + 1'b1 == scratch_consumer_groups_q) begin
+                                scratch_consumer_group_q <= 11'd0;
+                                scratch_consumer_token_q <= scratch_consumer_token_q + 1'b1;
+                            end else begin
+                                scratch_consumer_group_q <= scratch_consumer_group_q + 1'b1;
+                            end
+                            scratch_consumer_state_q <= CONSUMER_REQ_GATE;
+                        end
+                    end
+
+                    default: begin
+                        scratch_consumer_busy_q  <= 1'b0;
+                        scratch_consumer_done_q  <= 1'b1;
+                        scratch_consumer_state_q <= CONSUMER_IDLE;
+                        scratch_error_q[5]       <= 1'b1;
+                    end
+                endcase
+            end
+
+            if (internal_activation_mode && q8_activation_abort) begin
+                scratch_consumer_busy_q  <= 1'b0;
+                scratch_consumer_done_q  <= 1'b1;
+                scratch_consumer_state_q <= CONSUMER_IDLE;
+                scratch_error_q[6]       <= 1'b1;
+                scratch_valid_q          <= 4'd0;
             end
 
             if (scratch_drain_busy_q && !scratch_abort_strobe) begin
@@ -558,7 +852,7 @@ module decode_top #(
             end
 
             if (scratch_abort_strobe) begin
-                if (scratch_tee_run_q || scratch_wr_busy) begin
+                if (scratch_writer_active || scratch_wr_busy) begin
                     scratch_valid_q[scratch_write_role_q] <= 1'b0;
                     scratch_error_q[2] <= 1'b1;
                 end
@@ -569,6 +863,15 @@ module decode_top #(
                     scratch_drain_group_valid_q <= 1'b0;
                     scratch_drain_emit_valid_q <= 1'b0;
                     scratch_error_q[2]         <= 1'b1;
+                end
+                if (scratch_consumer_busy_q || scratch_section_active_q) begin
+                    scratch_consumer_busy_q  <= 1'b0;
+                    scratch_consumer_done_q  <= 1'b1;
+                    scratch_consumer_state_q <= CONSUMER_IDLE;
+                    scratch_section_active_q <= 1'b0;
+                    scratch_section_done_q   <= 1'b1;
+                    scratch_valid_q          <= 4'd0;
+                    scratch_error_q[2]       <= 1'b1;
                 end
             end
         end
@@ -633,10 +936,12 @@ module decode_top #(
             scratch_tokens_q <= 3'd0;
             scratch_drain_start_strobe <= 1'b0;
             scratch_abort_strobe <= 1'b0;
+            scratch_section_begin_strobe <= 1'b0;
         end else begin
             start_strobe <= 1'b0;
             scratch_drain_start_strobe <= 1'b0;
             scratch_abort_strobe <= 1'b0;
+            scratch_section_begin_strobe <= 1'b0;
 
             awready_q <= write_accept;
             wready_q  <= write_accept;
@@ -698,6 +1003,7 @@ module decode_top #(
                         if (s_axi_wstrb[0]) begin
                             scratch_drain_start_strobe <= s_axi_wdata[0];
                             scratch_abort_strobe <= s_axi_wdata[1];
+                            scratch_section_begin_strobe <= s_axi_wdata[2];
                         end
                     end
                     default: ;
@@ -735,17 +1041,19 @@ module decode_top #(
                     MATMUL_OFF_LOADED_EPOCH[7:0]:  rdata_q <= loaded_act_epoch;
                     MATMUL_OFF_LOADED_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, loaded_act_q1_blocks};
                     MATMUL_OFF_LOADED_COLS[7:0]:   rdata_q <= {16'd0, loaded_act_cols};
-                    MATMUL_OFF_QUANT_STATUS[7:0]:  rdata_q <= {28'd0, quantizer_status};
+                    MATMUL_OFF_QUANT_STATUS[7:0]:  rdata_q <= {26'd0, quantizer_status};
                     MATMUL_OFF_SCRATCH_MODE[7:0]:  rdata_q <= {30'd0, scratch_mode_q};
                     MATMUL_OFF_SCRATCH_ROLE[7:0]:  rdata_q <= {30'd0, scratch_role_q};
                     MATMUL_OFF_SCRATCH_ROWS[7:0]:  rdata_q <= {18'd0, scratch_rows_q};
                     MATMUL_OFF_SCRATCH_TOKENS[7:0]: rdata_q <= {29'd0, scratch_tokens_q};
                     MATMUL_OFF_SCRATCH_STATUS[7:0]: rdata_q <= {
-                        23'd0, scratch_valid_q, |scratch_error_q,
+                        19'd0, scratch_section_done_q, scratch_section_active_q,
+                        scratch_consumer_done_q, scratch_consumer_busy_q,
+                        scratch_valid_q, |scratch_error_q,
                         scratch_drain_done_q, scratch_drain_busy_q,
                         scratch_writer_done_q, scratch_wr_busy
                     };
-                    MATMUL_OFF_SCRATCH_ERROR[7:0]: rdata_q <= {27'd0, scratch_error_q};
+                    MATMUL_OFF_SCRATCH_ERROR[7:0]: rdata_q <= {25'd0, scratch_error_q};
                     MATMUL_OFF_CYCLES[7:0]:        rdata_q <= cycle_count_q;
                     MATMUL_OFF_ROWS[7:0]:          rdata_q <= MATMUL_RST_ROWS;
                     MATMUL_OFF_CLK_HZ[7:0]:        rdata_q <= CLK_HZ;
@@ -772,6 +1080,125 @@ module decode_top #(
     assign s_axi_rdata   = rdata_q;
     assign s_axi_rresp   = 2'b00;
     assign s_axi_rvalid  = rvalid_q;
+
+`ifdef FORMAL
+    reg        f_decode_past_valid = 1'b0;
+    reg [3:0]  f_reads_per_record = 4'd0;
+    reg [5:0]  f_scalars_per_record = 6'd0;
+
+    always @(posedge clk) begin
+        f_decode_past_valid <= 1'b1;
+        if (!rst_n || scratch_consumer_start || scratch_abort_strobe) begin
+            f_reads_per_record <= 4'd0;
+            f_scalars_per_record <= 6'd0;
+        end else if (scratch_consumer_busy_q) begin
+            if (scratch_rd_req_valid && scratch_rd_req_ready)
+                f_reads_per_record <= f_reads_per_record + 1'b1;
+            if (swiglu_in_valid && swiglu_in_ready)
+                f_scalars_per_record <= f_scalars_per_record + 1'b1;
+            if (q8_internal_record_done) begin
+                assert(f_reads_per_record == 4'd8);
+                assert(f_scalars_per_record == 6'd32);
+                f_reads_per_record <= 4'd0;
+                f_scalars_per_record <= 6'd0;
+            end
+        end
+
+        if (rst_n) begin
+            assert(scratch_consumer_state_q <= CONSUMER_DRAIN);
+            assert(scratch_consumer_blocks_q <= scratch_consumer_total_blocks_q);
+            assert(scratch_consumer_total_blocks_q <= 16'd1536);
+            assert(f_reads_per_record <= 4'd8);
+            assert(f_scalars_per_record <= 6'd32);
+
+            if (scratch_only_run_q) begin
+                assert(scratch_section_active_q);
+                assert(!m_axis_tvalid);
+            end
+            if (internal_activation_mode)
+                assert(!s_axis_acts_tready);
+
+            if (scratch_section_active_q && scratch_valid_q[1])
+                assert(scratch_valid_q[2]);
+
+            if (scratch_consumer_busy_q) begin
+                assert(scratch_section_active_q);
+                assert(internal_activation_mode);
+                assert(scratch_valid_q[1] && scratch_valid_q[2]);
+                assert(!scratch_drain_busy_q && !scratch_writer_active);
+                assert(scratch_consumer_group_q < scratch_consumer_groups_q);
+                assert(scratch_consumer_token_q < scratch_tokens_q);
+                assert(scratch_consumer_lane_q <= 3'd7);
+            end
+
+            if (scratch_consumer_req_gate)
+                assert(scratch_rd_req_valid && scratch_rd_req_role == 2'd1);
+            if (scratch_consumer_req_up)
+                assert(scratch_rd_req_valid && scratch_rd_req_role == 2'd2);
+            if (scratch_consumer_state_q == CONSUMER_DRAIN) begin
+                assert(!scratch_rd_req_valid);
+                assert(!swiglu_in_valid);
+            end
+
+            if (scratch_consumer_start) begin
+                assert(scratch_consumer_shape_ok);
+                assert(({7'd0, scratch_rows_q[13:5]} *
+                        {13'd0, scratch_tokens_q}) <= 16'd1536);
+            end
+
+            if (f_decode_past_valid && $past(rst_n && scratch_consumer_start)) begin
+                assert(scratch_consumer_busy_q);
+                assert(scratch_consumer_state_q == CONSUMER_REQ_GATE);
+                assert(scratch_consumer_total_blocks_q ==
+                       ({7'd0, $past(scratch_rows_q[13:5])} *
+                        {13'd0, $past(scratch_tokens_q)}));
+            end
+
+            if (f_decode_past_valid &&
+                $past(rst_n && scratch_section_begin_ok)) begin
+                assert(scratch_section_active_q);
+                assert(!scratch_section_done_q);
+                assert(scratch_valid_q == 4'd0);
+                assert(scratch_error_q == 7'd0);
+            end
+
+            if (f_decode_past_valid &&
+                $past(rst_n && scratch_abort_strobe &&
+                      (scratch_consumer_busy_q || scratch_section_active_q))) begin
+                assert(!scratch_consumer_busy_q && !scratch_section_active_q);
+                assert(scratch_consumer_done_q && scratch_section_done_q);
+                assert(scratch_valid_q == 4'd0);
+                assert(scratch_error_q[2]);
+            end
+
+            if (f_decode_past_valid &&
+                $past(rst_n && kernel_done && internal_activation_mode &&
+                      scratch_section_active_q)) begin
+                assert(!scratch_section_active_q && scratch_section_done_q);
+                assert(scratch_valid_q == 4'd0);
+            end
+
+            if (f_decode_past_valid &&
+                $past(rst_n && internal_activation_mode && q8_activation_abort)) begin
+                assert(!scratch_consumer_busy_q && scratch_consumer_done_q);
+                assert(scratch_valid_q == 4'd0);
+                assert(scratch_error_q[6]);
+            end
+        end
+
+        cover(rst_n && scratch_section_active_q &&
+              scratch_valid_q[2] && !scratch_valid_q[1]);
+        cover(rst_n && scratch_section_active_q &&
+              scratch_valid_q[2] && scratch_valid_q[1]);
+        cover(rst_n && scratch_consumer_busy_q &&
+              scratch_consumer_state_q == CONSUMER_DRAIN);
+        cover(rst_n && scratch_section_done_q && !scratch_section_active_q &&
+              scratch_consumer_done_q && scratch_valid_q == 4'd0);
+        cover(rst_n && scratch_error_q[2] && scratch_section_done_q &&
+              !scratch_section_active_q && !scratch_consumer_busy_q &&
+              scratch_valid_q == 4'd0);
+    end
+`endif
 
     wire _unused = &{
         1'b0,

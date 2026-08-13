@@ -1,6 +1,6 @@
 const std = @import("std");
 
-pub const version: u16 = 14;
+pub const version: u16 = 15;
 pub const response_meta_len: usize = 64;
 
 pub const RequestTag = enum(u16) {
@@ -33,6 +33,7 @@ pub const OpTag = enum(u16) {
     argmax = 16,
     pad = 17,
     matmul_q1a8_group2 = 18,
+    ffn_section = 19,
 };
 
 pub const Status = enum(u16) {
@@ -268,6 +269,25 @@ pub const MatmulQ1A8Group2 = struct {
     k: u32,
 };
 
+/// One complete Qwen/Bonsai feed-forward section. Intermediate RMSNorm,
+/// projection, and SwiGLU tensors are private to the device implementation;
+/// only the semantic inputs and final residual result cross the wire.
+pub const FfnSection = struct {
+    residual: TensorRange,
+    norm_weight: TensorRange,
+    up_weights: TensorRange,
+    gate_weights: TensorRange,
+    down_weights: TensorRange,
+    dst: TensorRange,
+    model_dim: u32,
+    ffn_dim: u32,
+    token_count: u32,
+    eps: f32,
+    weight_fmt: WeightFormat,
+    contract_version: u16 = 1,
+    flags: u16 = 0,
+};
+
 pub const UnaryF32 = struct {
     src: TensorRange,
     dst: TensorRange,
@@ -426,6 +446,7 @@ pub const Command = union(OpTag) {
     argmax: Argmax,
     pad: UnaryF32,
     matmul_q1a8_group2: MatmulQ1A8Group2,
+    ffn_section: FfnSection,
 };
 
 pub const ResponseMeta = struct {
@@ -645,6 +666,7 @@ pub fn commandBufferLen(commands: []const Command) EncodeError!usize {
             .argmax => 4 + rangeLen * 2 + 8,
             .pad => 4 + rangeLen * 2,
             .matmul_q1a8_group2 => 4 + rangeLen + 8 + 2 * (rangeLen * 2 + 8),
+            .ffn_section => 4 + rangeLen * 6 + 24,
         };
     }
     return len;
@@ -866,6 +888,23 @@ pub fn encodeCommandBuffer(commands: []const Command, out: []u8) EncodeError!usi
                 putU32(out, &cursor, @intFromEnum(projection.weight_fmt));
             }
         },
+        .ffn_section => |ffn| {
+            putU16(out, &cursor, @intFromEnum(OpTag.ffn_section));
+            putU16(out, &cursor, 0);
+            putRange(out, &cursor, ffn.residual);
+            putRange(out, &cursor, ffn.norm_weight);
+            putRange(out, &cursor, ffn.up_weights);
+            putRange(out, &cursor, ffn.gate_weights);
+            putRange(out, &cursor, ffn.down_weights);
+            putRange(out, &cursor, ffn.dst);
+            putU32(out, &cursor, ffn.model_dim);
+            putU32(out, &cursor, ffn.ffn_dim);
+            putU32(out, &cursor, ffn.token_count);
+            putF32(out, &cursor, ffn.eps);
+            putU32(out, &cursor, @intFromEnum(ffn.weight_fmt));
+            putU16(out, &cursor, ffn.contract_version);
+            putU16(out, &cursor, ffn.flags);
+        },
     };
     return cursor;
 }
@@ -878,7 +917,7 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
 
     for (commands) |*command| {
         const raw_tag = try takeU16(bytes, &cursor);
-        _ = try takeU16(bytes, &cursor);
+        const reserved = try takeU16(bytes, &cursor);
         const tag = enumFromInt(OpTag, raw_tag) orelse return error.InvalidTag;
         command.* = switch (tag) {
             .copy => .{ .copy = .{ .src = try takeRange(bytes, &cursor), .dst = try takeRange(bytes, &cursor) } },
@@ -911,6 +950,39 @@ pub fn decodeCommandBuffer(allocator: std.mem.Allocator, bytes: []const u8) (Dec
                     .projections = projections,
                     .cols = cols,
                     .k = k,
+                } };
+            },
+            .ffn_section => blk: {
+                if (reserved != 0) return error.InvalidFlags;
+                const residual = try takeRange(bytes, &cursor);
+                const norm_weight = try takeRange(bytes, &cursor);
+                const up_weights = try takeRange(bytes, &cursor);
+                const gate_weights = try takeRange(bytes, &cursor);
+                const down_weights = try takeRange(bytes, &cursor);
+                const dst = try takeRange(bytes, &cursor);
+                const model_dim = try takeU32(bytes, &cursor);
+                const ffn_dim = try takeU32(bytes, &cursor);
+                const token_count = try takeU32(bytes, &cursor);
+                const eps = try takeF32(bytes, &cursor);
+                const weight_fmt = enumFromInt(WeightFormat, try takeU32(bytes, &cursor)) orelse return error.InvalidTag;
+                const contract_version = try takeU16(bytes, &cursor);
+                const flags = try takeU16(bytes, &cursor);
+                if (contract_version != 1) return error.UnsupportedVersion;
+                if (flags != 0) return error.InvalidFlags;
+                break :blk .{ .ffn_section = .{
+                    .residual = residual,
+                    .norm_weight = norm_weight,
+                    .up_weights = up_weights,
+                    .gate_weights = gate_weights,
+                    .down_weights = down_weights,
+                    .dst = dst,
+                    .model_dim = model_dim,
+                    .ffn_dim = ffn_dim,
+                    .token_count = token_count,
+                    .eps = eps,
+                    .weight_fmt = weight_fmt,
+                    .contract_version = contract_version,
+                    .flags = flags,
                 } };
             },
             .rmsnorm => blk: {
@@ -1490,6 +1562,21 @@ test "command buffer roundtrip" {
             .cols = 2,
             .k = 128,
         } },
+        .{ .ffn_section = .{
+            .residual = a,
+            .norm_weight = b,
+            .up_weights = c,
+            .gate_weights = b,
+            .down_weights = c,
+            .dst = b,
+            .model_dim = 4096,
+            .ffn_dim = 12288,
+            .token_count = 4,
+            .eps = 1e-6,
+            .weight_fmt = .w158a8,
+            .contract_version = 1,
+            .flags = 0,
+        } },
     };
     var buf: [2048]u8 = undefined;
     const n = try encodeCommandBuffer(&commands, &buf);
@@ -1531,6 +1618,52 @@ test "command buffer roundtrip" {
     try std.testing.expectEqual(commands[17].matmul_q1a8_group2.cols, got[17].matmul_q1a8_group2.cols);
     try std.testing.expectEqual(commands[17].matmul_q1a8_group2.projections[1].weights, got[17].matmul_q1a8_group2.projections[1].weights);
     try std.testing.expectEqual(commands[17].matmul_q1a8_group2.projections[1].weight_fmt, got[17].matmul_q1a8_group2.projections[1].weight_fmt);
+    try std.testing.expectEqual(commands[18].ffn_section.residual, got[18].ffn_section.residual);
+    try std.testing.expectEqual(commands[18].ffn_section.down_weights, got[18].ffn_section.down_weights);
+    try std.testing.expectEqual(commands[18].ffn_section.ffn_dim, got[18].ffn_section.ffn_dim);
+    try std.testing.expectEqual(commands[18].ffn_section.eps, got[18].ffn_section.eps);
+    try std.testing.expectEqual(commands[18].ffn_section.weight_fmt, got[18].ffn_section.weight_fmt);
+    try std.testing.expectEqual(commands[18].ffn_section.contract_version, got[18].ffn_section.contract_version);
+}
+
+test "ffn section command encoding has a fixed ABI15 layout" {
+    const r = TensorRange{ .handle = 1, .offset = 2, .nbytes = 3 };
+    const command = Command{ .ffn_section = .{
+        .residual = r,
+        .norm_weight = r,
+        .up_weights = r,
+        .gate_weights = r,
+        .down_weights = r,
+        .dst = r,
+        .model_dim = 256,
+        .ffn_dim = 512,
+        .token_count = 16,
+        .eps = 1e-6,
+        .weight_fmt = .w1a8,
+    } };
+    var encoded: [176]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, encoded.len), try commandBufferLen(&.{command}));
+    try std.testing.expectEqual(@as(usize, encoded.len), try encodeCommandBuffer(&.{command}, &encoded));
+    try std.testing.expectEqual(@as(u16, @intFromEnum(OpTag.ffn_section)), std.mem.readInt(u16, encoded[4..6], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, encoded[6..8], .little));
+    try std.testing.expectEqual(@as(u16, 1), std.mem.readInt(u16, encoded[172..174], .little));
+    try std.testing.expectEqual(@as(u16, 0), std.mem.readInt(u16, encoded[174..176], .little));
+
+    try std.testing.expectError(error.Truncated, decodeCommandBuffer(std.testing.allocator, encoded[0 .. encoded.len - 1]));
+    var trailing: [177]u8 = undefined;
+    @memcpy(trailing[0..encoded.len], &encoded);
+    trailing[encoded.len] = 0;
+    try std.testing.expectError(error.TrailingBytes, decodeCommandBuffer(std.testing.allocator, &trailing));
+
+    var invalid = encoded;
+    std.mem.writeInt(u16, invalid[6..8], 1, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeCommandBuffer(std.testing.allocator, &invalid));
+    invalid = encoded;
+    std.mem.writeInt(u16, invalid[172..174], 2, .little);
+    try std.testing.expectError(error.UnsupportedVersion, decodeCommandBuffer(std.testing.allocator, &invalid));
+    invalid = encoded;
+    std.mem.writeInt(u16, invalid[174..176], 1, .little);
+    try std.testing.expectError(error.InvalidFlags, decodeCommandBuffer(std.testing.allocator, &invalid));
 }
 
 test "rmsnorm optional weight encoding is exact and rejects invalid flags" {

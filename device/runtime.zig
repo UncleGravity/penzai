@@ -23,6 +23,7 @@ const wire = shared.wire;
 const profiling = shared.profiling;
 const capabilities = shared.capabilities;
 const layout = shared.layout;
+const section = shared.section;
 
 pub const RuntimeError = error{
     InvalidRequest,
@@ -351,6 +352,50 @@ pub fn RuntimeFor(comptime Heap: type) type {
             if (nbad > 0) std.debug.print("pl verify flash hdq={d} nkv={d} ntok={d}: {d}/{d} approximation outlier (max_abs={d:.4} max_norm={d:.4})\n", .{ attn.head_dim_q, attn.n_kv, attn.n_tokens, nbad, n, max_abs, max_norm });
         }
 
+        /// Named FFN verification is deliberately end-to-end: gate/up are
+        /// private section values, so only the final residual result can be
+        /// observed. A normalized 2% tolerance matches the existing approximate
+        /// PL smoke gates while an absolute floor ignores values near zero.
+        fn verifyFfn(self: *Self, ffn: wire.FfnSection) void {
+            const residual = self.heap.read(ffn.residual) catch return;
+            const norm_weight = self.heap.read(ffn.norm_weight) catch return;
+            const up_weights = self.heap.read(ffn.up_weights) catch return;
+            const gate_weights = self.heap.read(ffn.gate_weights) catch return;
+            const down_weights = self.heap.read(ffn.down_weights) catch return;
+            const dst = self.heap.bytes(ffn.dst) catch return;
+            const scratch = self.allocator.alloc(u8, dst.len) catch return;
+            defer self.allocator.free(scratch);
+            _ = runFfnOracle(
+                self.allocator,
+                ffn,
+                residual,
+                norm_weight,
+                up_weights,
+                gate_weights,
+                down_weights,
+                scratch,
+                null,
+            ) catch return;
+
+            var max_abs: f32 = 0;
+            var max_norm: f32 = 0;
+            var nbad: usize = 0;
+            const n = dst.len / @sizeOf(f32);
+            for (0..n) |i| {
+                const actual: f32 = @bitCast(std.mem.readInt(u32, dst[i * 4 ..][0..4], .little));
+                const expected: f32 = @bitCast(std.mem.readInt(u32, scratch[i * 4 ..][0..4], .little));
+                const abs_err = @abs(actual - expected);
+                const norm_err = abs_err / @max(@abs(expected), 1.0);
+                max_abs = @max(max_abs, abs_err);
+                max_norm = @max(max_norm, norm_err);
+                if (norm_err > 0.02 and abs_err > 1e-3) nbad += 1;
+            }
+            if (nbad > 0) std.debug.print(
+                "pl verify ffn model={d} ffn={d} ntok={d}: {d}/{d} approximation outlier (max_abs={d:.4} max_norm={d:.4})\n",
+                .{ ffn.model_dim, ffn.ffn_dim, ffn.token_count, nbad, n, max_abs, max_norm },
+            );
+        }
+
         fn plVerifyEnabled() bool {
             const raw = std.c.getenv("PENZAI_PL_VERIFY") orelse return false;
             const v = std.mem.span(raw);
@@ -533,6 +578,71 @@ pub fn RuntimeFor(comptime Heap: type) type {
                         else => return error.InvalidRequest,
                     };
                     return .{ .backend = .ps, .path = .software };
+                },
+                .ffn_section => |ffn| {
+                    if (ffn.contract_version != section.version or ffn.flags != 0 or
+                        ffn.eps < 0 or !std.math.isFinite(ffn.eps)) return error.InvalidRequest;
+                    (section.FfnCommandShape{
+                        .token_count = ffn.token_count,
+                        .model_dim = ffn.model_dim,
+                        .ffn_dim = ffn.ffn_dim,
+                    }).validate() catch return error.InvalidRequest;
+
+                    const model_bytes = checkedProduct3(ffn.model_dim, ffn.token_count, @sizeOf(f32)) orelse return error.InvalidRequest;
+                    const norm_weight_bytes = checkedProduct3(ffn.model_dim, 1, @sizeOf(f32)) orelse return error.InvalidRequest;
+                    const up_weight_bytes = ffnWeightBytes(ffn.weight_fmt, ffn.ffn_dim, ffn.model_dim) orelse return error.InvalidRequest;
+                    const down_weight_bytes = ffnWeightBytes(ffn.weight_fmt, ffn.model_dim, ffn.ffn_dim) orelse return error.InvalidRequest;
+                    if (ffn.residual.nbytes != model_bytes or ffn.norm_weight.nbytes != norm_weight_bytes or
+                        ffn.up_weights.nbytes != up_weight_bytes or ffn.gate_weights.nbytes != up_weight_bytes or
+                        ffn.down_weights.nbytes != down_weight_bytes or ffn.dst.nbytes != model_bytes)
+                        return error.InvalidRequest;
+
+                    const external = [_]wire.TensorRange{
+                        ffn.residual,     ffn.norm_weight,  ffn.up_weights,
+                        ffn.gate_weights, ffn.down_weights, ffn.dst,
+                    };
+                    for (external, 0..) |a, ai| {
+                        for (external[ai + 1 ..]) |b| if (rangesOverlap(a, b)) return error.InvalidRequest;
+                    }
+
+                    // Resolve the complete external contract before either a PL
+                    // backend or the PS oracle can mutate the destination.
+                    const residual = self.heap.read(ffn.residual) catch |err| return mapHeapError(err);
+                    const norm_weight = self.heap.read(ffn.norm_weight) catch |err| return mapHeapError(err);
+                    const up_weights = self.heap.read(ffn.up_weights) catch |err| return mapHeapError(err);
+                    const gate_weights = self.heap.read(ffn.gate_weights) catch |err| return mapHeapError(err);
+                    const down_weights = self.heap.read(ffn.down_weights) catch |err| return mapHeapError(err);
+                    const dst = self.heap.bytes(ffn.dst) catch |err| return mapHeapError(err);
+
+                    if (comptime pl_supported and @hasDecl(PlBackend, "tryFfnSection")) {
+                        if (self.pl) |*backend| {
+                            const maybe = backend.tryFfnSection(&self.heap, ffn, ctx) catch |err| {
+                                std.debug.print("pl ffn section failed: {s}\n", .{@errorName(err)});
+                                return error.BackendFailure;
+                            };
+                            if (maybe) |execution| {
+                                const execution_path: profiling.ExecutionPath = if (execution.gate_up.path == .staged or execution.down.path == .staged) .staged else .direct;
+                                if (self.pl_verify) self.verifyFfn(ffn);
+                                return .{ .backend = .pl, .path = execution_path, .detail = .{ .ffn = execution } };
+                            }
+                        }
+                    }
+
+                    const result = self.allocator.alloc(u8, model_bytes) catch return error.OutOfMemory;
+                    defer self.allocator.free(result);
+                    const execution = try runFfnOracle(
+                        self.allocator,
+                        ffn,
+                        residual,
+                        norm_weight,
+                        up_weights,
+                        gate_weights,
+                        down_weights,
+                        result,
+                        ctx,
+                    );
+                    @memcpy(dst, result);
+                    return .{ .backend = .ps, .path = .software, .detail = .{ .ffn = execution } };
                 },
                 .rmsnorm => |rmsnorm| {
                     const input = self.heap.read(rmsnorm.input) catch |err| return mapHeapError(err);
@@ -721,6 +831,89 @@ fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
 fn checkedProduct3(a: usize, b: usize, c: usize) ?usize {
     const ab = std.math.mul(usize, a, b) catch return null;
     return std.math.mul(usize, ab, c) catch null;
+}
+
+fn ffnWeightBytes(fmt: wire.WeightFormat, rows: usize, k: usize) ?usize {
+    return switch (fmt) {
+        .w1a8 => layout.packedWeightBytes(rows, k),
+        .w158a8 => layout.packedTernaryWeightBytes(rows, k),
+    } catch null;
+}
+
+fn runFfnOracle(
+    allocator: std.mem.Allocator,
+    ffn: wire.FfnSection,
+    residual: []const u8,
+    norm_weight: []const u8,
+    up_weights: []const u8,
+    gate_weights: []const u8,
+    down_weights: []const u8,
+    result: []u8,
+    ctx: ?*profile.ProfileContext,
+) RuntimeError!profile.FfnExecution {
+    const tile_tokens: usize = @min(ffn.token_count, section.query_tile_max);
+    const tile_model_bytes = checkedProduct3(ffn.model_dim, tile_tokens, @sizeOf(f32)) orelse return error.InvalidRequest;
+    const tile_ffn_bytes = checkedProduct3(ffn.ffn_dim, tile_tokens, @sizeOf(f32)) orelse return error.InvalidRequest;
+    const normalized = allocator.alloc(u8, tile_model_bytes) catch return error.OutOfMemory;
+    defer allocator.free(normalized);
+    const up = allocator.alloc(u8, tile_ffn_bytes) catch return error.OutOfMemory;
+    defer allocator.free(up);
+    const gate = allocator.alloc(u8, tile_ffn_bytes) catch return error.OutOfMemory;
+    defer allocator.free(gate);
+    const down = allocator.alloc(u8, tile_model_bytes) catch return error.OutOfMemory;
+    defer allocator.free(down);
+
+    var execution: profile.FfnExecution = .{};
+    var last = profile.begin(ctx);
+    var token_offset: usize = 0;
+    while (token_offset < ffn.token_count) {
+        const count: usize = @min(section.query_tile_max, ffn.token_count - token_offset);
+        const model_tile_len = checkedProduct3(ffn.model_dim, count, @sizeOf(f32)) orelse unreachable;
+        const ffn_tile_len = checkedProduct3(ffn.ffn_dim, count, @sizeOf(f32)) orelse unreachable;
+        const model_offset = checkedProduct3(ffn.model_dim, token_offset, @sizeOf(f32)) orelse unreachable;
+        const residual_tile = residual[model_offset..][0..model_tile_len];
+        const result_tile = result[model_offset..][0..model_tile_len];
+        const normalized_tile = normalized[0..model_tile_len];
+        const up_tile = up[0..ffn_tile_len];
+        const gate_tile = gate[0..ffn_tile_len];
+        const down_tile = down[0..model_tile_len];
+
+        ps_rmsnorm.runWeightedBytes(
+            residual_tile,
+            norm_weight,
+            normalized_tile,
+            ffn.model_dim,
+            @intCast(count),
+            ffn.eps,
+        ) catch |err| return mapKernelError(err);
+        execution.norm_ns +|= profile.lap(ctx, &last);
+
+        ps_matmul_q1a8.runGroup2(allocator, .{
+            .{ .packed_weights = up_weights, .dst_f32 = up_tile },
+            .{ .packed_weights = gate_weights, .dst_f32 = gate_tile },
+        }, normalized_tile, ffn.ffn_dim, @intCast(count), ffn.model_dim, ffn.weight_fmt) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidRequest,
+        };
+        execution.gate_up_command_ns +|= profile.lap(ctx, &last);
+
+        ps_activations.swigluBytes(gate_tile, up_tile, gate_tile) catch |err| return mapKernelError(err);
+        execution.swiglu_ns +|= profile.lap(ctx, &last);
+
+        (switch (ffn.weight_fmt) {
+            .w1a8 => ps_matmul_q1a8.runQ1A8(allocator, down_weights, gate_tile, down_tile, ffn.model_dim, @intCast(count), ffn.ffn_dim),
+            .w158a8 => ps_matmul_q1a8.runW158A8(allocator, down_weights, gate_tile, down_tile, ffn.model_dim, @intCast(count), ffn.ffn_dim),
+        }) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => return error.InvalidRequest,
+        };
+        execution.down_command_ns +|= profile.lap(ctx, &last);
+
+        ps_elemwise.add2dBytes(down_tile, residual_tile, result_tile, ffn.model_dim, @intCast(count), false) catch |err| return mapKernelError(err);
+        execution.residual_add_ns +|= profile.lap(ctx, &last);
+        token_offset += count;
+    }
+    return execution;
 }
 
 fn combineMatmulExecutions(a: profile.MatmulExecution, b: profile.MatmulExecution) profile.MatmulExecution {
@@ -915,6 +1108,173 @@ test "runtime executes atomic grouped binary matmul and rejects overlapping outp
     try std.testing.expectError(error.UnknownHandle, runtime.execute(.{ .matmul_q1a8_group2 = invalid_second }, null));
     const untouched = try runtime.heap.read(dst0);
     for (untouched) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+test "runtime tiled ffn section matches unfused Q1 and Q2 execution atomically" {
+    try testFfnSectionFormat(.w1a8);
+    try testFfnSectionFormat(.w158a8);
+}
+
+fn testFfnSectionFormat(fmt: wire.WeightFormat) !void {
+    const model_dim: usize = layout.q1_block;
+    const ffn_dim: usize = layout.q1_block;
+    const token_count: usize = section.query_tile_max + 1;
+    var runtime = try Runtime.init(std.testing.allocator, 256 * 1024);
+    defer runtime.deinit();
+
+    const up_packed = try testPackedWeights(std.testing.allocator, fmt, ffn_dim, model_dim, 1);
+    defer std.testing.allocator.free(up_packed);
+    const gate_packed = try testPackedWeights(std.testing.allocator, fmt, ffn_dim, model_dim, 7);
+    defer std.testing.allocator.free(gate_packed);
+    const down_packed = try testPackedWeights(std.testing.allocator, fmt, model_dim, ffn_dim, 13);
+    defer std.testing.allocator.free(down_packed);
+
+    const residual = try tensor(&runtime, model_dim * token_count);
+    const norm_weight = try tensor(&runtime, model_dim);
+    const up_weights = try rawTensor(&runtime, up_packed.len, 64);
+    const gate_weights = try rawTensor(&runtime, gate_packed.len, 64);
+    const down_weights = try rawTensor(&runtime, down_packed.len, 64);
+    const normalized = try tensor(&runtime, model_dim * token_count);
+    const up = try tensor(&runtime, ffn_dim * token_count);
+    const gate = try tensor(&runtime, ffn_dim * token_count);
+    const down = try tensor(&runtime, model_dim * token_count);
+    const expected_dst = try tensor(&runtime, model_dim * token_count);
+    const fused_dst = try tensor(&runtime, model_dim * token_count);
+
+    const residual_values = try std.testing.allocator.alloc(f32, model_dim * token_count);
+    defer std.testing.allocator.free(residual_values);
+    for (residual_values, 0..) |*value, i| {
+        const signed: i32 = @intCast(i % 29);
+        value.* = @as(f32, @floatFromInt(signed - 14)) / 9.0 + @as(f32, @floatFromInt(i / model_dim)) / 17.0;
+    }
+    const gamma = try std.testing.allocator.alloc(f32, model_dim);
+    defer std.testing.allocator.free(gamma);
+    for (gamma, 0..) |*value, i| value.* = 0.75 + @as(f32, @floatFromInt(i % 7)) / 32.0;
+    try writeTensor(&runtime, residual, residual_values);
+    try writeTensor(&runtime, norm_weight, gamma);
+    try runtime.heap.write(up_weights, up_packed);
+    try runtime.heap.write(gate_weights, gate_packed);
+    try runtime.heap.write(down_weights, down_packed);
+
+    _ = try runtime.execute(.{ .rmsnorm = .{
+        .input = residual,
+        .weight = norm_weight,
+        .dst = normalized,
+        .rows = model_dim,
+        .cols = token_count,
+        .eps = 1e-6,
+        .has_weight = true,
+    } }, null);
+    _ = try runtime.execute(.{ .matmul_q1a8_group2 = .{
+        .acts = normalized,
+        .projections = .{
+            .{ .weights = up_weights, .dst = up, .rows = ffn_dim, .weight_fmt = fmt },
+            .{ .weights = gate_weights, .dst = gate, .rows = ffn_dim, .weight_fmt = fmt },
+        },
+        .cols = token_count,
+        .k = model_dim,
+    } }, null);
+    _ = try runtime.execute(.{ .swiglu = .{ .lhs = gate, .rhs = up, .dst = gate } }, null);
+    _ = try runtime.execute(.{ .matmul_q1a8 = .{
+        .weights = down_weights,
+        .acts = gate,
+        .dst = down,
+        .rows = model_dim,
+        .cols = token_count,
+        .k = ffn_dim,
+        .weight_fmt = fmt,
+    } }, null);
+    _ = try runtime.execute(.{ .add_f32 = .{
+        .lhs = down,
+        .rhs = residual,
+        .dst = expected_dst,
+        .rows = model_dim,
+        .cols = token_count,
+        .mode = .same_shape,
+    } }, null);
+    const expected = try std.testing.allocator.dupe(u8, try runtime.heap.read(expected_dst));
+    defer std.testing.allocator.free(expected);
+
+    const ffn = wire.FfnSection{
+        .residual = residual,
+        .norm_weight = norm_weight,
+        .up_weights = up_weights,
+        .gate_weights = gate_weights,
+        .down_weights = down_weights,
+        .dst = fused_dst,
+        .model_dim = model_dim,
+        .ffn_dim = ffn_dim,
+        .token_count = token_count,
+        .eps = 1e-6,
+        .weight_fmt = fmt,
+    };
+    const outcome = try runtime.execute(.{ .ffn_section = ffn }, null);
+    try std.testing.expectEqual(profiling.Backend.ps, outcome.backend);
+    try std.testing.expectEqual(profile.CommandOutcome.Detail.ffn, std.meta.activeTag(outcome.detail));
+    try std.testing.expectEqualSlices(u8, expected, try runtime.heap.read(fused_dst));
+
+    try runtime.heap.fill(fused_dst, 0xA5);
+    var malformed = ffn;
+    malformed.down_weights.handle = std.math.maxInt(u64);
+    try std.testing.expectError(error.UnknownHandle, runtime.execute(.{ .ffn_section = malformed }, null));
+    const untouched = try runtime.heap.read(fused_dst);
+    for (untouched) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+
+    malformed = ffn;
+    malformed.gate_weights.nbytes -= 1;
+    try std.testing.expectError(error.InvalidRequest, runtime.execute(.{ .ffn_section = malformed }, null));
+    for (try runtime.heap.read(fused_dst)) |byte| try std.testing.expectEqual(@as(u8, 0xA5), byte);
+}
+
+fn testPackedWeights(
+    allocator: std.mem.Allocator,
+    fmt: wire.WeightFormat,
+    rows: usize,
+    k: usize,
+    seed: usize,
+) ![]u8 {
+    return switch (fmt) {
+        .w1a8 => blk: {
+            const encoded = try allocator.alloc(u8, try layout.packedWeightBytes(rows, k));
+            errdefer allocator.free(encoded);
+            const bits = try allocator.alloc(u128, rows);
+            defer allocator.free(bits);
+            const scales = try allocator.alloc(f16, rows);
+            defer allocator.free(scales);
+            for (bits, scales, 0..) |*row_bits, *scale, row| {
+                var value: u128 = 0;
+                for (0..layout.q1_block) |i| {
+                    if ((i + row + seed) % 5 < 2) value |= @as(u128, 1) << @intCast(i);
+                }
+                row_bits.* = value;
+                scale.* = @floatCast(0.015625 + @as(f32, @floatFromInt((row + seed) % 3)) / 256.0);
+            }
+            try layout.packWeightsFromLogical(rows, k, bits, scales, encoded);
+            break :blk encoded;
+        },
+        .w158a8 => blk: {
+            const raw_blocks_per_row = k / layout.q2_source_block;
+            const raw_len = rows * raw_blocks_per_row * layout.q2_source_block_bytes;
+            const raw = try allocator.alloc(u8, raw_len);
+            defer allocator.free(raw);
+            @memset(raw, 0);
+            for (0..rows) |row| {
+                for (0..raw_blocks_per_row) |block| {
+                    const offset = (row * raw_blocks_per_row + block) * layout.q2_source_block_bytes;
+                    const scale: f16 = @floatCast(0.03125 + @as(f32, @floatFromInt((row + block + seed) % 3)) / 256.0);
+                    std.mem.writeInt(u16, raw[offset..][0..2], @bitCast(scale), .little);
+                    for (0..layout.q2_source_block) |i| {
+                        const code: u8 = @intCast((i + row + block + seed) % 3);
+                        raw[offset + 2 + i / 4] |= code << @intCast((i % 4) * 2);
+                    }
+                }
+            }
+            const encoded = try allocator.alloc(u8, try layout.packedTernaryWeightBytes(rows, k));
+            errdefer allocator.free(encoded);
+            try layout.packWeightsFromGgmlQ2_0(rows, k, raw, encoded);
+            break :blk encoded;
+        },
+    };
 }
 
 test "runtime dispatches ps f32 command variants" {

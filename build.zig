@@ -193,6 +193,45 @@ fn addFormalSteps(b: *std.Build) void {
     section_f32_scratch_step.dependOn(&section_f32_scratch_map_run.step);
     section_f32_scratch_step.dependOn(&section_f32_scratch_storage_run.step);
 
+    const section_swiglu_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_swiglu",
+        "fpga/formal/section_swiglu.sby",
+    });
+    const section_swiglu_step = b.step(
+        "formal-section-swiglu",
+        "Prove section SwiGLU credit, backpressure, and abort stream control",
+    );
+    section_swiglu_step.dependOn(&section_swiglu_run.step);
+
+    const q8_internal_ingress_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/q8_internal_ingress",
+        "fpga/formal/q8_internal_ingress.sby",
+    });
+    const q8_internal_ingress_step = b.step(
+        "formal-q8-internal-ingress",
+        "Prove section scalar framing, native-record pacing, fail-closed errors, and restart",
+    );
+    q8_internal_ingress_step.dependOn(&q8_internal_ingress_run.step);
+
+    const decode_ffn_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/decode_ffn",
+        "fpga/formal/decode_ffn.sby",
+    });
+    const decode_ffn_step = b.step(
+        "formal-decode-ffn",
+        "Model-check v15 section ownership, traversal accounting, abort, and terminal invalidation",
+    );
+    decode_ffn_step.dependOn(&decode_ffn_run.step);
+
     const formal = b.step("formal", "Run formal verification pilots");
     formal.dependOn(seq_reg_master_step);
     formal.dependOn(seq_core_step);
@@ -201,6 +240,9 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(gemm_ternary_selector_step);
     formal.dependOn(flash_kernel_step);
     formal.dependOn(section_f32_scratch_step);
+    formal.dependOn(section_swiglu_step);
+    formal.dependOn(q8_internal_ingress_step);
+    formal.dependOn(decode_ffn_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps interpolation, exp,
@@ -291,14 +333,17 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/decode_top.v",
     "fpga/rtl/q8_ingress.v",
     "fpga/rtl/q8_quantizer.v",
+    "fpga/rtl/section_swiglu.v",
     "fpga/rtl/section_f32_scratch.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/fadd.v",
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_f32_scratch.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_swiglu.v fpga/rtl/section_f32_scratch.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fmul.v fpga/rtl/numeric/fadd.v fpga/rtl/numeric/fma.v";
 
 // Exact canonical FP32 -> Q8_0 activation quantizer. Kept standalone until its
 // numerical and routed-cost gates justify attaching it to the GEMM activation RAM.
@@ -310,6 +355,12 @@ const q8_quantizer_rtl = [_][]const u8{
 // result sink and an elastic 256-bit group read port.
 const section_f32_scratch_rtl = [_][]const u8{
     "fpga/rtl/section_f32_scratch.v",
+};
+
+const section_swiglu_rtl = [_][]const u8{
+    "fpga/rtl/section_swiglu.v",
+    "fpga/rtl/numeric/fmul.v",
+    "fpga/rtl/numeric/fadd.v",
 };
 
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
@@ -362,6 +413,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
     const q8_quantizer_cosim = addCosim(b, target, optimize, "test-rtl-q8-quantizer", "Verilator cosim: exact-RNE FP32 to Q8_0 quantizer vs shared/layout.zig", "q8_quantizer", "fpga/sim/q8_quantizer", &q8_quantizer_rtl, .q8);
     const section_f32_scratch_cosim = addCosim(b, target, optimize, "test-rtl-section-f32-scratch", "Verilator cosim: GEMM-order writes into P2 four-bank FP32 section scratch", "section_f32_scratch", "fpga/sim/section_f32_scratch", &section_f32_scratch_rtl, .section);
+    const section_swiglu_cosim = addCosim(b, target, optimize, "test-rtl-section-swiglu", "Verilator cosim: bit-exact PWL section SwiGLU with elastic stream", "section_swiglu", "fpga/sim/section_swiglu", &section_swiglu_rtl, .swiglu);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
@@ -375,10 +427,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(flash_top_cosim);
     rtl_cosim.dependOn(q8_quantizer_cosim);
     rtl_cosim.dependOn(section_f32_scratch_cosim);
+    rtl_cosim.dependOn(section_swiglu_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
-const CosimKind = enum { matmul, flash, seq, q8, section };
+const CosimKind = enum { matmul, flash, seq, q8, section, swiglu };
 
 fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // The one production layout source; the sim layout shim derives its block
@@ -388,12 +441,16 @@ fn attachCosimSupport(b: *std.Build, mod: *std.Build.Module, target: std.Build.R
     layout.addImport("shared_layout", shared_layout);
     const pack = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/pack.zig"), .target = target, .optimize = optimize });
     const ref = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/matmul_ref.zig"), .target = target, .optimize = optimize });
+    const swiglu_coeffs = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/swiglu_coeffs.zig"), .target = target, .optimize = optimize });
+    const swiglu_ref = b.createModule(.{ .root_source_file = b.path("fpga/sim/support/swiglu_ref.zig"), .target = target, .optimize = optimize });
     pack.addImport("layout", layout);
     ref.addImport("layout", layout);
+    swiglu_ref.addImport("swiglu_coeffs.zig", swiglu_coeffs);
     mod.addImport("layout", layout);
     mod.addImport("shared_layout", shared_layout);
     mod.addImport("pack", pack);
     mod.addImport("matmul_ref", ref);
+    mod.addImport("swiglu_ref", swiglu_ref);
 }
 
 // Verilator cosim of an RTL top, driven from Zig. `kind` picks the reference
@@ -432,6 +489,7 @@ fn addCosim(
     switch (kind) {
         .matmul => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/numeric" }),
         .flash => vcmd.addArgs(&.{ "+incdir+fpga/regmap", "+incdir+fpga/rtl/flash_attn", "+incdir+fpga/rtl/numeric" }),
+        .swiglu => vcmd.addArgs(&.{"+incdir+fpga/rtl/numeric"}),
         .seq, .q8, .section => {}, // these leaves have no Verilog includes
     }
     vcmd.addArgs(rtl);
@@ -469,6 +527,31 @@ fn addCosim(
             .target = target,
             .optimize = optimize,
         })),
+        .swiglu => {
+            const coeffs = b.createModule(.{
+                .root_source_file = b.path("fpga/sim/support/swiglu_coeffs.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            const ref = b.createModule(.{
+                .root_source_file = b.path("fpga/sim/support/swiglu_ref.zig"),
+                .target = target,
+                .optimize = optimize,
+            });
+            ref.addImport("swiglu_coeffs.zig", coeffs);
+            tb_mod.addImport("swiglu_coeffs", coeffs);
+            tb_mod.addImport("swiglu_ref", ref);
+            tb_mod.addImport("shared_layout", b.createModule(.{
+                .root_source_file = b.path("shared/layout.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+            tb_mod.addImport("ps_activations", b.createModule(.{
+                .root_source_file = b.path("device/ps/activations.zig"),
+                .target = target,
+                .optimize = optimize,
+            }));
+        },
     }
     tb_mod.addIncludePath(b.path(dir));
     tb_mod.addIncludePath(.{ .cwd_relative = b.fmt("{s}/include", .{vroot}) });

@@ -560,6 +560,7 @@ pub fn writeScoreboard(
     const mac_cyc = if (mm.cycles == 0) 0 else @as(f64, @floatFromInt(mm.macs)) / @as(f64, @floatFromInt(mm.cycles));
     const flash_ns = rg.op_totals[@intFromEnum(wire.OpTag.flash_attn_f32)].total_ns;
     const swiglu_ns = rg.op_totals[@intFromEnum(wire.OpTag.swiglu)].total_ns;
+    const ffn_ns = rg.op_totals[@intFromEnum(wire.OpTag.ffn_section)].total_ns;
     const fa = attentionTotals(rg.usedFlash());
     const flash_cycles_valid = if (fa.pl_valid_qhkv_updates == 0) 0 else @as(f64, @floatFromInt(fa.cycles)) / @as(f64, @floatFromInt(fa.pl_valid_qhkv_updates));
     const flash_mvalid_s = if (fa.cycles == 0 or rg.device_fclk_hz == 0) 0 else @as(f64, @floatFromInt(fa.pl_valid_qhkv_updates)) * @as(f64, @floatFromInt(rg.device_fclk_hz)) /
@@ -569,7 +570,7 @@ pub fn writeScoreboard(
         "scoreboard variant={s} tok_s={d:.2} decode_ms={d:.1} device_ms={d:.1} transport_ms={d:.1}" ++
             " matmul_gmac_s={d:.2} matmul_mac_cyc={d:.1} matmul_w_gbps={d:.2} matmul_w_stall_pct={d:.1}" ++
             " flash_ms_tok={d:.1} flash_cyc_valid_qhkv={d:.2} flash_mvalid_qhkv_s={d:.2}" ++
-            " swiglu_ms_tok={d:.1}\n",
+            " swiglu_ms_tok={d:.1} ffn_ms_tok={d:.1}\n",
         .{
             variant,
             perSecond(tokens, decode.wall_ns),
@@ -584,6 +585,7 @@ pub fn writeScoreboard(
             flash_cycles_valid,
             flash_mvalid_s,
             nsToMs(swiglu_ns) / t,
+            nsToMs(ffn_ns) / t,
         },
     );
 }

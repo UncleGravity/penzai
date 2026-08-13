@@ -7,7 +7,7 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x0000000E   v14 = section FP32 scratch tee and canonical drain
+0x04      VERSION         ro      0x0000000F   v15 = same-command section FFN pipeline
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
@@ -36,20 +36,20 @@
 0x40      WEIGHT_PORTS    ro      0x00000004   synchronized AXIS weight ports
 0x44      WEIGHT_FMT      rw      0x00000001   1 = binary w1a8, 2 = ternary w158a8
 0x48      NUM_ROWS        rw      0x00000000   logical output rows; 0 preserves full rowblocks
-0x4C      ACT_MODE        rw      0x00000000   0 = packed Q8 load, 1 = reuse resident Q8, 2 = raw F32 load
+0x4C      ACT_MODE        rw      0x00000000   0 = packed Q8 load, 1 = reuse resident Q8, 2 = raw F32 load, 3 = scratch SwiGLU load
 0x50      ACT_EPOCH       rw      0x00000000   caller-owned activation epoch for load/reuse matching
 0x54      ACT_STATE       ro      0x00000000   bit0 = resident valid, bit1 = last-run activation error
 0x58      LOADED_EPOCH    ro      0x00000000   epoch of resident Q8 activation
 0x5C      LOADED_Q1_BLOCKS ro     0x00000000   K/128 of resident Q8 activation
 0x60      LOADED_COLS     ro      0x00000000   columns of resident Q8 activation
-0x64      QUANT_STATUS    ro      0x00000000   raw-ingress status bits: nonfinite, scale, frame, arithmetic
-0x68      SCRATCH_MODE    rw      0x00000000   0 = legacy DDR, 1 = atomic DDR+scratch tee, 2 = scratch drain
+0x64      QUANT_STATUS    ro      0x00000000   ingress status: q8 bits [3:0], SwiGLU nonfinite/overflow bits [5:4]
+0x68      SCRATCH_MODE    rw      0x00000000   0 = legacy DDR, 1 = atomic DDR+scratch tee, 2 = scratch drain, 3 = scratch only
 0x6C      SCRATCH_ROLE    rw      0x00000000   0 = R, 1 = X0/gate, 2 = X1/up, 3 = X2
 0x70      SCRATCH_ROWS    rw      0x00000000   logical rows; integrated tee requires NUM_ROWS equality and 16-row alignment
 0x74      SCRATCH_TOKENS  rw      0x00000000   token/column count; tee requires NUM_COLS equality, valid range 1..4
-0x78      SCRATCH_CTRL    wo      0x00000000   bit0 = start drain, bit1 = abort active tee/drain
-0x7C      SCRATCH_STATUS  ro      0x00000000   writer/drain state, any error, role-valid bits [8:5]
-0x80      SCRATCH_ERROR   ro      0x00000000   config, writer, abort, read/collision, stale-role error bits
+0x78      SCRATCH_CTRL    wo      0x00000000   bit0 = start drain, bit1 = abort active operation/section, bit2 = begin section
+0x7C      SCRATCH_STATUS  ro      0x00000000   v14 bits [8:0]; consumer busy/done [10:9], section active/done [12:11]
+0x80      SCRATCH_ERROR   ro      0x00000000   v14 bits [4:0]; consumer read/framing bit5, SwiGLU/Q8 bit6
 #
 # (v8 had a writable EMIN window-floor register at 0x44. v9 bakes the window floor in as a
 # constant of the f16 format — decode_top.EMIN_FLOOR — so there is no EMIN register and no

@@ -8,6 +8,7 @@ const std = @import("std");
 const layout = @import("layout.zig");
 
 pub const version: u16 = 1;
+pub const ffn_kernel_version: u32 = 15;
 
 // V1 is the first routed point. A command may contain a longer prompt; the
 // controller walks it in tiles no larger than this value.
@@ -130,6 +131,22 @@ pub const FfnShape = struct {
 
     pub fn validate(self: FfnShape) Error!void {
         try validateTokenCount(self.token_count);
+        try validateModelDim(self.model_dim);
+        if (self.ffn_dim == 0 or self.ffn_dim > ffn_dim_max or self.ffn_dim % layout.q1_block != 0)
+            return error.InvalidFfnDim;
+    }
+};
+
+/// Host-visible section extent. The controller tiles this full command into
+/// `FfnShape` chunks, so it accepts the full context rather than one PL tile.
+pub const FfnCommandShape = struct {
+    token_count: u32,
+    model_dim: u32,
+    ffn_dim: u32,
+
+    pub fn validate(self: FfnCommandShape) Error!void {
+        if (self.token_count == 0 or self.token_count > context_max)
+            return error.InvalidTokenCount;
         try validateModelDim(self.model_dim);
         if (self.ffn_dim == 0 or self.ffn_dim > ffn_dim_max or self.ffn_dim % layout.q1_block != 0)
             return error.InvalidFfnDim;
@@ -273,4 +290,9 @@ test "v1 Bonsai section shapes and capacities are explicit" {
     try std.testing.expectEqual(F32Role.x2.bytes(), try attention.outputAccumulatorBytes());
     try std.testing.expectEqual(@as(u64, 512 * 1024), totalF32Bytes());
     try std.testing.expectError(error.InvalidTokenCount, (FfnShape{ .token_count = 5, .model_dim = 4096, .ffn_dim = 12288 }).validate());
+
+    try (FfnCommandShape{ .token_count = 1, .model_dim = 4096, .ffn_dim = 12288 }).validate();
+    try (FfnCommandShape{ .token_count = 16, .model_dim = 4096, .ffn_dim = 12288 }).validate();
+    try (FfnCommandShape{ .token_count = context_max, .model_dim = 4096, .ffn_dim = 12288 }).validate();
+    try std.testing.expectError(error.InvalidTokenCount, (FfnCommandShape{ .token_count = context_max + 1, .model_dim = 4096, .ffn_dim = 12288 }).validate());
 }

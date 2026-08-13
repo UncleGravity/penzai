@@ -9,6 +9,7 @@ const layout = @import("layout");
 const shared_layout = @import("shared_layout");
 const pack = @import("pack");
 const ref = @import("matmul_ref");
+const swiglu_ref = @import("swiglu_ref");
 
 const c = @cImport(@cInclude("shim.h"));
 
@@ -47,16 +48,19 @@ const REG_SCRATCH_ERROR: u8 = 0x80;
 const ACT_PACKED_LOAD: u32 = 0;
 const ACT_REUSE: u32 = 1;
 const ACT_RAW_LOAD: u32 = 2;
+const ACT_SCRATCH_SWIGLU: u32 = 3;
 const QUANT_NONFINITE: u32 = 1 << 0;
 const QUANT_FRAME: u32 = 1 << 2;
 
 const SCRATCH_MODE_DDR: u32 = 0;
 const SCRATCH_MODE_TEE: u32 = 1;
 const SCRATCH_MODE_DRAIN: u32 = 2;
+const SCRATCH_MODE_ONLY: u32 = 3;
 const SCRATCH_ROLE_X0: u32 = 1;
 const SCRATCH_ROLE_X1: u32 = 2;
 const SCRATCH_CTRL_DRAIN_START: u32 = 1;
 const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
+const SCRATCH_CTRL_SECTION_BEGIN: u32 = 1 << 2;
 const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
 const SCRATCH_WRITER_DONE: u32 = 1 << 1;
 const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
@@ -64,6 +68,10 @@ const SCRATCH_DRAIN_DONE: u32 = 1 << 3;
 const SCRATCH_ANY_ERROR: u32 = 1 << 4;
 const SCRATCH_X0_VALID: u32 = 1 << 6;
 const SCRATCH_X1_VALID: u32 = 1 << 7;
+const SCRATCH_CONSUMER_BUSY: u32 = 1 << 9;
+const SCRATCH_CONSUMER_DONE: u32 = 1 << 10;
+const SCRATCH_SECTION_ACTIVE: u32 = 1 << 11;
+const SCRATCH_SECTION_DONE: u32 = 1 << 12;
 const SCRATCH_ERROR_CONFIG: u32 = 1 << 0;
 const SCRATCH_ERROR_WRITER: u32 = 1 << 1;
 const SCRATCH_ERROR_ABORT: u32 = 1 << 2;
@@ -632,6 +640,416 @@ fn packRawF32(values: []const f32, beats: []u64) void {
     }
 }
 
+fn runScratchOnlyProjection(
+    dut: *Dut,
+    rows: usize,
+    q1_blocks: usize,
+    tokens: usize,
+    role: u32,
+    act_mode: u32,
+    epoch: u32,
+    ports: [PORTS][]const u8,
+    raw_beats: []const u64,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_ONLY, role, rows, tokens);
+    configureProjection(dut, rows, rows, q1_blocks, tokens, WEIGHT_FMT_BINARY, act_mode, epoch);
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    var wi = [_]usize{0} ** PORTS;
+    var ai: usize = 0;
+    var cycle: usize = 0;
+    while (cycle < CYCLE_LIMIT and (wi[0] < w_beats or ai < raw_beats.len)) : (cycle += 1) {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid) readPortBeat(ports[port], wi[port]) else [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(dut.h, @intCast(port), &words, @intFromBool(valid));
+        }
+        const a_valid = ai < raw_beats.len;
+        c.dut_set_a(
+            dut.h,
+            if (a_valid) raw_beats[ai] else 0,
+            @intFromBool(a_valid),
+            @intFromBool(a_valid and ai + 1 == raw_beats.len),
+        );
+        c.dut_set_m_ready(dut.h, @intFromBool(cycle % 7 < 3));
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0) return error.ScratchOnlyExposedResult;
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| w_fire[port] = w_valid[port] and c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        const a_fire = a_valid and c.dut_a_ready(dut.h) != 0;
+        if (act_mode == ACT_REUSE and c.dut_a_ready(dut.h) != 0)
+            return error.ScratchOnlyReuseRequestedActivation;
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+        if (a_fire) ai += 1;
+    }
+    if (cycle == CYCLE_LIMIT) return error.ScratchOnlyInputTimeout;
+
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    var done = false;
+    var poll: usize = 0;
+    while (poll < CYCLE_LIMIT and !done) : (poll += 128) {
+        for (0..128) |_| {
+            c.dut_eval(dut.h);
+            if (c.dut_m_valid(dut.h) != 0) return error.ScratchOnlyExposedResult;
+            dut.step();
+        }
+        done = (try axiRead(dut, REG_STATUS)) & 2 != 0;
+    }
+    if (!done) return error.ScratchOnlyDoneTimeout;
+    const expected_a_beats: u32 = if (act_mode == ACT_RAW_LOAD) @intCast(raw_beats.len) else 0;
+    if (try axiRead(dut, REG_W_BEATS) != w_beats or
+        try axiRead(dut, REG_A_BEATS) != expected_a_beats or
+        try axiRead(dut, REG_R_BEATS) != 0)
+        return error.ScratchOnlyCounterMismatch;
+    const valid_mask = if (role == SCRATCH_ROLE_X1) SCRATCH_X1_VALID else SCRATCH_X0_VALID;
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_WRITER_DONE | valid_mask) != (SCRATCH_WRITER_DONE | valid_mask) or
+        status & SCRATCH_ANY_ERROR != 0)
+        return error.ScratchOnlyStatusMismatch;
+}
+
+const InternalRun = struct {
+    stream: []u8,
+    read_fires: usize,
+    swiglu_fires: usize,
+    record_fires: usize,
+};
+
+fn runInternalDown(
+    a: std.mem.Allocator,
+    dut: *Dut,
+    rows: usize,
+    ffn_dim: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+) !InternalRun {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        ffn_dim / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_0002,
+    );
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    const stream = try a.alloc(u8, rows * tokens * @sizeOf(f32));
+    errdefer a.free(stream);
+    var wi = [_]usize{0} ** PORTS;
+    var out_offset: usize = 0;
+    var saw_last = false;
+    var read_fires: usize = 0;
+    var swiglu_fires: usize = 0;
+    var record_fires: usize = 0;
+    var reads_since_record: usize = 0;
+    var swiglu_since_record: usize = 0;
+
+    for (0..CYCLE_LIMIT) |cycle| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid) readPortBeat(ports[port], wi[port]) else [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(dut.h, @intCast(port), &words, @intFromBool(valid));
+        }
+        // Internal mode must ignore even a continuously asserted external source.
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        const ready = cycle % 13 < 8;
+        c.dut_set_m_ready(dut.h, @intFromBool(ready));
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0) return error.InternalModeAcceptedExternalActivation;
+        if (c.dut_dbg_scratch_read_fire(dut.h) != 0) {
+            read_fires += 1;
+            reads_since_record += 1;
+        }
+        if (c.dut_dbg_swiglu_input_fire(dut.h) != 0) {
+            swiglu_fires += 1;
+            swiglu_since_record += 1;
+        }
+        if (c.dut_dbg_internal_record_done(dut.h) != 0) {
+            if (reads_since_record != 8 or swiglu_since_record != 32)
+                return error.InternalRecordScheduleMismatch;
+            reads_since_record = 0;
+            swiglu_since_record = 0;
+            record_fires += 1;
+        }
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| w_fire[port] = w_valid[port] and c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        if (c.dut_m_valid(dut.h) != 0 and ready) {
+            if (c.dut_m_keep(dut.h) != 0xff or out_offset + 8 > stream.len)
+                return error.InternalDownFraming;
+            std.mem.writeInt(u64, stream[out_offset..][0..8], c.dut_m_data(dut.h), .little);
+            out_offset += 8;
+            if (c.dut_m_last(dut.h) != 0) {
+                if (saw_last or out_offset != stream.len) return error.InternalDownFraming;
+                saw_last = true;
+            }
+        }
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+        if (saw_last) break;
+    } else return error.InternalDownTimeout;
+
+    c.dut_set_a(dut.h, 0, 0, 0);
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    for (0..128) |_| dut.step();
+    if ((try axiRead(dut, REG_STATUS)) & 2 == 0 or
+        try axiRead(dut, REG_A_BEATS) != 0 or
+        try axiRead(dut, REG_R_BEATS) != stream.len / 8 or
+        try axiRead(dut, REG_QUANT_STATUS) != 0)
+        return error.InternalDownCounterMismatch;
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_SECTION_DONE | SCRATCH_CONSUMER_DONE) !=
+        (SCRATCH_SECTION_DONE | SCRATCH_CONSUMER_DONE) or
+        status & (SCRATCH_SECTION_ACTIVE | SCRATCH_CONSUMER_BUSY | SCRATCH_ANY_ERROR |
+            SCRATCH_X0_VALID | SCRATCH_X1_VALID) != 0)
+        return error.InternalDownStatusMismatch;
+    return .{
+        .stream = stream,
+        .read_fires = read_fires,
+        .swiglu_fires = swiglu_fires,
+        .record_fires = record_fires,
+    };
+}
+
+fn abortInternalAndRestart(
+    dut: *Dut,
+    rows: usize,
+    ffn_dim: usize,
+    tokens: usize,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        ffn_dim / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_A807,
+    );
+    c.dut_set_m_ready(dut.h, 0);
+    c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+
+    var saw_request = false;
+    for (0..64) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+            return error.InternalAbortExposedExternalStream;
+        if (c.dut_dbg_scratch_read_fire(dut.h) != 0) {
+            saw_request = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!saw_request) return error.InternalAbortNoScratchRequest;
+
+    // Abort on the first accepted read, then begin the next section without an
+    // intervening reset.  Any response left by the killed consumer must drain
+    // while idle and cannot deadlock or poison the new section.
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    c.dut_set_m_ready(dut.h, 1);
+    var status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_CONSUMER_BUSY | SCRATCH_SECTION_ACTIVE) != 0 or
+        status & (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+        try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_ABORT == 0)
+        return error.InternalAbortStatusMismatch;
+
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & SCRATCH_SECTION_ACTIVE == 0 or
+        status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR | SCRATCH_X0_VALID | SCRATCH_X1_VALID) != 0 or
+        try axiRead(dut, REG_SCRATCH_ERROR) != 0)
+        return error.InternalImmediateRestartFailed;
+}
+
+fn verifyMaxScratchBlockTarget(dut: *Dut) !void {
+    const max_rows: usize = 12288;
+    const max_tokens: usize = 4;
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, max_rows, max_tokens);
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    if (try axiRead(dut, REG_SCRATCH_STATUS) & SCRATCH_SECTION_ACTIVE == 0)
+        return error.MaxScratchSectionBeginRejected;
+
+    // The bit-exact case exercises real role commits.  For this isolated
+    // production-width arithmetic check, seed matching metadata and require
+    // the normal preflight/start path to snapshot the target register.
+    c.dut_dbg_seed_scratch_roles(dut.h, max_rows, max_tokens);
+    configureProjection(
+        dut,
+        ROWS,
+        ROWS,
+        max_rows / layout.Q1_BLOCK,
+        max_tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_1536,
+    );
+    // Accepted launches are registered after shape/ownership preflight.
+    // Advance through that boundary before observing the consumer snapshot.
+    dut.step();
+    c.dut_eval(dut.h);
+    if (c.dut_dbg_scratch_total_blocks(dut.h) != 1536 or
+        c.dut_dbg_scratch_consumer_state(dut.h) == 0)
+        return error.MaxScratchBlockTargetTruncated;
+
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT);
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_CONSUMER_BUSY | SCRATCH_SECTION_ACTIVE) != 0 or
+        status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR))
+        return error.MaxScratchAbortFailed;
+}
+
+fn runFfnSectionCase(a: std.mem.Allocator) !void {
+    const model_dim: usize = 128;
+    const ffn_dim: usize = 128;
+    const tokens: usize = 2;
+    const q1_blocks: usize = 1;
+    var prng = std.Random.DefaultPrng.init(0xF15F_5E07_10C0_0001);
+    const rnd = prng.random();
+
+    var weight_bits: [3][model_dim]u128 = undefined;
+    var weight_scales: [3][model_dim]f16 = undefined;
+    for (&weight_bits) |*projection| {
+        for (projection) |*bits| {
+            bits.* = (@as(u128, rnd.int(u64)) << 64) | rnd.int(u64);
+        }
+    }
+    for (&weight_scales) |*projection| {
+        for (projection) |*scale| {
+            scale.* = @floatCast(@as(f32, 1.0 / 128.0));
+        }
+    }
+
+    var port_storage: [3][PORTS][]u8 = undefined;
+    var port_views: [3][PORTS][]const u8 = undefined;
+    for (0..3) |projection| {
+        for (0..PORTS) |port| {
+            port_storage[projection][port] = try a.alloc(
+                u8,
+                weightPortBytes(model_dim / ROWS, q1_blocks, WEIGHT_FMT_BINARY),
+            );
+            port_views[projection][port] = port_storage[projection][port];
+        }
+        packWeightPorts(
+            model_dim,
+            q1_blocks,
+            weight_bits[projection][0..],
+            weight_scales[projection][0..],
+            port_storage[projection],
+        );
+    }
+    defer {
+        for (&port_storage) |*projection| {
+            for (projection) |storage| a.free(storage);
+        }
+    }
+
+    var raw: [tokens * model_dim]f32 = undefined;
+    for (&raw) |*value| value.* = (rnd.float(f32) - 0.5) * 0.5;
+    var raw_beats: [raw.len / 2]u64 = undefined;
+    packRawF32(&raw, &raw_beats);
+    var raw_quants: [raw.len]i8 = undefined;
+    var raw_scales: [raw.len / shared_layout.q8_block]f16 = undefined;
+    try shared_layout.quantizeQ8_0(&raw, &raw_quants, &raw_scales);
+
+    var up: [tokens * ffn_dim]f32 = undefined;
+    var gate: [tokens * ffn_dim]f32 = undefined;
+    const upstream = [_]*[tokens * ffn_dim]f32{ &up, &gate };
+    var saturations: usize = 0;
+    for (0..2) |projection| {
+        for (0..tokens) |token| {
+            var sat: usize = 0;
+            ref.windowedFixedOutput(.{
+                .rows = ffn_dim,
+                .q1_blocks = q1_blocks,
+                .weight_bits = weight_bits[projection][0..],
+                .weight_scales = weight_scales[projection][0..],
+                .act_quants = raw_quants[token * model_dim ..][0..model_dim],
+                .act_scales = raw_scales[token * layout.Q8_SUBBLOCKS ..][0..layout.Q8_SUBBLOCKS],
+            }, ref.fixedWindow(), upstream[projection][token * ffn_dim ..][0..ffn_dim], &sat);
+            saturations += sat;
+        }
+    }
+    if (saturations != 0) return error.WindowTooNarrow;
+
+    var swiglu: [tokens * ffn_dim]f32 = undefined;
+    for (&swiglu, gate, up) |*dst, gate_value, up_value| {
+        const modeled = swiglu_ref.model(gate_value, up_value);
+        if (modeled.status != 0) return error.SwigluOracleStatus;
+        dst.* = @bitCast(modeled.bits);
+    }
+    var swiglu_quants: [swiglu.len]i8 = undefined;
+    var swiglu_scales: [swiglu.len / shared_layout.q8_block]f16 = undefined;
+    try shared_layout.quantizeQ8_0(&swiglu, &swiglu_quants, &swiglu_scales);
+    var expected: [tokens * model_dim]f32 = undefined;
+    for (0..tokens) |token| {
+        var sat: usize = 0;
+        ref.windowedFixedOutput(.{
+            .rows = model_dim,
+            .q1_blocks = q1_blocks,
+            .weight_bits = weight_bits[2][0..],
+            .weight_scales = weight_scales[2][0..],
+            .act_quants = swiglu_quants[token * ffn_dim ..][0..ffn_dim],
+            .act_scales = swiglu_scales[token * layout.Q8_SUBBLOCKS ..][0..layout.Q8_SUBBLOCKS],
+        }, ref.fixedWindow(), expected[token * model_dim ..][0..model_dim], &sat);
+        saturations += sat;
+    }
+    if (saturations != 0) return error.WindowTooNarrow;
+
+    var dut = Dut.init();
+    defer dut.deinit();
+    reset(&dut);
+    try verifyMaxScratchBlockTarget(&dut);
+    configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+    axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    if (try axiRead(&dut, REG_SCRATCH_STATUS) & SCRATCH_SECTION_ACTIVE == 0)
+        return error.SectionBeginRejected;
+    try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X1, ACT_RAW_LOAD, 0xF15F_0001, port_views[0], &raw_beats);
+    try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X0, ACT_REUSE, 0xF15F_0001, port_views[1], &.{});
+    try abortInternalAndRestart(&dut, model_dim, ffn_dim, tokens);
+    try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X1, ACT_RAW_LOAD, 0xF15F_0003, port_views[0], &raw_beats);
+    try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X0, ACT_REUSE, 0xF15F_0003, port_views[1], &.{});
+    const down = try runInternalDown(a, &dut, model_dim, ffn_dim, tokens, port_views[2]);
+    defer a.free(down.stream);
+
+    var offset: usize = 0;
+    for (0..model_dim / ROWS) |rb| {
+        for (0..tokens) |token| {
+            for (0..ROWS) |lane| {
+                const got = std.mem.readInt(u32, down.stream[offset..][0..4], .little);
+                offset += 4;
+                const want: u32 = @bitCast(expected[token * model_dim + rb * ROWS + lane]);
+                if (got != want) return error.FfnSectionResultMismatch;
+            }
+        }
+    }
+    const expected_records = tokens * ffn_dim / shared_layout.q8_block;
+    if (down.read_fires != expected_records * 8 or
+        down.swiglu_fires != expected_records * shared_layout.q8_block or
+        down.record_fires != expected_records)
+        return error.FfnSectionTraversalMismatch;
+    std.debug.print(
+        "decode_top v15 FFN section: scratch-only A/R={d}/0 then {d}/0, internal reads/y/records={d}/{d}/{d}, DOWN bit-exact\n",
+        .{ raw_beats.len, @as(usize, 0), down.read_fires, down.swiglu_fires, down.record_fires },
+    );
+}
+
 fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: usize) !void {
     const rows: usize = ROWS;
     const epoch: u32 = if (ternary) 0xF320_0158 else 0xF320_0001;
@@ -817,7 +1235,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
 
     if (blocks == 2 and cols == 3) {
         reset(&dut);
-        if (try axiRead(&dut, 0x04) != 14) return error.ScratchVersionMismatch;
+        if (try axiRead(&dut, 0x04) != 15) return error.ScratchVersionMismatch;
 
         configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X1, rows, cols);
         const tee_up = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch, ports_load, raw_beats, raw_beats.len, .none, true, false);
@@ -934,5 +1352,6 @@ pub fn main() !void {
     try runRawResidentCase(a, true, 1, 2);
     try runRawResidentCase(a, false, 2, 3);
     try runRawResidentCase(a, true, 2, 3);
+    try runFfnSectionCase(a);
     std.debug.print("all decode_top cosim cases passed (decode_top === windowedFixedOutput, bit-exact)\n", .{});
 }

@@ -77,6 +77,11 @@ module section_f32_scratch_map_formal(input wire clk);
     reg [9:0] ref_rowblock = 10'd0;
     reg [2:0] ref_token = 3'd0;
     reg [2:0] ref_pair = 3'd0;
+    reg ref_rd_pending = 1'b0;
+    reg [13:0] ref_rd_address = 14'd0;
+    reg ref_rd_pending_error = 1'b0;
+    reg ref_rsp_expected = 1'b0;
+    reg ref_rsp_error = 1'b0;
 
     wire wr_cfg_valid = rst_n && !cfg_sent;
     wire wr_cfg_ready;
@@ -170,7 +175,25 @@ module section_f32_scratch_map_formal(input wire clk);
             ref_rowblock <= 10'd0;
             ref_token <= 3'd0;
             ref_pair <= 3'd0;
+            ref_rd_pending <= 1'b0;
+            ref_rsp_expected <= 1'b0;
         end else begin
+            ref_rsp_expected <= ref_rd_pending;
+            if (ref_rd_pending) begin
+                ref_rsp_error <= ref_rd_pending_error ||
+                                 (wr_commit_valid &&
+                                  (ref_rd_address == wr_commit_address));
+            end
+
+            ref_rd_pending <= rd_issue_valid;
+            if (rd_issue_valid) begin
+                ref_rd_address <= rd_issue_address;
+                ref_rd_pending_error <= rd_request_bad_ref ||
+                                        (wr_commit_valid &&
+                                         (rd_issue_address ==
+                                          wr_commit_address));
+            end
+
             if (cfg_accept) begin
                 cfg_sent <= 1'b1;
                 run_active <= 1'b1;
@@ -207,6 +230,8 @@ module section_f32_scratch_map_formal(input wire clk);
             assert(wr_cfg_ready == (!wr_busy && !abort_run));
 `ifndef MAP_PROVE
             assert(wr_busy == run_active);
+            if (run_active)
+                assert(wr_commit_address == ref_address);
 `endif
             assert(s_axis_tready == (wr_busy && !abort_run));
             assert(wr_commit_valid == stream_accept);
@@ -259,15 +284,15 @@ module section_f32_scratch_map_formal(input wire clk);
 `endif
 
             if ($past(rd_issue_valid)) begin
+                assert(!rd_req_ready);
+                assert(!rd_rsp_valid);
+            end
+            if (ref_rsp_expected) begin
                 assert(rd_rsp_valid);
 `ifdef MAP_PROVE
-                if ($past(rd_request_bad_ref)) assert(rd_rsp_error);
+                if (ref_rsp_error) assert(rd_rsp_error);
 `else
-                assert(rd_rsp_error ==
-                       ($past(rd_request_bad_ref) ||
-                        ($past(wr_commit_valid) &&
-                         ($past(rd_issue_address) ==
-                          $past(wr_commit_address)))));
+                assert(rd_rsp_error == ref_rsp_error);
 `endif
             end
             if ($past(rd_rsp_valid && !rd_rsp_ready)) begin

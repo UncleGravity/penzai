@@ -13,6 +13,8 @@ const lower = @import("lower.zig");
 const census_mod = @import("census.zig");
 
 const layout = shared.layout;
+const capabilities = shared.capabilities;
+const section = shared.section;
 const wire = shared.wire;
 const profiling = shared.profiling;
 
@@ -60,6 +62,7 @@ pub const Device = struct {
     census: ?*census_mod.Census = null,
     profile: ?*prof_collector.Collector = null,
     pending_preload: std.ArrayList(u8) = .empty,
+    lower_features: lower.Features = .{},
     name: [*:0]const u8 = "penzai",
     desc: [*:0]const u8 = "penzai remote tensor backend",
 
@@ -68,8 +71,13 @@ pub const Device = struct {
     // heap it and pass it only as *Device; never copy or move it after wiring.
     pub fn create(allocator: std.mem.Allocator, link: link_mod.Client) BackendError!*Self {
         link.hello() catch return error.HandshakeFailed;
+        const report = link.capabilities() catch return error.HandshakeFailed;
         const self = try allocator.create(Self);
-        self.* = .{ .allocator = allocator, .link = link };
+        self.* = .{
+            .allocator = allocator,
+            .link = link,
+            .lower_features = lowerFeatures(report),
+        };
         self.wire();
         return self;
     }
@@ -96,6 +104,32 @@ pub const Device = struct {
         self.backend = .{ .guid = null, .iface = backend_iface, .device = &self.device, .context = self };
     }
 };
+
+fn lowerFeatures(report: capabilities.Report) lower.Features {
+    return .{
+        .ffn_section_v1 = report.wire_abi == wire.version and
+            report.engine_mask & capabilities.Engine.matmul != 0 and
+            report.matmul.version >= section.ffn_kernel_version,
+    };
+}
+
+test "FFN lowering derives only from a matching live ABI15 matmul capability" {
+    var report: capabilities.Report = .{
+        .wire_abi = wire.version,
+        .engine_mask = capabilities.Engine.matmul,
+        .matmul = .{ .version = section.ffn_kernel_version },
+    };
+    try std.testing.expect(lowerFeatures(report).ffn_section_v1);
+
+    report.wire_abi -= 1;
+    try std.testing.expect(!lowerFeatures(report).ffn_section_v1);
+    report.wire_abi = wire.version;
+    report.matmul.version -= 1;
+    try std.testing.expect(!lowerFeatures(report).ffn_section_v1);
+    report.matmul.version = section.ffn_kernel_version;
+    report.engine_mask = 0;
+    try std.testing.expect(!lowerFeatures(report).ffn_section_v1);
+}
 
 // ===========================  Residency — reservations, buffers, bindings  ===========================
 // Reserved (PROT_NONE) address space gives ggml a stable base for tensor->data
@@ -603,7 +637,7 @@ fn backendGraphCompute(backend: c.ggml_backend_t, graph: ?*c.ggml_cgraph) callco
         return c.GGML_STATUS_SUCCESS;
     }
 
-    const commands = lower.lowerGraph(dev.allocator, g, lookup) catch |err| {
+    const commands = lower.lowerGraphWithFeatures(dev.allocator, g, lookup, dev.lower_features) catch |err| {
         std.debug.print("penzai backend: graph lowering failed: {s}\n", .{@errorName(err)});
         dev.counters.unsupported_graphs += 1;
         return c.GGML_STATUS_FAILED;

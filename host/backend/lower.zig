@@ -9,6 +9,7 @@ const c = @import("c_ggml");
 const shared = @import("shared");
 
 const layout = shared.layout;
+const section = shared.section;
 const wire = shared.wire;
 
 pub const LowerError = error{
@@ -24,6 +25,12 @@ pub const Binding = struct {
 };
 
 const max_flash_head_dim = 256;
+
+pub const Features = struct {
+    /// Set only after a live capabilities query reports the matmul engine at
+    /// the ABI15 named-section contract.
+    ffn_section_v1: bool = false,
+};
 
 pub const Lookup = struct {
     ctx: *anyopaque,
@@ -66,6 +73,15 @@ pub fn lowerGraph(
     graph: *c.ggml_cgraph,
     lookup: Lookup,
 ) LowerError![]wire.Command {
+    return lowerGraphWithFeatures(allocator, graph, lookup, .{});
+}
+
+pub fn lowerGraphWithFeatures(
+    allocator: std.mem.Allocator,
+    graph: *c.ggml_cgraph,
+    lookup: Lookup,
+    features: Features,
+) LowerError![]wire.Command {
     var commands: std.ArrayList(wire.Command) = .empty;
     errdefer commands.deinit(allocator);
 
@@ -98,6 +114,13 @@ pub fn lowerGraph(
             continue;
         }
         if (supportsRmsNormF32(node)) {
+            if (features.ffn_section_v1) {
+                if (tryLowerFfnSection(graph, i, lookup)) |ffn| {
+                    try commands.append(allocator, ffn.command);
+                    i = ffn.last_index;
+                    continue;
+                }
+            }
             if (tryLowerRmsNormMulF32(graph, i, lookup)) |command| {
                 try commands.append(allocator, command);
                 i += 1;
@@ -222,11 +245,15 @@ const RmsNormMulF32Pair = struct {
 };
 
 fn rmsNormMulF32Pair(graph: *c.ggml_cgraph, rms_index: c_int) ?RmsNormMulF32Pair {
+    return rmsNormMulF32PairAt(graph, rms_index, rms_index + 1);
+}
+
+fn rmsNormMulF32PairAt(graph: *c.ggml_cgraph, rms_index: c_int, mul_index: c_int) ?RmsNormMulF32Pair {
     const n = c.ggml_graph_n_nodes(graph);
-    if (rms_index < 0 or rms_index + 1 >= n) return null;
+    if (rms_index < 0 or mul_index <= rms_index or mul_index >= n) return null;
 
     const rmsnorm: *const c.ggml_tensor = c.ggml_graph_node(graph, rms_index) orelse return null;
-    const mul: *const c.ggml_tensor = c.ggml_graph_node(graph, rms_index + 1) orelse return null;
+    const mul: *const c.ggml_tensor = c.ggml_graph_node(graph, mul_index) orelse return null;
     if (!supportsRmsNormF32(rmsnorm) or mul.*.op != c.GGML_OP_MUL) return null;
     if ((rmsnorm.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0 or (mul.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0) return null;
     if ((rmsnorm.*.flags & c.GGML_TENSOR_FLAG_OUTPUT) != 0 or rmsnorm.*.view_src != null) return null;
@@ -529,6 +556,219 @@ fn safeGroupedMatmulNode(node: *const c.ggml_tensor) bool {
     if ((node.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0) return false;
     const unsafe_flags = c.GGML_TENSOR_FLAG_INPUT | c.GGML_TENSOR_FLAG_OUTPUT | c.GGML_TENSOR_FLAG_PARAM | c.GGML_TENSOR_FLAG_LOSS;
     return (node.*.flags & unsafe_flags) == 0;
+}
+
+const LoweredFfnSection = struct {
+    command: wire.Command,
+    last_index: c_int,
+};
+
+/// Recognize only the pinned Qwen/Bonsai FFN compute sequence. The command
+/// erases six graph-visible intermediates, so every dataflow edge, lifetime,
+/// resident range, and non-aliasing condition is checked before it is emitted.
+fn tryLowerFfnSection(graph: *c.ggml_cgraph, first_index: c_int, lookup: Lookup) ?LoweredFfnSection {
+    const n = c.ggml_graph_n_nodes(graph);
+    if (first_index < 0 or first_index >= n) return null;
+    var indices: [7]c_int = undefined;
+    indices[0] = first_index;
+    var cursor = first_index;
+    for (1..indices.len) |slot| {
+        while (true) {
+            cursor += 1;
+            if (cursor >= n) return null;
+            const candidate = c.ggml_graph_node(graph, cursor) orelse continue;
+            if (isMetadataOp(candidate.*.op) or tensorElements(candidate) == 0) continue;
+            indices[slot] = cursor;
+            break;
+        }
+    }
+
+    const pair = rmsNormMulF32PairAt(graph, indices[0], indices[1]) orelse return null;
+    // Qwen builds the gate projection first, then the up projection. The GLU
+    // operand roles below make that semantic ordering explicit without names.
+    const gate: *const c.ggml_tensor = c.ggml_graph_node(graph, indices[2]) orelse return null;
+    const up: *const c.ggml_tensor = c.ggml_graph_node(graph, indices[3]) orelse return null;
+    const swiglu: *const c.ggml_tensor = c.ggml_graph_node(graph, indices[4]) orelse return null;
+    const down: *const c.ggml_tensor = c.ggml_graph_node(graph, indices[5]) orelse return null;
+    const add: *const c.ggml_tensor = c.ggml_graph_node(graph, indices[6]) orelse return null;
+
+    if (!safeSectionIntermediate(pair.rmsnorm) or !safeSectionIntermediate(pair.mul) or
+        !safeSectionIntermediate(up) or !safeSectionIntermediate(gate) or
+        !safeSectionIntermediate(swiglu) or !safeSectionIntermediate(down)) return null;
+    if ((add.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0 or add.*.view_src != null) return null;
+
+    if (!supportsMatmulQ1A8(up) or !supportsMatmulQ1A8(gate) or !supportsSwigluF32(swiglu) or
+        !supportsMatmulQ1A8(down)) return null;
+    if (gate.*.src[1] != pair.mul or up.*.src[1] != pair.mul) return null;
+    const swiglu_gate: *const c.ggml_tensor = swiglu.*.src[0] orelse return null;
+    const swiglu_up: *const c.ggml_tensor = swiglu.*.src[1] orelse return null;
+    const down_acts: *const c.ggml_tensor = down.*.src[1] orelse return null;
+    if (!exclusiveMetadataAliases(graph, swiglu_gate, gate) or
+        !exclusiveMetadataAliases(graph, swiglu_up, up) or
+        !exclusiveMetadataAliases(graph, down_acts, swiglu)) return null;
+
+    const add_lowering = binaryF32Lowering(add) orelse return null;
+    if (add.*.op != c.GGML_OP_ADD or add_lowering.mode != .same_shape or
+        add.*.src[0] != down or add.*.src[1] != pair.input) return null;
+
+    const up_command = lowerMatmulQ1A8(up, lookup) catch return null;
+    const gate_command = lowerMatmulQ1A8(gate, lookup) catch return null;
+    const down_command = lowerMatmulQ1A8(down, lookup) catch return null;
+    const up_mm = up_command.matmul_q1a8;
+    const gate_mm = gate_command.matmul_q1a8;
+    const down_mm = down_command.matmul_q1a8;
+
+    if (up_mm.rows != gate_mm.rows or up_mm.cols != gate_mm.cols or up_mm.k != gate_mm.k or
+        up_mm.weight_fmt != gate_mm.weight_fmt or down_mm.weight_fmt != up_mm.weight_fmt) return null;
+    if (down_mm.rows != up_mm.k or down_mm.cols != up_mm.cols or down_mm.k != up_mm.rows) return null;
+
+    const model_dim = up_mm.k;
+    const ffn_dim = up_mm.rows;
+    const token_count = up_mm.cols;
+    (section.FfnCommandShape{
+        .token_count = token_count,
+        .model_dim = model_dim,
+        .ffn_dim = ffn_dim,
+    }).validate() catch return null;
+
+    if (!sameShape(pair.input, pair.rmsnorm) or !sameShape(pair.rmsnorm, pair.mul) or
+        !sameShape(up, gate) or !sameShape(gate, swiglu) or !sameShape(down, add)) return null;
+    if ((u32Dim(dim(pair.mul, 0)) catch return null) != model_dim or
+        (flattenedCols(pair.mul, model_dim) catch return null) != token_count) return null;
+
+    const skipped = [_]*const c.ggml_tensor{ pair.rmsnorm, pair.mul, up, gate, swiglu, down };
+    const expected_uses = [_]usize{ 1, 2, 1, 1, 1, 1 };
+    for (skipped, expected_uses) |tensor, expected| {
+        if (tensorUseCount(graph, tensor) != expected) return null;
+    }
+    if (tensorHasView(graph, pair.rmsnorm) or tensorHasView(graph, pair.mul) or
+        tensorHasView(graph, down)) return null;
+    if (tensorUseCount(graph, pair.input) != 2) return null;
+
+    const model_bytes = f32MatrixBytes(model_dim, token_count) catch return null;
+    const ffn_bytes = f32MatrixBytes(ffn_dim, token_count) catch return null;
+    const norm_weight_bytes = f32MatrixBytes(model_dim, 1) catch return null;
+    const up_weight_bytes = weightBytes(up_mm.weight_fmt, ffn_dim, model_dim) orelse return null;
+    const down_weight_bytes = weightBytes(down_mm.weight_fmt, model_dim, ffn_dim) orelse return null;
+
+    const gate_alias_range = fullBackingRange(lookup.find(swiglu_gate) orelse return null, ffn_bytes) catch return null;
+    const up_alias_range = fullBackingRange(lookup.find(swiglu_up) orelse return null, ffn_bytes) catch return null;
+    const swiglu_range = fullBackingRange(lookup.find(swiglu) orelse return null, ffn_bytes) catch return null;
+    if (!std.meta.eql(gate_alias_range, gate_mm.dst) or !std.meta.eql(up_alias_range, up_mm.dst) or
+        !std.meta.eql(down_mm.acts, swiglu_range)) return null;
+
+    // Require all graph-resident intermediates too: a missing or truncated
+    // binding must never become easier to execute merely because fusion hides it.
+    const intermediate_bytes = [_]usize{ model_bytes, model_bytes, ffn_bytes, ffn_bytes, ffn_bytes, model_bytes };
+    for (skipped, intermediate_bytes) |tensor, bytes| {
+        const binding = lookup.find(tensor) orelse return null;
+        _ = fullBackingRange(binding, bytes) catch return null;
+    }
+
+    const residual = fullBackingRange(lookup.find(pair.input) orelse return null, model_bytes) catch return null;
+    const norm_weight = fullBackingRange(lookup.find(pair.weight) orelse return null, norm_weight_bytes) catch return null;
+    const up_weights_tensor: *const c.ggml_tensor = up.*.src[0] orelse return null;
+    const gate_weights_tensor: *const c.ggml_tensor = gate.*.src[0] orelse return null;
+    const down_weights_tensor: *const c.ggml_tensor = down.*.src[0] orelse return null;
+    if (up_weights_tensor == gate_weights_tensor or up_weights_tensor == down_weights_tensor or
+        gate_weights_tensor == down_weights_tensor) return null;
+    const up_weights = fullBackingRange(lookup.find(up_weights_tensor) orelse return null, up_weight_bytes) catch return null;
+    const gate_weights = fullBackingRange(lookup.find(gate_weights_tensor) orelse return null, up_weight_bytes) catch return null;
+    const down_weights = fullBackingRange(lookup.find(down_weights_tensor) orelse return null, down_weight_bytes) catch return null;
+    const dst = fullBackingRange(lookup.find(add) orelse return null, model_bytes) catch return null;
+
+    const external = [_]wire.TensorRange{ residual, norm_weight, up_weights, gate_weights, down_weights, dst };
+    for (external, 0..) |a, ai| {
+        for (external[ai + 1 ..]) |b| if (rangesOverlap(a, b)) return null;
+    }
+
+    return .{
+        .command = .{ .ffn_section = .{
+            .residual = residual,
+            .norm_weight = norm_weight,
+            .up_weights = up_weights,
+            .gate_weights = gate_weights,
+            .down_weights = down_weights,
+            .dst = dst,
+            .model_dim = model_dim,
+            .ffn_dim = ffn_dim,
+            .token_count = token_count,
+            .eps = opParamF32(pair.rmsnorm, 0),
+            .weight_fmt = up_mm.weight_fmt,
+            .contract_version = section.version,
+            .flags = 0,
+        } },
+        .last_index = indices[6],
+    };
+}
+
+fn safeSectionIntermediate(node: *const c.ggml_tensor) bool {
+    if (node.*.view_src != null or (node.*.flags & c.GGML_TENSOR_FLAG_COMPUTE) == 0) return false;
+    const unsafe_flags = c.GGML_TENSOR_FLAG_INPUT | c.GGML_TENSOR_FLAG_OUTPUT |
+        c.GGML_TENSOR_FLAG_PARAM | c.GGML_TENSOR_FLAG_LOSS;
+    return (node.*.flags & unsafe_flags) == 0;
+}
+
+fn tensorUseCount(graph: *c.ggml_cgraph, target: *const c.ggml_tensor) usize {
+    const n = c.ggml_graph_n_nodes(graph);
+    var count: usize = 0;
+    var index: c_int = 0;
+    while (index < n) : (index += 1) {
+        const node = c.ggml_graph_node(graph, index) orelse continue;
+        for (node.*.src) |src| if (src == target) {
+            count += 1;
+        };
+    }
+    return count;
+}
+
+fn tensorHasView(graph: *c.ggml_cgraph, target: *const c.ggml_tensor) bool {
+    const n = c.ggml_graph_n_nodes(graph);
+    var index: c_int = 0;
+    while (index < n) : (index += 1) {
+        const node = c.ggml_graph_node(graph, index) orelse continue;
+        if (node.*.view_src == target) return true;
+    }
+    return false;
+}
+
+fn exclusiveMetadataAliases(graph: *c.ggml_cgraph, start: *const c.ggml_tensor, target: *const c.ggml_tensor) bool {
+    var current = start;
+    var allowed_view: ?*const c.ggml_tensor = null;
+    var depth: usize = 0;
+    while (depth < 16) : (depth += 1) {
+        if (current == target) return !tensorHasUnexpectedView(graph, current, allowed_view);
+        if (!isMetadataOp(current.*.op)) return false;
+        const unsafe_flags = c.GGML_TENSOR_FLAG_INPUT | c.GGML_TENSOR_FLAG_OUTPUT |
+            c.GGML_TENSOR_FLAG_PARAM | c.GGML_TENSOR_FLAG_LOSS;
+        if ((current.*.flags & unsafe_flags) != 0 or tensorUseCount(graph, current) != 1)
+            return false;
+        if (tensorHasUnexpectedView(graph, current, allowed_view)) return false;
+        allowed_view = current;
+        current = current.*.src[0] orelse return false;
+    }
+    return false;
+}
+
+fn tensorHasUnexpectedView(
+    graph: *c.ggml_cgraph,
+    target: *const c.ggml_tensor,
+    allowed: ?*const c.ggml_tensor,
+) bool {
+    const n = c.ggml_graph_n_nodes(graph);
+    var index: c_int = 0;
+    while (index < n) : (index += 1) {
+        const node = c.ggml_graph_node(graph, index) orelse continue;
+        if (node.*.view_src == target and node != allowed) return true;
+    }
+    return false;
+}
+
+fn weightBytes(fmt: wire.WeightFormat, rows: u32, k: u32) ?usize {
+    return switch (fmt) {
+        .w1a8 => layout.packedWeightBytes(rows, k),
+        .w158a8 => layout.packedTernaryWeightBytes(rows, k),
+    } catch null;
 }
 
 fn lowerBinaryF32(node: *const c.ggml_tensor, lookup: Lookup) LowerError!wire.Command {
@@ -907,6 +1147,11 @@ fn backingRange(binding: Binding, nbytes: usize) LowerError!wire.TensorRange {
     };
 }
 
+fn fullBackingRange(binding: Binding, nbytes: usize) LowerError!wire.TensorRange {
+    if (nbytes > binding.range.nbytes) return error.InvalidShape;
+    return backingRange(binding, nbytes);
+}
+
 fn backingRemaining(binding: Binding) LowerError!wire.TensorRange {
     if (binding.range.offset > binding.handle_nbytes) return error.InvalidShape;
     return .{
@@ -1036,6 +1281,21 @@ const TestMatmulPair = struct {
     second: *c.ggml_tensor,
 };
 
+const TestFfn = struct {
+    residual: *c.ggml_tensor,
+    norm_weight: *c.ggml_tensor,
+    rmsnorm: *c.ggml_tensor,
+    normalized: *c.ggml_tensor,
+    up_weights: *c.ggml_tensor,
+    gate_weights: *c.ggml_tensor,
+    down_weights: *c.ggml_tensor,
+    up: *c.ggml_tensor,
+    gate: *c.ggml_tensor,
+    swiglu: *c.ggml_tensor,
+    down: *c.ggml_tensor,
+    result: *c.ggml_tensor,
+};
+
 fn testContext() !*c.ggml_context {
     return c.ggml_init(.{
         .mem_size = 1024 * 1024,
@@ -1080,6 +1340,38 @@ fn testMatmulPair(ctx: *c.ggml_context, rows: i64, cols: i64, second_acts: bool,
     };
 }
 
+fn testFfn(ctx: *c.ggml_context, token_count: i64, ternary: bool) !TestFfn {
+    const model_dim: i64 = layout.q1_block;
+    const ffn_dim: i64 = layout.q1_block;
+    const weight_type: c.enum_ggml_type = @intCast(if (ternary) c.GGML_TYPE_Q2_0 else c.GGML_TYPE_Q1_0);
+    const residual = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, model_dim, token_count) orelse return error.OutOfMemory;
+    const norm_weight = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, model_dim) orelse return error.OutOfMemory;
+    const rmsnorm = c.ggml_rms_norm(ctx, residual, 1e-6) orelse return error.OutOfMemory;
+    const normalized = c.ggml_mul(ctx, rmsnorm, norm_weight) orelse return error.OutOfMemory;
+    const up_weights = c.ggml_new_tensor_2d(ctx, weight_type, model_dim, ffn_dim) orelse return error.OutOfMemory;
+    const gate_weights = c.ggml_new_tensor_2d(ctx, weight_type, model_dim, ffn_dim) orelse return error.OutOfMemory;
+    const up = c.ggml_mul_mat(ctx, up_weights, normalized) orelse return error.OutOfMemory;
+    const gate = c.ggml_mul_mat(ctx, gate_weights, normalized) orelse return error.OutOfMemory;
+    const swiglu = c.ggml_swiglu_split(ctx, gate, up) orelse return error.OutOfMemory;
+    const down_weights = c.ggml_new_tensor_2d(ctx, weight_type, ffn_dim, model_dim) orelse return error.OutOfMemory;
+    const down = c.ggml_mul_mat(ctx, down_weights, swiglu) orelse return error.OutOfMemory;
+    const result = c.ggml_add(ctx, down, residual) orelse return error.OutOfMemory;
+    return .{
+        .residual = residual,
+        .norm_weight = norm_weight,
+        .rmsnorm = rmsnorm,
+        .normalized = normalized,
+        .up_weights = up_weights,
+        .gate_weights = gate_weights,
+        .down_weights = down_weights,
+        .up = up,
+        .gate = gate,
+        .swiglu = swiglu,
+        .down = down,
+        .result = result,
+    };
+}
+
 fn testFindBinding(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
     _ = ctx;
     const t = tensor orelse return null;
@@ -1109,6 +1401,21 @@ const TestMissingBinding = struct {
     }
 };
 
+const TestTruncatedBinding = struct {
+    tensor: *const c.ggml_tensor,
+
+    fn find(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
+        const self: *TestTruncatedBinding = @ptrCast(@alignCast(ctx));
+        var binding = testFindBinding(ctx, tensor) orelse return null;
+        if (tensor == self.tensor and binding.range.nbytes > 0) binding.range.nbytes -= 1;
+        return binding;
+    }
+
+    fn lookup(self: *TestTruncatedBinding) Lookup {
+        return .{ .ctx = self, .findFn = find };
+    }
+};
+
 const TestAliasedBindings = struct {
     alias: *const c.ggml_tensor,
     target: *const c.ggml_tensor,
@@ -1120,6 +1427,23 @@ const TestAliasedBindings = struct {
     }
 
     fn lookup(self: *TestAliasedBindings) Lookup {
+        return .{ .ctx = self, .findFn = find };
+    }
+};
+
+const TestMetadataBindings = struct {
+    aliases: [2]*const c.ggml_tensor,
+    targets: [2]*const c.ggml_tensor,
+
+    fn find(ctx: *anyopaque, tensor: ?*const c.ggml_tensor) ?Binding {
+        const self: *TestMetadataBindings = @ptrCast(@alignCast(ctx));
+        for (self.aliases, self.targets) |alias, target| {
+            if (tensor == alias) return testFindBinding(ctx, target);
+        }
+        return testFindBinding(ctx, tensor);
+    }
+
+    fn lookup(self: *TestMetadataBindings) Lookup {
         return .{ .ctx = self, .findFn = find };
     }
 };
@@ -1146,6 +1470,125 @@ fn expectStandaloneMatmulPair(commands: []const wire.Command) !void {
         .matmul_q1a8 => {},
         else => return error.TestUnexpectedResult,
     }
+}
+
+test "ABI15 feature lowers the exact seven-node Qwen FFN section" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const ffn = try testFfn(ctx, 5, true);
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, ffn.result);
+
+    const legacy = try lowerGraph(std.testing.allocator, graph, testLookup());
+    defer std.testing.allocator.free(legacy);
+    try std.testing.expectEqual(@as(usize, 5), legacy.len);
+    try std.testing.expectEqual(wire.OpTag.rmsnorm, std.meta.activeTag(legacy[0]));
+    try std.testing.expectEqual(wire.OpTag.matmul_q1a8_group2, std.meta.activeTag(legacy[1]));
+
+    const commands = try lowerGraphWithFeatures(std.testing.allocator, graph, testLookup(), .{ .ffn_section_v1 = true });
+    defer std.testing.allocator.free(commands);
+    try std.testing.expectEqual(@as(usize, 1), commands.len);
+    const command = commands[0].ffn_section;
+    try std.testing.expectEqual(@as(u32, layout.q1_block), command.model_dim);
+    try std.testing.expectEqual(@as(u32, layout.q1_block), command.ffn_dim);
+    try std.testing.expectEqual(@as(u32, 5), command.token_count);
+    try std.testing.expectEqual(wire.WeightFormat.w158a8, command.weight_fmt);
+    try std.testing.expectEqual(@as(u16, section.version), command.contract_version);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.residual))), command.residual.handle);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.result))), command.dst.handle);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.up_weights))), command.up_weights.handle);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.gate_weights))), command.gate_weights.handle);
+}
+
+test "FFN section follows exact metadata aliases between compute nodes" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const ffn = try testFfn(ctx, 3, true);
+    const gate_alias = c.ggml_reshape_2d(ctx, ffn.gate, layout.q1_block, 3) orelse return error.OutOfMemory;
+    const up_alias = c.ggml_reshape_2d(ctx, ffn.up, layout.q1_block, 3) orelse return error.OutOfMemory;
+    ffn.swiglu.*.src[0] = gate_alias;
+    ffn.swiglu.*.src[1] = up_alias;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, ffn.result);
+
+    var bindings = TestMetadataBindings{
+        .aliases = .{ gate_alias, up_alias },
+        .targets = .{ ffn.gate, ffn.up },
+    };
+    const lowered = tryLowerFfnSection(graph, 0, bindings.lookup()) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(c_int, 8), lowered.last_index);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.gate_weights))), lowered.command.ffn_section.gate_weights.handle);
+    try std.testing.expectEqual(@as(u64, @intCast(@intFromPtr(ffn.up_weights))), lowered.command.ffn_section.up_weights.handle);
+}
+
+test "FFN section rejects an intervening compute node" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+    const ffn = try testFfn(ctx, 2, false);
+    const lhs = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const rhs = c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_F32, 8) orelse return error.OutOfMemory;
+    const middle = c.ggml_add(ctx, lhs, rhs) orelse return error.OutOfMemory;
+    const graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(graph, ffn.normalized);
+    c.ggml_build_forward_expand(graph, middle);
+    c.ggml_build_forward_expand(graph, ffn.result);
+    try std.testing.expect(tryLowerFfnSection(graph, 0, testLookup()) == null);
+}
+
+test "FFN section matcher rejects lifetime, operand order, missing, and aliased contracts" {
+    const ctx = try testContext();
+    defer c.ggml_free(ctx);
+
+    const extra = try testFfn(ctx, 2, false);
+    const extra_rhs = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, layout.q1_block, 2) orelse return error.OutOfMemory;
+    const extra_use = c.ggml_add(ctx, extra.up, extra_rhs) orelse return error.OutOfMemory;
+    const extra_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(extra_graph, extra.result);
+    c.ggml_build_forward_expand(extra_graph, extra_use);
+    try std.testing.expect(tryLowerFfnSection(extra_graph, 0, testLookup()) == null);
+
+    const reversed = try testFfn(ctx, 2, false);
+    reversed.swiglu.*.src[0] = reversed.up;
+    reversed.swiglu.*.src[1] = reversed.gate;
+    const reversed_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(reversed_graph, reversed.result);
+    try std.testing.expect(tryLowerFfnSection(reversed_graph, 0, testLookup()) == null);
+
+    const missing = try testFfn(ctx, 2, false);
+    const missing_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(missing_graph, missing.result);
+    var missing_binding = TestMissingBinding{ .tensor = missing.down_weights };
+    try std.testing.expect(tryLowerFfnSection(missing_graph, 0, missing_binding.lookup()) == null);
+    var truncated_binding = TestTruncatedBinding{ .tensor = missing.down_weights };
+    try std.testing.expect(tryLowerFfnSection(missing_graph, 0, truncated_binding.lookup()) == null);
+
+    var aliases = TestAliasedBindings{ .alias = missing.result, .target = missing.residual };
+    try std.testing.expect(tryLowerFfnSection(missing_graph, 0, aliases.lookup()) == null);
+    c.ggml_set_output(missing.up);
+    try std.testing.expect(tryLowerFfnSection(missing_graph, 0, testLookup()) == null);
+
+    const viewed = try testFfn(ctx, 2, false);
+    const view = c.ggml_view_2d(ctx, viewed.gate, layout.q1_block, 2, layout.q1_block * @sizeOf(f32), 0) orelse return error.OutOfMemory;
+    const view_rhs = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, layout.q1_block, 2) orelse return error.OutOfMemory;
+    const view_use = c.ggml_add(ctx, view, view_rhs) orelse return error.OutOfMemory;
+    const view_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(view_graph, viewed.result);
+    c.ggml_build_forward_expand(view_graph, view_use);
+    try std.testing.expect(tryLowerFfnSection(view_graph, 0, testLookup()) == null);
+
+    const branched = try testFfn(ctx, 2, false);
+    const alias = c.ggml_reshape_2d(ctx, branched.gate, layout.q1_block, 2) orelse return error.OutOfMemory;
+    branched.swiglu.*.src[0] = alias;
+    const alias_rhs = c.ggml_new_tensor_2d(ctx, c.GGML_TYPE_F32, layout.q1_block, 2) orelse return error.OutOfMemory;
+    const alias_use = c.ggml_add(ctx, alias, alias_rhs) orelse return error.OutOfMemory;
+    const branch_graph = try testGraph(ctx);
+    c.ggml_build_forward_expand(branch_graph, branched.result);
+    c.ggml_build_forward_expand(branch_graph, alias_use);
+    var branch_bindings = TestMetadataBindings{
+        .aliases = .{ alias, alias },
+        .targets = .{ branched.gate, branched.gate },
+    };
+    try std.testing.expect(tryLowerFfnSection(branch_graph, 0, branch_bindings.lookup()) == null);
 }
 
 test "lowering groups exact adjacent matmuls with one activation" {

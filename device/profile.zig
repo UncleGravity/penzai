@@ -56,6 +56,19 @@ pub const MatmulExecution = struct {
     r_beats: u64 = 0,
 };
 
+/// Nested timings for a named FFN command. The command aggregate remains the
+/// authoritative wall time; these fields attribute its internal stages and
+/// feed the existing matmul buckets without changing the profiling wire ABI.
+pub const FfnExecution = struct {
+    gate_up: MatmulExecution = .{ .path = .software },
+    down: MatmulExecution = .{ .path = .software },
+    gate_up_command_ns: u64 = 0,
+    down_command_ns: u64 = 0,
+    norm_ns: u64 = 0,
+    swiglu_ns: u64 = 0,
+    residual_add_ns: u64 = 0,
+};
+
 pub const FlashExecution = struct {
     path: profiling.ExecutionPath,
     kernel_runs: u32 = 0,
@@ -96,6 +109,7 @@ pub const CommandOutcome = struct {
         none,
         matmul: MatmulExecution,
         flash: FlashExecution,
+        ffn: FfnExecution,
     };
 };
 
@@ -139,7 +153,7 @@ pub const Collector = struct {
                     .matmul => |value| value,
                     else => MatmulExecution{ .path = outcome.path },
                 };
-                self.recordMatmul(mm.rows, mm.cols, mm.k, mm.weight_fmt, 1, command_ns, outcome, detail);
+                self.recordMatmul(mm.rows, mm.cols, mm.k, mm.weight_fmt, 1, 1, command_ns, outcome, detail);
             },
             .matmul_q1a8_group2 => |group| {
                 const group_detail = switch (outcome.detail) {
@@ -153,11 +167,47 @@ pub const Collector = struct {
                     group.cols,
                     group.k,
                     group.projections[0].weight_fmt,
+                    1,
                     group.projections.len,
                     command_ns,
                     outcome,
                     group_detail,
                 );
+            },
+            .ffn_section => |ffn| {
+                const detail = switch (outcome.detail) {
+                    .ffn => |value| value,
+                    else => FfnExecution{
+                        .gate_up = .{ .path = outcome.path },
+                        .down = .{ .path = outcome.path },
+                    },
+                };
+                self.recordMatmul(
+                    ffn.ffn_dim,
+                    ffn.token_count,
+                    ffn.model_dim,
+                    ffn.weight_fmt,
+                    1,
+                    2,
+                    detail.gate_up_command_ns,
+                    outcome,
+                    detail.gate_up,
+                );
+                self.recordMatmul(
+                    ffn.model_dim,
+                    ffn.token_count,
+                    ffn.ffn_dim,
+                    ffn.weight_fmt,
+                    1,
+                    1,
+                    detail.down_command_ns,
+                    outcome,
+                    detail.down,
+                );
+                const stage_ns = detail.norm_ns +| detail.gate_up_command_ns +|
+                    detail.swiglu_ns +| detail.down_command_ns +| detail.residual_add_ns;
+                if (stage_ns > command_ns)
+                    self.accounting_violations |= profiling.AccountingViolation.wrapper_segments;
             },
             .flash_attn_f32 => |fa| {
                 const detail = switch (outcome.detail) {
@@ -227,6 +277,7 @@ pub const Collector = struct {
         cols: u32,
         k: u32,
         weight_fmt: wire.WeightFormat,
+        logical_count: usize,
         logical_multiplicity: usize,
         command_ns: u64,
         outcome: CommandOutcome,
@@ -241,7 +292,7 @@ pub const Collector = struct {
             .k = k,
         };
         const stat = self.matmulBucket(incoming) orelse return;
-        stat.count +|= 1;
+        stat.count +|= @intCast(logical_count);
         stat.kernel_runs +|= detail.kernel_runs;
         stat.macs +|= mul(mul(mul(rows, cols), k), logical_multiplicity);
         stat.command_ns +|= command_ns;
@@ -332,6 +383,7 @@ pub fn commandTag(command: wire.Command) wire.OpTag {
         .cpy_f32_to_f16 => .cpy_f32_to_f16,
         .matmul_q1a8 => .matmul_q1a8,
         .matmul_q1a8_group2 => .matmul_q1a8_group2,
+        .ffn_section => .ffn_section,
         .rmsnorm => .rmsnorm,
         .rope => .rope,
         .softmax => .softmax,
@@ -360,6 +412,9 @@ pub fn commandBytes(command: wire.Command) u64 {
         .matmul_q1a8_group2 => |op| op.acts.nbytes +|
             op.projections[0].weights.nbytes +| op.projections[0].dst.nbytes +|
             op.projections[1].weights.nbytes +| op.projections[1].dst.nbytes,
+        .ffn_section => |op| op.residual.nbytes +| op.norm_weight.nbytes +|
+            op.up_weights.nbytes +| op.gate_weights.nbytes +| op.down_weights.nbytes +|
+            op.dst.nbytes,
         .rmsnorm => |op| op.input.nbytes +| (if (op.has_weight) op.weight.nbytes else 0) +| op.dst.nbytes,
         .rope => |op| op.input.nbytes +| op.positions.nbytes +| op.dst.nbytes,
         .softmax => |op| op.src.nbytes +| op.dst.nbytes,
@@ -531,6 +586,56 @@ test "grouped matmul accounting counts one activation and two logical projection
     try std.testing.expectEqual(@as(u64, 100), collector.matmul_stats[0].command_ns);
     try std.testing.expectEqual(@as(u64, 2 * 16 * 2 * 128), collector.matmul_stats[0].macs);
     try std.testing.expectEqual(@as(u32, 2), collector.matmul_stats[0].kernel_runs);
+}
+
+test "ffn section records one aggregate and three logical matmuls" {
+    const residual = wire.TensorRange{ .handle = 1, .offset = 0, .nbytes = 1024 };
+    const norm_weight = wire.TensorRange{ .handle = 2, .offset = 0, .nbytes = 512 };
+    const up_weights = wire.TensorRange{ .handle = 3, .offset = 0, .nbytes = 4096 };
+    const gate_weights = wire.TensorRange{ .handle = 4, .offset = 0, .nbytes = 4096 };
+    const down_weights = wire.TensorRange{ .handle = 5, .offset = 0, .nbytes = 4096 };
+    const dst = wire.TensorRange{ .handle = 6, .offset = 0, .nbytes = 1024 };
+    const command = wire.Command{ .ffn_section = .{
+        .residual = residual,
+        .norm_weight = norm_weight,
+        .up_weights = up_weights,
+        .gate_weights = gate_weights,
+        .down_weights = down_weights,
+        .dst = dst,
+        .model_dim = 128,
+        .ffn_dim = 256,
+        .token_count = 2,
+        .eps = 1e-6,
+        .weight_fmt = .w1a8,
+    } };
+    try std.testing.expectEqual(@as(u64, 14_848), commandBytes(command));
+
+    var collector: Collector = .{};
+    collector.record(command, 100, .{
+        .backend = .pl,
+        .path = .direct,
+        .detail = .{ .ffn = .{
+            .gate_up = .{ .path = .direct, .kernel_runs = 2, .wrapper_ns = 35, .wait_ns = 30 },
+            .down = .{ .path = .direct, .kernel_runs = 1, .wrapper_ns = 25, .wait_ns = 20 },
+            .gate_up_command_ns = 40,
+            .down_command_ns = 30,
+            .norm_ns = 10,
+            .swiglu_ns = 5,
+            .residual_add_ns = 5,
+        } },
+    });
+    const aggregate = collector.aggregates[@intFromEnum(wire.OpTag.ffn_section)];
+    try std.testing.expectEqual(@as(u32, 1), aggregate.count);
+    try std.testing.expectEqual(@as(u64, 100), aggregate.total_ns);
+    try std.testing.expectEqual(@as(u64, 14_848), aggregate.bytes);
+    try std.testing.expectEqual(@as(usize, 2), collector.matmul_count);
+    try std.testing.expectEqual(@as(u32, 1), collector.matmul_stats[0].count);
+    try std.testing.expectEqual(@as(u64, 2 * 256 * 2 * 128), collector.matmul_stats[0].macs);
+    try std.testing.expectEqual(@as(u64, 40), collector.matmul_stats[0].command_ns);
+    try std.testing.expectEqual(@as(u32, 1), collector.matmul_stats[1].count);
+    try std.testing.expectEqual(@as(u64, 128 * 2 * 256), collector.matmul_stats[1].macs);
+    try std.testing.expectEqual(@as(u64, 30), collector.matmul_stats[1].command_ns);
+    try std.testing.expectEqual(@as(u32, 0), collector.accounting_violations);
 }
 
 fn testMatmulCommand(rows: u32) wire.Command {

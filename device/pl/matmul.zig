@@ -19,6 +19,8 @@ const gather = @import("gather.zig");
 const seq = @import("seq.zig");
 const seq_ctrl_mod = @import("seq_ctrl.zig");
 const profile = @import("../profile.zig");
+const ps_rmsnorm = @import("../ps/rmsnorm.zig");
+const ps_elemwise = @import("../ps/elemwise.zig");
 
 const wire = shared.wire;
 const layout = shared.layout;
@@ -62,22 +64,29 @@ const ACT_STATE_VALID: u32 = 1 << 0;
 const ACT_STATE_ERROR: u32 = 1 << 1;
 const SCRATCH_CTRL_DRAIN_START: u32 = 1 << 0;
 const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
+const SCRATCH_CTRL_SECTION_BEGIN: u32 = 1 << 2;
 const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
 const SCRATCH_WRITER_DONE: u32 = 1 << 1;
 const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
 const SCRATCH_DRAIN_DONE: u32 = 1 << 3;
 const SCRATCH_ANY_ERROR: u32 = 1 << 4;
+const SCRATCH_CONSUMER_BUSY: u32 = 1 << 9;
+const SCRATCH_CONSUMER_DONE: u32 = 1 << 10;
+const SCRATCH_SECTION_ACTIVE: u32 = 1 << 11;
+const SCRATCH_SECTION_DONE: u32 = 1 << 12;
 
 const ActivationMode = enum(u32) {
     packed_load = 0,
     reuse = 1,
     raw_f32_load = 2,
+    scratch_swiglu_load = 3,
 };
 
 const ScratchMode = enum(u32) {
     ddr_only = 0,
     tee = 1,
     drain = 2,
+    scratch_only = 3,
 };
 
 /// Minimum kernel VERSION the driver accepts. v9 is the fixed-window gemm kernel (104-bit
@@ -95,6 +104,7 @@ pub const version_with_ternary: u32 = 11;
 pub const version_with_logical_rows: u32 = 12;
 pub const version_with_activation_reuse: u32 = 13;
 pub const version_with_scratch: u32 = 14;
+pub const version_with_ffn_section: u32 = 15;
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -140,6 +150,10 @@ pub const Kernel = struct {
 
     pub fn hasScratch(self: Kernel) bool {
         return self.version >= version_with_scratch;
+    }
+
+    pub fn hasFfnSection(self: Kernel) bool {
+        return self.version >= version_with_ffn_section;
     }
 
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
@@ -238,6 +252,33 @@ pub const Kernel = struct {
         self.configureScratch(.tee, role, rows, tokens);
     }
 
+    pub fn beginFfnSection(self: *Kernel) void {
+        std.debug.assert(self.hasFfnSection());
+        self.selectDdrResult();
+        self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_SECTION_BEGIN);
+    }
+
+    pub fn waitFfnSectionActive(self: *Kernel) KernelError!void {
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            if (status & SCRATCH_ANY_ERROR != 0) return error.ScratchState;
+            if (status & SCRATCH_SECTION_ACTIVE != 0) return;
+        }
+        return error.ScratchTimeout;
+    }
+
+    pub fn configureScratchOnly(self: *Kernel, role: section.F32Role, rows: u32, tokens: u32) void {
+        std.debug.assert(self.hasFfnSection());
+        std.debug.assert(role == .x0 or role == .x1);
+        self.configureScratch(.scratch_only, role, rows, tokens);
+    }
+
+    pub fn configureFfnConsumer(self: *Kernel, rows: u32, tokens: u32) void {
+        std.debug.assert(self.hasFfnSection());
+        self.configureScratch(.ddr_only, .x0, rows, tokens);
+    }
+
     pub fn configureScratchDrain(self: *Kernel, role: section.F32Role, rows: u32, tokens: u32) void {
         std.debug.assert(self.hasScratch());
         self.configureScratch(.drain, role, rows, tokens);
@@ -263,6 +304,17 @@ pub const Kernel = struct {
         try self.waitScratchDone(SCRATCH_DRAIN_DONE, 0);
     }
 
+    pub fn waitFfnConsumerDone(self: *Kernel) KernelError!void {
+        try self.waitScratchDone(SCRATCH_CONSUMER_DONE, 0);
+    }
+
+    pub fn waitFfnSectionDone(self: *Kernel) KernelError!void {
+        try self.waitScratchDone(SCRATCH_SECTION_DONE, 0);
+        const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+        if (status & (SCRATCH_SECTION_ACTIVE | SCRATCH_CONSUMER_BUSY) != 0)
+            return error.ScratchState;
+    }
+
     fn waitScratchDone(self: *Kernel, done_mask: u32, required_valid_mask: u32) KernelError!void {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
@@ -285,7 +337,9 @@ pub const Kernel = struct {
     pub fn finishScratchDiagnostic(self: *Kernel) void {
         if (!self.hasScratch()) return;
         const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
-        if (status & (SCRATCH_WRITER_BUSY | SCRATCH_DRAIN_BUSY) != 0) {
+        if (status & (SCRATCH_WRITER_BUSY | SCRATCH_DRAIN_BUSY |
+            SCRATCH_CONSUMER_BUSY | SCRATCH_SECTION_ACTIVE) != 0)
+        {
             self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_ABORT);
         }
         self.selectDdrResult();
@@ -877,6 +931,225 @@ pub fn Backend(comptime Heap: type) type {
             return result;
         }
 
+        /// Execute one semantic FFN command as three GEMM runs. RMSNorm and the
+        /// final residual add stay on the PS for v15; gate/up intermediates and
+        /// SwiGLU never leave section-private PL storage.
+        pub fn tryFfnSection(
+            self: *Self,
+            heap: *Heap,
+            op: wire.FfnSection,
+            ctx: ?*profile.ProfileContext,
+        ) Error!?profile.FfnExecution {
+            if (!self.kernel.hasFfnSection()) return null;
+            if (op.contract_version != section.version or op.flags != 0 or
+                op.eps < 0 or !std.math.isFinite(op.eps)) return null;
+            if (op.model_dim == 0 or op.model_dim > section.model_dim_max or
+                op.model_dim % layout.q1_block != 0 or
+                op.ffn_dim == 0 or op.ffn_dim > section.ffn_dim_max or
+                op.ffn_dim % layout.q1_block != 0 or
+                op.token_count == 0 or op.token_count > section.context_max)
+                return null;
+            if (op.weight_fmt == .w158a8 and self.kernel.version < version_with_ternary) return null;
+
+            const model_dim: usize = op.model_dim;
+            const ffn_dim: usize = op.ffn_dim;
+            const tokens: usize = op.token_count;
+            const model_bytes = std.math.mul(usize, model_dim * @sizeOf(f32), tokens) catch return null;
+            const ffn_weight_bytes = switch (op.weight_fmt) {
+                .w1a8 => layout.packedWeightBytes(ffn_dim, model_dim) catch return null,
+                .w158a8 => layout.packedTernaryWeightBytes(ffn_dim, model_dim) catch return null,
+            };
+            const down_weight_bytes = switch (op.weight_fmt) {
+                .w1a8 => layout.packedWeightBytes(model_dim, ffn_dim) catch return null,
+                .w158a8 => layout.packedTernaryWeightBytes(model_dim, ffn_dim) catch return null,
+            };
+            if (op.residual.nbytes != model_bytes or op.dst.nbytes != model_bytes or
+                op.norm_weight.nbytes != model_dim * @sizeOf(f32) or
+                op.up_weights.nbytes != ffn_weight_bytes or
+                op.gate_weights.nbytes != ffn_weight_bytes or
+                op.down_weights.nbytes != down_weight_bytes)
+                return null;
+            const down_num_rb = layout.rowblocksFor(model_dim);
+            const max_tile_tokens = @min(tokens, @as(usize, section.query_tile_max));
+            const max_tile_model_bytes = model_dim * max_tile_tokens * @sizeOf(f32);
+            const max_down_dma_bytes = down_num_rb * max_tile_tokens * result_bytes_per_rb;
+            if (max_tile_model_bytes > acts_staging_cap or
+                max_down_dma_bytes > result_staging_cap or ffnRangesOverlap(op)) return null;
+
+            // Resolve and reserve the complete external/private contract before
+            // RMSNorm staging or any DMA can mutate state. The private result
+            // keeps dst authoritative: no partial tile is published on failure.
+            const residual = heap.read(op.residual) catch return error.HeapFailure;
+            const norm_weight = heap.read(op.norm_weight) catch return error.HeapFailure;
+            const dst = heap.bytes(op.dst) catch return error.HeapFailure;
+            const normalized_max_dma = subRange(self.acts_staging, max_tile_model_bytes);
+            const down_max_dma = subRange(self.result_staging, max_down_dma_bytes);
+            _ = heap.bytes(normalized_max_dma) catch return error.HeapFailure;
+            _ = heap.bytes(down_max_dma) catch return error.HeapFailure;
+            const normalized_phys = heap.deviceAddress(normalized_max_dma) catch return error.HeapFailure;
+            const down_phys = heap.deviceAddress(down_max_dma) catch return error.HeapFailure;
+            const up_weights_phys = heap.deviceAddress(op.up_weights) catch return error.HeapFailure;
+            const gate_weights_phys = heap.deviceAddress(op.gate_weights) catch return error.HeapFailure;
+            const down_weights_phys = heap.deviceAddress(op.down_weights) catch return error.HeapFailure;
+            const private_down = self.allocator.alloc(u8, model_bytes) catch return error.OutOfMemory;
+            defer self.allocator.free(private_down);
+
+            const execution_path = ffnExecutionPath(tokens);
+            var result: profile.FfnExecution = .{
+                .gate_up = .{ .path = execution_path },
+                .down = .{ .path = execution_path },
+            };
+            var gate_up_counters: Counters = .{};
+            var down_counters: Counters = .{};
+            var last = profile.begin(ctx);
+            const upstream_num_rb = layout.rowblocksFor(ffn_dim);
+            const upstream_q1_blocks = model_dim / layout.q1_block;
+            const upstream_port_bytes = ffnWeightBytesPerPort(op.weight_fmt, upstream_num_rb, upstream_q1_blocks);
+            const downstream_q1_blocks = ffn_dim / layout.q1_block;
+            const downstream_port_bytes = ffnWeightBytesPerPort(op.weight_fmt, down_num_rb, downstream_q1_blocks);
+            const projections = [_]struct { weights_phys: u64, role: section.F32Role, mode: ActivationMode }{
+                .{ .weights_phys = up_weights_phys, .role = .x1, .mode = .raw_f32_load },
+                .{ .weights_phys = gate_weights_phys, .role = .x0, .mode = .reuse },
+            };
+            var section_started = false;
+            var dmas_armed = false;
+            defer {
+                if (section_started) self.kernel.finishScratchDiagnostic();
+                self.kernel.selectPackedActivation();
+            }
+            errdefer {
+                // Release scratch/kernel ownership before resetting movers that
+                // may still be connected to an active section command.
+                if (section_started) {
+                    self.kernel.finishScratchDiagnostic();
+                    section_started = false;
+                }
+                if (dmas_armed) self.abortProjectionDmas();
+            }
+
+            var col0: usize = 0;
+            while (col0 < tokens) {
+                const tile_tokens = @min(@as(usize, section.query_tile_max), tokens - col0);
+                const tile_model_bytes = model_dim * tile_tokens * @sizeOf(f32);
+                const tile_down_dma_bytes = down_num_rb * tile_tokens * result_bytes_per_rb;
+                const residual_offset = col0 * model_dim * @sizeOf(f32);
+                const residual_tile = residual[residual_offset..][0..tile_model_bytes];
+                const normalized_dma = subRange(self.acts_staging, tile_model_bytes);
+                const normalized = heap.bytes(normalized_dma) catch return error.HeapFailure;
+                const down_dma = subRange(self.result_staging, tile_down_dma_bytes);
+                const down_buf = heap.bytes(down_dma) catch return error.HeapFailure;
+                const epoch = self.takeActivationEpoch();
+
+                ps_rmsnorm.runWeightedBytes(
+                    residual_tile,
+                    norm_weight,
+                    normalized,
+                    op.model_dim,
+                    @intCast(tile_tokens),
+                    op.eps,
+                ) catch return error.HeapFailure;
+                result.norm_ns +|= profile.lap(ctx, &last);
+                heap.syncToDevice(normalized_dma) catch return error.HeapFailure;
+                result.gate_up.sync_to_ns +|= profile.lap(ctx, &last);
+
+                self.kernel.beginFfnSection();
+                section_started = true;
+                try self.kernel.waitFfnSectionActive();
+
+                for (projections) |projection| {
+                    if (projection.mode == .reuse and
+                        !self.kernel.residentMatches(epoch, @intCast(upstream_q1_blocks), @intCast(tile_tokens)))
+                        return error.ActivationState;
+                    try self.dma_w[0].resetMm2s();
+                    for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
+                    if (projection.mode == .raw_f32_load) try self.dma_a.resetMm2s();
+                    dmas_armed = true;
+                    for (&self.dma_w, 0..) |*dma, port| {
+                        try dma.startReadFromDdr(
+                            projection.weights_phys + @as(u64, @intCast(port * upstream_port_bytes)),
+                            upstream_port_bytes,
+                        );
+                    }
+                    if (projection.mode == .raw_f32_load)
+                        try self.dma_a.startReadFromDdr(normalized_phys, tile_model_bytes);
+                    self.kernel.configureScratchOnly(projection.role, op.ffn_dim, @intCast(tile_tokens));
+                    self.kernel.runWithActivation(
+                        @intCast(upstream_q1_blocks),
+                        @intCast(upstream_num_rb),
+                        @intCast(tile_tokens),
+                        op.ffn_dim,
+                        op.weight_fmt,
+                        projection.mode,
+                        epoch,
+                    );
+                    result.gate_up.setup_ns +|= profile.lap(ctx, &last);
+                    try self.kernel.waitDone();
+                    try self.kernel.waitScratchWriterDone(projection.role);
+                    for (&self.dma_w) |*dma| try dma.waitReadDone();
+                    if (projection.mode == .raw_f32_load) try self.dma_a.waitReadDone();
+                    dmas_armed = false;
+                    result.gate_up.wait_ns +|= profile.lap(ctx, &last);
+                    result.gate_up.kernel_runs +|= 1;
+                    if (ctx != null) accumulateCounters(&gate_up_counters, self.readCounters());
+                }
+
+                try self.dma_w[0].reset();
+                for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
+                dmas_armed = true;
+                try self.dma_w[0].startWriteToDdr(down_phys, tile_down_dma_bytes);
+                for (&self.dma_w, 0..) |*dma, port| {
+                    try dma.startReadFromDdr(
+                        down_weights_phys + @as(u64, @intCast(port * downstream_port_bytes)),
+                        downstream_port_bytes,
+                    );
+                }
+                self.kernel.configureFfnConsumer(op.ffn_dim, @intCast(tile_tokens));
+                self.kernel.runWithActivation(
+                    @intCast(downstream_q1_blocks),
+                    @intCast(down_num_rb),
+                    @intCast(tile_tokens),
+                    op.model_dim,
+                    op.weight_fmt,
+                    .scratch_swiglu_load,
+                    self.takeActivationEpoch(),
+                );
+                result.down.setup_ns +|= profile.lap(ctx, &last);
+                try self.kernel.waitDone();
+                try self.kernel.waitFfnConsumerDone();
+                try self.kernel.waitFfnSectionDone();
+                for (&self.dma_w) |*dma| try dma.waitReadDone();
+                try self.dma_w[0].waitWriteDone();
+                dmas_armed = false;
+                section_started = false;
+                result.down.wait_ns +|= profile.lap(ctx, &last);
+                result.down.kernel_runs +|= 1;
+                if (ctx != null) accumulateCounters(&down_counters, self.readCounters());
+
+                heap.syncFromDevice(down_dma) catch return error.HeapFailure;
+                result.down.sync_from_ns +|= profile.lap(ctx, &last);
+                gather.gatherResults(private_down, down_buf, model_dim, tile_tokens, col0, down_num_rb);
+                result.down.result_layout_ns +|= profile.lap(ctx, &last);
+                col0 += tile_tokens;
+            }
+            result.gate_up_command_ns = result.gate_up.setup_ns +| result.gate_up.wait_ns +|
+                result.gate_up.sync_to_ns;
+            result.down_command_ns = result.down.setup_ns +| result.down.wait_ns +|
+                result.down.sync_from_ns +| result.down.result_layout_ns;
+            result.gate_up.wrapper_ns = result.gate_up_command_ns;
+            result.down.wrapper_ns = result.down_command_ns;
+            // PL SwiGLU is fused into the down kernel wait and cannot be timed
+            // independently without perturbing the section pipeline.
+            result.swiglu_ns = 0;
+            ps_elemwise.addBytes(private_down, residual, private_down) catch return error.HeapFailure;
+            @memcpy(dst, private_down);
+            heap.syncToDevice(op.dst) catch return error.HeapFailure;
+            result.residual_add_ns = profile.lap(ctx, &last);
+
+            applyCounters(&result.gate_up, gate_up_counters);
+            applyCounters(&result.down, down_counters);
+            return result;
+        }
+
         fn verifyScratchTile(
             self: *Self,
             heap: *Heap,
@@ -987,6 +1260,29 @@ fn groupRangesOverlap(group: wire.MatmulQ1A8Group2) bool {
         rangesOverlap(second.dst, first.weights) or rangesOverlap(second.dst, second.weights);
 }
 
+fn ffnRangesOverlap(op: wire.FfnSection) bool {
+    const ranges = [_]wire.TensorRange{
+        op.residual,     op.norm_weight,  op.up_weights,
+        op.gate_weights, op.down_weights, op.dst,
+    };
+    for (ranges, 0..) |a, i| {
+        for (ranges[i + 1 ..]) |b| if (rangesOverlap(a, b)) return true;
+    }
+    return false;
+}
+
+fn ffnWeightBytesPerPort(fmt: wire.WeightFormat, num_rb: usize, q1_blocks: usize) usize {
+    const bytes_per_block = switch (fmt) {
+        .w1a8 => layout.packed_per_port_q1_block,
+        .w158a8 => layout.ternary_packed_per_port_block,
+    };
+    return num_rb * q1_blocks * bytes_per_block;
+}
+
+fn ffnExecutionPath(tokens: usize) shared.profiling.ExecutionPath {
+    return if (tokens == 1) .direct else .staged;
+}
+
 fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
     if (a.handle != b.handle or a.nbytes == 0 or b.nbytes == 0) return false;
     const a_end = std.math.add(u64, a.offset, a.nbytes) catch return true;
@@ -1003,6 +1299,16 @@ fn accumulateCounters(dst: *Counters, src: Counters) void {
     dst.w_beats += src.w_beats;
     dst.a_beats += src.a_beats;
     dst.r_beats += src.r_beats;
+}
+
+fn applyCounters(dst: *profile.MatmulExecution, counters: Counters) void {
+    dst.cycles = counters.cycles;
+    dst.w_stall_cycles = counters.w_stall;
+    dst.a_stall_cycles = counters.a_stall;
+    dst.r_stall_cycles = counters.r_stall;
+    dst.w_beats = counters.w_beats;
+    dst.a_beats = counters.a_beats;
+    dst.r_beats = counters.r_beats;
 }
 
 /// Pack the activation stream: per Q1 block, per Q8 sub-block, 4 int8 beats then
@@ -1162,6 +1468,12 @@ test "scratch group tiles and projection roles match the Qwen FFN schedule" {
     try std.testing.expectEqual(@as(u32, 1 << 6), scratchRoleValidMask(.x0));
     try std.testing.expectEqual(@as(u32, 1 << 7), scratchRoleValidMask(.x1));
     try std.testing.expectEqual(@as(usize, 6144 * 4 * @sizeOf(f32)), scratchDrainBytes(6144, 4));
+}
+
+test "FFN execution path follows the semantic token count" {
+    try std.testing.expectEqual(shared.profiling.ExecutionPath.direct, ffnExecutionPath(1));
+    try std.testing.expectEqual(shared.profiling.ExecutionPath.staged, ffnExecutionPath(2));
+    try std.testing.expectEqual(shared.profiling.ExecutionPath.staged, ffnExecutionPath(section.query_tile_max + 1));
 }
 
 test "scratch drain comparison is exact" {

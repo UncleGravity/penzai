@@ -1,4 +1,5 @@
 #include "Vdecode_top.h"
+#include "Vdecode_top___024root.h"
 #include "verilated.h"
 #include "shim.h"
 
@@ -111,6 +112,34 @@ int dut_m_valid(Dut *d) { return d->t->m_axis_tvalid; }
 int dut_m_last(Dut *d) { return d->t->m_axis_tlast; }
 int dut_m_keep(Dut *d) { return d->t->m_axis_tkeep; }
 uint64_t dut_m_data(Dut *d) { return d->t->m_axis_tdata; }
+int dut_dbg_scratch_read_fire(Dut *d) {
+    return d->t->rootp->decode_top__DOT__scratch_rd_req_valid &&
+           d->t->rootp->decode_top__DOT__scratch_rd_req_ready;
+}
+int dut_dbg_swiglu_input_fire(Dut *d) {
+    return d->t->rootp->decode_top__DOT__scratch_consumer_state_q == 5 &&
+           d->t->rootp->decode_top__DOT__swiglu_in_ready;
+}
+int dut_dbg_internal_record_done(Dut *d) {
+    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__state == 5 &&
+           d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__emit_index == 4 &&
+           d->t->rootp->decode_top__DOT__native_acts_tready;
+}
+int dut_dbg_scratch_consumer_state(Dut *d) {
+    return d->t->rootp->decode_top__DOT__scratch_consumer_state_q;
+}
+uint32_t dut_dbg_scratch_total_blocks(Dut *d) {
+    return d->t->rootp->decode_top__DOT__scratch_consumer_total_blocks_q;
+}
+void dut_dbg_seed_scratch_roles(Dut *d, uint32_t rows, uint32_t tokens) {
+    // Test-only setup for the production-width block-count regression. The
+    // ordinary FFN case below populates these records through real GEMM writes.
+    d->t->rootp->decode_top__DOT__scratch_valid_q = 0x6;
+    d->t->rootp->decode_top__DOT__scratch_valid_rows_q[1] = rows;
+    d->t->rootp->decode_top__DOT__scratch_valid_rows_q[2] = rows;
+    d->t->rootp->decode_top__DOT__scratch_valid_tokens_q[1] = tokens;
+    d->t->rootp->decode_top__DOT__scratch_valid_tokens_q[2] = tokens;
+}
 int dut_axi_rvalid(Dut *d) { return d->t->s_axi_rvalid; }
 uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }
 }

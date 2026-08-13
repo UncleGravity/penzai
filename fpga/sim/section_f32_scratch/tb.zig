@@ -211,6 +211,9 @@ fn readGroup(
     try std.testing.expectEqual(expected_address, c.dut_read_issue_address(dut.handle));
     dut.step();
     c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
+    try std.testing.expect(c.dut_read_request_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_read_response_valid(dut.handle) == 0);
+    dut.step();
     dut.eval();
 
     try std.testing.expect(c.dut_read_response_valid(dut.handle) != 0);
@@ -407,6 +410,7 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     dut.step();
     c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
     c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
+    dut.step();
     dut.eval();
     const cross_role = try consumeCurrentRead(dut, 4);
     try std.testing.expect(!cross_role.is_error);
@@ -434,6 +438,7 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     dut.step();
     c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
     c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
+    dut.step();
     dut.eval();
     const collided = try consumeCurrentRead(dut, 3);
     try std.testing.expect(collided.is_error);
@@ -451,6 +456,35 @@ fn testSimultaneousPorts(dut: *Dut) !void {
     }
     try std.testing.expect(c.dut_write_error(dut.handle) == 0);
     try expectGroup(dut, .x2, 0, 0, 6, 1);
+
+    // A write to the requested address one cycle later, when the registered
+    // address reaches the memories, is the same invalid schedule and must also
+    // return a deterministic error response.
+    try configure(dut, .x2, 8, 1);
+    c.dut_set_read_ready(dut.handle, 0);
+    c.dut_set_read_request(dut.handle, 1, roleCode(.x2), 0, 0);
+    dut.step();
+    c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
+    c.dut_set_write_stream(dut.handle, 1, pairWord(8, .x2, 0, 0), 0xff, 0);
+    dut.step();
+    c.dut_set_write_stream(dut.handle, 0, 0, 0, 0);
+    dut.eval();
+    const issue_collided = try consumeCurrentRead(dut, 2);
+    try std.testing.expect(issue_collided.is_error);
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, issue_collided.lanes);
+    for (1..4) |pair| {
+        try sendMappedBeat(
+            dut,
+            .x2,
+            0,
+            @intCast(pair * 2),
+            pairWord(8, .x2, 0, @intCast(pair * 2)),
+            0xff,
+            pair == 3,
+        );
+    }
+    try std.testing.expect(c.dut_write_error(dut.handle) == 0);
+    try expectGroup(dut, .x2, 0, 0, 8, 1);
 }
 
 pub fn main() !void {

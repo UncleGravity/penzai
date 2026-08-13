@@ -50,7 +50,8 @@ module section_f32_scratch (
     input  wire [2:0]    rd_req_token,
     input  wire [10:0]   rd_req_group,
 
-    // Accepted physical group-read address.
+    // Accepted bounded group-read address.  The physical memory access follows
+    // from this registered address on the next cycle.
     output wire          rd_issue_valid,
     output wire [13:0]   rd_issue_address,
 
@@ -77,14 +78,15 @@ module section_f32_scratch (
     // ---- Write configuration and GEMM-order address generation ----
 
     reg         wr_busy_q;
-    reg [1:0]   run_role;
     reg         run_half_final;
     reg [2:0]   run_tokens;
     reg [13:0]  run_role_base;
+    reg [10:0]  run_groups_per_token;
     reg [9:0]   run_rowblocks;
     reg [9:0]   wr_rowblock;
     reg [2:0]   wr_token;
     reg [2:0]   wr_pair;
+    reg [13:0]  wr_address_q;
 
     reg [13:0] cfg_capacity;
     reg [13:0] cfg_role_base;
@@ -135,21 +137,14 @@ module section_f32_scratch (
     wire wr_frame_bad = (s_axis_tkeep != 8'hff) ||
                         (s_axis_tlast != wr_expected_last);
 
-    // A 16-row GEMM rowblock contributes two physical row groups.  pair 0..3
-    // selects the first group; pair 4..7 selects the second.
-    wire [13:0] wr_row_group = {3'b000, wr_rowblock, 1'b0} +
-                               ((wr_pair >= 3'd4) ? 14'd1 : 14'd0);
-    reg [13:0] wr_token_offset;
-    always @* begin
-        case (run_role)
-            ROLE_R, ROLE_X2:
-                wr_token_offset = {2'b00, wr_token, 9'b0}; // token * 512
-            default:
-                wr_token_offset = {1'b0, wr_token, 10'b0} +
-                                  {2'b00, wr_token, 9'b0}; // token * 1536
-        endcase
-    end
-    wire [13:0] wr_address = run_role_base + wr_token_offset + wr_row_group;
+    // Keep the physical write address registered at the URAM boundary.  A
+    // 16-row rowblock contributes two groups: pairs 0..3 share one address and
+    // pairs 4..7 share the next.  The sequential updates below jump directly
+    // between tokens and rowblocks without putting that arithmetic on the URAM
+    // address pins.
+    wire [13:0] wr_address = wr_address_q;
+    wire [13:0] wr_next_rowblock_address =
+        run_role_base + {3'b000, wr_rowblock, 1'b0} + 14'd2;
     wire [1:0] wr_bank = wr_pair[1:0];
     // A partial byte word is consumed and diagnosed, but never mutates storage.
     wire wr_mem_write = wr_accept && (s_axis_tkeep == 8'hff);
@@ -201,16 +196,25 @@ module section_f32_scratch (
     // data is masked to zero by rd_rsp_error below.
     wire [13:0] rd_address = rd_request_bad ? 14'd0 : rd_address_unchecked;
 
+    reg         rd_pending_q;
+    reg [13:0]  rd_address_q;
+    reg         rd_pending_error_q;
     reg         rd_rsp_valid_q;
     reg [63:0]  rd_bank0_q;
     reg [63:0]  rd_bank1_q;
     reg [63:0]  rd_bank2_q;
     reg [63:0]  rd_bank3_q;
 
-    assign rd_req_ready = rst_n && (!rd_rsp_valid_q || rd_rsp_ready);
+    // The accepted request is registered before it reaches the four-deep URAM
+    // cascades.  Keeping only one request pending also preserves the single
+    // elastic response slot without a response FIFO.
+    assign rd_req_ready = rst_n && !rd_pending_q &&
+                          (!rd_rsp_valid_q || rd_rsp_ready);
     wire rd_accept = rd_req_valid && rd_req_ready;
-    wire rd_collision = rd_accept && !rd_request_bad && wr_mem_write &&
-                        (rd_address == wr_address);
+    wire rd_accept_collision = rd_accept && !rd_request_bad && wr_mem_write &&
+                               (rd_address == wr_address);
+    wire rd_issue_collision = rd_pending_q &&
+                              wr_mem_write && (rd_address_q == wr_address);
 
     assign rd_rsp_valid = rd_rsp_valid_q;
     assign rd_issue_valid = rd_accept;
@@ -231,11 +235,11 @@ module section_f32_scratch (
             endcase
         end
 
-        if (rd_accept) begin
-            rd_bank0_q <= bank0_mem[rd_address];
-            rd_bank1_q <= bank1_mem[rd_address];
-            rd_bank2_q <= bank2_mem[rd_address];
-            rd_bank3_q <= bank3_mem[rd_address];
+        if (rd_pending_q) begin
+            rd_bank0_q <= bank0_mem[rd_address_q];
+            rd_bank1_q <= bank1_mem[rd_address_q];
+            rd_bank2_q <= bank2_mem[rd_address_q];
+            rd_bank3_q <= bank3_mem[rd_address_q];
         end
     end
 
@@ -244,14 +248,16 @@ module section_f32_scratch (
             wr_busy_q       <= 1'b0;
             wr_done         <= 1'b0;
             wr_error        <= 1'b0;
-            run_role        <= ROLE_R;
             run_half_final  <= 1'b0;
             run_tokens      <= 3'd0;
             run_role_base   <= 14'd0;
+            run_groups_per_token <= 11'd0;
             run_rowblocks   <= 10'd0;
             wr_rowblock     <= 10'd0;
             wr_token        <= 3'd0;
             wr_pair         <= 3'd0;
+            wr_address_q    <= 14'd0;
+            rd_pending_q    <= 1'b0;
             rd_rsp_valid_q  <= 1'b0;
             rd_rsp_error    <= 1'b0;
         end else begin
@@ -262,12 +268,15 @@ module section_f32_scratch (
                 wr_rowblock   <= 10'd0;
                 wr_token      <= 3'd0;
                 wr_pair       <= 3'd0;
+                wr_address_q  <= cfg_role_base;
                 if (cfg_shape_ok) begin
                     wr_busy_q     <= 1'b1;
-                    run_role      <= wr_cfg_role;
                     run_half_final <= wr_cfg_rows[3];
                     run_tokens    <= wr_cfg_tokens;
                     run_role_base <= cfg_role_base;
+                    run_groups_per_token <=
+                        ((wr_cfg_role == ROLE_R) || (wr_cfg_role == ROLE_X2)) ?
+                            11'd512 : 11'd1536;
                     run_rowblocks <= wr_cfg_rows[13:4] + {{9{1'b0}}, wr_cfg_rows[3]};
                 end else begin
                     wr_busy_q <= 1'b0;
@@ -293,18 +302,35 @@ module section_f32_scratch (
                             wr_done   <= 1'b1;
                         end else begin
                             wr_rowblock <= wr_rowblock + 1'b1;
+                            wr_address_q <= wr_next_rowblock_address;
                         end
                     end else begin
                         wr_token <= wr_token + 1'b1;
+                        if (wr_active_last_pair == 3'd3)
+                            wr_address_q <= wr_address_q +
+                                            {3'b000, run_groups_per_token};
+                        else
+                            wr_address_q <= wr_address_q +
+                                            {3'b000, run_groups_per_token} - 14'd1;
                     end
                 end else begin
                     wr_pair <= wr_pair + 1'b1;
+                    if (wr_pair == 3'd3)
+                        wr_address_q <= wr_address_q + 1'b1;
                 end
             end
 
             if (rd_accept) begin
+                rd_pending_q       <= 1'b1;
+                rd_address_q       <= rd_address;
+                rd_pending_error_q <= rd_request_bad || rd_accept_collision;
+            end else if (rd_pending_q) begin
+                rd_pending_q <= 1'b0;
+            end
+
+            if (rd_pending_q) begin
                 rd_rsp_valid_q <= 1'b1;
-                rd_rsp_error   <= rd_request_bad || rd_collision;
+                rd_rsp_error   <= rd_pending_error_q || rd_issue_collision;
             end else if (rd_rsp_valid_q && rd_rsp_ready) begin
                 rd_rsp_valid_q <= 1'b0;
                 rd_rsp_error   <= 1'b0;

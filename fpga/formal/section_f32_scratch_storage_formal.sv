@@ -25,9 +25,12 @@ module section_f32_scratch_storage_formal(input wire clk);
     reg [3:0] phase = PH_RESET;
     reg [4:0] write_index = 5'd0;
     reg [2:0] read_index = 3'd0;
-    reg pending_read = 1'b0;
-    reg pending_role_x1 = 1'b0;
-    reg [2:0] pending_index = 3'd0;
+    reg pending_read_d1 = 1'b0;
+    reg pending_read_d2 = 1'b0;
+    reg pending_role_x1_d1 = 1'b0;
+    reg pending_role_x1_d2 = 1'b0;
+    reg [2:0] pending_index_d1 = 3'd0;
+    reg [2:0] pending_index_d2 = 3'd0;
     reg x0_valid = 1'b0;
     reg x1_valid = 1'b0;
 
@@ -93,16 +96,22 @@ module section_f32_scratch_storage_formal(input wire clk);
             phase <= PH_CFG_X0;
             write_index <= 5'd0;
             read_index <= 3'd0;
-            pending_read <= 1'b0;
-            pending_role_x1 <= 1'b0;
-            pending_index <= 3'd0;
+            pending_read_d1 <= 1'b0;
+            pending_read_d2 <= 1'b0;
+            pending_role_x1_d1 <= 1'b0;
+            pending_role_x1_d2 <= 1'b0;
+            pending_index_d1 <= 3'd0;
+            pending_index_d2 <= 3'd0;
             x0_valid <= 1'b0;
             x1_valid <= 1'b0;
         end else begin
-            pending_read <= rd_issue_valid;
+            pending_read_d2 <= pending_read_d1;
+            pending_role_x1_d2 <= pending_role_x1_d1;
+            pending_index_d2 <= pending_index_d1;
+            pending_read_d1 <= rd_issue_valid;
             if (rd_issue_valid) begin
-                pending_role_x1 <= rd_req_role == ROLE_X1;
-                pending_index <= read_index;
+                pending_role_x1_d1 <= rd_req_role == ROLE_X1;
+                pending_index_d1 <= read_index;
             end
 
             case (phase)
@@ -200,16 +209,21 @@ module section_f32_scratch_storage_formal(input wire clk);
                        (read_index[0] ? 14'd1 : 14'd0));
             end
 
-            if (pending_read) begin
+            if (pending_read_d1) begin
+                assert(!rd_req_ready);
+                assert(!rd_rsp_valid);
+            end
+
+            if (pending_read_d2) begin
                 assert(rd_rsp_valid);
                 assert(!rd_rsp_error);
                 for (i = 0; i < 4; i = i + 1) begin
-                    if (pending_role_x1)
+                    if (pending_role_x1_d2)
                         assert(rd_rsp_data[i*64 +: 64] ==
-                               expected_x1[{pending_index, 2'b00} + i]);
+                               expected_x1[{pending_index_d2, 2'b00} + i]);
                     else
                         assert(rd_rsp_data[i*64 +: 64] ==
-                               expected_x0[{pending_index, 2'b00} + i]);
+                               expected_x0[{pending_index_d2, 2'b00} + i]);
                 end
             end
 
