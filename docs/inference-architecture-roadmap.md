@@ -344,22 +344,43 @@ and full-model correctness. Its profiled device observations improved, but its
 unprofiled c0 medians regressed by about 2.8%. P3 replaces the remaining generic
 GEMM-plus-scratch schedule in measured increments:
 
-1. **P3a, fixed-cost attribution and removal.** Split matching/preflight, PS norm,
-   synchronization, setup, kernel, scratch feed, gather, residual, and publication
-   time. Remove avoidable host matching/runtime work and bypass DOWN gathering for
-   naturally direct one-token layouts. Gate with pinned census, numerical tests,
-   exact fallback behavior, and repeated unprofiled A/B; this step should require
-   no Vivado build when RTL is unchanged.
-2. **P3b, DOWN feeder repair.** Prefetch scratch, insert ping-pong block buffers,
-   and pipeline or replicate exact Q8 block conversion enough to keep DOWN fed.
-   Add producer-empty and consumer-stall counters. Gate with hardened cosim/formal,
-   exact Q8 behavior, utilization counters, integrated OOC, a clean combined route,
-   and repeated board A/B.
-3. **P3c, streaming superkernel.** Schedule paired UP/GATE output-row blocks,
-   consume each pair immediately through SwiGLU and exact Q8, and retain only a
-   compact ping-ponged DOWN-input tensor. Eliminate the complete X0/X1 F32
-   materialization and later rescan. Gate with per-layer differential tests, exact
-   stream accounting, resource deltas, integrated OOC, and a clean combined route.
+1. **P3a, fixed-cost attribution and removal (complete).** Split
+   matching/preflight, PS norm, synchronization, setup, kernel, scratch feed,
+   gather, residual, and publication time. Remove avoidable host matching/runtime
+   work and bypass DOWN gathering for naturally direct one-token layouts. Gate
+   with pinned census, numerical tests, exact fallback behavior, and a focused
+   same-image A/B; product wall performance remains a later P3 gate. This step
+   should require no Vivado build when RTL is unchanged.
+   Commit `cbb621b` implements graph-fact caching and direct canonical one-token
+   publication. The same-image summary has SHA-256
+   `e92232efc1d74bcad42f279ed78e25d679feda8f7801796648f8fd2327cbe55e`:
+   Q1/Q2 DOWN layout totals fall from 78.1/77.9 ms to zero and device time falls
+   0.42/0.54 ms/token. A host-scheduling-inclusive matcher proxy falls
+   1.26/1.12 ms/token directionally; this is not a direct matcher timer or a wall
+   performance claim. Quality and accounting remain exact.
+2. **P3b, DOWN feeder repair (complete).** Prefetch scratch, insert ping-pong
+   block buffers, and pipeline or replicate exact Q8 block conversion enough to
+   keep DOWN fed. Add producer-empty and consumer-stall counters. Gate with
+   hardened cosim/formal, exact Q8 behavior, utilization counters, integrated
+   OOC, a clean combined route, and repeated board A/B.
+   Commit `813fd87` passes integrated OOC at +0.190/+0.040 ns and clean route
+   `20260813T200433Z-813fd87ce299-w512-p4-f285-clean` at +0.008/+0.010 ns. The
+   deployed-bit SHA-256 is
+   `9329e56b858505828bccf048d50e74443eac73cbf1dcfcea33db349c93901ebe`.
+   Board Q1 changes are DOWN cycles -10.064%, DOWN MAC/cycle +11.190%, FFN
+   -3.802%, device -1.652%, and unprofiled -2.758%; Q2 changes are -7.017%,
+   +7.546%, -2.494%, -1.190%, and -0.752% in the same order. All quality and
+   accounting gates pass.
+3. **P3c, streaming superkernel (active).** Schedule paired UP/GATE output-row
+   blocks, consume each pair immediately through SwiGLU and exact Q8, and retain
+   only a compact ping-ponged DOWN-input tensor. Eliminate the complete X0/X1 F32
+   materialization and later rescan. Gate with per-layer differential tests,
+   exact stream accounting, resource deltas, integrated OOC, and a clean combined
+   route.
+   Commits `54043ee`, `2b1e6f4`, and `bd196d9` establish the first Q8 section-buffer
+   leaf. Leaf OOC passes at +0.487/+0.108 ns using 312 LUTs, 928 FFs, four CARRY8s,
+   four URAMs, two BRAM36s, two BRAM18s, and no LUTRAM or DSPs. It is not yet
+   integrated and makes no full-design timing or performance claim.
 4. **P3d, PL norm and residual.** Add weighted RMSNorm-to-Q8 and residual addition
    in PL, populate the resident residual role, and keep the PS implementation as
    oracle and strict pre-start fallback. Map reduction state and queues to
@@ -372,9 +393,10 @@ GEMM-plus-scratch schedule in measured increments:
    superseded debug datapaths and run the complete Q1/Q2 characterization and
    regression suite on the final clean image.
 
-P3 closes only when repeated same-image unprofiled Q1 and Q2 runs beat the legacy
-operation path. The strict matcher, fail-before-start fallback, one-command profile,
-and full numerical/accounting contract remain unchanged.
+P3a and P3b are complete, P3c is active, and P3d/P3e have not started. P3 closes
+only when repeated same-image unprofiled Q1 and Q2 runs beat the legacy operation
+path. The strict matcher, fail-before-start fallback, one-command profile, and full
+numerical/accounting contract remain unchanged.
 
 ### P4: named attention section
 

@@ -90,7 +90,7 @@ profiled measurements are compared only against profiled measurements.
 | 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
 | 1 | Bounded waste removal (complete) | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
 | 2 | Section substrate and unified PL attention (complete) | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, first executable section |
-| 3 | Streaming FFN and local hard-block rebalance | Turn the qualified P2f section into a product gain and stop starving DOWN | A streamed FFN beats the op path in repeated unprofiled Q1/Q2 runs |
+| 3 | Streaming FFN and local hard-block rebalance (P3c active) | Turn the qualified P2f section into a product gain and stop starving DOWN | A streamed FFN beats the op path in repeated unprofiled Q1/Q2 runs |
 | 4 | Named attention section | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | One strict command with correct same-token KV visibility |
 | 5 | Resident transformer execution | Removes the remaining sublayer and layer residual DDR boundaries | One block, then all 28 layers, execute with a banked resident residual |
 | 6 | Persistent controller and DMA consolidation | Section commands make the generic ten-DMA shell unnecessary | Fixed layer controller, persistent weight readers, and fewer movers/control targets |
@@ -633,9 +633,13 @@ and the PS still owns normalization, result staging, and residual publication.
 The old grouped path is less integrated but amortizes some of those fixed costs
 and can feed its mature GEMM path more continuously.
 
+P3a and P3b are complete. P3c is active at the leaf-buffer stage; P3d and P3e
+have not started. P3 remains open until the final repeated unprofiled performance
+gate passes.
+
 Build P3 as five independently measurable increments:
 
-#### P3a: measure and remove fixed software costs
+#### P3a: measure and remove fixed software costs (complete)
 
 - Attribute section preflight, matching, normalization, synchronization, setup,
   kernel, scratch feed, gather, residual, and publication time separately.
@@ -645,10 +649,19 @@ Build P3 as five independently measurable increments:
   merely because it changes the section implementation.
 
 Gate: pinned lowering census and failure behavior remain exact, numerical tests
-pass, and the repeated unprofiled A/B explains whether software fixed costs account
-for the c0 regression.
+pass, and a same-image focused A/B attributes the removed fixed costs. Product wall
+performance remains a later P3 gate.
 
-#### P3b: keep the DOWN feeder full
+Commit `cbb621b` caches graph facts and publishes canonical one-token DOWN results
+directly. The same-P2f-image A/B summary `/tmp/p3a-same-bitstream-summary.json`
+(SHA-256 `e92232efc1d74bcad42f279ed78e25d679feda8f7801796648f8fd2327cbe55e`)
+records Q1/Q2 decode DOWN result-layout totals falling from 78.1/77.9 ms to zero
+and device reductions of 0.42/0.54 ms/token. The directional matcher proxy falls
+by 1.26/1.12 ms/token, but it includes host scheduling and is not a direct matcher
+timer. P3a therefore makes no wall-time claim; all correctness and accounting
+checks pass.
+
+#### P3b: keep the DOWN feeder full (complete)
 
 - Prefetch scratch blocks and add ping-pong block buffers between SwiGLU, exact Q8
   conversion, and the DOWN activation reader.
@@ -662,7 +675,17 @@ ownership; counters show materially higher DOWN utilization; integrated OOC and 
 clean combined route pass; repeated Q1/Q2 device and unprofiled results improve
 without numerical drift.
 
-#### P3c: replace scratch tensors with a streaming FFN superkernel
+Commit `813fd87` overlaps FFN activation production and consumption. Integrated
+decode OOC passes at +0.190/+0.040 ns setup/hold. Clean run
+`20260813T200433Z-813fd87ce299-w512-p4-f285-clean` is fully routed at
++0.008/+0.010 ns; its deployed-bit SHA-256 is
+`9329e56b858505828bccf048d50e74443eac73cbf1dcfcea33db349c93901ebe`.
+Against P2f, Q1 changes are DOWN cycles -10.064%, DOWN MAC/cycle +11.190%, FFN
+time -3.802%, device time -1.652%, and unprofiled time -2.758%. Q2 changes are
+-7.017%, +7.546%, -2.494%, -1.190%, and -0.752% in the same order. Full-model
+quality, command accounting, fallback, and capability checks pass.
+
+#### P3c: replace scratch tensors with a streaming FFN superkernel (active)
 
 - Schedule paired UP/GATE output-row blocks so each completed pair can pass directly
   through SwiGLU and exact Q8 into a compact, ping-ponged DOWN-input bank.
@@ -675,6 +698,12 @@ without numerical drift.
 Gate: per-layer differential tests, exact stream accounting, leaf and integrated
 resource/timing feedback, and a clean combined route for the coherent superkernel
 milestone.
+
+Commits `54043ee`, `2b1e6f4`, and `bd196d9` establish the first streaming Q8
+section-buffer leaf. Leaf OOC passes at +0.487/+0.108 ns with 312 LUTs, 928 FFs,
+four CARRY8s, four URAMs, two BRAM36s, two BRAM18s, and no LUTRAM or DSPs. This
+leaf has not yet been integrated, so it carries no full-design timing or board
+performance claim.
 
 #### P3d: move normalization and residual handling into PL
 
