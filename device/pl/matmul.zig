@@ -991,8 +991,17 @@ pub fn Backend(comptime Heap: type) type {
             const up_weights_phys = heap.deviceAddress(op.up_weights) catch return error.HeapFailure;
             const gate_weights_phys = heap.deviceAddress(op.gate_weights) catch return error.HeapFailure;
             const down_weights_phys = heap.deviceAddress(op.down_weights) catch return error.HeapFailure;
-            const private_down = self.allocator.alloc(u8, model_bytes) catch return error.OutOfMemory;
-            defer self.allocator.free(private_down);
+            // A one-token DOWN stream is already canonical column-major F32. Keep
+            // it private in result_staging until every PL stage has completed,
+            // then consume it directly during publication. Multi-token tiles still
+            // need a command-sized buffer because their rowblock-major stream must
+            // be gathered across tiles before the destination can be published.
+            const private_down = if (ffnDownNeedsGather(tokens))
+                self.allocator.alloc(u8, model_bytes) catch return error.OutOfMemory
+            else
+                null;
+            defer if (private_down) |buffer| self.allocator.free(buffer);
+            var direct_down: ?[]const u8 = null;
 
             const execution_path = ffnExecutionPath(tokens);
             var result: profile.FfnExecution = .{
@@ -1127,8 +1136,13 @@ pub fn Backend(comptime Heap: type) type {
 
                 heap.syncFromDevice(down_dma) catch return error.HeapFailure;
                 result.down.sync_from_ns +|= profile.lap(ctx, &last);
-                gather.gatherResults(private_down, down_buf, model_dim, tile_tokens, col0, down_num_rb);
-                result.down.result_layout_ns +|= profile.lap(ctx, &last);
+                if (private_down) |buffer| {
+                    gather.gatherResults(buffer, down_buf, model_dim, tile_tokens, col0, down_num_rb);
+                    result.down.result_layout_ns +|= profile.lap(ctx, &last);
+                } else {
+                    std.debug.assert(col0 == 0 and tile_tokens == 1 and down_buf.len == model_bytes);
+                    direct_down = down_buf;
+                }
                 col0 += tile_tokens;
             }
             result.gate_up_command_ns = result.gate_up.setup_ns +| result.gate_up.wait_ns +|
@@ -1140,8 +1154,14 @@ pub fn Backend(comptime Heap: type) type {
             // PL SwiGLU is fused into the down kernel wait and cannot be timed
             // independently without perturbing the section pipeline.
             result.swiglu_ns = 0;
-            ps_elemwise.addBytes(private_down, residual, private_down) catch return error.HeapFailure;
-            @memcpy(dst, private_down);
+            const down_result = if (private_down) |buffer|
+                @as([]const u8, buffer)
+            else
+                direct_down orelse unreachable;
+            // Publication starts only after every PL tile succeeds. addBytes
+            // validates all lengths before writing, so this removes the redundant
+            // private-buffer copy without weakening fail-before-publication.
+            ps_elemwise.addBytes(down_result, residual, dst) catch return error.HeapFailure;
             heap.syncToDevice(op.dst) catch return error.HeapFailure;
             result.residual_add_ns = profile.lap(ctx, &last);
 
@@ -1281,6 +1301,10 @@ fn ffnWeightBytesPerPort(fmt: wire.WeightFormat, num_rb: usize, q1_blocks: usize
 
 fn ffnExecutionPath(tokens: usize) shared.profiling.ExecutionPath {
     return if (tokens == 1) .direct else .staged;
+}
+
+fn ffnDownNeedsGather(tokens: usize) bool {
+    return tokens != 1;
 }
 
 fn rangesOverlap(a: wire.TensorRange, b: wire.TensorRange) bool {
@@ -1474,6 +1498,35 @@ test "FFN execution path follows the semantic token count" {
     try std.testing.expectEqual(shared.profiling.ExecutionPath.direct, ffnExecutionPath(1));
     try std.testing.expectEqual(shared.profiling.ExecutionPath.staged, ffnExecutionPath(2));
     try std.testing.expectEqual(shared.profiling.ExecutionPath.staged, ffnExecutionPath(section.query_tile_max + 1));
+}
+
+test "FFN DOWN gathering is unnecessary only for canonical one-token output" {
+    try std.testing.expect(!ffnDownNeedsGather(1));
+    try std.testing.expect(ffnDownNeedsGather(2));
+    try std.testing.expect(ffnDownNeedsGather(section.query_tile_max));
+    try std.testing.expect(ffnDownNeedsGather(section.context_max));
+}
+
+test "one-token FFN direct publication matches the gathered path" {
+    const rows = layout.q1_block;
+    var down: [rows]f32 = undefined;
+    var residual: [rows]f32 = undefined;
+    for (&down, &residual, 0..) |*d, *r, i| {
+        d.* = @as(f32, @floatFromInt(i)) * 0.25 - 7.0;
+        r.* = @as(f32, @floatFromInt(i)) * -0.125 + 3.0;
+    }
+
+    var expected: [rows]f32 = undefined;
+    const down_bytes = std.mem.sliceAsBytes(&down);
+    const residual_bytes = std.mem.sliceAsBytes(&residual);
+    const expected_bytes = std.mem.sliceAsBytes(&expected);
+    gather.gatherResults(expected_bytes, down_bytes, rows, 1, 0, layout.rowblocksFor(rows));
+    try ps_elemwise.addBytes(expected_bytes, residual_bytes, expected_bytes);
+
+    var actual: [rows]f32 = undefined;
+    const actual_bytes = std.mem.sliceAsBytes(&actual);
+    try ps_elemwise.addBytes(down_bytes, residual_bytes, actual_bytes);
+    try std.testing.expectEqualSlices(u8, expected_bytes, actual_bytes);
 }
 
 test "scratch drain comparison is exact" {
