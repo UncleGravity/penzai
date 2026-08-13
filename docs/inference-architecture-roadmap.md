@@ -1,15 +1,13 @@
 # Penzai inference architecture roadmap
 
-Status: 2026-07-10. This document is the performance and offload plan for the
-current KR260 implementation. It starts from the deployed f300 bitstream, the
-current Zig/RTL data paths, and one measured Bonsai-1.7B run. Estimates below are
-explicitly marked; everything else is either measured in that run or derived
-from hardware counters.
+Status: 2026-08-13. This document records the performance and offload architecture
+for the KR260 implementation. Its early measurements start from the historical
+deployed f300 bitstream and one Bonsai-1.7B run; P0-P2 results that supersede that
+baseline are summarized in `docs/accelerator-priorities.md`.
 
-The measurement baseline and phase ordering in this detailed document are
-historical. See `docs/accelerator-priorities.md` for the completed P0 baseline and
-current ranking; retain this document for the detailed engine and integration
-rationale.
+The P0-P2 delivery text below is retained as design history. The forward P3-P8
+ordering is current and matches `docs/accelerator-priorities.md`, which remains the
+short authoritative tracker.
 
 ## Executive decision
 
@@ -25,13 +23,18 @@ The destination architecture is therefore:
 1. Keep the existing output-stationary GEMM and native-layout online attention.
 2. Make Q8 quantized activations an internal PL data type, not a PS-generated DMA
    staging format.
-3. Execute the attention and FFN sublayers as a small number of named pipelines
-   that retain short-lived intermediates on-chip.
-4. Keep weights and the KV cache resident in DDR, streaming each only when the
-   model operation requires it.
-5. Optimize dense exact attention first. Introduce KV compression or approximate
+3. Replace the generic GEMM/scratch FFN schedule with a fixed streaming
+   superkernel, and execute attention as a strict named section.
+4. Keep the residual banked on chip across both sublayers and ultimately through
+   the fixed 28-layer walk. Keep weights and historical KV in DDR, streaming each
+   only when the model operation requires it.
+5. Replace repeated DMA setup with a persistent layer controller after the named
+   sections and resident execution have fixed the real movement schedule.
+6. Treat DSP/BRAM/URAM mapping and removal of superseded LUT-heavy logic as a
+   requirement in every architectural increment.
+7. Optimize dense exact attention first. Introduce KV compression or approximate
    sparsity only when real context lengths make KV traffic comparable to weights.
-6. Preserve one bitstream and one downstream datapath for binary and ternary
+8. Preserve one bitstream and one downstream datapath for binary and ternary
    weights; only packing and the GEMM front end depend on weight format.
 
 At the present binary weight density and measured bandwidth, the absolute
@@ -168,12 +171,18 @@ traffic is small. Long-context compression is important, but not the current
 
 ### Implementation capacity
 
-The routed f300 build uses 65.47% LUT, 38.76% FF, 33.68% BRAM, 6.25% URAM, and
-7.37% DSP. Timing passes by only 0.003 ns. The design has abundant DSP, BRAM, and
-URAM but little timing margin and localized LUT-routing pressure. Prefer on-chip
-buffers and DSP-shaped arithmetic; require a clean routed build for every RTL
-increment. An ASIC-style shared Booth datapath or a 52k-LUT ternary lookup engine
-does not match this resource balance.
+The historical routed f300 baseline used 65.47% LUT, 38.76% FF, 33.68% BRAM,
+6.25% URAM, and 7.37% DSP. P2's section substrate and unified attention engine
+changed the limiting resource: the qualified P2f image uses 83,463 LUTs, 98,323
+FFs, 58 BRAM tiles, 20 URAMs, and 98 DSPs, with roughly 99.6% of CLBs occupied.
+It passes f285 at +0.015/+0.010 ns setup/hold.
+
+The design is now CLB/routing constrained while substantial DSP and block-memory
+capacity remains. Prefer BRAM/URAM queues and state plus DSP-shaped arithmetic,
+and remove each superseded LUT-heavy path. Use leaf and integrated OOC for local
+feedback, with a clean combined route at coherent architectural milestones rather
+than every RTL edit. An ASIC-style shared Booth datapath or a 52k-LUT ternary
+lookup engine does not match this resource balance.
 
 ## Target execution model
 
@@ -202,16 +211,19 @@ head and its two query heads, not an arbitrary single query head.
 
 ```text
 residual/input
-  -> RMSNorm * gamma -> one Q8 activation
-  -> grouped gate/up projections
-  -> SwiGLU
-  -> Q8 quantization -> down projection
-  -> residual add
+  -> PL RMSNorm * gamma -> one Q8 activation
+  -> paired UP/GATE output blocks
+  -> immediate SwiGLU and exact Q8
+  -> ping-pong DOWN-input RAM -> down projection
+  -> PL residual add -> resident residual
 ```
 
-The gate vector can be buffered while the up projection streams, then the SwiGLU
-output can feed the down-projection quantizer without an fp32 DDR round trip.
-The largest Bonsai intermediate is small relative to available BRAM/URAM.
+The FFN should be one fixed streaming machine, not three generic GEMMs separated
+by complete F32 scratch tensors. Pair UP/GATE work in output-row chunks, consume
+each pair through SwiGLU immediately, and write only compact canonical Q8 blocks
+for DOWN. Ping-pong buffering decouples the exact quantizer from the DOWN reader.
+The largest Bonsai intermediate is small relative to available BRAM/URAM; use that
+capacity to reduce LUT muxing and DDR traffic.
 
 ### Internal contracts
 
@@ -325,93 +337,142 @@ Gate: packed-layout round trip, bit-exact ternary dot products against the softw
 oracle, routed single bitstream, and a measured physical roof that agrees with the
 actual packed ternary bytes including scales and alignment.
 
-### Phase 3: named layer-local pipelines
+### P3: streaming FFN and local hard-block rebalance
 
-Build two closed operations, in this order.
+P2f proved a strict named FFN command, exact failure boundary, scratch contract,
+and full-model correctness. Its profiled device observations improved, but its
+unprofiled c0 medians regressed by about 2.8%. P3 replaces the remaining generic
+GEMM-plus-scratch schedule in measured increments:
 
-1. **FFN pipeline.** Fuse normalized Q8 production, gate/up launch, on-chip
-   gate buffering, SwiGLU, down-input quantization, and down projection. This is
-   simpler than attention and removes the measured 7.0 ms/token SwiGLU pass plus
-   intermediate writes and another quantization boundary.
-2. **Attention pipeline.** Fuse normalized Q8 production with grouped Q/K/V;
-   attach Q/K normalization and RoPE to attention ingress; append K/V; run flash;
-   quantize its output for the output projection. Add residual production where
-   doing so does not destroy a value needed by the next sublayer.
-3. Use ready/valid FIFOs and explicit small BRAM/URAM buffers between stages.
-   Do not require both large weight and KV streams to peak concurrently; schedule
-   around the shared DDR controller and prove overlap with stall counters.
-4. Keep intermediate f32 materialization as a debug/fallback mode until the
-   fused path passes full-model numerical gates.
+1. **P3a, fixed-cost attribution and removal.** Split matching/preflight, PS norm,
+   synchronization, setup, kernel, scratch feed, gather, residual, and publication
+   time. Remove avoidable host matching/runtime work and bypass DOWN gathering for
+   naturally direct one-token layouts. Gate with pinned census, numerical tests,
+   exact fallback behavior, and repeated unprofiled A/B; this step should require
+   no Vivado build when RTL is unchanged.
+2. **P3b, DOWN feeder repair.** Prefetch scratch, insert ping-pong block buffers,
+   and pipeline or replicate exact Q8 block conversion enough to keep DOWN fed.
+   Add producer-empty and consumer-stall counters. Gate with hardened cosim/formal,
+   exact Q8 behavior, utilization counters, integrated OOC, a clean combined route,
+   and repeated board A/B.
+3. **P3c, streaming superkernel.** Schedule paired UP/GATE output-row blocks,
+   consume each pair immediately through SwiGLU and exact Q8, and retain only a
+   compact ping-ponged DOWN-input tensor. Eliminate the complete X0/X1 F32
+   materialization and later rescan. Gate with per-layer differential tests, exact
+   stream accounting, resource deltas, integrated OOC, and a clean combined route.
+4. **P3d, PL norm and residual.** Add weighted RMSNorm-to-Q8 and residual addition
+   in PL, populate the resident residual role, and keep the PS implementation as
+   oracle and strict pre-start fallback. Map reduction state and queues to
+   BRAM/URAM and suitable arithmetic to DSPs, removing replaced LUT/PS machinery.
+   Gate with arithmetic cosim, formal control, full-model quality, resources, and
+   a clean combined route.
+5. **P3e, prefill scale and qualification.** Evaluate an eight-token tile against
+   the current four-token tile using the existing eight-column GEMM capacity.
+   Retain four if routing or throughput does not repay added scratch. Remove
+   superseded debug datapaths and run the complete Q1/Q2 characterization and
+   regression suite on the final clean image.
 
-Gate: per-layer differential tests, full logits/perplexity, routed timing, and
-end-to-end counters showing that standalone RMSNorm/mul/SwiGLU/RoPE/set_rows calls
-fall rather than merely moving time to an opaque fused bucket.
+P3 closes only when repeated same-image unprofiled Q1 and Q2 runs beat the legacy
+operation path. The strict matcher, fail-before-start fallback, one-command profile,
+and full numerical/accounting contract remain unchanged.
 
-A defensible binary destination after Phase 3 is approximately 33-38 ms/token
-device time: about 21 ms weights, the current 7 ms attention pending its own
-optimization, and 5-10 ms of remaining control/data movement. This corresponds
-to roughly 26-30 device tokens/s. Wall throughput will be lower until Phase 5.
+### P4: named attention section
 
-### Phase 4: attention throughput and prefill
+P2 already supplied the pipelined KV-major engine and adaptive query-blocked
+prefill. P4 closes the boundaries around that engine:
 
-1. Remove the per-call mask scan duplication. All 28 layer calls in a graph share
-   the same causal extent; compute it once per graph or carry an explicit validated
-   `kv_hi` into each command.
-2. Pipeline the existing dense exact kernel before considering sparsity. Interleave
-   independent heads through dot, score, softmax, and AXPY pipelines instead of
-   waiting for each numeric result in a sequential handshake. The target is a
-   measured feed-bound kernel, not merely zero AXIS stalls around a compute-bound
-   FSM.
-3. Add query-blocked prefill. Hold `p` query tokens and their online-softmax state,
-   stream each native-layout K/V position once for the block, and suppress causally
-   invalid query/KV pairs. Start with `p=4`; do not replicate arithmetic merely to
-   match a paper's diagram.
-4. Keep decode and prefill schedules behind the same external op and numerical
-   oracle. Decode remains KV-major with one query; prefill adds a query-tile axis.
+1. Freeze and strictly match the concrete attention descriptor, including layout,
+   normalization, RoPE, mask, cache extent, strides, and alias/range safety.
+2. Produce one normalized Q8 activation for Q/K/V; attach Q/K normalization and
+   RoPE to attention ingress rather than materializing them in DDR.
+3. Append new K/V locally and guarantee that those rows are visible to the same
+   causal section before invoking the existing tiled attention schedule.
+4. Quantize attention output for the output projection and produce the residual
+   without publishing intermediate Q/K/V or attention tensors.
+5. Schedule weight and historical-KV traffic around the shared DDR controller and
+   prove the schedule using actual bytes, extent, and starvation counters.
 
-Gate: actual cycles versus real `kv_hi`, attention error versus the PS oracle,
-decode latency across context lengths, and prefill wall improvement. Moving the
-measured 102 ms prefill attention to PL is useful only if K/V are reused across
-the query block; a token-outer PL loop would just move the bottleneck.
+Gate: strict fallback tests, per-layer differential coverage, full logits/perplexity,
+same-token KV visibility, exact counters, non-negative clean-route timing, and a
+repeated prefill/decode A/B.
 
-### Long-context track: compression before approximation
+### P5: resident transformer execution
 
-Only promote this track when benchmarks cover contexts near or above 2k tokens.
+1. Introduce two banked residual roles and alternate ownership across attention
+   and FFN without an intermediate DDR residual.
+2. Qualify one complete transformer block against the standalone section oracles.
+3. Add a fixed descriptor/layer table and walk all 28 layers while the residual
+   remains resident. Weights and historical KV continue to stream from DDR.
+4. Retain standalone named attention and FFN commands for differential debugging,
+   recovery, and strict fallback before resident execution begins.
 
-1. Measure int8 K/V storage and attention first. It approximately halves KV
-   traffic while preserving contiguous access and admits the same numerical gates
-   as other precision changes.
-2. Consider block-sparse or predictive top-K attention only after reporting
-   candidate ratio, index-gather bandwidth, perplexity, and downstream task
-   quality. A top-K selector that turns one contiguous DMA into many random reads
-   can lose despite reducing bytes.
-3. Keep exact dense attention available for short contexts and as the quality
-   oracle.
+Gate: block and full-layer-walk equivalence, exact layer/traffic counters, reduced
+DDR residual traffic, full-model quality, clean routing, and lower unprofiled wall
+time on the same image.
 
-The leading-one predictor in VitaLLM is a research option for this track, not a
-near-term optimization for the current 13-37-token workload.
+### P6: persistent controller and DMA consolidation
 
-### Phase 5: control plane and transport
+After P5 fixes the actual movement schedule, replace the ten-DMA, 13-target generic
+shell rather than adding another controller beside it:
 
-Revisit control batching only after named layer operations exist.
+1. Keep four persistent weight readers unless counters justify a different split.
+2. Use one fixed layer controller and one sequential activation/result mover.
+3. Consolidate K/V movement only if starvation counters prove that it will not
+   throttle attention.
+4. Remove superseded movers, control targets, and duplicated generic Q8/FP units;
+   re-measure command bytes, transport, response work, CLBs, and routing pressure.
+5. Consider a separate control clock only after topology simplification. CDC alone
+   is not a token-throughput feature.
 
-1. A resident program should launch a small number of attention/FFN operations
-   per layer, with dynamic token position and KV extent patches. Replaying hundreds
-   of today's tiny operations is not the target.
-2. Re-measure the 7.6 ms/token transport bucket using Phase-0 decomposition. The
-   request already contains one graph RPC/token; likely candidates include command
-   serialization, approximately 10 KiB of per-token preloads, device preload writes,
-   profiling response work, and TCP framing.
-3. Reduce command bytes by lowering fused operations before designing a new wire
-   transport. Preserve the current request/response correctness model until data
-   shows it is the limiter.
-4. Split the control clock only if it creates robust timing margin for the fused
-   build. The current f300 design passes by 3 ps, so margin matters, but a clock
-   split is not itself a token-throughput feature.
+Gate: fewer routed movers/targets, recovered CLB capacity, unchanged error and
+stream semantics, and improved unprofiled wall time without device regression.
 
-Gate: unprofiled wall time, device/transport decomposition, commands/token, wire
-bytes/token, and a timing-clean bitstream. The sequencer is successful only if it
-reduces end-to-end wall time, not if it reduces AXI-Lite writes in isolation.
+### P7: ternary and KV memory efficiency
+
+1. Evaluate denser exact ternary packing once P3-P6 make weight bytes the measured
+   limit; retain a lossless source-to-resident adapter and exhaustive decoder tests.
+2. Measure int8 or other explicitly qualified K/V storage first. Keep access
+   contiguous and preserve dense exact attention as the short-context oracle.
+3. Consider block-sparse or predictive top-K attention only after reporting
+   candidate ratio, gather bandwidth, perplexity, and downstream task quality.
+
+The leading-one predictor in VitaLLM remains a research option, not an assumption
+in the dense execution plan.
+
+### P8: spatial scaling, conditional
+
+Do not replace the compressed-weight shared GEMM with a conventional systolic
+array. If fused prefill, continuous batching, or speculative verification later
+becomes compute-bound, broadcast weights into two or four spatial compute columns
+and measure the same-device throughput/resource trade. Single-token decode cannot
+escape its full weight stream by adding MACs.
+
+Gate: counters demonstrate a compute rather than DDR/control bottleneck, and a
+same-image A/B repays the additional area without degrading the single-request path.
+
+### Vivado iteration ladder
+
+Use increasingly expensive evidence only as the design becomes ready for it:
+
+| Tier | Evidence | Purpose |
+|---:|---|---|
+| 0 | Focused Zig/Verilator/numerical tests and focused formal | Every relevant edit; functional, arithmetic, handshake, bounds, and ownership checks |
+| 1 | Leaf OOC | Local inference, resource, and Fmax feedback for a changed RTL block |
+| 2 | Integrated decode OOC | Boundary changes across GEMM, scratch, Q8, section, attention, or control logic |
+| 3 | Synthesis/place/congestion probe or incremental combined route | Early exploratory fit/congestion feedback for a coherent batch |
+| 4 | Clean combined route | Deployable milestone or material top-level, clock, constraint, memory, DMA, regmap, or control change |
+| 5 | Board qualification | End-to-end correctness and performance claim for the routed milestone |
+
+Host matchers, codecs without RTL changes, profiling, docs, harnesses, and RTL
+that still fails Tier 0 do not justify a combined route. Synthesis-only/place-only
+hooks, durable source-hash-addressed remote jobs, identical-build reuse, checkpoint
+reuse, and a build lock should shorten feedback. Incremental routing is exploratory;
+only a clean route supports release.
+
+Timing acceptance is deliberately sign-only: a fully routed, structurally
+constrained build passes when both WNS and WHS are non-negative. Positive slack is
+a pass no matter how close it is to zero. Earning additional margin is a separate
+timing-optimization pass, not a reason to reject or repeat a functional milestone.
 
 ## Ideas deliberately rejected for the current path
 
@@ -450,16 +511,21 @@ References:
 
 The roadmap is complete when:
 
-1. Binary and issue-ordered two-bit ternary run from one timing-clean bitstream.
-2. Decode profiling shows weight streaming as the largest remaining short-context
-   component, with no repeated PS activation quantization or standalone FFN passes.
-3. The binary design sustains at least 26 device tokens/s on the fixed benchmark,
-   or a measured hardware limit explains the miss.
-4. User-visible 13-token TTFT is reported correctly and is materially below the
-   current approximately 1.2 seconds; 64-token prefill is a standard regression.
-5. Dense attention scales against real, not padded, KV length; query-blocked PL
+1. Binary and issue-ordered two-bit ternary run from one fully routed image with
+   non-negative setup and hold slack.
+2. The streaming FFN and named attention sections remove repeated PS activation
+   quantization and intermediate sublayer materialization.
+3. A fixed layer walk retains the residual through all 28 layers, and its persistent
+   controller has retired the superseded generic DMA/control shell.
+4. Decode profiling shows weight streaming as the largest remaining short-context
+   component, and the binary design sustains at least 26 device tokens/s on the
+   fixed benchmark or a measured hardware limit explains the miss.
+5. User-visible 13-token TTFT is reported correctly and is materially below the
+   historical approximately 1.2 seconds; 64-token prefill is a standard regression.
+6. Dense attention scales against real, not padded, KV length; query-blocked PL
    prefill is faster than the PS oracle.
-6. Long-context compression or sparsity is enabled only with quality and actual
+7. Long-context compression or sparsity is enabled only with quality and actual
    memory-traffic evidence.
-7. Every claimed win has an independent A/B, a numerical gate, hardware counters,
-   and a routed timing report.
+8. Every claimed win has an independent A/B, a numerical gate, hardware counters,
+   and the Vivado evidence appropriate to its iteration tier; deployed milestones
+   include a clean routed timing report.

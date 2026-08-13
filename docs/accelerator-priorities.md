@@ -21,11 +21,17 @@ Preserve:
 - KV-major online attention with FP32 softmax state and accumulation;
 - PS kernels as correctness fallbacks.
 
-Change the shell around those kernels. The destination is two named layer sections,
-FFN and attention, connected through banked on-chip scratch memory and started with
-section-level commands. Q8_0 should be an internal PL activation type. DDR should
-hold weights, historical KV, residual boundaries, and outputs that genuinely must
-leave the section, not every intermediate tensor.
+Change the shell around those kernels. First build two named layer sections, FFN
+and attention, connected through banked on-chip scratch memory and started with
+section-level commands. Then keep the residual resident across a transformer block
+and ultimately across the fixed layer walk. Q8_0 should be an internal PL activation
+type. In the target schedule DDR holds weights, historical KV, graph inputs, and
+final outputs, not every intermediate tensor or every sublayer residual.
+
+Treat hard-block use as a constraint on every phase, not a cleanup project. Put
+queues and state in BRAM/URAM, map suitable arithmetic into DSPs, and remove the
+LUT-heavy logic each replacement supersedes. The current routed image is nearly
+out of CLBs even though DSP and block-memory capacity remains available.
 
 Use one online attention engine for both modes. Decode runs it with one query;
 prefill runs it with a small query tile and reuses K/V across those queries. Do not
@@ -84,11 +90,12 @@ profiled measurements are compared only against profiled measurements.
 | 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
 | 1 | Bounded waste removal (complete) | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
 | 2 | Section substrate and unified PL attention (complete) | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, first executable section |
-| 3 | FFN section optimization | Turn the qualified P2f section into a product gain | Named FFN command retains intermediates on chip and beats the op path |
-| 4 | Attention section pipeline | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | Named attention command with correct same-token KV visibility |
-| 5 | Ternary weight and KV memory efficiency | Raises the Q2 bandwidth roof and enables larger contexts/models | Lossless format adapter, routed decoder, quality and bandwidth A/B |
-| 6 | Control, DMA, and transport consolidation | Useful after section commands reduce operation count | Fewer movers/control targets and lower wall residual without device regression |
-| 7 | Spatial GEMM scaling | Expensive and unsupported by present bottlenecks | Only start if fused prefill or batched decode is compute-bound |
+| 3 | Streaming FFN and local hard-block rebalance | Turn the qualified P2f section into a product gain and stop starving DOWN | A streamed FFN beats the op path in repeated unprofiled Q1/Q2 runs |
+| 4 | Named attention section | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | One strict command with correct same-token KV visibility |
+| 5 | Resident transformer execution | Removes the remaining sublayer and layer residual DDR boundaries | One block, then all 28 layers, execute with a banked resident residual |
+| 6 | Persistent controller and DMA consolidation | Section commands make the generic ten-DMA shell unnecessary | Fixed layer controller, persistent weight readers, and fewer movers/control targets |
+| 7 | Ternary weight and KV memory efficiency | Raises the Q2 bandwidth roof and enables larger contexts/models | Lossless format adapter, routed decoder, quality and bandwidth A/B |
+| 8 | Spatial GEMM scaling | Expensive and unsupported by present bottlenecks | Only start if fused prefill or batched decode is compute-bound |
 
 ### P0: truthful measurement and build identity
 
@@ -612,19 +619,90 @@ guard. P2f therefore closes the P2 contract and substrate and establishes the P3
 baseline; P3 remains open for a repeatable product-path improvement. The named
 attention section remains P4.
 
-### P3: FFN section optimization
+### P3: streaming FFN and local hard-block rebalance
 
 P2f established the first named FFN pipeline and its strict fallback boundary:
 
 `residual -> norm*gamma -> Q8 -> gate/up GEMM -> SwiGLU -> Q8 -> down GEMM -> residual`
 
 P3 must turn that qualified substrate into a repeatable product gain. Profiled
-device time improved, but the unprofiled c0 medians regressed by roughly 2.8%; the
-completion gate remains a named FFN path that beats the legacy operation path
-under the fixed unprofiled regression contract. Optimization may target the PS
-normalization/residual boundaries, tile orchestration, or measured kernel/DMA
-costs without weakening the strict matcher, fail-before-start fallback, numerical
-gate, or one-command profiling contract.
+device time improved, but the unprofiled c0 medians regressed by roughly 2.8%.
+P2f still schedules three generic GEMMs around full scratch tensors: scratch feeds
+SwiGLU and exact Q8 conversion in small serial blocks, DOWN waits for that feeder,
+and the PS still owns normalization, result staging, and residual publication.
+The old grouped path is less integrated but amortizes some of those fixed costs
+and can feed its mature GEMM path more continuously.
+
+Build P3 as five independently measurable increments:
+
+#### P3a: measure and remove fixed software costs
+
+- Attribute section preflight, matching, normalization, synchronization, setup,
+  kernel, scratch feed, gather, residual, and publication time separately.
+- Remove avoidable matcher/runtime work and bypass unconditional DOWN gathering
+  when the private one-token result already has the canonical destination layout.
+- Keep this a host-only change where possible; it does not earn a Vivado build
+  merely because it changes the section implementation.
+
+Gate: pinned lowering census and failure behavior remain exact, numerical tests
+pass, and the repeated unprofiled A/B explains whether software fixed costs account
+for the c0 regression.
+
+#### P3b: keep the DOWN feeder full
+
+- Prefetch scratch blocks and add ping-pong block buffers between SwiGLU, exact Q8
+  conversion, and the DOWN activation reader.
+- Pipeline or replicate the exact block quantizer only as required to prevent
+  activation starvation; expose producer-empty and consumer-stall counters.
+- Preserve canonical Q8 scale rounding and byte behavior. Approximate arithmetic
+  is not part of this increment.
+
+Gate: hardened cosim/formal covers bubbles, backpressure, framing, and buffer-bank
+ownership; counters show materially higher DOWN utilization; integrated OOC and a
+clean combined route pass; repeated Q1/Q2 device and unprofiled results improve
+without numerical drift.
+
+#### P3c: replace scratch tensors with a streaming FFN superkernel
+
+- Schedule paired UP/GATE output-row blocks so each completed pair can pass directly
+  through SwiGLU and exact Q8 into a compact, ping-ponged DOWN-input bank.
+- Do not materialize complete F32 UP and GATE tensors or rescan X0/X1 after both
+  projections. Repack paired weights only if measurement shows it improves the
+  schedule without increasing total weight traffic.
+- Keep explicit small FIFOs and block memories between stages; do not form one
+  device-wide combinational ready/valid path.
+
+Gate: per-layer differential tests, exact stream accounting, leaf and integrated
+resource/timing feedback, and a clean combined route for the coherent superkernel
+milestone.
+
+#### P3d: move normalization and residual handling into PL
+
+- Add PL weighted RMSNorm-to-Q8 production and PL residual addition while retaining
+  the PS implementations as the numerical oracle and strict pre-start fallback.
+- Populate the resident residual scratch role so the output can feed the next
+  named section without an intermediate DDR round trip. P5 generalizes this from
+  one section boundary to a whole block and layer walk.
+- Put reduction state and queues in BRAM/URAM and suitable multiply/reduction work
+  in DSPs. Each new block must replace its superseded LUT/PS path rather than coexist
+  indefinitely.
+
+Gate: exhaustive block-level arithmetic tests, full-model logits/perplexity,
+formal control checks, resource deltas, and a clean combined route.
+
+#### P3e: prefill scale and final qualification
+
+- Evaluate an eight-token FFN tile using the existing eight-column GEMM activation
+  capacity, expanding or banking scratch only after a resource and route estimate.
+- Retain four-token tiles if eight-token routing or measured throughput does not
+  repay its cost; decode must not regress for a prefill-only win.
+- Remove superseded debug datapaths from the production build, then run the complete
+  Q1/Q2 characterization and regression contract.
+
+Gate: the named FFN path wins in repeated same-image unprofiled Q1 and Q2 runs,
+all correctness/accounting gates pass, and the production image is fully routed
+with non-negative setup and hold slack. This performance gate, not a speculative
+latency estimate, closes P3.
 
 ### P4: attention section
 
@@ -638,14 +716,49 @@ gate, or one-command profiling contract.
 - Keep banked scratch between stages; do not build one device-wide combinational
   ready/valid chain.
 
-### P5: ternary and KV memory efficiency
+### P5: resident transformer execution
+
+- Introduce two banked residual roles so attention and FFN can alternate ownership
+  without publishing the intermediate residual to DDR.
+- First execute one complete transformer block with the residual resident. Then
+  add a fixed descriptor/layer table and walk all 28 layers on chip.
+- Retain standalone FFN and attention commands for differential testing, recovery,
+  and strict fallback before resident execution starts.
+- Keep weights and historical KV in DDR. Resident execution removes activation
+  boundaries; it does not pretend the model weights fit on chip.
+
+Gate: a complete block and then the fixed 28-layer walk match the standalone
+section oracles, expose exact layer/traffic counters, reduce DDR residual traffic,
+and improve unprofiled wall time on one qualified image.
+
+### P6: persistent controller and DMA consolidation
+
+The current combined design has ten AXI DMA engines and a 13-target control
+SmartConnect. Once P4 and P5 have reduced the operation surface, replace that
+generic shell rather than layering a second controller beside it.
+
+- Retain four persistent weight readers unless measured bandwidth says otherwise.
+- Use one fixed layer controller and consolidate sequential activation/result
+  traffic behind one mover.
+- Consolidate K/V movement only if per-port starvation counters show the shared
+  mover can sustain the attention schedule.
+- Remove obsolete DMA/control targets as replacements qualify; re-measure command
+  bytes, TCP work, and response overhead after the command count falls.
+- Reconsider a slower control clock only after simplifying the topology; a clock
+  split is not itself a throughput feature.
+
+Gate: fewer routed movers and control targets, recovered CLB/routing capacity,
+unchanged stream/error semantics, and lower unprofiled wall residual without a
+device-time regression.
+
+### P7: ternary and KV memory efficiency
 
 The current resident ternary layout uses 576 bytes for 16 x 128 weights, or 2.25
 physical bits per weight including scale/padding structure. The measured kernel
 streams about 484 MB/token and has an approximately 23 token/s bandwidth roof.
 
 - [ ] Define the exact supported ternary scale semantics independently of GGML names.
-- [ ] Evaluate denser trit packing only after P2-P4 make weight traffic dominant.
+- [ ] Evaluate denser trit packing only after P3-P6 make weight traffic dominant.
 - [ ] Add a lossless source-to-resident adapter and exhaustive selector/decoder tests.
 - [ ] Add f16 or quantized KV options for large-model/long-context operation.
 
@@ -653,19 +766,7 @@ The practical heap is about 1.5 GiB. A binary Bonsai-8B file is roughly 1.15 GB 
 a 4K f16 KV cache is roughly another 576 MiB before compute buffers, so memory work
 is mandatory for that operating point regardless of available PL logic.
 
-### P6: control, DMA, and transport
-
-The current combined design has ten AXI DMA engines and a 13-target control
-SmartConnect. Do not immediately rewrite it: first reduce hundreds of operation
-commands to a few section commands.
-
-- Consolidate activation/result/KV movement behind a layer controller.
-- Retain four weight streams unless measured bandwidth says otherwise.
-- Reconsider a slower control clock only after simplifying the control topology;
-  doing it now would reintroduce CDC complexity that the single-clock build removed.
-- Re-measure TCP encoding, transfer, and response overhead after the command count falls.
-
-### P7: spatial scaling, deferred
+### P8: spatial scaling, deferred
 
 Do not build a conventional systolic array now. Decode still has to read every weight,
 and prefill first needs to eliminate activation/result overhead. If fused, tiled
@@ -696,6 +797,33 @@ Formal verification should target control snapshots, bounds, handshakes, TLAST/T
 DMA safety, and liveness under explicit fairness assumptions. Approximate floating
 point behavior belongs in cosim and model-level quality tests.
 
+### Iteration and Vivado cadence
+
+Use the cheapest gate that can answer the current question. A full production route
+is release evidence, not the edit/compile loop:
+
+| Tier | Gate | Run when |
+|---:|---|---|
+| 0 | Focused Zig tests, Verilator cosim, numerical oracle, and focused formal | Every relevant edit; correctness, protocol, arithmetic, and bounded control work |
+| 1 | Leaf OOC synthesis/implementation | A changed RTL leaf needs DSP/BRAM/URAM inference, local resource, or local Fmax feedback |
+| 2 | Integrated decode OOC | A coherent change crosses GEMM, scratch, Q8, SwiGLU, attention, or controller boundaries |
+| 3 | Synthesis/place/congestion probe or incremental combined route | A coherent batch needs early fit or congestion feedback; exploratory only |
+| 4 | Clean combined route | A changed-RTL milestone is ready to deploy, or clocks, constraints, top-level connectivity, regmaps, memory counts/types, DMA, or control topology changed materially |
+| 5 | Board qualification | A routed image is a deployable milestone and its correctness/performance claim is ready for end-to-end evidence |
+
+Host matching, descriptors/codecs without RTL changes, profiling, documentation,
+test harnesses, and RTL that still fails Tier 0 do not require a combined Vivado
+build. Add and use synthesis-only/place-only hooks for fast fit rejection, durable
+source-hash-addressed remote jobs, identical-build reuse, and a build lock so OOC
+and production routing do not compete. Post-synthesis checkpoint reuse and
+incremental routing may accelerate exploration, but neither substitutes for the
+clean route attached to a release claim.
+
+For P3, budget clean routes at coherent architectural boundaries: the feeder
+repair, streaming superkernel, PL norm/residual boundary, and final qualified
+section. Run fewer only when one source state combines those boundaries; do not
+route every pipeline-register experiment independently.
+
 ## Current timing notes
 
 Historical accumulator reset and broad-enable problems were real and the fixes should
@@ -720,8 +848,11 @@ warnings, and ULMTCS-1; resolving those findings and earning more slack belong t
 a separate timing-optimization pass.
 Therefore:
 
-- accept fully routed builds with non-negative setup and hold slack; treat additional
-  slack as a separate timing-optimization objective;
+- accept a fully routed, structurally constrained build when setup and hold slack
+  are both non-negative; positive slack passes regardless of how close it is to
+  zero;
+- treat additional slack as a separate timing-optimization objective, not a reason
+  to rerun or reject an otherwise passing milestone;
 - treat f285 as P2f's bounded qualification point, not proof of f300 closure;
 - resolve the methodology findings before defining a stricter production budget;
 - add per-port starvation counters before adding elastic weight FIFOs;
