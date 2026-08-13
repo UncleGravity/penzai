@@ -125,6 +125,26 @@ int dut_dbg_internal_record_done(Dut *d) {
            d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__emit_index == 4 &&
            d->t->rootp->decode_top__DOT__native_acts_tready;
 }
+int dut_dbg_q8_state(Dut *d) {
+    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__state;
+}
+int dut_dbg_q8_scalar_index(Dut *d) {
+    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__scalar_index;
+}
+int dut_dbg_q8_emit_index(Dut *d) {
+    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__emit_index;
+}
+int dut_dbg_q8_quantizer_state(Dut *d) {
+    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__u_quantizer__DOT__state;
+}
+uint32_t dut_dbg_q8_handshakes(Dut *d) {
+    return (d->t->s_axis_acts_tready ? 1u : 0u) |
+           (d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__internal_source_accept ? 2u : 0u) |
+           (d->t->rootp->decode_top__DOT__native_acts_tvalid ? 4u : 0u) |
+           (d->t->rootp->decode_top__DOT__q8_internal_record_done ? 8u : 0u) |
+           (d->t->rootp->decode_top__DOT__q8_activation_abort ? 16u : 0u) |
+           (d->t->rootp->decode_top__DOT__q8_ingress_abort ? 0x80000000u : 0u);
+}
 int dut_dbg_scratch_consumer_state(Dut *d) {
     return d->t->rootp->decode_top__DOT__scratch_consumer_state_q;
 }
@@ -132,8 +152,8 @@ uint32_t dut_dbg_scratch_total_blocks(Dut *d) {
     return d->t->rootp->decode_top__DOT__scratch_consumer_total_blocks_q;
 }
 void dut_dbg_seed_scratch_roles(Dut *d, uint32_t rows, uint32_t tokens) {
-    // Test-only setup for the production-width block-count regression. The
-    // ordinary FFN case below populates these records through real GEMM writes.
+    // Test-only metadata setup for production-width arithmetic and lifecycle
+    // relaunch checks. The ordinary FFN path populates it through real writes.
     d->t->rootp->decode_top__DOT__scratch_valid_q = 0x6;
     d->t->rootp->decode_top__DOT__scratch_valid_rows_q[1] = rows;
     d->t->rootp->decode_top__DOT__scratch_valid_rows_q[2] = rows;

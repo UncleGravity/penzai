@@ -846,41 +846,91 @@ fn abortInternalAndRestart(
         ACT_SCRATCH_SWIGLU,
         0xF15F_A807,
     );
-    c.dut_set_m_ready(dut.h, 0);
+    c.dut_set_m_ready(dut.h, 1);
     c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
 
-    var saw_request = false;
-    for (0..64) |_| {
-        c.dut_eval(dut.h);
-        if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
-            return error.InternalAbortExposedExternalStream;
-        if (c.dut_dbg_scratch_read_fire(dut.h) != 0) {
-            saw_request = true;
-            break;
+    // The fourth target proves that the third abort also restarts; it is then
+    // aborted only to return the shared DUT to an empty section for the normal
+    // bit-exact run below.
+    const targets = [_]enum { input, quant, emit, restarted_input }{
+        .input,
+        .quant,
+        .emit,
+        .restarted_input,
+    };
+    for (targets, 0..) |target, target_index| {
+        var reached = false;
+        for (0..4096) |_| {
+            c.dut_eval(dut.h);
+            if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+                return error.InternalAbortExposedExternalStream;
+            const state = c.dut_dbg_q8_state(dut.h);
+            const scalar_index = c.dut_dbg_q8_scalar_index(dut.h);
+            const emit_index = c.dut_dbg_q8_emit_index(dut.h);
+            const quantizer_state = c.dut_dbg_q8_quantizer_state(dut.h);
+            reached = switch (target) {
+                .input, .restarted_input => state == 8 and
+                    scalar_index >= 4 and scalar_index <= 28,
+                .quant => state == 4 and quantizer_state != 0 and
+                    quantizer_state != 9,
+                .emit => state == 5 and emit_index >= 1 and emit_index <= 3,
+            };
+            if (reached) break;
+            dut.step();
         }
+        if (!reached) return error.InternalAbortStageTimeout;
+
+        // Drive the existing section abort source at the retained-work cycle.
+        // The q8 boundary is combinationally closed before the aborting edge.
+        c.dut_set_axi_write(dut.h, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT, 1);
         dut.step();
+        dut.step();
+        c.dut_set_axi_idle(dut.h);
+        c.dut_eval(dut.h);
+        const abort_mask = c.dut_dbg_q8_handshakes(dut.h);
+        if (abort_mask != 0x8000_0000)
+            return error.InternalAbortHandshakeLeak;
+        dut.step();
+        c.dut_eval(dut.h);
+        if (c.dut_dbg_q8_state(dut.h) != 0 or
+            c.dut_dbg_q8_quantizer_state(dut.h) != 0 or
+            c.dut_dbg_q8_handshakes(dut.h) != 0)
+            return error.InternalAbortDidNotClearQ8;
+
+        var status = try axiRead(dut, REG_SCRATCH_STATUS);
+        if (status & (SCRATCH_CONSUMER_BUSY | SCRATCH_SECTION_ACTIVE) != 0 or
+            status & (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+                (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+            try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_ABORT == 0 or
+            try axiRead(dut, REG_QUANT_STATUS) != 0)
+            return error.InternalAbortStatusMismatch;
+
+        axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+        status = try axiRead(dut, REG_SCRATCH_STATUS);
+        if (status & SCRATCH_SECTION_ACTIVE == 0 or
+            status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR | SCRATCH_X0_VALID | SCRATCH_X1_VALID) != 0 or
+            try axiRead(dut, REG_SCRATCH_ERROR) != 0 or
+            try axiRead(dut, REG_QUANT_STATUS) != 0)
+            return error.InternalImmediateRestartFailed;
+
+        if (target_index + 1 < targets.len) {
+            // Test-only metadata setup isolates q8 lifecycle restart from the
+            // already-covered physical scratch refill path.
+            c.dut_dbg_seed_scratch_roles(dut.h, @intCast(ffn_dim), @intCast(tokens));
+            configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+            configureProjection(
+                dut,
+                rows,
+                rows,
+                ffn_dim / layout.Q1_BLOCK,
+                tokens,
+                WEIGHT_FMT_BINARY,
+                ACT_SCRATCH_SWIGLU,
+                0xF15F_A808 + @as(u32, @intCast(target_index)),
+            );
+        }
     }
-    if (!saw_request) return error.InternalAbortNoScratchRequest;
-
-    // Abort on the first accepted read, then begin the next section without an
-    // intervening reset.  Any response left by the killed consumer must drain
-    // while idle and cannot deadlock or poison the new section.
-    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT);
     c.dut_set_a(dut.h, 0, 0, 0);
-    c.dut_set_m_ready(dut.h, 1);
-    var status = try axiRead(dut, REG_SCRATCH_STATUS);
-    if (status & (SCRATCH_CONSUMER_BUSY | SCRATCH_SECTION_ACTIVE) != 0 or
-        status & (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
-            (SCRATCH_CONSUMER_DONE | SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
-        try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_ABORT == 0)
-        return error.InternalAbortStatusMismatch;
-
-    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
-    status = try axiRead(dut, REG_SCRATCH_STATUS);
-    if (status & SCRATCH_SECTION_ACTIVE == 0 or
-        status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR | SCRATCH_X0_VALID | SCRATCH_X1_VALID) != 0 or
-        try axiRead(dut, REG_SCRATCH_ERROR) != 0)
-        return error.InternalImmediateRestartFailed;
 }
 
 fn verifyMaxScratchBlockTarget(dut: *Dut) !void {

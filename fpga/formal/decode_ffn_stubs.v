@@ -1,7 +1,7 @@
 `default_nettype none
 
 module q8_ingress (
-    input wire clk, input wire rst_n, input wire start,
+    input wire clk, input wire rst_n, input wire start, input wire abort,
     input wire raw_mode, input wire internal_mode,
     input wire [15:0] num_q1_blocks, input wire [15:0] num_cols,
     input wire [63:0] s_axis_tdata, input wire s_axis_tvalid,
@@ -20,18 +20,25 @@ module q8_ingress (
     reg emit_active;
     reg error_q;
 
-    assign s_axis_tready = raw_mode && !internal_run && !error_q;
-    assign internal_ready = internal_run && (quant_wait == 0) &&
+    assign s_axis_tready = !abort && raw_mode && !internal_run && !error_q;
+    assign internal_ready = !abort && internal_run && (quant_wait == 0) &&
                             !emit_active && !error_q;
     assign m_axis_tdata = 64'd0;
-    assign m_axis_tvalid = internal_run && emit_active && !error_q;
+    assign m_axis_tvalid = !abort && internal_run && emit_active && !error_q;
     assign internal_record_done = m_axis_tvalid && m_axis_tready &&
                                   (emit_count == 3'd4);
-    assign activation_abort = error_q;
-    assign quantizer_status = error_q ? 6'b000100 : 6'd0;
+    assign activation_abort = !abort && error_q;
+    assign quantizer_status = (!abort && error_q) ? 6'b000100 : 6'd0;
 
     always @(posedge clk) begin
         if (!rst_n) begin
+            internal_run <= 1'b0;
+            scalar_count <= 6'd0;
+            emit_count <= 3'd0;
+            quant_wait <= 7'd0;
+            emit_active <= 1'b0;
+            error_q <= 1'b0;
+        end else if (abort) begin
             internal_run <= 1'b0;
             scalar_count <= 6'd0;
             emit_count <= 3'd0;

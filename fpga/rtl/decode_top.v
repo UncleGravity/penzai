@@ -217,6 +217,7 @@ module decode_top #(
     wire [15:0] loaded_act_cols;
     wire [5:0] quantizer_status;
     wire q8_activation_abort;
+    wire q8_ingress_abort;
     wire kernel_start;
     wire weight_tready;
     wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid &&
@@ -260,6 +261,7 @@ module decode_top #(
         .clk(clk),
         .rst_n(rst_n),
         .start(kernel_start),
+        .abort(q8_ingress_abort),
         .raw_mode(raw_activation_mode),
         .internal_mode(internal_activation_mode),
         .num_q1_blocks(num_q1_blocks_q),
@@ -517,6 +519,13 @@ module decode_top #(
     assign swiglu_in_last = (scratch_consumer_group_q[1:0] == 2'd3) &&
                             (scratch_consumer_lane_q == 3'd7);
 
+    // Section abort is a lifecycle boundary for every stage that can retain
+    // work. A traversal failure also kills any scalar, quantization, or native
+    // record still owned by the section before software starts another run.
+    assign q8_ingress_abort = raw_activation_mode &&
+                              (scratch_abort_strobe ||
+                               (internal_activation_mode && scratch_error_q[5]));
+
     section_swiglu u_section_swiglu (
         .clk(clk),
         .rst_n(rst_n),
@@ -561,7 +570,7 @@ module decode_top #(
         .weight_fmt(weight_fmt_q),
         .act_mode(internal_activation_mode ? 2'd2 : act_mode_q),
         .act_epoch(act_epoch_q),
-        .activation_abort(q8_activation_abort ||
+        .activation_abort(q8_activation_abort || q8_ingress_abort ||
                           (scratch_writer_active && scratch_abort_strobe) ||
                           (scratch_consumer_busy_q && scratch_abort_strobe) ||
                           (internal_activation_mode && |scratch_error_q[6:5])),
@@ -1156,6 +1165,14 @@ module decode_top #(
             end
             if (internal_activation_mode)
                 assert(!s_axis_acts_tready);
+
+            if (q8_ingress_abort) begin
+                assert(!raw_acts_tready);
+                assert(!native_acts_tvalid);
+                assert(!q8_internal_record_done);
+                assert(!q8_activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
 
             if (scratch_section_active_q && scratch_valid_q[1])
                 assert(scratch_valid_q[2]);

@@ -11,6 +11,7 @@ module q8_ingress (
     input  wire        clk,
     input  wire        rst_n,
     input  wire        start,
+    input  wire        abort,
     input  wire        raw_mode,
     input  wire        internal_mode,
     input  wire [15:0] num_q1_blocks,
@@ -65,7 +66,7 @@ module q8_ingress (
     reg [1:0]  internal_status_q;
     reg        internal_valid_q;
 
-    assign s_axis_tready = state == ST_INPUT;
+    assign s_axis_tready = !abort && (state == ST_INPUT);
 
     wire q_in_ready;
     wire q_out_valid;
@@ -74,7 +75,7 @@ module q8_ingress (
     wire [3:0] q_out_status;
     wire internal_frame_ok = quant_scalar_last == (scalar_index == 6'd31);
     wire internal_stage_ok = (internal_status_q == 2'd0) && internal_frame_ok;
-    wire internal_accept = internal_run && (state == ST_INTERNAL) &&
+    wire internal_accept = !abort && internal_run && (state == ST_INTERNAL) &&
                            internal_valid_q && q_in_ready;
     // A diagnosed scalar is consumed by the section controller but is not
     // allowed to mutate the quantizer's partial block before fail-closed abort.
@@ -83,7 +84,7 @@ module q8_ingress (
     // cone. The stage is elastic within a block: when the quantizer accepts a
     // healthy non-final scalar, the source may replace it on the same edge.
     // Block-final and diagnosed scalars retain the fail-closed boundary.
-    assign internal_ready = rst_n && !start && internal_run &&
+    assign internal_ready = rst_n && !start && !abort && internal_run &&
                             (state == ST_INTERNAL) &&
                             (!internal_valid_q ||
                              (q_in_ready && internal_stage_ok &&
@@ -92,19 +93,23 @@ module q8_ingress (
     wire internal_replace = internal_source_accept && internal_valid_q;
     // Completion means all five native beats for this block were accepted by
     // gemm_kernel. The scratch walker uses this to retire queued blocks.
-    assign internal_record_done = internal_run && (state == ST_EMIT) &&
+    assign internal_record_done = !abort && internal_run &&
+                                  (state == ST_EMIT) &&
                                   (emit_index == 3'd4) && m_axis_tready;
     // Keep the leaf's complete record stable through all five output beats. The
     // fifth accepted beat releases it for the next block.
-    wire q_out_ready = (state == ST_EMIT) && (emit_index == 3'd4) && m_axis_tready;
+    wire q_out_ready = !abort && (state == ST_EMIT) &&
+                       (emit_index == 3'd4) && m_axis_tready;
 
-    // Reset the leaf at every kernel launch. This also makes an aborted raw run
-    // recoverable without resetting the complete accelerator.
-    wire q_rst_n = rst_n && !start;
+    // Reset the sole numeric leaf on either lifecycle boundary. Abort is
+    // independent of kernel launch, so a killed section cannot leave a partial
+    // block or completed record owned by the next run.
+    wire q_rst_n = rst_n && !start && !abort;
+    wire q_in_valid = quant_scalar_valid && !abort;
     q8_quantizer u_quantizer (
         .clk(clk),
         .rst_n(q_rst_n),
-        .in_valid(quant_scalar_valid),
+        .in_valid(q_in_valid),
         .in_ready(q_in_ready),
         .in_data(quant_scalar),
         .in_last(quant_scalar_last),
@@ -115,10 +120,10 @@ module q8_ingress (
         .out_status(q_out_status)
     );
 
-    assign m_axis_tvalid = state == ST_EMIT;
+    assign m_axis_tvalid = !abort && (state == ST_EMIT);
     assign m_axis_tdata = emit_data;
-    assign activation_abort = state == ST_ERROR;
-    assign quantizer_status = error_status;
+    assign activation_abort = !abort && (state == ST_ERROR);
+    assign quantizer_status = abort ? 6'd0 : error_status;
 
     wire final_block = (block_sub == 2'd3) &&
                        (block_q1 == last_q1) &&
@@ -139,6 +144,21 @@ module q8_ingress (
             emit_index         <= 3'd0;
             error_status       <= 6'd0;
             internal_run       <= 1'b0;
+            internal_valid_q   <= 1'b0;
+        end else if (abort) begin
+            state              <= ST_IDLE;
+            quant_scalar_valid <= 1'b0;
+            quant_scalar_last  <= 1'b0;
+            scalar_index       <= 6'd0;
+            block_sub          <= 2'd0;
+            block_q1           <= 16'd0;
+            block_col          <= 16'd0;
+            last_q1            <= 16'd0;
+            last_col           <= 16'd0;
+            emit_index         <= 3'd0;
+            error_status       <= 6'd0;
+            internal_run       <= 1'b0;
+            internal_status_q  <= 2'd0;
             internal_valid_q   <= 1'b0;
         end else if (start) begin
             quant_scalar_valid <= 1'b0;
@@ -292,7 +312,7 @@ module q8_ingress (
 
     always @(posedge clk) begin
         f_past_valid <= 1'b1;
-        if (!rst_n || start) begin
+        if (!rst_n || start || abort) begin
             f_scalar_count <= 6'd0;
             f_native_beat <= 3'd0;
             f_record_pending <= 1'b0;
@@ -332,17 +352,29 @@ module q8_ingress (
         if (rst_n) begin
             assert(state <= ST_INTERNAL);
             assert(internal_record_done ==
-                   (internal_run && (state == ST_EMIT) &&
+                   (!abort && internal_run && (state == ST_EMIT) &&
                     (emit_index == 3'd4) && m_axis_tready));
 
-            if (f_past_valid && $past(rst_n) &&
+            if (abort) begin
+                assert(!s_axis_tready);
+                assert(!internal_ready);
+                assert(!internal_record_done);
+                assert(!q_in_valid);
+                assert(!q_out_ready);
+                assert(!m_axis_tvalid);
+                assert(!activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
+
+            if (f_past_valid && !abort && $past(rst_n) &&
                 $past(m_axis_tvalid && !m_axis_tready)) begin
                 assert(m_axis_tvalid);
                 assert(m_axis_tdata == $past(m_axis_tdata));
                 assert(emit_index == $past(emit_index));
             end
 
-            if (f_past_valid && $past(rst_n) && !$past(start) &&
+            if (f_past_valid && !abort && $past(rst_n) &&
+                !$past(start) && !$past(abort) &&
                 $past(internal_accept &&
                       ((internal_status_q != 2'd0) || !internal_frame_ok))) begin
                 assert(state == ST_ERROR);
@@ -350,8 +382,8 @@ module q8_ingress (
                 assert(!m_axis_tvalid && !internal_ready);
             end
 
-            if (f_past_valid && !start && $past(rst_n && !start &&
-                                                internal_replace)) begin
+            if (f_past_valid && !start && !abort &&
+                $past(rst_n && !start && !abort && internal_replace)) begin
                 assert(state == ST_INTERNAL);
                 assert(internal_valid_q);
                 assert(quant_scalar == $past(internal_data));
@@ -364,7 +396,7 @@ module q8_ingress (
                          ($past(scalar_index) == 6'd30))));
             end
 
-            if (f_past_valid && $past(rst_n && start && raw_mode &&
+            if (f_past_valid && $past(rst_n && start && !abort && raw_mode &&
                                       internal_mode &&
                                       (num_q1_blocks != 0) &&
                                       (num_cols != 0))) begin
@@ -372,11 +404,28 @@ module q8_ingress (
                 assert(state == ST_INTERNAL);
                 assert(quantizer_status == 6'd0);
             end
+
+            // Abort has priority over a simultaneous start and clears all
+            // adapter/quantizer ownership without manufacturing an error.
+            if (f_past_valid && $past(rst_n && abort)) begin
+                assert(state == ST_IDLE);
+                assert(!internal_run);
+                assert(!quant_scalar_valid);
+                assert(!internal_valid_q);
+                assert(scalar_index == 6'd0);
+                assert(emit_index == 3'd0);
+                assert(!activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
         end
 
         cover(rst_n && internal_record_done);
         cover(rst_n && internal_replace);
         cover(rst_n && internal_run && activation_abort);
+        cover(rst_n && abort && internal_run &&
+              (state == ST_INTERNAL) && (scalar_index != 6'd0));
+        cover(rst_n && abort && internal_run && (state == ST_WAIT));
+        cover(rst_n && abort && internal_run && (state == ST_EMIT));
     end
 `endif
 endmodule
