@@ -142,8 +142,11 @@ module section_q8_buffer (
     // Duplicate metadata is split per ping-pong bank so the inactive bank can
     // clear while the other bank captures or replays. These arrays are also
     // reset-free synchronous RAMs.
-    (* ram_style = "block" *) reg seen0_mem [0:SEEN_DEPTH-1];
-    (* ram_style = "block" *) reg seen1_mem [0:SEEN_DEPTH-1];
+    // Pad the one-bit flags to a BRAM-native word width. Vivado otherwise maps
+    // the independent simple-dual-port arrays into distributed RAM despite the
+    // block style; bit zero remains the sole semantic duplicate flag.
+    (* ram_style = "block" *) reg [7:0] seen0_mem [0:SEEN_DEPTH-1];
+    (* ram_style = "block" *) reg [7:0] seen1_mem [0:SEEN_DEPTH-1];
 
     reg bank0_clearing_q;
     reg bank1_clearing_q;
@@ -340,24 +343,24 @@ module section_q8_buffer (
 
     always @(posedge clk) begin
         if (bank0_clearing_q)
-            seen0_mem[bank0_clear_address_q] <= 1'b0;
+            seen0_mem[bank0_clear_address_q] <= 8'd0;
         else if (cap_commit_valid && !cap_bank_q)
-            seen0_mem[cap_local_address_q] <= 1'b1;
+            seen0_mem[cap_local_address_q] <= 8'd1;
         if (cap_start && !s_axis_bank)
             seen0_probe_q <= seen0_mem[
                 (s_axis_block < BLOCK_CAPACITY) ?
-                    local_address(s_axis_token, s_axis_block) : 11'd0];
+                    local_address(s_axis_token, s_axis_block) : 11'd0][0];
     end
 
     always @(posedge clk) begin
         if (bank1_clearing_q)
-            seen1_mem[bank1_clear_address_q] <= 1'b0;
+            seen1_mem[bank1_clear_address_q] <= 8'd0;
         else if (cap_commit_valid && cap_bank_q)
-            seen1_mem[cap_local_address_q] <= 1'b1;
+            seen1_mem[cap_local_address_q] <= 8'd1;
         if (cap_start && s_axis_bank)
             seen1_probe_q <= seen1_mem[
                 (s_axis_block < BLOCK_CAPACITY) ?
-                    local_address(s_axis_token, s_axis_block) : 11'd0];
+                    local_address(s_axis_token, s_axis_block) : 11'd0][0];
     end
 
     // Bank-zero lifecycle and exact-record accounting.
