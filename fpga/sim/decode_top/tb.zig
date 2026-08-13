@@ -719,6 +719,8 @@ const InternalRun = struct {
     read_fires: usize,
     swiglu_fires: usize,
     record_fires: usize,
+    cycles: usize,
+    peak_pending_records: usize,
 };
 
 fn runInternalDown(
@@ -749,10 +751,11 @@ fn runInternalDown(
     var read_fires: usize = 0;
     var swiglu_fires: usize = 0;
     var record_fires: usize = 0;
-    var reads_since_record: usize = 0;
-    var swiglu_since_record: usize = 0;
+    var cycles: usize = 0;
+    var peak_pending_records: usize = 0;
 
     for (0..CYCLE_LIMIT) |cycle| {
+        cycles = cycle + 1;
         var w_valid = [_]bool{false} ** PORTS;
         for (0..PORTS) |port| {
             const valid = wi[port] < w_beats;
@@ -768,19 +771,20 @@ fn runInternalDown(
         if (c.dut_a_ready(dut.h) != 0) return error.InternalModeAcceptedExternalActivation;
         if (c.dut_dbg_scratch_read_fire(dut.h) != 0) {
             read_fires += 1;
-            reads_since_record += 1;
         }
         if (c.dut_dbg_swiglu_input_fire(dut.h) != 0) {
             swiglu_fires += 1;
-            swiglu_since_record += 1;
         }
         if (c.dut_dbg_internal_record_done(dut.h) != 0) {
-            if (reads_since_record != 8 or swiglu_since_record != 32)
+            if (read_fires < (record_fires + 1) * 8 or
+                swiglu_fires < (record_fires + 1) * shared_layout.q8_block)
                 return error.InternalRecordScheduleMismatch;
-            reads_since_record = 0;
-            swiglu_since_record = 0;
             record_fires += 1;
         }
+        peak_pending_records = @max(
+            peak_pending_records,
+            swiglu_fires / shared_layout.q8_block - record_fires,
+        );
         var w_fire = [_]bool{false} ** PORTS;
         for (0..PORTS) |port| w_fire[port] = w_valid[port] and c.dut_w_ready(dut.h, @intCast(port)) != 0;
         if (c.dut_m_valid(dut.h) != 0 and ready) {
@@ -820,6 +824,8 @@ fn runInternalDown(
         .read_fires = read_fires,
         .swiglu_fires = swiglu_fires,
         .record_fires = record_fires,
+        .cycles = cycles,
+        .peak_pending_records = peak_pending_records,
     };
 }
 
@@ -1044,9 +1050,16 @@ fn runFfnSectionCase(a: std.mem.Allocator) !void {
         down.swiglu_fires != expected_records * shared_layout.q8_block or
         down.record_fires != expected_records)
         return error.FfnSectionTraversalMismatch;
+    if (down.peak_pending_records < 2)
+        return error.FfnSectionDidNotPipelineBlocks;
+    // The former record-at-a-time walker takes 3,095 cycles for this exact
+    // deterministic case. Keep modest headroom while requiring the elastic
+    // feeder to retain its measured throughput gain.
+    if (down.cycles > 2800)
+        return error.FfnSectionFeederCycleRegression;
     std.debug.print(
-        "decode_top v15 FFN section: scratch-only A/R={d}/0 then {d}/0, internal reads/y/records={d}/{d}/{d}, DOWN bit-exact\n",
-        .{ raw_beats.len, @as(usize, 0), down.read_fires, down.swiglu_fires, down.record_fires },
+        "decode_top v15 FFN section: scratch-only A/R={d}/0 then {d}/0, internal reads/y/records={d}/{d}/{d}, pending={d}, cycles={d}, DOWN bit-exact\n",
+        .{ raw_beats.len, @as(usize, 0), down.read_fires, down.swiglu_fires, down.record_fires, down.peak_pending_records, down.cycles },
     );
 }
 

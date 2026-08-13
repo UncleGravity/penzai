@@ -196,6 +196,7 @@ module decode_top #(
     reg [10:0] scratch_consumer_groups_q;
     reg [2:0]  scratch_consumer_lane_q;
     reg [15:0] scratch_consumer_blocks_q;
+    reg [15:0] scratch_consumer_records_q;
     reg [15:0] scratch_consumer_total_blocks_q;
     reg [255:0] scratch_consumer_gate_q;
     reg [255:0] scratch_consumer_up_q;
@@ -495,6 +496,9 @@ module decode_top #(
     wire scratch_consumer_wait_rsp = scratch_consumer_busy_q &&
                                      ((scratch_consumer_state_q == CONSUMER_WAIT_GATE) ||
                                       (scratch_consumer_state_q == CONSUMER_WAIT_UP));
+    wire scratch_consumer_record_accounting_ok =
+        (scratch_consumer_records_q < scratch_consumer_blocks_q) &&
+        (scratch_consumer_records_q < scratch_consumer_total_blocks_q);
     assign scratch_rd_rsp_ready = scratch_consumer_wait_rsp ||
                                   ((!scratch_consumer_busy_q && !scratch_drain_busy_q) &&
                                    scratch_rd_rsp_valid) ||
@@ -605,6 +609,7 @@ module decode_top #(
             scratch_consumer_groups_q  <= 11'd0;
             scratch_consumer_lane_q    <= 3'd0;
             scratch_consumer_blocks_q  <= 16'd0;
+            scratch_consumer_records_q <= 16'd0;
             scratch_consumer_total_blocks_q <= 16'd0;
             scratch_drain_busy_q       <= 1'b0;
             scratch_drain_done_q       <= 1'b0;
@@ -711,6 +716,7 @@ module decode_top #(
                 scratch_consumer_groups_q <= scratch_rows_q[13:3];
                 scratch_consumer_lane_q   <= 3'd0;
                 scratch_consumer_blocks_q <= 16'd0;
+                scratch_consumer_records_q <= 16'd0;
                 // Keep both operands explicitly widened.  The maximum section
                 // consumes (12288 / 32) * 4 = 1536 native Q8 records; an
                 // operand-sized multiply would silently truncate that result.
@@ -718,7 +724,23 @@ module decode_top #(
                     {7'd0, scratch_rows_q[13:5]} * {13'd0, scratch_tokens_q};
             end else if (scratch_consumer_busy_q && !scratch_abort_strobe &&
                          !q8_activation_abort) begin
-                case (scratch_consumer_state_q)
+                // Input blocks may run ahead into the SwiGLU BRAM FIFO. Retire
+                // them only after all five canonical Q8 record beats are accepted.
+                if (q8_internal_record_done) begin
+                    if (scratch_consumer_record_accounting_ok) begin
+                        scratch_consumer_records_q <=
+                            scratch_consumer_records_q + 1'b1;
+                    end else begin
+                        scratch_consumer_busy_q  <= 1'b0;
+                        scratch_consumer_done_q  <= 1'b1;
+                        scratch_consumer_state_q <= CONSUMER_IDLE;
+                        scratch_error_q[5] <= 1'b1;
+                    end
+                end
+
+                if (!q8_internal_record_done ||
+                    scratch_consumer_record_accounting_ok) begin
+                    case (scratch_consumer_state_q)
                     CONSUMER_REQ_GATE: if (scratch_rd_req_ready)
                         scratch_consumer_state_q <= CONSUMER_WAIT_GATE;
 
@@ -753,9 +775,20 @@ module decode_top #(
                     CONSUMER_ISSUE: if (swiglu_in_ready) begin
                         if (scratch_consumer_lane_q == 3'd7) begin
                             scratch_consumer_lane_q <= 3'd0;
-                            if (scratch_consumer_group_q[1:0] == 2'd3) begin
+                            if (scratch_consumer_group_q[1:0] == 2'd3)
                                 scratch_consumer_blocks_q <= scratch_consumer_blocks_q + 1'b1;
+
+                            if ((scratch_consumer_group_q + 1'b1 ==
+                                 scratch_consumer_groups_q) &&
+                                (scratch_consumer_token_q + 1'b1 ==
+                                 scratch_tokens_q)) begin
                                 scratch_consumer_state_q <= CONSUMER_DRAIN;
+                            end else if (scratch_consumer_group_q + 1'b1 ==
+                                         scratch_consumer_groups_q) begin
+                                scratch_consumer_group_q <= 11'd0;
+                                scratch_consumer_token_q <=
+                                    scratch_consumer_token_q + 1'b1;
+                                scratch_consumer_state_q <= CONSUMER_REQ_GATE;
                             end else begin
                                 scratch_consumer_group_q <= scratch_consumer_group_q + 1'b1;
                                 scratch_consumer_state_q <= CONSUMER_REQ_GATE;
@@ -766,21 +799,13 @@ module decode_top #(
                     end
 
                     CONSUMER_DRAIN: if (q8_internal_record_done) begin
-                        if ((scratch_consumer_group_q + 1'b1 == scratch_consumer_groups_q) &&
-                            (scratch_consumer_token_q + 1'b1 == scratch_tokens_q)) begin
+                        if (scratch_consumer_records_q + 1'b1 ==
+                            scratch_consumer_total_blocks_q) begin
                             scratch_consumer_busy_q  <= 1'b0;
                             scratch_consumer_done_q  <= 1'b1;
                             scratch_consumer_state_q <= CONSUMER_IDLE;
                             if (scratch_consumer_blocks_q != scratch_consumer_total_blocks_q)
                                 scratch_error_q[5] <= 1'b1;
-                        end else begin
-                            if (scratch_consumer_group_q + 1'b1 == scratch_consumer_groups_q) begin
-                                scratch_consumer_group_q <= 11'd0;
-                                scratch_consumer_token_q <= scratch_consumer_token_q + 1'b1;
-                            end else begin
-                                scratch_consumer_group_q <= scratch_consumer_group_q + 1'b1;
-                            end
-                            scratch_consumer_state_q <= CONSUMER_REQ_GATE;
                         end
                     end
 
@@ -790,7 +815,8 @@ module decode_top #(
                         scratch_consumer_state_q <= CONSUMER_IDLE;
                         scratch_error_q[5]       <= 1'b1;
                     end
-                endcase
+                    endcase
+                end
             end
 
             if (internal_activation_mode && q8_activation_abort) begin
@@ -1083,33 +1109,46 @@ module decode_top #(
 
 `ifdef FORMAL
     reg        f_decode_past_valid = 1'b0;
-    reg [3:0]  f_reads_per_record = 4'd0;
-    reg [5:0]  f_scalars_per_record = 6'd0;
+    reg [3:0]  f_reads_per_block = 4'd0;
+    reg [5:0]  f_scalars_per_block = 6'd0;
+
+    wire f_swiglu_input_fire = swiglu_in_valid && swiglu_in_ready;
+    wire f_swiglu_block_last = f_swiglu_input_fire &&
+                               (scratch_consumer_lane_q == 3'd7) &&
+                               (scratch_consumer_group_q[1:0] == 2'd3);
 
     always @(posedge clk) begin
         f_decode_past_valid <= 1'b1;
         if (!rst_n || scratch_consumer_start || scratch_abort_strobe) begin
-            f_reads_per_record <= 4'd0;
-            f_scalars_per_record <= 6'd0;
+            f_reads_per_block <= 4'd0;
+            f_scalars_per_block <= 6'd0;
         end else if (scratch_consumer_busy_q) begin
             if (scratch_rd_req_valid && scratch_rd_req_ready)
-                f_reads_per_record <= f_reads_per_record + 1'b1;
-            if (swiglu_in_valid && swiglu_in_ready)
-                f_scalars_per_record <= f_scalars_per_record + 1'b1;
-            if (q8_internal_record_done) begin
-                assert(f_reads_per_record == 4'd8);
-                assert(f_scalars_per_record == 6'd32);
-                f_reads_per_record <= 4'd0;
-                f_scalars_per_record <= 6'd0;
+                f_reads_per_block <= f_reads_per_block + 1'b1;
+            if (f_swiglu_input_fire) begin
+                if (f_swiglu_block_last) begin
+                    assert(f_reads_per_block == 4'd8);
+                    assert(f_scalars_per_block == 6'd31);
+                    f_reads_per_block <= 4'd0;
+                    f_scalars_per_block <= 6'd0;
+                end else begin
+                    f_scalars_per_block <= f_scalars_per_block + 1'b1;
+                end
             end
+            if (q8_internal_record_done)
+                assert(scratch_consumer_records_q <
+                       scratch_consumer_blocks_q);
         end
 
         if (rst_n) begin
             assert(scratch_consumer_state_q <= CONSUMER_DRAIN);
+            assert(scratch_consumer_records_q <= scratch_consumer_blocks_q);
             assert(scratch_consumer_blocks_q <= scratch_consumer_total_blocks_q);
+            assert(scratch_consumer_blocks_q <=
+                   scratch_consumer_records_q + 16'd3);
             assert(scratch_consumer_total_blocks_q <= 16'd1536);
-            assert(f_reads_per_record <= 4'd8);
-            assert(f_scalars_per_record <= 6'd32);
+            assert(f_reads_per_block <= 4'd8);
+            assert(f_scalars_per_block <= 6'd31);
 
             if (scratch_only_run_q) begin
                 assert(scratch_section_active_q);
@@ -1192,6 +1231,9 @@ module decode_top #(
               scratch_valid_q[2] && scratch_valid_q[1]);
         cover(rst_n && scratch_consumer_busy_q &&
               scratch_consumer_state_q == CONSUMER_DRAIN);
+        cover(rst_n && scratch_consumer_busy_q &&
+              (scratch_consumer_blocks_q >=
+               scratch_consumer_records_q + 16'd2));
         cover(rst_n && scratch_section_done_q && !scratch_section_active_q &&
               scratch_consumer_done_q && scratch_valid_q == 4'd0);
         cover(rst_n && scratch_error_q[2] && scratch_section_done_q &&

@@ -16,11 +16,13 @@ module q8_ingress (
     reg internal_run;
     reg [5:0] scalar_count;
     reg [2:0] emit_count;
+    reg [6:0] quant_wait;
     reg emit_active;
     reg error_q;
 
     assign s_axis_tready = raw_mode && !internal_run && !error_q;
-    assign internal_ready = internal_run && !emit_active && !error_q;
+    assign internal_ready = internal_run && (quant_wait == 0) &&
+                            !emit_active && !error_q;
     assign m_axis_tdata = 64'd0;
     assign m_axis_tvalid = internal_run && emit_active && !error_q;
     assign internal_record_done = m_axis_tvalid && m_axis_tready &&
@@ -33,12 +35,14 @@ module q8_ingress (
             internal_run <= 1'b0;
             scalar_count <= 6'd0;
             emit_count <= 3'd0;
+            quant_wait <= 7'd0;
             emit_active <= 1'b0;
             error_q <= 1'b0;
         end else if (start) begin
             internal_run <= internal_mode;
             scalar_count <= 6'd0;
             emit_count <= 3'd0;
+            quant_wait <= 7'd0;
             emit_active <= 1'b0;
             error_q <= 1'b0;
         end else begin
@@ -49,10 +53,17 @@ module q8_ingress (
                 end else if (scalar_count == 6'd31) begin
                     scalar_count <= 6'd0;
                     emit_count <= 3'd0;
-                    emit_active <= 1'b1;
+                    // Model the canonical quantizer's nontrivial block latency so
+                    // the controller proof exercises multiple queued blocks.
+                    quant_wait <= 7'd64;
                 end else begin
                     scalar_count <= scalar_count + 1'b1;
                 end
+            end
+            if (quant_wait != 0) begin
+                quant_wait <= quant_wait - 1'b1;
+                if (quant_wait == 1)
+                    emit_active <= 1'b1;
             end
             if (m_axis_tvalid && m_axis_tready) begin
                 if (emit_count == 3'd4) begin
@@ -77,11 +88,39 @@ module section_swiglu (
     output wire [31:0] out_data, output wire out_last,
     output wire [1:0] out_status
 );
-    assign in_ready = out_ready && rst_n && !abort;
-    assign out_valid = in_valid && rst_n && !abort;
+    reg [6:0] queued;
+    reg [5:0] input_lane;
+    reg [5:0] output_lane;
+    wire input_fire = in_valid && in_ready;
+    wire output_fire = out_valid && out_ready;
+
+    assign in_ready = rst_n && !abort && (queued < 7'd64);
+    assign out_valid = rst_n && !abort && (queued != 0);
     assign out_data = in_gate;
-    assign out_last = in_last;
+    assign out_last = output_lane == 6'd31;
     assign out_status = 2'd0;
+
+    always @(posedge clk) begin
+        if (!rst_n || abort) begin
+            queued <= 7'd0;
+            input_lane <= 6'd0;
+            output_lane <= 6'd0;
+        end else begin
+            case ({input_fire, output_fire})
+                2'b10: queued <= queued + 1'b1;
+                2'b01: queued <= queued - 1'b1;
+                default: queued <= queued;
+            endcase
+            if (input_fire) begin
+                assert(in_last == (input_lane == 6'd31));
+                input_lane <= (input_lane == 6'd31) ?
+                              6'd0 : input_lane + 1'b1;
+            end
+            if (output_fire)
+                output_lane <= (output_lane == 6'd31) ?
+                               6'd0 : output_lane + 1'b1;
+        end
+    end
     wire _unused = &{1'b0, clk, in_up};
 endmodule
 
@@ -197,7 +236,10 @@ module gemm_kernel #(
             kernel_done <= 1'b0;
             if (start_kernel && !busy_q) begin
                 busy_q <= 1'b1;
-                wait_count <= (act_epoch == 32'd2) ? 9'd260 : 9'd3;
+                // Internal activation production owns completion ordering. Keep
+                // this control stub busy beyond the proof horizon so it cannot
+                // retire before the buffered Q8 source has delivered its records.
+                wait_count <= (act_epoch == 32'd2) ? 9'd500 : 9'd3;
                 activation_error <= 1'b0;
                 if (act_mode == 2'd2) begin
                     activation_valid <= 1'b1;

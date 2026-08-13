@@ -73,20 +73,25 @@ module q8_ingress (
     wire [15:0] q_out_scale;
     wire [3:0] q_out_status;
     wire internal_frame_ok = quant_scalar_last == (scalar_index == 6'd31);
+    wire internal_stage_ok = (internal_status_q == 2'd0) && internal_frame_ok;
     wire internal_accept = internal_run && (state == ST_INTERNAL) &&
                            internal_valid_q && q_in_ready;
     // A diagnosed scalar is consumed by the section controller but is not
     // allowed to mutate the quantizer's partial block before fail-closed abort.
     // Both raw and internal modes use the same final scalar registers, keeping
     // the mode select and SwiGLU arithmetic out of the quantizer's amax/control
-    // cone. There is deliberately no fall-through: each staged scalar is
-    // consumed before the source can replace it.
+    // cone. The stage is elastic within a block: when the quantizer accepts a
+    // healthy non-final scalar, the source may replace it on the same edge.
+    // Block-final and diagnosed scalars retain the fail-closed boundary.
     assign internal_ready = rst_n && !start && internal_run &&
                             (state == ST_INTERNAL) &&
-                            !internal_valid_q;
+                            (!internal_valid_q ||
+                             (q_in_ready && internal_stage_ok &&
+                              (scalar_index != 6'd31)));
+    wire internal_source_accept = internal_valid && internal_ready;
+    wire internal_replace = internal_source_accept && internal_valid_q;
     // Completion means all five native beats for this block were accepted by
-    // gemm_kernel.  The scratch walker uses this boundary before issuing any
-    // scalar from the next 32-value block.
+    // gemm_kernel. The scratch walker uses this to retire queued blocks.
     assign internal_record_done = internal_run && (state == ST_EMIT) &&
                                   (emit_index == 3'd4) && m_axis_tready;
     // Keep the leaf's complete record stable through all five output beats. The
@@ -151,15 +156,6 @@ module q8_ingress (
             state              <= (raw_mode && num_q1_blocks != 0 && num_cols != 0) ?
                                   (internal_mode ? ST_INTERNAL : ST_INPUT) : ST_IDLE;
         end else begin
-            if (internal_ready && internal_valid) begin
-                quant_scalar      <= internal_data;
-                quant_scalar_last <= internal_last;
-                quant_scalar_valid <= (internal_status == 2'd0) &&
-                                      (internal_last == (scalar_index == 6'd31));
-                internal_status_q <= internal_status;
-                internal_valid_q  <= 1'b1;
-            end
-
             case (state)
                 ST_INPUT: if (s_axis_tvalid) begin
                     upper_scalar <= s_axis_tdata[63:32];
@@ -196,21 +192,47 @@ module q8_ingress (
                     end
                 end
 
-                ST_INTERNAL: if (internal_accept) begin
-                    internal_valid_q   <= 1'b0;
-                    quant_scalar_valid <= 1'b0;
-                    quant_scalar_last  <= 1'b0;
-                    if (internal_status_q != 2'd0) begin
-                        error_status <= {internal_status_q, 4'd0};
-                        state <= ST_ERROR;
-                    end else if (!internal_frame_ok) begin
-                        error_status <= 6'b000100;
-                        state <= ST_ERROR;
-                    end else if (scalar_index == 6'd31) begin
-                        scalar_index <= 6'd0;
-                        state <= ST_WAIT;
-                    end else begin
-                        scalar_index <= scalar_index + 6'd1;
+                ST_INTERNAL: begin
+                    if (internal_accept) begin
+                        if (!internal_stage_ok) begin
+                            internal_valid_q   <= 1'b0;
+                            quant_scalar_valid <= 1'b0;
+                            quant_scalar_last  <= 1'b0;
+                            if (internal_status_q != 2'd0)
+                                error_status <= {internal_status_q, 4'd0};
+                            else
+                                error_status <= 6'b000100;
+                            state <= ST_ERROR;
+                        end else if (scalar_index == 6'd31) begin
+                            internal_valid_q   <= 1'b0;
+                            quant_scalar_valid <= 1'b0;
+                            quant_scalar_last  <= 1'b0;
+                            scalar_index <= 6'd0;
+                            state <= ST_WAIT;
+                        end else begin
+                            scalar_index <= scalar_index + 1'b1;
+                            if (internal_replace) begin
+                                quant_scalar      <= internal_data;
+                                quant_scalar_last <= internal_last;
+                                quant_scalar_valid <= (internal_status == 2'd0) &&
+                                                      (internal_last ==
+                                                       (scalar_index == 6'd30));
+                                internal_status_q <= internal_status;
+                                internal_valid_q  <= 1'b1;
+                            end else begin
+                                internal_valid_q   <= 1'b0;
+                                quant_scalar_valid <= 1'b0;
+                                quant_scalar_last  <= 1'b0;
+                            end
+                        end
+                    end else if (internal_source_accept) begin
+                        quant_scalar      <= internal_data;
+                        quant_scalar_last <= internal_last;
+                        quant_scalar_valid <= (internal_status == 2'd0) &&
+                                              (internal_last ==
+                                               (scalar_index == 6'd31));
+                        internal_status_q <= internal_status;
+                        internal_valid_q  <= 1'b1;
                     end
                 end
 
@@ -328,6 +350,20 @@ module q8_ingress (
                 assert(!m_axis_tvalid && !internal_ready);
             end
 
+            if (f_past_valid && !start && $past(rst_n && !start &&
+                                                internal_replace)) begin
+                assert(state == ST_INTERNAL);
+                assert(internal_valid_q);
+                assert(quant_scalar == $past(internal_data));
+                assert(quant_scalar_last == $past(internal_last));
+                assert(internal_status_q == $past(internal_status));
+                assert(scalar_index == $past(scalar_index) + 1'b1);
+                assert(quant_scalar_valid ==
+                       (($past(internal_status) == 2'd0) &&
+                        ($past(internal_last) ==
+                         ($past(scalar_index) == 6'd30))));
+            end
+
             if (f_past_valid && $past(rst_n && start && raw_mode &&
                                       internal_mode &&
                                       (num_q1_blocks != 0) &&
@@ -339,6 +375,7 @@ module q8_ingress (
         end
 
         cover(rst_n && internal_record_done);
+        cover(rst_n && internal_replace);
         cover(rst_n && internal_run && activation_abort);
     end
 `endif

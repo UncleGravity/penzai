@@ -12,8 +12,8 @@
 // The existing floating-point leaves are deliberately truncating or LUT based,
 // so this block keeps its exact-RNE divider/multiplier local. Division is iterative
 // (27 quotient bits) and multiplication is time-multiplexed across the 32 lanes.
-// The implementation is consequently small and latency-tolerant, which is the
-// right trade for a value intended to be reused by two or three projections.
+// The surrounding ingress and section controller buffer this block latency while
+// keeping this leaf as the sole exact canonical conversion implementation.
 //
 // Status bits are sticky for the completed block:
 //   [0] a non-finite input was replaced with zero in the quant stream
