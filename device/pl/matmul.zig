@@ -74,6 +74,11 @@ const SCRATCH_CONSUMER_BUSY: u32 = 1 << 9;
 const SCRATCH_CONSUMER_DONE: u32 = 1 << 10;
 const SCRATCH_SECTION_ACTIVE: u32 = 1 << 11;
 const SCRATCH_SECTION_DONE: u32 = 1 << 12;
+// V16 reuses the legacy consumer bits for the streamed GATE producer and adds
+// one readiness bit. The register offsets and the FFN wire command stay fixed.
+const SCRATCH_FFN_PRODUCER_BUSY: u32 = SCRATCH_CONSUMER_BUSY;
+const SCRATCH_FFN_PRODUCER_DONE: u32 = SCRATCH_CONSUMER_DONE;
+const SCRATCH_FFN_GATE_READY: u32 = 1 << 13;
 
 const ActivationMode = enum(u32) {
     packed_load = 0,
@@ -105,6 +110,16 @@ pub const version_with_logical_rows: u32 = 12;
 pub const version_with_activation_reuse: u32 = 13;
 pub const version_with_scratch: u32 = 14;
 pub const version_with_ffn_section: u32 = 15;
+pub const version_with_streaming_ffn: u32 = 16;
+
+const FfnSectionSchedule = enum { legacy_scratch, streaming_q8 };
+
+fn ffnSectionSchedule(version: u32) FfnSectionSchedule {
+    return if (version >= version_with_streaming_ffn)
+        .streaming_q8
+    else
+        .legacy_scratch;
+}
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
 /// bitstream can never disagree.
@@ -154,6 +169,10 @@ pub const Kernel = struct {
 
     pub fn hasFfnSection(self: Kernel) bool {
         return self.version >= version_with_ffn_section;
+    }
+
+    pub fn hasStreamingFfn(self: Kernel) bool {
+        return ffnSectionSchedule(self.version) == .streaming_q8;
     }
 
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
@@ -258,6 +277,14 @@ pub const Kernel = struct {
         self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_SECTION_BEGIN);
     }
 
+    pub fn beginStreamingFfnSection(self: *Kernel, rows: u32, tokens: u32) void {
+        std.debug.assert(self.hasStreamingFfn());
+        self.selectDdrResult();
+        self.win.wr(regmap.offsetOf("SCRATCH_ROWS"), rows);
+        self.win.wr(regmap.offsetOf("SCRATCH_TOKENS"), tokens);
+        self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_SECTION_BEGIN);
+    }
+
     pub fn waitFfnSectionActive(self: *Kernel) KernelError!void {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
@@ -306,6 +333,16 @@ pub const Kernel = struct {
 
     pub fn waitFfnConsumerDone(self: *Kernel) KernelError!void {
         try self.waitScratchDone(SCRATCH_CONSUMER_DONE, 0);
+    }
+
+    pub fn waitFfnGateReady(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasStreamingFfn());
+        try self.waitScratchDone(SCRATCH_FFN_GATE_READY, 0);
+    }
+
+    pub fn waitFfnProducerDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasStreamingFfn());
+        try self.waitScratchDone(SCRATCH_FFN_PRODUCER_DONE, 0);
     }
 
     pub fn waitFfnSectionDone(self: *Kernel) KernelError!void {
@@ -1004,6 +1041,7 @@ pub fn Backend(comptime Heap: type) type {
             var direct_down: ?[]const u8 = null;
 
             const execution_path = ffnExecutionPath(tokens);
+            const streaming_ffn = self.kernel.hasStreamingFfn();
             var result: profile.FfnExecution = .{
                 .gate_up = .{ .path = execution_path },
                 .down = .{ .path = execution_path },
@@ -1061,14 +1099,21 @@ pub fn Backend(comptime Heap: type) type {
                 heap.syncToDevice(normalized_dma) catch return error.HeapFailure;
                 result.gate_up.sync_to_ns +|= profile.lap(ctx, &last);
 
-                self.kernel.beginFfnSection();
+                if (streaming_ffn)
+                    self.kernel.beginStreamingFfnSection(op.ffn_dim, @intCast(tile_tokens))
+                else
+                    self.kernel.beginFfnSection();
                 section_started = true;
                 try self.kernel.waitFfnSectionActive();
 
-                for (projections) |projection| {
+                for (projections, 0..) |projection, projection_index| {
                     if (projection.mode == .reuse and
                         !self.kernel.residentMatches(epoch, @intCast(upstream_q1_blocks), @intCast(tile_tokens)))
                         return error.ActivationState;
+                    // V16 clears the tagged Q8 bank while UP runs. Do not launch
+                    // GATE until X1 is committed and that bank is capture-ready.
+                    if (projection_index == 1 and streaming_ffn)
+                        try self.kernel.waitFfnGateReady();
                     try self.dma_w[0].resetMm2s();
                     for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
                     if (projection.mode == .raw_f32_load) try self.dma_a.resetMm2s();
@@ -1093,7 +1138,10 @@ pub fn Backend(comptime Heap: type) type {
                     );
                     result.gate_up.setup_ns +|= profile.lap(ctx, &last);
                     try self.kernel.waitDone();
-                    try self.kernel.waitScratchWriterDone(projection.role);
+                    if (projection_index == 1 and streaming_ffn)
+                        try self.kernel.waitFfnProducerDone()
+                    else
+                        try self.kernel.waitScratchWriterDone(projection.role);
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
                     if (projection.mode == .raw_f32_load) try self.dma_a.waitReadDone();
                     dmas_armed = false;
@@ -1124,7 +1172,8 @@ pub fn Backend(comptime Heap: type) type {
                 );
                 result.down.setup_ns +|= profile.lap(ctx, &last);
                 try self.kernel.waitDone();
-                try self.kernel.waitFfnConsumerDone();
+                if (!streaming_ffn)
+                    try self.kernel.waitFfnConsumerDone();
                 try self.kernel.waitFfnSectionDone();
                 for (&self.dma_w) |*dma| try dma.waitReadDone();
                 try self.dma_w[0].waitWriteDone();
@@ -1492,6 +1541,21 @@ test "scratch group tiles and projection roles match the Qwen FFN schedule" {
     try std.testing.expectEqual(@as(u32, 1 << 6), scratchRoleValidMask(.x0));
     try std.testing.expectEqual(@as(u32, 1 << 7), scratchRoleValidMask(.x1));
     try std.testing.expectEqual(@as(usize, 6144 * 4 * @sizeOf(f32)), scratchDrainBytes(6144, 4));
+}
+
+test "FFN section schedule switches only at kernel v16" {
+    try std.testing.expectEqual(
+        FfnSectionSchedule.legacy_scratch,
+        ffnSectionSchedule(version_with_ffn_section),
+    );
+    try std.testing.expectEqual(
+        FfnSectionSchedule.streaming_q8,
+        ffnSectionSchedule(version_with_streaming_ffn),
+    );
+    try std.testing.expectEqual(
+        FfnSectionSchedule.streaming_q8,
+        ffnSectionSchedule(version_with_streaming_ffn + 1),
+    );
 }
 
 test "FFN execution path follows the semantic token count" {
