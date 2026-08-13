@@ -191,8 +191,8 @@ module section_q8_buffer (
     reg cap_bad_q;
     reg cap_duplicate_q;
     reg cap_probe_pending_q;
-    reg seen0_probe_q;
-    reg seen1_probe_q;
+    reg [7:0] seen0_probe_q;
+    reg [7:0] seen1_probe_q;
 
     wire cap_target_active = s_axis_bank ? bank1_active_q : bank0_active_q;
     wire cap_target_valid = s_axis_bank ? bank1_valid_q : bank0_valid_q;
@@ -234,7 +234,8 @@ module section_q8_buffer (
                           (cap_body_tag_bad || cap_body_frame_bad ||
                            cap_scale_pad_bad);
     wire cap_probe_fault = cap_probe_pending_q &&
-                           (cap_bank_q ? seen1_probe_q : seen0_probe_q);
+                           (cap_bank_q ? seen1_probe_q[0] :
+                                         seen0_probe_q[0]);
 
     wire cap_final = cap_body && (cap_index_q == 3'd4);
     wire cap_bank_sticky_error = cap_bank_q ? bank1_error_q : bank0_error_q;
@@ -341,26 +342,37 @@ module section_q8_buffer (
         end
     end
 
+    wire seen0_write_enable = bank0_clearing_q ||
+                              (cap_commit_valid && !cap_bank_q);
+    wire [10:0] seen0_write_address = bank0_clearing_q ?
+        bank0_clear_address_q : cap_local_address_q;
+    wire [7:0] seen0_write_data = bank0_clearing_q ? 8'd0 : 8'd1;
+    wire seen1_write_enable = bank1_clearing_q ||
+                              (cap_commit_valid && cap_bank_q);
+    wire [10:0] seen1_write_address = bank1_clearing_q ?
+        bank1_clear_address_q : cap_local_address_q;
+    wire [7:0] seen1_write_data = bank1_clearing_q ? 8'd0 : 8'd1;
+    wire [10:0] cap_probe_address = (s_axis_block < BLOCK_CAPACITY) ?
+        local_address(s_axis_token, s_axis_block) : 11'd0;
+
     always @(posedge clk) begin
-        if (bank0_clearing_q)
-            seen0_mem[bank0_clear_address_q] <= 8'd0;
-        else if (cap_commit_valid && !cap_bank_q)
-            seen0_mem[cap_local_address_q] <= 8'd1;
-        if (cap_start && !s_axis_bank)
-            seen0_probe_q <= seen0_mem[
-                (s_axis_block < BLOCK_CAPACITY) ?
-                    local_address(s_axis_token, s_axis_block) : 11'd0][0];
+        if (seen0_write_enable)
+            seen0_mem[seen0_write_address] <= seen0_write_data;
     end
 
     always @(posedge clk) begin
-        if (bank1_clearing_q)
-            seen1_mem[bank1_clear_address_q] <= 8'd0;
-        else if (cap_commit_valid && cap_bank_q)
-            seen1_mem[cap_local_address_q] <= 8'd1;
+        if (cap_start && !s_axis_bank)
+            seen0_probe_q <= seen0_mem[cap_probe_address];
+    end
+
+    always @(posedge clk) begin
+        if (seen1_write_enable)
+            seen1_mem[seen1_write_address] <= seen1_write_data;
+    end
+
+    always @(posedge clk) begin
         if (cap_start && s_axis_bank)
-            seen1_probe_q <= seen1_mem[
-                (s_axis_block < BLOCK_CAPACITY) ?
-                    local_address(s_axis_token, s_axis_block) : 11'd0][0];
+            seen1_probe_q <= seen1_mem[cap_probe_address];
     end
 
     // Bank-zero lifecycle and exact-record accounting.
@@ -509,8 +521,9 @@ module section_q8_buffer (
             end else begin
                 if (cap_probe_pending_q) begin
                     cap_probe_pending_q <= 1'b0;
-                    cap_duplicate_q <= cap_bank_q ? seen1_probe_q : seen0_probe_q;
-                    if (cap_bank_q ? seen1_probe_q : seen0_probe_q)
+                    cap_duplicate_q <= cap_bank_q ? seen1_probe_q[0] :
+                                                    seen0_probe_q[0];
+                    if (cap_bank_q ? seen1_probe_q[0] : seen0_probe_q[0])
                         cap_bad_q <= 1'b1;
                 end
 
