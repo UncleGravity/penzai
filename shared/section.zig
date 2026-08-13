@@ -76,6 +76,7 @@ pub fn f32BankDepth() u32 {
 }
 
 pub const Error = error{
+    InvalidBank,
     InvalidTokenCount,
     InvalidModelDim,
     InvalidFfnDim,
@@ -117,6 +118,30 @@ pub const Q8Location = struct {
 };
 
 pub const q8_column_capacity: u32 = 8;
+
+// P3's compact DOWN-input store holds one native Q8 record per FFN block and
+// token in each ping-pong bank. The block-major physical layout accepts the
+// producer schedule directly; consumers can request the same records in
+// token-major order without a transpose copy.
+pub const q8_buffer_bank_count: u32 = 2;
+pub const q8_buffer_token_capacity: u32 = query_tile_max;
+pub const q8_buffer_block_capacity: u32 = ffn_dim_max / layout.q8_block;
+pub const q8_buffer_records_per_bank: u32 =
+    q8_buffer_token_capacity * q8_buffer_block_capacity;
+pub const q8_buffer_record_capacity: u32 =
+    q8_buffer_bank_count * q8_buffer_records_per_bank;
+
+pub const Q8BufferLocation = struct {
+    address: u32,
+};
+
+pub fn q8BufferLocation(bank: u32, token: u32, block: u32) Error!Q8BufferLocation {
+    if (bank >= q8_buffer_bank_count) return error.InvalidBank;
+    if (token >= q8_buffer_token_capacity) return error.InvalidTokenCount;
+    if (block >= q8_buffer_block_capacity) return error.InvalidSubblock;
+    return .{ .address = bank * q8_buffer_records_per_bank +
+        block * q8_buffer_token_capacity + token };
+}
 
 pub fn q8Location(subblock: u32, token: u32) Error!Q8Location {
     if (token >= query_tile_max) return error.InvalidTokenCount;
@@ -271,6 +296,40 @@ test "native Q8 addresses preserve token reuse within GEMM storage" {
     try std.testing.expectEqual(@as(u32, 19), (try q8Location(2, 3)).address);
     try std.testing.expectError(error.InvalidTokenCount, q8Location(0, query_tile_max));
     try std.testing.expectError(error.InvalidSubblock, q8Location(layout.max_sub_index, 0));
+}
+
+test "P3 Q8 buffer mapping is block-major, exhaustive, and ping-ponged" {
+    try std.testing.expectEqual(@as(u32, 384), q8_buffer_block_capacity);
+    try std.testing.expectEqual(@as(u32, 1536), q8_buffer_records_per_bank);
+    try std.testing.expectEqual(@as(u32, 3072), q8_buffer_record_capacity);
+    try std.testing.expectEqual(@as(u32, 0), (try q8BufferLocation(0, 0, 0)).address);
+    try std.testing.expectEqual(@as(u32, 7), (try q8BufferLocation(0, 3, 1)).address);
+    try std.testing.expectEqual(@as(u32, 1536), (try q8BufferLocation(1, 0, 0)).address);
+    try std.testing.expectEqual(@as(u32, 3071), (try q8BufferLocation(1, 3, 383)).address);
+
+    var seen = [_]bool{false} ** q8_buffer_record_capacity;
+    var visited: usize = 0;
+    for (0..q8_buffer_bank_count) |bank| {
+        for (0..q8_buffer_block_capacity) |block| {
+            for (0..q8_buffer_token_capacity) |token| {
+                const loc = try q8BufferLocation(
+                    @intCast(bank),
+                    @intCast(token),
+                    @intCast(block),
+                );
+                try std.testing.expect(loc.address < q8_buffer_record_capacity);
+                try std.testing.expect(!seen[loc.address]);
+                seen[loc.address] = true;
+                visited += 1;
+            }
+        }
+    }
+    try std.testing.expectEqual(@as(usize, q8_buffer_record_capacity), visited);
+    for (seen) |mapped| try std.testing.expect(mapped);
+
+    try std.testing.expectError(error.InvalidBank, q8BufferLocation(2, 0, 0));
+    try std.testing.expectError(error.InvalidTokenCount, q8BufferLocation(0, 4, 0));
+    try std.testing.expectError(error.InvalidSubblock, q8BufferLocation(0, 0, 384));
 }
 
 test "v1 Bonsai section shapes and capacities are explicit" {
