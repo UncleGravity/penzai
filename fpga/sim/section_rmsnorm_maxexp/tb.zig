@@ -128,9 +128,14 @@ fn runSuccess(
             0,
             @intFromBool(presenting and sent_groups + 1 == total_groups),
         );
-        const result_ready = !random_stalls or rnd.uintLessThan(u8, 3) != 0;
+        var result_ready = !random_stalls or rnd.uintLessThan(u8, 3) != 0;
         c.dut_set_result_ready(dut.handle, @intFromBool(result_ready));
         dut.eval();
+        if (random_stalls and c.dut_result_valid(dut.handle) != 0 and result_stalls == 0) {
+            result_ready = false;
+            c.dut_set_result_ready(dut.handle, 0);
+            dut.eval();
+        }
 
         const group_fire = presenting and c.dut_group_ready(dut.handle) != 0;
         const result_valid = c.dut_result_valid(dut.handle) != 0;
@@ -212,6 +217,8 @@ fn expectFirstGroupFault(
     dut.step();
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
+    try std.testing.expect(c.dut_done(dut.handle) == 0);
+    dut.step();
     try std.testing.expect(c.dut_done(dut.handle) != 0);
     try std.testing.expect(c.dut_error(dut.handle) != 0);
     try std.testing.expectEqual(
@@ -267,6 +274,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     dut.step();
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
+    dut.step();
     try std.testing.expect(c.dut_error(dut.handle) != 0);
     try std.testing.expectEqual(
         section.RmsNormMaxExpStatus.frame,
@@ -282,6 +290,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     dut.step();
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
+    dut.step();
     try std.testing.expect(c.dut_result_valid(dut.handle) != 0);
     try std.testing.expectEqual(@as(u8, 127), c.dut_result_max_exp(dut.handle));
     dut.step();
@@ -291,6 +300,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     dut.step();
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
+    dut.step();
     try std.testing.expect(c.dut_error(dut.handle) != 0);
     try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
 
@@ -311,6 +321,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     dut.step();
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
+    dut.step();
     try std.testing.expect(c.dut_result_valid(dut.handle) != 0);
     c.dut_set_abort(dut.handle, 1);
     dut.step();
@@ -319,7 +330,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
 
     const stats = try runSuccess(dut, &ones, 8, 1, false, 0);
-    try std.testing.expectEqual(@as(usize, 2), stats.cycles);
+    try std.testing.expectEqual(@as(usize, 3), stats.cycles);
 }
 
 fn fillRandom(values: []u32, rows: usize, tokens: usize, seed: u64) void {
@@ -359,7 +370,7 @@ pub fn main() !void {
     var max_values: [4096 * 4]u32 = undefined;
     fillRandom(&max_values, 4096, 4, 0x4096_0004);
     const max_stats = try runSuccess(&dut, &max_values, 4096, 4, false, 0);
-    try std.testing.expectEqual(@as(usize, max_values.len / 8 + 4), max_stats.cycles);
+    try std.testing.expectEqual(@as(usize, max_values.len / 8 + 8), max_stats.cycles);
 
     try verifyFaultsAndRestart(&dut);
 

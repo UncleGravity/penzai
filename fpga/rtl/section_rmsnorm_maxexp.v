@@ -48,7 +48,8 @@ module section_rmsnorm_maxexp (
 
     localparam [1:0] ST_IDLE   = 2'd0;
     localparam [1:0] ST_INPUT  = 2'd1;
-    localparam [1:0] ST_RESULT = 2'd2;
+    localparam [1:0] ST_DRAIN  = 2'd2;
+    localparam [1:0] ST_RESULT = 2'd3;
 
     reg [1:0] state_q;
     reg [13:0] run_rows_q;
@@ -58,6 +59,12 @@ module section_rmsnorm_maxexp (
     reg [9:0] group_q;
     reg [7:0] token_max_exp_q;
     reg token_subnormal_q;
+    reg summary_valid_q;
+    reg [7:0] summary_max_exp_q;
+    reg summary_nonfinite_q;
+    reg summary_subnormal_q;
+    reg summary_frame_bad_q;
+    reg summary_scratch_q;
 
     wire cfg_shape_ok = (cfg_rows >= 14'd8) &&
                         (cfg_rows <= 14'd4096) &&
@@ -65,10 +72,14 @@ module section_rmsnorm_maxexp (
                         (cfg_tokens != 3'd0) &&
                         (cfg_tokens <= 3'd4);
     wire cfg_accept = cfg_valid && cfg_ready;
+    wire summary_fatal = summary_valid_q &&
+                         (summary_scratch_q || summary_frame_bad_q ||
+                          summary_nonfinite_q);
 
     assign cfg_ready = rst_n && !abort_run && (state_q == ST_IDLE);
     assign busy = state_q != ST_IDLE;
-    assign s_group_ready = rst_n && !abort_run && (state_q == ST_INPUT);
+    assign s_group_ready = rst_n && !abort_run && (state_q == ST_INPUT) &&
+                           !summary_fatal;
     assign result_valid = rst_n && !abort_run && (state_q == ST_RESULT);
     assign result_token = token_q;
     assign result_rows = run_rows_q;
@@ -108,7 +119,10 @@ module section_rmsnorm_maxexp (
     wire [7:0] max03 = max2(max01, max23);
     wire [7:0] max47 = max2(max45, max67);
     wire [7:0] group_max_exp = max2(max03, max47);
-    wire [7:0] next_max_exp = max2(token_max_exp_q, group_max_exp);
+    // The group tree is registered before the token feedback comparison. A
+    // prior summary retires while the next group is accepted, preserving one
+    // accepted group per cycle within a token without a four-comparator path.
+    wire [7:0] next_max_exp = max2(token_max_exp_q, summary_max_exp_q);
 
     wire group_nonfinite = (exp0 == 8'hff) || (exp1 == 8'hff) ||
                            (exp2 == 8'hff) || (exp3 == 8'hff) ||
@@ -131,6 +145,7 @@ module section_rmsnorm_maxexp (
             status <= status | failure;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            summary_valid_q <= 1'b0;
         end
     endtask
 
@@ -144,6 +159,12 @@ module section_rmsnorm_maxexp (
             group_q <= 10'd0;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            summary_valid_q <= 1'b0;
+            summary_max_exp_q <= 8'd0;
+            summary_nonfinite_q <= 1'b0;
+            summary_subnormal_q <= 1'b0;
+            summary_frame_bad_q <= 1'b0;
+            summary_scratch_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
             status <= 6'd0;
@@ -155,6 +176,12 @@ module section_rmsnorm_maxexp (
             group_q <= 10'd0;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            summary_valid_q <= 1'b0;
+            summary_max_exp_q <= 8'd0;
+            summary_nonfinite_q <= 1'b0;
+            summary_subnormal_q <= 1'b0;
+            summary_frame_bad_q <= 1'b0;
+            summary_scratch_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
             status <= 6'd0;
@@ -171,6 +198,12 @@ module section_rmsnorm_maxexp (
                     group_q <= 10'd0;
                     token_max_exp_q <= 8'd0;
                     token_subnormal_q <= 1'b0;
+                    summary_valid_q <= 1'b0;
+                    summary_max_exp_q <= 8'd0;
+                    summary_nonfinite_q <= 1'b0;
+                    summary_subnormal_q <= 1'b0;
+                    summary_frame_bad_q <= 1'b0;
+                    summary_scratch_q <= 1'b0;
                     result_max_exp <= 8'd0;
                     result_subnormal_warning <= 1'b0;
                     if (!cfg_shape_ok) begin
@@ -186,27 +219,56 @@ module section_rmsnorm_maxexp (
                     end
                 end
 
-                ST_INPUT: if (group_accept) begin
-                    if (s_group_error) begin
+                ST_INPUT: begin
+                    if (summary_fatal) begin
+                        if (summary_scratch_q)
+                            fail_run(STATUS_SCRATCH);
+                        else if (summary_frame_bad_q)
+                            fail_run(STATUS_FRAME);
+                        else
+                            fail_run(STATUS_NONFINITE);
+                    end else begin
+                        summary_valid_q <= group_accept;
+                        if (summary_valid_q) begin
+                            token_max_exp_q <= next_max_exp;
+                            if (summary_subnormal_q) begin
+                                token_subnormal_q <= 1'b1;
+                                status <= status | STATUS_SUBNORMAL_WARNING;
+                            end
+                        end
+                        if (group_accept) begin
+                            summary_max_exp_q <= group_max_exp;
+                            summary_nonfinite_q <= group_nonfinite;
+                            summary_subnormal_q <= group_subnormal;
+                            summary_frame_bad_q <= group_frame_bad;
+                            summary_scratch_q <= s_group_error;
+                            if (group_final)
+                                state_q <= ST_DRAIN;
+                            else
+                                group_q <= group_q + 1'b1;
+                        end
+                    end
+                end
+
+                ST_DRAIN: begin
+                    summary_valid_q <= 1'b0;
+                    if (!summary_valid_q) begin
+                        fail_run(STATUS_INTERNAL);
+                    end else if (summary_scratch_q) begin
                         fail_run(STATUS_SCRATCH);
-                    end else if (group_frame_bad) begin
+                    end else if (summary_frame_bad_q) begin
                         fail_run(STATUS_FRAME);
-                    end else if (group_nonfinite) begin
+                    end else if (summary_nonfinite_q) begin
                         fail_run(STATUS_NONFINITE);
                     end else begin
-                        if (group_subnormal) begin
+                        result_max_exp <= next_max_exp;
+                        result_subnormal_warning <=
+                            token_subnormal_q || summary_subnormal_q;
+                        if (summary_subnormal_q) begin
                             token_subnormal_q <= 1'b1;
                             status <= status | STATUS_SUBNORMAL_WARNING;
                         end
-                        if (group_final) begin
-                            result_max_exp <= next_max_exp;
-                            result_subnormal_warning <=
-                                token_subnormal_q || group_subnormal;
-                            state_q <= ST_RESULT;
-                        end else begin
-                            group_q <= group_q + 1'b1;
-                            token_max_exp_q <= next_max_exp;
-                        end
+                        state_q <= ST_RESULT;
                     end
                 end
 
@@ -219,6 +281,7 @@ module section_rmsnorm_maxexp (
                         group_q <= 10'd0;
                         token_max_exp_q <= 8'd0;
                         token_subnormal_q <= 1'b0;
+                        summary_valid_q <= 1'b0;
                         state_q <= ST_INPUT;
                     end
                 end
