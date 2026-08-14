@@ -351,6 +351,7 @@ module q8_ingress (
 
         if (rst_n) begin
             assert(state <= ST_INTERNAL);
+            assert((quantizer_status != 6'd0) == activation_abort);
             assert(internal_record_done ==
                    (!abort && internal_run && (state == ST_EMIT) &&
                     (emit_index == 3'd4) && m_axis_tready));

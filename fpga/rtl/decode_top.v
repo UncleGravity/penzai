@@ -949,7 +949,7 @@ module decode_top #(
                              (scratch_write_role_q == 2'd2) &&
                              !scratch_wr_error))));
     wire q8_numeric_fault = ffn_producer_busy_q &&
-                            ((quantizer_status != 6'd0)
+                            (q8_activation_abort
 `ifdef VERILATOR
                              || sim_inject_q8_numeric_error
 `endif
