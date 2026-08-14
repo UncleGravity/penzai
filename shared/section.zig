@@ -96,6 +96,19 @@ pub const RmsNormSumsqStatus = struct {
     pub const fatal_mask: u7 = bad_cfg | nonfinite | max_mismatch | frame | scratch | internal;
 };
 
+/// Coarse fail-closed status at the composed RMSNorm reduction boundary.
+pub const RmsNormFrontendStatus = struct {
+    pub const bad_cfg: u7 = 1 << 0;
+    pub const loader: u7 = 1 << 1;
+    pub const max_exp: u7 = 1 << 2;
+    pub const sum_sq: u7 = 1 << 3;
+    pub const scratch: u7 = 1 << 4;
+    pub const subnormal: u7 = 1 << 5;
+    pub const internal: u7 = 1 << 6;
+    pub const fatal_mask: u7 = bad_cfg | loader | max_exp | sum_sq |
+        scratch | subnormal | internal;
+};
+
 pub const rmsnorm_sumsq_synthetic_model_relative_limit: f64 = 3e-5;
 pub const rmsnorm_sumsq_adversarial_relative_limit: f64 = 1e-3;
 

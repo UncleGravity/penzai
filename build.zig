@@ -282,6 +282,19 @@ fn addFormalSteps(b: *std.Build) void {
     );
     section_rmsnorm_sumsq_step.dependOn(&section_rmsnorm_sumsq_run.step);
 
+    const section_rmsnorm_frontend_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_rmsnorm_frontend",
+        "fpga/formal/section_rmsnorm_frontend.sby",
+    });
+    const section_rmsnorm_frontend_step = b.step(
+        "formal-section-rmsnorm-frontend",
+        "Prove RMSNorm residual-load, replay ownership, reduction, faults, and restart",
+    );
+    section_rmsnorm_frontend_step.dependOn(&section_rmsnorm_frontend_run.step);
+
     const section_ffn_pairer_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -347,6 +360,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_rmsnorm_loader_step);
     formal.dependOn(section_rmsnorm_maxexp_step);
     formal.dependOn(section_rmsnorm_sumsq_step);
+    formal.dependOn(section_rmsnorm_frontend_step);
     formal.dependOn(section_ffn_pairer_step);
     formal.dependOn(section_gate_packer_step);
     formal.dependOn(q8_internal_ingress_step);
@@ -504,6 +518,13 @@ const section_rmsnorm_sumsq_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_sumsq.v",
 };
 
+const section_rmsnorm_frontend_rtl = [_][]const u8{
+    "fpga/rtl/section_rmsnorm_frontend.v",
+    "fpga/rtl/section_rmsnorm_loader.v",
+    "fpga/rtl/section_rmsnorm_maxexp.v",
+    "fpga/rtl/section_rmsnorm_sumsq.v",
+};
+
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
     // matmul regmap module). One emitter, two artifacts: the Verilog register
@@ -572,6 +593,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",                "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_sumsq",
         "fpga/rtl/section_rmsnorm_sumsq.v",
     });
+    const section_rmsnorm_frontend_lint = b.addSystemCommand(&.{
+        "verilator",                           "--lint-only",                       "-Wall",                             "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",                   "-Wno-UNUSEDPARAM",                  "--top-module",                      "section_rmsnorm_frontend",
+        "fpga/rtl/section_rmsnorm_frontend.v", "fpga/rtl/section_rmsnorm_loader.v", "fpga/rtl/section_rmsnorm_maxexp.v", "fpga/rtl/section_rmsnorm_sumsq.v",
+    });
     const lint_step = b.step("lint-rtl", "Verilator lint the deployable GEMM RTL and section leaves");
     lint_step.dependOn(&lint.step);
     lint_step.dependOn(&section_q8_buffer_lint.step);
@@ -580,6 +606,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     lint_step.dependOn(&section_rmsnorm_loader_lint.step);
     lint_step.dependOn(&section_rmsnorm_maxexp_lint.step);
     lint_step.dependOn(&section_rmsnorm_sumsq_lint.step);
+    lint_step.dependOn(&section_rmsnorm_frontend_lint.step);
 
     _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
     _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
@@ -598,6 +625,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const section_rmsnorm_loader_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-loader", "Verilator cosim: token-major residual writes and exponent-scan group packing", "section_rmsnorm_loader", "fpga/sim/section_rmsnorm_loader", &section_rmsnorm_loader_rtl, .section);
     const section_rmsnorm_maxexp_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-maxexp", "Verilator cosim: exact token-local RMSNorm maximum-exponent scan", "section_rmsnorm_maxexp", "fpga/sim/section_rmsnorm_maxexp", &section_rmsnorm_maxexp_rtl, .section);
     const section_rmsnorm_sumsq_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-sumsq", "Verilator cosim: exact prior-max fixed RMSNorm sumsq reduction", "section_rmsnorm_sumsq", "fpga/sim/section_rmsnorm_sumsq", &section_rmsnorm_sumsq_rtl, .section);
+    const section_rmsnorm_frontend_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-frontend", "Verilator cosim: residual load, max-exponent scan, R replay, and fixed sumsq", "section_rmsnorm_frontend", "fpga/sim/section_rmsnorm_frontend", &section_rmsnorm_frontend_rtl, .section);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
@@ -618,6 +646,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(section_rmsnorm_loader_cosim);
     rtl_cosim.dependOn(section_rmsnorm_maxexp_cosim);
     rtl_cosim.dependOn(section_rmsnorm_sumsq_cosim);
+    rtl_cosim.dependOn(section_rmsnorm_frontend_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.

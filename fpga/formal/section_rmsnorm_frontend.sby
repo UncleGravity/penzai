@@ -1,0 +1,30 @@
+[tasks]
+bmc
+faults
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 48
+faults: mode bmc
+faults: depth 80
+cover: mode cover
+cover: depth 140
+
+[engines]
+bmc: abc bmc3
+faults: abc bmc3
+cover: smtbmc boolector
+
+[script]
+bmc: read -formal -D FORMAL -D FORMAL_BMC section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
+faults: read -formal -D FORMAL -D FORMAL_FAULTS section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
+cover: read -formal -D FORMAL -D FORMAL_COVER section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
+prep -top section_rmsnorm_frontend_formal -flatten
+
+[files]
+fpga/rtl/section_rmsnorm_loader.v
+fpga/rtl/section_rmsnorm_maxexp.v
+fpga/rtl/section_rmsnorm_sumsq.v
+fpga/rtl/section_rmsnorm_frontend.v
+fpga/formal/section_rmsnorm_frontend_formal.sv
