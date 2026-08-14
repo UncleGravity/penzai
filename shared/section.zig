@@ -25,6 +25,56 @@ pub const f32_values_per_word: u32 = 2;
 pub const f32_word_bytes: u32 = f32_values_per_word * @sizeOf(f32);
 pub const f32_rows_per_group: u32 = f32_banks_per_role * f32_values_per_word;
 
+/// Diagnostic status bits shared with `section_rmsnorm_maxexp.v`.
+pub const RmsNormMaxExpStatus = struct {
+    pub const bad_cfg: u6 = 1 << 0;
+    pub const nonfinite: u6 = 1 << 1;
+    pub const frame: u6 = 1 << 2;
+    pub const scratch: u6 = 1 << 3;
+    pub const internal: u6 = 1 << 4;
+    pub const subnormal_warning: u6 = 1 << 5;
+    pub const fatal_mask: u6 = bad_cfg | nonfinite | frame | scratch | internal;
+};
+
+pub const RmsNormMaxExpError = error{
+    InvalidShape,
+    Nonfinite,
+};
+
+pub const RmsNormMaxExpResult = struct {
+    max_exp: u8,
+    subnormal_warning: bool,
+};
+
+/// Exact token-local oracle for the P3d prior-exponent scan. Zeros and
+/// subnormals do not contribute to the maximum; subnormals set a warning that
+/// integration must reject before architectural publication.
+pub fn rmsNormMaxExp(
+    values: []const u32,
+    rows: u32,
+) RmsNormMaxExpError!RmsNormMaxExpResult {
+    if (rows < f32_rows_per_group or rows > model_dim_max or
+        rows % f32_rows_per_group != 0 or values.len != rows)
+        return error.InvalidShape;
+
+    var max_exp: u8 = 0;
+    var subnormal_warning = false;
+    for (values) |bits| {
+        const exponent: u8 = @truncate(bits >> 23);
+        const mantissa: u23 = @truncate(bits);
+        if (exponent == 0xff) return error.Nonfinite;
+        if (exponent == 0) {
+            if (mantissa != 0) subnormal_warning = true;
+        } else {
+            max_exp = @max(max_exp, exponent);
+        }
+    }
+    return .{
+        .max_exp = max_exp,
+        .subnormal_warning = subnormal_warning,
+    };
+}
+
 /// Diagnostic status bits shared with `section_rmsnorm_sumsq.v`.
 pub const RmsNormSumsqStatus = struct {
     pub const bad_cfg: u7 = 1 << 0;
@@ -584,6 +634,41 @@ test "P3d RMSNorm sumsq status and fixed integer oracle are explicit" {
     try std.testing.expectError(error.MaxMismatch, rmsNormSumsqFixed(&ones, 8, 128));
     try std.testing.expectError(error.InvalidMaxExponent, rmsNormSumsqFixed(&ones, 8, 0xff));
     try std.testing.expectError(error.InvalidShape, rmsNormSumsqFixed(ones[0..7], 7, 127));
+}
+
+test "P3d RMSNorm max exponent scan is exact and preserves warnings" {
+    try std.testing.expectEqual(@as(u6, 0x1f), RmsNormMaxExpStatus.fatal_mask);
+    try std.testing.expectEqual(@as(u6, 0x20), RmsNormMaxExpStatus.subnormal_warning);
+
+    const values = [_]u32{
+        0x0000_0000,
+        0x8000_0000,
+        0x0000_0001,
+        0x3f80_0000,
+        0xc120_0000,
+        0x4080_0000,
+        0x007f_ffff,
+        0xbf00_0000,
+    };
+    const got = try rmsNormMaxExp(&values, values.len);
+    try std.testing.expectEqual(@as(u8, 130), got.max_exp);
+    try std.testing.expect(got.subnormal_warning);
+
+    const zeros = [_]u32{0} ** 8;
+    const all_zero = try rmsNormMaxExp(&zeros, zeros.len);
+    try std.testing.expectEqual(@as(u8, 0), all_zero.max_exp);
+    try std.testing.expect(!all_zero.subnormal_warning);
+}
+
+test "P3d RMSNorm max exponent scan rejects shape and nonfinite input" {
+    const short = [_]u32{0} ** 7;
+    try std.testing.expectError(error.InvalidShape, rmsNormMaxExp(&short, short.len));
+
+    var values = [_]u32{0} ** 8;
+    values[5] = 0x7f80_0000;
+    try std.testing.expectError(error.Nonfinite, rmsNormMaxExp(&values, values.len));
+    values[5] = 0x7fc0_0001;
+    try std.testing.expectError(error.Nonfinite, rmsNormMaxExp(&values, values.len));
 }
 
 test "P3d RMSNorm sumsq oracle covers every exponent-alignment class" {
