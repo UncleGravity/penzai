@@ -109,8 +109,31 @@ pub const RmsNormFrontendStatus = struct {
         scratch | subnormal | internal;
 };
 
+/// Diagnostic status bits shared with `section_rmsnorm_inv.v`.
+pub const RmsNormInvStatus = struct {
+    pub const bad_cfg: u4 = 1 << 0;
+    pub const frame: u4 = 1 << 1;
+    pub const arithmetic: u4 = 1 << 2;
+    pub const internal: u4 = 1 << 3;
+    pub const fatal_mask: u4 = bad_cfg | frame | arithmetic | internal;
+};
+
+pub const RmsNormInvError = error{
+    InvalidShape,
+    InvalidEpsilon,
+    InvalidRecord,
+    ArithmeticOverflow,
+};
+
+pub const RmsNormInvResult = struct {
+    mean_bits: u32,
+    adjusted_mean_bits: u32,
+    inv_rms_bits: u32,
+};
+
 pub const rmsnorm_sumsq_synthetic_model_relative_limit: f64 = 3e-5;
 pub const rmsnorm_sumsq_adversarial_relative_limit: f64 = 1e-3;
+pub const rmsnorm_inv_scalar_relative_limit: f64 = 6e-6;
 
 pub const RmsNormSumsqError = error{
     InvalidShape,
@@ -172,6 +195,157 @@ pub fn rmsNormSumsqMeanF64(sum_sq: u48, rows: u32, max_exp: u8) f64 {
     const scaled = @as(f64, @floatFromInt(sum_sq)) /
         @as(f64, @floatFromInt(rows));
     return std.math.ldexp(scaled, 2 * (@as(i32, max_exp) - 144));
+}
+
+fn truncFp32MulBits(a: u32, b: u32) u32 {
+    const sign = (a ^ b) & 0x8000_0000;
+    const ea: u32 = (a >> 23) & 0xff;
+    const eb: u32 = (b >> 23) & 0xff;
+    if (ea == 0 or eb == 0) return sign;
+
+    const siga: u64 = 0x80_0000 | (a & 0x7f_ffff);
+    const sigb: u64 = 0x80_0000 | (b & 0x7f_ffff);
+    const product = siga * sigb;
+    const renormalizes = ((product >> 47) & 1) != 0;
+    const mantissa: u32 = @truncate(if (renormalizes)
+        (product >> 24) & 0x7f_ffff
+    else
+        (product >> 23) & 0x7f_ffff);
+    const exponent = @as(i32, @intCast(ea)) + @as(i32, @intCast(eb)) - 127 +
+        @as(i32, @intFromBool(renormalizes));
+    if (exponent <= 0) return sign;
+    if (exponent >= 255) return sign | 0x7f7f_ffff;
+    return sign | (@as(u32, @intCast(exponent)) << 23) | mantissa;
+}
+
+fn truncFp32AddBits(a: u32, b: u32) u32 {
+    const sa = a >> 31;
+    const sb = b >> 31;
+    const ea: u32 = (a >> 23) & 0xff;
+    const eb: u32 = (b >> 23) & 0xff;
+    const ma = a & 0x7f_ffff;
+    const mb = b & 0x7f_ffff;
+    const a_zero = ea == 0;
+    const b_zero = eb == 0;
+
+    const a_ge_b = ea >= eb;
+    const exp_big = if (a_ge_b) ea else eb;
+    const exp_diff = if (a_ge_b) ea - eb else eb - ea;
+    const mant_big: u32 = 0x80_0000 | (if (a_ge_b) ma else mb);
+    const mant_small: u32 = 0x80_0000 | (if (a_ge_b) mb else ma);
+    const sign_big = if (a_ge_b) sa else sb;
+    const sign_small = if (a_ge_b) sb else sa;
+    const mant_small_aligned = if (exp_diff > 24) 0 else mant_small >> @intCast(exp_diff);
+    const small_bigger = mant_small_aligned > mant_big;
+    const m1 = if (small_bigger) mant_small_aligned else mant_big;
+    const m2 = if (small_bigger) mant_big else mant_small_aligned;
+    const result_sign = if (small_bigger) sign_small else sign_big;
+    const mant_sum: u32 = if (sign_big == sign_small) m1 + m2 else m1 - m2;
+
+    if (a_zero) return b;
+    if (b_zero) return a;
+    if (mant_sum == 0) return result_sign << 31;
+
+    const lead_pos: u5 = @intCast(31 - @clz(mant_sum));
+    const shift_right = lead_pos > 23;
+    const right_amount: u5 = if (shift_right) lead_pos - 23 else 0;
+    const left_amount: u5 = if (lead_pos < 23) 23 - lead_pos else 0;
+    const exponent = if (shift_right)
+        @as(i32, @intCast(exp_big)) + @as(i32, right_amount)
+    else
+        @as(i32, @intCast(exp_big)) - @as(i32, left_amount);
+    if (exponent <= 0) return result_sign << 31;
+    if (exponent >= 255) return (result_sign << 31) | 0x7f7f_ffff;
+    const normalized = if (shift_right)
+        mant_sum >> right_amount
+    else
+        mant_sum << left_amount;
+    return (result_sign << 31) | (@as(u32, @intCast(exponent)) << 23) |
+        (normalized & 0x7f_ffff);
+}
+
+/// Round the fixed reduction identity once to positive binary32. Values below
+/// the normal range flush to zero, matching the numeric leaf convention.
+pub fn rmsNormFixedMeanBits(
+    sum_sq: u48,
+    rows: u32,
+    max_exp: u8,
+) RmsNormInvError!u32 {
+    if (rows < f32_rows_per_group or rows > model_dim_max or
+        (rows & (rows - 1)) != 0)
+        return error.InvalidShape;
+    if (max_exp == 0xff or ((sum_sq == 0) != (max_exp == 0)))
+        return error.InvalidRecord;
+    if (sum_sq == 0) return 0;
+
+    var msb: u6 = @intCast(47 - @clz(sum_sq));
+    var significand: u64 = undefined;
+    if (msb <= 23) {
+        significand = @as(u64, sum_sq) << @intCast(23 - msb);
+    } else {
+        const shift: u6 = msb - 23;
+        significand = @as(u64, sum_sq) >> shift;
+        const remainder_mask = (@as(u64, 1) << shift) - 1;
+        const remainder = @as(u64, sum_sq) & remainder_mask;
+        const halfway = @as(u64, 1) << @intCast(shift - 1);
+        if (remainder > halfway or
+            (remainder == halfway and (significand & 1) != 0))
+            significand += 1;
+        if (significand == (@as(u64, 1) << 24)) {
+            significand >>= 1;
+            msb += 1;
+        }
+    }
+
+    const row_shift: i32 = @intCast(@ctz(rows));
+    const unbiased = @as(i32, msb) +
+        2 * (@as(i32, max_exp) - 144) - row_shift;
+    const biased = unbiased + 127;
+    if (biased <= 0) return 0;
+    if (biased >= 255) return error.ArithmeticOverflow;
+    return (@as(u32, @intCast(biased)) << 23) |
+        @as(u23, @truncate(significand));
+}
+
+/// Bit-faithful model of the serialized two-step Newton leaf. The seed is the
+/// classic affine binary32 estimate; every refinement uses the repository's
+/// truncating `fmul`/`fadd` semantics rather than host IEEE arithmetic.
+pub fn rmsNormInvSqrtApproxBits(value_bits: u32) RmsNormInvError!u32 {
+    const exponent: u8 = @truncate(value_bits >> 23);
+    // The shared multiplier flushes subnormal intermediates. This bounded input
+    // range keeps x/2 and both y*y products normal through the two refinements.
+    if ((value_bits >> 31) != 0 or exponent < 2 or exponent > 251)
+        return error.InvalidRecord;
+
+    const half_value = value_bits - (1 << 23);
+    var estimate = @as(u32, 0x5f37_59df) - (value_bits >> 1);
+    for (0..2) |_| {
+        const square = truncFp32MulBits(estimate, estimate);
+        const scaled = truncFp32MulBits(half_value, square);
+        const correction = truncFp32AddBits(0x3fc0_0000, scaled ^ 0x8000_0000);
+        estimate = truncFp32MulBits(estimate, correction);
+    }
+    return estimate;
+}
+
+/// Full scalar oracle for the P3d inverse-RMS leaf. Epsilon is restricted to a
+/// positive finite normal so unsupported requests can fall back before launch.
+pub fn rmsNormInvFixed(
+    sum_sq: u48,
+    rows: u32,
+    max_exp: u8,
+    eps_bits: u32,
+) RmsNormInvError!RmsNormInvResult {
+    const eps_exp: u8 = @truncate(eps_bits >> 23);
+    if ((eps_bits >> 31) != 0 or eps_exp == 0 or eps_exp == 0xff)
+        return error.InvalidEpsilon;
+    const mean_bits = try rmsNormFixedMeanBits(sum_sq, rows, max_exp);
+    const adjusted = truncFp32AddBits(mean_bits, eps_bits);
+    return .{
+        .mean_bits = mean_bits,
+        .adjusted_mean_bits = adjusted,
+        .inv_rms_bits = try rmsNormInvSqrtApproxBits(adjusted),
+    };
 }
 
 /// High-precision-enough characterization of the exact-real input sum. Every
@@ -762,6 +936,71 @@ test "P3d RMSNorm sumsq oracle covers every exponent-alignment class" {
         rmsnorm_sumsq_adversarial_relative_limit);
     try std.testing.expect(rmsNormSumsqRelativeErrorBound(2048) <
         rmsnorm_sumsq_adversarial_relative_limit);
+}
+
+test "P3d RMSNorm inverse scalar fixes mean rounding and request bounds" {
+    const one_sum: u48 = @as(u48, 8) << 34;
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), try rmsNormFixedMeanBits(one_sum, 8, 127));
+    try std.testing.expectEqual(@as(u32, 0), try rmsNormFixedMeanBits(0, 2048, 0));
+
+    const cases = [_]struct { sum: u48, rows: u32, exponent: u8 }{
+        .{ .sum = 0x0000_1234_5678, .rows = 8, .exponent = 110 },
+        .{ .sum = 0x0001_ffff_ffff, .rows = 128, .exponent = 127 },
+        .{ .sum = 0x1234_5678_9abc, .rows = 2048, .exponent = 132 },
+        .{ .sum = 0xffff_ff00_0000, .rows = 4096, .exponent = 144 },
+    };
+    for (cases) |case| {
+        const value = std.math.ldexp(
+            @as(f64, @floatFromInt(case.sum)) /
+                @as(f64, @floatFromInt(case.rows)),
+            2 * (@as(i32, case.exponent) - 144),
+        );
+        const expected: u32 = @bitCast(@as(f32, @floatCast(value)));
+        try std.testing.expectEqual(expected, try rmsNormFixedMeanBits(case.sum, case.rows, case.exponent));
+    }
+
+    try std.testing.expectError(error.InvalidShape, rmsNormFixedMeanBits(one_sum, 24, 127));
+    try std.testing.expectError(error.InvalidRecord, rmsNormFixedMeanBits(one_sum, 8, 0));
+    try std.testing.expectError(error.InvalidRecord, rmsNormFixedMeanBits(0, 8, 127));
+    try std.testing.expectError(error.InvalidEpsilon, rmsNormInvFixed(one_sum, 8, 127, 0));
+    try std.testing.expectError(error.InvalidEpsilon, rmsNormInvFixed(one_sum, 8, 127, 0xbf80_0000));
+}
+
+test "P3d RMSNorm two-step inverse square root has a bounded scalar error" {
+    var maximum_relative_error: f64 = 0;
+    var exponent: u32 = 2;
+    while (exponent <= 251) : (exponent += 1) {
+        var sample: u32 = 0;
+        while (sample <= 32) : (sample += 1) {
+            const mantissa: u32 = @intCast(
+                (@as(u64, sample) * 0x7f_ffff) / 32,
+            );
+            const bits = (exponent << 23) | mantissa;
+            const value = @as(f64, @floatCast(@as(f32, @bitCast(bits))));
+            const approx_bits = try rmsNormInvSqrtApproxBits(bits);
+            const approx = @as(f64, @floatCast(@as(f32, @bitCast(approx_bits))));
+            const expected = 1.0 / @sqrt(value);
+            maximum_relative_error = @max(
+                maximum_relative_error,
+                @abs(approx - expected) / expected,
+            );
+        }
+    }
+    if (maximum_relative_error > rmsnorm_inv_scalar_relative_limit)
+        std.debug.print("maximum inverse-sqrt relative error: {e}\n", .{
+            maximum_relative_error,
+        });
+    try std.testing.expect(maximum_relative_error <= rmsnorm_inv_scalar_relative_limit);
+
+    const one_sum: u48 = @as(u48, 2048) << 34;
+    const result = try rmsNormInvFixed(one_sum, 2048, 127, 0x3586_37bd);
+    try std.testing.expectEqual(@as(u32, 0x3f80_0000), result.mean_bits);
+    const adjusted: f64 = @floatCast(@as(f32, @bitCast(result.adjusted_mean_bits)));
+    const inverse: f64 = @floatCast(@as(f32, @bitCast(result.inv_rms_bits)));
+    try std.testing.expect(@abs(inverse - 1.0 / @sqrt(adjusted)) <=
+        rmsnorm_inv_scalar_relative_limit);
+    try std.testing.expectError(error.InvalidRecord, rmsNormInvSqrtApproxBits(0x0080_0000));
+    try std.testing.expectError(error.InvalidRecord, rmsNormInvSqrtApproxBits(0x7e00_0000));
 }
 
 test "v1 Bonsai section shapes and capacities are explicit" {
