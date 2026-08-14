@@ -137,11 +137,14 @@ module section_rmsnorm_sumsq (
     wire [17:0] lane_quant = (lane_zero || lane_subnormal) ? 18'd0 :
                              lane_shifted[17:0];
 
-    // Lane k is decoded while lane k-1 is squared. The registered product breaks
-    // the multiplier-to-accumulator DSP cascade; two drain cycles retire the last
-    // product. Full-range unsigned 18x18 uses two DSP48E2s on this device.
+    // Lane k is decoded while lane k-1 is squared. The product register is
+    // deliberately unconditional and resetless so Vivado can absorb it into the
+    // DSP PREG; product_valid_q makes stale values unobservable. Two drain cycles
+    // retire the last product. Full-range unsigned 18x18 uses two DSP48E2s.
     (* use_dsp = "yes" *) wire [35:0] quant_product = quant_q * quant_q;
     wire [47:0] mac_sum = sum_q + {12'd0, product_q};
+    always @(posedge clk)
+        product_q <= quant_product;
 `ifdef FORMAL
     // The legal geometry proves the bit discarded by production's canonical
     // 48-bit MAC is unreachable; keep this observer out of synthesized logic.
@@ -159,7 +162,6 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
-            product_q <= 36'd0;
             product_valid_q <= 1'b0;
         end
     endtask
@@ -180,7 +182,6 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
-            product_q <= 36'd0;
             product_valid_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
@@ -197,7 +198,6 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
-            product_q <= 36'd0;
             product_valid_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
@@ -219,7 +219,6 @@ module section_rmsnorm_sumsq (
                     saw_max_exp_q <= 1'b0;
                     quant_q <= 18'd0;
                     quant_valid_q <= 1'b0;
-                    product_q <= 36'd0;
                     product_valid_q <= 1'b0;
                     result_sum_sq <= 48'd0;
                     result_subnormal_warning <= 1'b0;
@@ -259,8 +258,6 @@ module section_rmsnorm_sumsq (
                     end else begin
                         if (product_valid_q)
                             sum_q <= mac_sum;
-                        if (quant_valid_q)
-                            product_q <= quant_product;
                         product_valid_q <= quant_valid_q;
                         quant_q <= lane_quant;
                         quant_valid_q <= 1'b1;
@@ -281,8 +278,6 @@ module section_rmsnorm_sumsq (
                 ST_DRAIN: begin
                     quant_valid_q <= 1'b0;
                     product_valid_q <= quant_valid_q;
-                    if (quant_valid_q)
-                        product_q <= quant_product;
                     if (product_valid_q)
                         sum_q <= mac_sum;
                     if (!quant_valid_q) begin
@@ -315,7 +310,6 @@ module section_rmsnorm_sumsq (
                         saw_max_exp_q <= 1'b0;
                         quant_q <= 18'd0;
                         quant_valid_q <= 1'b0;
-                        product_q <= 36'd0;
                         product_valid_q <= 1'b0;
                         state_q <= ST_INPUT;
                     end
