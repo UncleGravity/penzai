@@ -218,15 +218,15 @@ module section_rmsnorm_sumsq_formal(input wire clk);
 
     // Abort covers input, lane issue, drain, and stalled-result ownership. The
     // group-age tracker derives each phase from public handshakes. Age one is
-    // the first lane-issue cycle, age nine is the drain cycle, and age ten owns
-    // the result before its handshake.
+    // the first lane-issue cycle, ages nine and ten are the two drain cycles,
+    // and age eleven owns the result before its handshake.
     assign cover_abort_point =
         (abort_phase == 0) ? (busy && !cfg_pending_q &&
                               sent_groups_q == 0 &&
                               group_age_q == 0) :
         (abort_phase == 1) ? (busy && group_age_q == 4) :
         (abort_phase == 2) ? (busy && group_age_q == 9) :
-                             (busy && group_age_q == 10);
+                             (busy && group_age_q == 11);
 `ifdef FORMAL_COVER
     assign abort_run = (active_scenario == SC_ABORT) && !aborted_q &&
                        cover_abort_point;

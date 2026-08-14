@@ -79,6 +79,9 @@ module section_rmsnorm_sumsq (
     reg saw_max_exp_q;
     reg [17:0] quant_q;
     reg quant_valid_q;
+    reg [35:0] product_q;
+    reg product_valid_q;
+    reg [7:0] token_max_exp;
 
     wire cfg_shape_ok = (cfg_rows >= 14'd8) &&
                         (cfg_rows <= 14'd4096) &&
@@ -112,7 +115,6 @@ module section_rmsnorm_sumsq (
     wire lane_subnormal = lane_exp == 8'd0 && lane_mantissa != 23'd0;
     wire lane_nonfinite = lane_exp == 8'hff;
 
-    reg [7:0] token_max_exp;
     always @* begin
         case (token_q)
             2'd0: token_max_exp = run_max_exp_q[7:0];
@@ -135,15 +137,15 @@ module section_rmsnorm_sumsq (
     wire [17:0] lane_quant = (lane_zero || lane_subnormal) ? 18'd0 :
                              lane_shifted[17:0];
 
-    // Lane k is decoded while lane k-1 is accumulated, giving one scalar issue
-    // per cycle and one drain cycle per group. Full-range unsigned 18x18 may use
-    // two DSP48E2s because the hard multiplier's 18-bit input is signed.
+    // Lane k is decoded while lane k-1 is squared. The registered product breaks
+    // the multiplier-to-accumulator DSP cascade; two drain cycles retire the last
+    // product. Full-range unsigned 18x18 uses two DSP48E2s on this device.
     (* use_dsp = "yes" *) wire [35:0] quant_product = quant_q * quant_q;
-    wire [47:0] mac_sum = sum_q + {12'd0, quant_product};
+    wire [47:0] mac_sum = sum_q + {12'd0, product_q};
 `ifdef FORMAL
     // The legal geometry proves the bit discarded by production's canonical
     // 48-bit MAC is unreachable; keep this observer out of synthesized logic.
-    wire [48:0] formal_sum_ext = {1'b0, sum_q} + {13'd0, quant_product};
+    wire [48:0] formal_sum_ext = {1'b0, sum_q} + {13'd0, product_q};
 `endif
 
     task automatic fail_run(input [6:0] failure);
@@ -157,6 +159,8 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
+            product_q <= 36'd0;
+            product_valid_q <= 1'b0;
         end
     endtask
 
@@ -176,6 +180,8 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
+            product_q <= 36'd0;
+            product_valid_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
             status <= 7'd0;
@@ -191,6 +197,8 @@ module section_rmsnorm_sumsq (
             saw_max_exp_q <= 1'b0;
             quant_q <= 18'd0;
             quant_valid_q <= 1'b0;
+            product_q <= 36'd0;
+            product_valid_q <= 1'b0;
             done <= 1'b0;
             error <= 1'b0;
             status <= 7'd0;
@@ -211,6 +219,8 @@ module section_rmsnorm_sumsq (
                     saw_max_exp_q <= 1'b0;
                     quant_q <= 18'd0;
                     quant_valid_q <= 1'b0;
+                    product_q <= 36'd0;
+                    product_valid_q <= 1'b0;
                     result_sum_sq <= 48'd0;
                     result_subnormal_warning <= 1'b0;
                     if (!cfg_shape_ok || !cfg_exp_ok) begin
@@ -236,6 +246,7 @@ module section_rmsnorm_sumsq (
                         group_data_q <= s_group_data;
                         lane_q <= 3'd0;
                         quant_valid_q <= 1'b0;
+                        product_valid_q <= 1'b0;
                         state_q <= ST_LANES;
                     end
                 end
@@ -246,8 +257,11 @@ module section_rmsnorm_sumsq (
                     end else if (lane_max_mismatch) begin
                         fail_run(STATUS_MAX_MISMATCH);
                     end else begin
-                        if (quant_valid_q)
+                        if (product_valid_q)
                             sum_q <= mac_sum;
+                        if (quant_valid_q)
+                            product_q <= quant_product;
+                        product_valid_q <= quant_valid_q;
                         quant_q <= lane_quant;
                         quant_valid_q <= 1'b1;
                         if (lane_subnormal) begin
@@ -266,19 +280,25 @@ module section_rmsnorm_sumsq (
 
                 ST_DRAIN: begin
                     quant_valid_q <= 1'b0;
-                    if (!quant_valid_q) begin
-                        fail_run(STATUS_INTERNAL);
-                    end else if (group_q + 1'b1 != run_groups_q) begin
+                    product_valid_q <= quant_valid_q;
+                    if (quant_valid_q)
+                        product_q <= quant_product;
+                    if (product_valid_q)
                         sum_q <= mac_sum;
-                        group_q <= group_q + 1'b1;
-                        state_q <= ST_INPUT;
-                    end else if ((token_max_exp != 8'd0) &&
-                                 !saw_max_exp_q) begin
-                        fail_run(STATUS_MAX_MISMATCH);
-                    end else begin
-                        result_sum_sq <= mac_sum;
-                        result_subnormal_warning <= token_subnormal_q;
-                        state_q <= ST_RESULT;
+                    if (!quant_valid_q) begin
+                        if (!product_valid_q) begin
+                            fail_run(STATUS_INTERNAL);
+                        end else if (group_q + 1'b1 != run_groups_q) begin
+                            group_q <= group_q + 1'b1;
+                            state_q <= ST_INPUT;
+                        end else if ((token_max_exp != 8'd0) &&
+                                     !saw_max_exp_q) begin
+                            fail_run(STATUS_MAX_MISMATCH);
+                        end else begin
+                            result_sum_sq <= mac_sum;
+                            result_subnormal_warning <= token_subnormal_q;
+                            state_q <= ST_RESULT;
+                        end
                     end
                 end
 
@@ -295,6 +315,8 @@ module section_rmsnorm_sumsq (
                         saw_max_exp_q <= 1'b0;
                         quant_q <= 18'd0;
                         quant_valid_q <= 1'b0;
+                        product_q <= 36'd0;
+                        product_valid_q <= 1'b0;
                         state_q <= ST_INPUT;
                     end
                 end
@@ -311,7 +333,7 @@ module section_rmsnorm_sumsq (
         if (rst_n) begin
             assert(!(result_valid && error));
             assert(!(s_group_ready && result_valid));
-            if (quant_valid_q &&
+            if (product_valid_q &&
                 ((state_q == ST_LANES) || (state_q == ST_DRAIN)))
                 assert(!formal_sum_ext[48]);
             if (result_valid) begin

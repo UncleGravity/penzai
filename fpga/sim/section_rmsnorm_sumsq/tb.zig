@@ -296,8 +296,8 @@ fn testCadenceAndOutputStability(dut: *Dut) !void {
         if (c.dut_result_valid(dut.handle) != 0) result_cycle = cycle;
         if (result_cycle == null) dut.step();
     }
-    try std.testing.expectEqual(@as(usize, 10), accept_cycle[1] - accept_cycle[0]);
-    try std.testing.expectEqual(@as(usize, 10), result_cycle.? - accept_cycle[1]);
+    try std.testing.expectEqual(@as(usize, 11), accept_cycle[1] - accept_cycle[0]);
+    try std.testing.expectEqual(@as(usize, 11), result_cycle.? - accept_cycle[1]);
 
     const expected = try section.rmsNormSumsqFixed(&values, 16, 127);
     const held = readResult(dut);
@@ -621,7 +621,7 @@ pub fn main() !void {
         "section RMSNorm sumsq: exact fixed oracle, shifts d=0..19, " ++
             "max 4096x4 completed in {d} cycles\n" ++
             "  cadence: 8 scalar issue cycles/group at within-group II=1, " ++
-            "group accept interval 10 cycles (capture/drain bubbles)\n" ++
+            "group accept interval 11 cycles (capture/two-drain bubbles)\n" ++
             "  max relative error adversarial={e:.4}, synthetic model-shaped={e:.4}\n",
         .{ max_stats.cycles, characterization[0], characterization[1] },
     );
