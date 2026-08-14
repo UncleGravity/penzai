@@ -339,7 +339,7 @@ pub fn writeMatmulDetail(
         }
     }
     if (saw_axis_counters) {
-        try writer.writeAll("  note: A beats are external 64-bit AXIS transfers; primitive loads use packed Q8, grouped loads use raw F32, and reuse consumes zero\n");
+        try writer.writeAll("  note: A beats are 64-bit GEMM-ingress handshakes; ordinary packed/raw loads are external, reuse consumes zero, and v16 named-FFN DOWN may replay from the local section buffer\n");
     }
 }
 

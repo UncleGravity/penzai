@@ -90,7 +90,7 @@ profiled measurements are compared only against profiled measurements.
 | 0 | Measurement foundation (complete) | Later work needs a fixed A/B contract | Profiled characterization, unprofiled regression, immutable build identity |
 | 1 | Bounded waste removal (complete) | Low-risk short-context savings and benchmark validation | Independent A/B for each change with identical numerical output |
 | 2 | Section substrate and unified PL attention (complete) | Boundary traffic breaks prefill; attention dominates long-context decode | Banked scratch, PL Q8 ingress, tiled prefill on PL, first executable section |
-| 3 | Streaming FFN and local hard-block rebalance (P3c active) | Turn the qualified P2f section into a product gain and stop starving DOWN | A streamed FFN beats the op path in repeated unprofiled Q1/Q2 runs |
+| 3 | Streaming FFN and local hard-block rebalance (P3d active) | Turn the qualified P2f section into a product gain and stop starving DOWN | A streamed FFN beats the op path in repeated unprofiled Q1/Q2 runs |
 | 4 | Named attention section | Eliminates QKV/RoPE/KV/residual materialization around the P2 engine | One strict command with correct same-token KV visibility |
 | 5 | Resident transformer execution | Removes the remaining sublayer and layer residual DDR boundaries | One block, then all 28 layers, execute with a banked resident residual |
 | 6 | Persistent controller and DMA consolidation | Section commands make the generic ten-DMA shell unnecessary | Fixed layer controller, persistent weight readers, and fewer movers/control targets |
@@ -633,9 +633,8 @@ and the PS still owns normalization, result staging, and residual publication.
 The old grouped path is less integrated but amortizes some of those fixed costs
 and can feed its mature GEMM path more continuously.
 
-P3a and P3b are complete. P3c is active at the leaf-buffer stage; P3d and P3e
-have not started. P3 remains open until the final repeated unprofiled performance
-gate passes.
+P3a-P3c are complete. P3d is active and P3e has not started. P3 remains open
+until the final repeated unprofiled performance gate passes.
 
 Build P3 as five independently measurable increments:
 
@@ -685,27 +684,51 @@ time -3.802%, device time -1.652%, and unprofiled time -2.758%. Q2 changes are
 -7.017%, +7.546%, -2.494%, -1.190%, and -0.752% in the same order. Full-model
 quality, command accounting, fallback, and capability checks pass.
 
-#### P3c: replace scratch tensors with a streaming FFN superkernel (active)
+#### P3c: replace scratch tensors with a streaming FFN superkernel (complete)
 
-- Schedule paired UP/GATE output-row blocks so each completed pair can pass directly
-  through SwiGLU and exact Q8 into a compact, ping-ponged DOWN-input bank.
-- Do not materialize complete F32 UP and GATE tensors or rescan X0/X1 after both
-  projections. Repack paired weights only if measurement shows it improves the
+- Retain the complete F32 UP result in X1. Stream GATE through the packer and
+  pairer, combine it with X1 immediately through SwiGLU and exact Q8, and write
+  the compact canonical result into Q8 buffer bank 0 for DOWN replay.
+- Do not materialize a complete F32 GATE tensor or perform the former post-hoc
+  X0/X1 rescan. Repack paired weights only if measurement shows it improves the
   schedule without increasing total weight traffic.
 - Keep explicit small FIFOs and block memories between stages; do not form one
   device-wide combinational ready/valid path.
 
 Gate: per-layer differential tests, exact stream accounting, leaf and integrated
-resource/timing feedback, and a clean combined route for the coherent superkernel
-milestone.
+resource/timing feedback, a clean combined route, and bounded same-software Q1/Q2
+board qualification for the coherent superkernel milestone.
 
-Commits `54043ee`, `2b1e6f4`, and `bd196d9` establish the first streaming Q8
-section-buffer leaf. Leaf OOC passes at +0.487/+0.108 ns with 312 LUTs, 928 FFs,
-four CARRY8s, four URAMs, two BRAM36s, two BRAM18s, and no LUTRAM or DSPs. This
-leaf has not yet been integrated, so it carries no full-design timing or board
-performance claim.
+Commits `6957b1b` and `ee12c8a` integrate and time-harden the v16 streamed
+GATE/Q8 path. Production-strategy OOC run
+`20260814T041041Z-ee12c8a2826e-p3c-prod-strategy-full-decode` passes nominal
+setup/hold at +0.086/+0.057 ns at 3.333 ns and guarded setup at +0.011 ns. It uses
+24 URAMs, 38 DSPs, 10 BRAM36s, two BRAM18s, and 94 LUTRAMs. Clean f285 run
+`20260814T043858Z-ee12c8a2826e-w512-p4-f285-clean` passes at +0.021/+0.010 ns;
+its `bit.bin` SHA-256 is
+`1a4d8455a1217ed28da58e6d250e24ddc6b6f3566e2952d24ec952ffd45a1179`.
 
-#### P3d: move normalization and residual handling into PL
+Exact logits, capabilities, and accounting pass on the board. In profiled x3 A/B,
+P3c changes Q1 wall/device/FFN/DOWN cycles/DOWN MAC per cycle by
+-8.016%/-7.320%/-17.391%/-53.312%/+114.188%; Q2 changes the same metrics by
+-6.401%/-5.812%/-12.276%/-35.965%/+56.165%. The primary unprofiled Q1 x3 result
+was a near-tie at +0.218%, which triggered the predeclared order-balanced schema-4
+check. All schema-4 gates pass: C1/B2 is -4.169%, C4/B3 is -1.545%, and pooled
+C10/B10 is -3.428%. Those ranges overlap, so Q1 is a directional claim only. Q2
+unprofiled x3 changes -5.508% with disjoint ranges.
+
+The consolidated board summary
+`/tmp/p3c-board-qualification-20260814T053441Z/qualification-summary.json`
+has SHA-256 `b8ac70157f85658349fbcc7c793e9be4b477b85d14ac1d981285a90d6679ae4f`.
+Its 163-entry evidence ledger has SHA-256
+`5569dd0cc15941de566c34c19233710d73e217f4a73b1388b3a76da73c21b9f9` and
+passes an independent full rehash.
+
+v16 DOWN reports 960 activation beats per FFN command, or 1,720,320 across the
+qualification decode. These are local GEMM-ingress replay beats from Q8 bank 0,
+not external activation traffic or a regression from P3b's resident-reuse count.
+
+#### P3d: move normalization and residual handling into PL (active)
 
 - Add PL weighted RMSNorm-to-Q8 production and PL residual addition while retaining
   the PS implementations as the numerical oracle and strict pre-start fallback.

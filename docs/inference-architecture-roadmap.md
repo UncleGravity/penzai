@@ -371,20 +371,40 @@ GEMM-plus-scratch schedule in measured increments:
    -3.802%, device -1.652%, and unprofiled -2.758%; Q2 changes are -7.017%,
    +7.546%, -2.494%, -1.190%, and -0.752% in the same order. All quality and
    accounting gates pass.
-3. **P3c, streaming superkernel (active).** Schedule paired UP/GATE output-row
-   blocks, consume each pair immediately through SwiGLU and exact Q8, and retain
-   only a compact ping-ponged DOWN-input tensor. Eliminate the complete X0/X1 F32
-   materialization and later rescan. Gate with per-layer differential tests,
-   exact stream accounting, resource deltas, integrated OOC, and a clean combined
-   route.
-   Commits `54043ee`, `2b1e6f4`, and `bd196d9` establish the first Q8 section-buffer
-   leaf. Leaf OOC passes at +0.487/+0.108 ns using 312 LUTs, 928 FFs, four CARRY8s,
-   four URAMs, two BRAM36s, two BRAM18s, and no LUTRAM or DSPs. It is not yet
-   integrated and makes no full-design timing or performance claim.
-4. **P3d, PL norm and residual.** Add weighted RMSNorm-to-Q8 and residual addition
-   in PL, populate the resident residual role, and keep the PS implementation as
-   oracle and strict pre-start fallback. Map reduction state and queues to
-   BRAM/URAM and suitable arithmetic to DSPs, removing replaced LUT/PS machinery.
+3. **P3c, streaming superkernel (complete).** Retain the complete F32 UP result in
+   X1 while streaming GATE through the packer and pairer, SwiGLU, exact Q8, and the
+   compact Q8 buffer bank 0 for DOWN replay. This removes the complete F32 GATE
+   tensor and post-hoc X0/X1 rescan without claiming ping-pong integration. Gate
+   with per-layer differential tests, exact stream accounting, resource deltas,
+   integrated OOC, a clean combined route, and bounded same-software board A/B.
+   Commits `6957b1b` and `ee12c8a` integrate and time-harden this v16 path.
+   Production-strategy OOC run
+   `20260814T041041Z-ee12c8a2826e-p3c-prod-strategy-full-decode` passes nominal
+   setup/hold at +0.086/+0.057 ns at 3.333 ns and guarded setup at +0.011 ns, with
+   24 URAMs, 38 DSPs, 10 BRAM36s, two BRAM18s, and 94 LUTRAMs. Clean f285 run
+   `20260814T043858Z-ee12c8a2826e-w512-p4-f285-clean` passes at +0.021/+0.010 ns;
+   its `bit.bin` SHA-256 is
+   `1a4d8455a1217ed28da58e6d250e24ddc6b6f3566e2952d24ec952ffd45a1179`.
+   Exact logits, capabilities, and accounting pass. Profiled x3 Q1
+   wall/device/FFN/DOWN cycles/DOWN MAC per cycle changes are
+   -8.016%/-7.320%/-17.391%/-53.312%/+114.188%; Q2 changes are
+   -6.401%/-5.812%/-12.276%/-35.965%/+56.165%. Primary unprofiled Q1 x3 was a
+   near-tie at +0.218%; its predeclared order-balanced schema-4 follow-up passes
+   every gate at C1/B2 -4.169%, C4/B3 -1.545%, and pooled C10/B10 -3.428%.
+   Ranges overlap, so Q1 is directional only. Q2 unprofiled x3 changes -5.508%
+   with disjoint ranges. The consolidated summary
+   `/tmp/p3c-board-qualification-20260814T053441Z/qualification-summary.json`
+   has SHA-256 `b8ac70157f85658349fbcc7c793e9be4b477b85d14ac1d981285a90d6679ae4f`;
+   its 163-entry evidence ledger has SHA-256
+   `5569dd0cc15941de566c34c19233710d73e217f4a73b1388b3a76da73c21b9f9`
+   and passes an independent full rehash. v16 DOWN's 960 activation beats per
+   FFN command, or 1,720,320 per qualification decode, are local Q8-to-GEMM
+   replay beats rather than external traffic or a regression from P3b resident reuse.
+4. **P3d, PL norm and residual (active).** Add weighted RMSNorm-to-Q8 and residual
+   addition in PL, populate the resident residual role, and keep the PS
+   implementation as oracle and strict pre-start fallback. Map reduction state and
+   queues to BRAM/URAM and suitable arithmetic to DSPs, removing replaced LUT/PS
+   machinery.
    Gate with arithmetic cosim, formal control, full-model quality, resources, and
    a clean combined route.
 5. **P3e, prefill scale and qualification.** Evaluate an eight-token tile against
@@ -393,9 +413,9 @@ GEMM-plus-scratch schedule in measured increments:
    superseded debug datapaths and run the complete Q1/Q2 characterization and
    regression suite on the final clean image.
 
-P3a and P3b are complete, P3c is active, and P3d/P3e have not started. P3 closes
-only when repeated same-image unprofiled Q1 and Q2 runs beat the legacy operation
-path. The strict matcher, fail-before-start fallback, one-command profile, and full
+P3a-P3c are complete, P3d is active, and P3e has not started. P3 closes only when
+repeated same-image unprofiled Q1 and Q2 runs beat the legacy operation path. The
+strict matcher, fail-before-start fallback, one-command profile, and full
 numerical/accounting contract remain unchanged.
 
 ### P4: named attention section
