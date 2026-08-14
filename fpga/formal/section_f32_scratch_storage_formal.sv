@@ -81,6 +81,8 @@ module section_f32_scratch_storage_formal(input wire clk);
         .s_axis_tlast(stream_last),
         .wr_commit_valid(wr_commit_valid), .wr_commit_bank(wr_commit_bank),
         .wr_commit_address(wr_commit_address),
+        .r_wr_valid(1'b0), .r_wr_ready(), .r_wr_bank(2'd0),
+        .r_wr_address(14'd0), .r_wr_data(64'd0), .r_wr_error(),
         .rd_req_valid(rd_req_valid), .rd_req_ready(rd_req_ready),
         .rd_req_role(rd_req_role), .rd_req_token(rd_req_token),
         .rd_req_group(rd_req_group),

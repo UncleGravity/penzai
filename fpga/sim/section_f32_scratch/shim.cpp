@@ -13,6 +13,10 @@ extern "C" {
 Dut *dut_new(void) {
     Dut *d = new Dut();
     d->top = new Vsection_f32_scratch();
+    d->top->r_wr_valid = 0;
+    d->top->r_wr_bank = 0;
+    d->top->r_wr_address = 0;
+    d->top->r_wr_data = 0;
     return d;
 }
 
@@ -41,6 +45,13 @@ void dut_set_write_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int la
     d->top->s_axis_tlast = last;
 }
 
+void dut_set_r_write(Dut *d, int valid, uint8_t bank, uint16_t address, uint64_t data) {
+    d->top->r_wr_valid = valid;
+    d->top->r_wr_bank = bank;
+    d->top->r_wr_address = address;
+    d->top->r_wr_data = data;
+}
+
 void dut_set_read_request(Dut *d, int valid, uint8_t role, uint8_t token, uint16_t group) {
     d->top->rd_req_valid = valid;
     d->top->rd_req_role = role;
@@ -58,6 +69,8 @@ int dut_write_stream_ready(Dut *d) { return d->top->s_axis_tready; }
 int dut_write_commit_valid(Dut *d) { return d->top->wr_commit_valid; }
 uint8_t dut_write_commit_bank(Dut *d) { return d->top->wr_commit_bank; }
 uint16_t dut_write_commit_address(Dut *d) { return d->top->wr_commit_address; }
+int dut_r_write_ready(Dut *d) { return d->top->r_wr_ready; }
+int dut_r_write_error(Dut *d) { return d->top->r_wr_error; }
 int dut_read_request_ready(Dut *d) { return d->top->rd_req_ready; }
 int dut_read_issue_valid(Dut *d) { return d->top->rd_issue_valid; }
 uint16_t dut_read_issue_address(Dut *d) { return d->top->rd_issue_address; }

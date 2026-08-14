@@ -186,12 +186,20 @@ fn addFormalSteps(b: *std.Build) void {
         ".zig-cache/sby/section_f32_scratch_storage",
         "fpga/formal/section_f32_scratch_storage.sby",
     });
+    const section_f32_scratch_direct_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_f32_scratch_direct",
+        "fpga/formal/section_f32_scratch_direct.sby",
+    });
     const section_f32_scratch_step = b.step(
         "formal-section-f32-scratch",
         "Prove section FP32 scratch mapping, control, ownership, and storage lifecycle",
     );
     section_f32_scratch_step.dependOn(&section_f32_scratch_map_run.step);
     section_f32_scratch_step.dependOn(&section_f32_scratch_storage_run.step);
+    section_f32_scratch_step.dependOn(&section_f32_scratch_direct_run.step);
 
     const section_q8_buffer_map_run = b.addSystemCommand(&.{
         "sby",
@@ -454,8 +462,8 @@ const q8_quantizer_rtl = [_][]const u8{
     "fpga/rtl/q8_quantizer.v",
 };
 
-// P2 section-local FP32 scratch: four 64-bit UltraRAM banks with a direct GEMM
-// result sink and an elastic 256-bit group read port.
+// Section-local FP32 scratch: four 64-bit UltraRAM banks with GEMM-order and
+// token-major R write paths plus an elastic 256-bit group read port.
 const section_f32_scratch_rtl = [_][]const u8{
     "fpga/rtl/section_f32_scratch.v",
 };
@@ -582,7 +590,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const flash_kernel_cosim = addCosim(b, target, optimize, "test-rtl-flash-kernel", "Verilator cosim: full flash kernel vs flash_ref.attendHead", "flash_kernel", "fpga/sim/flash_kernel", &flash_kernel_rtl, .flash);
     const flash_top_cosim = addCosim(b, target, optimize, "test-rtl-flash-top", "Verilator cosim: flash_top AXI-Lite/DMA wrapper vs flash_ref", "flash_top", "fpga/sim/flash_top", &flash_top_rtl, .flash);
     const q8_quantizer_cosim = addCosim(b, target, optimize, "test-rtl-q8-quantizer", "Verilator cosim: exact-RNE FP32 to Q8_0 quantizer vs shared/layout.zig", "q8_quantizer", "fpga/sim/q8_quantizer", &q8_quantizer_rtl, .q8);
-    const section_f32_scratch_cosim = addCosim(b, target, optimize, "test-rtl-section-f32-scratch", "Verilator cosim: GEMM-order writes into P2 four-bank FP32 section scratch", "section_f32_scratch", "fpga/sim/section_f32_scratch", &section_f32_scratch_rtl, .section);
+    const section_f32_scratch_cosim = addCosim(b, target, optimize, "test-rtl-section-f32-scratch", "Verilator cosim: GEMM-order and token-major writes into four-bank FP32 section scratch", "section_f32_scratch", "fpga/sim/section_f32_scratch", &section_f32_scratch_rtl, .section);
     const section_q8_buffer_cosim = addCosim(b, target, optimize, "test-rtl-section-q8-buffer", "Verilator cosim: tagged native-Q8 ping-pong capture, seal, and token-major replay", "section_q8_buffer", "fpga/sim/section_q8_buffer", &section_q8_buffer_rtl, .section);
     const section_ffn_pairer_cosim = addCosim(b, target, optimize, "test-rtl-section-ffn-pairer", "Verilator cosim: tagged streamed GATE groups paired with resident X1/UP", "section_ffn_pairer", "fpga/sim/section_ffn_pairer", &section_ffn_pairer_rtl, .section);
     const section_gate_packer_cosim = addCosim(b, target, optimize, "test-rtl-section-gate-packer", "Verilator cosim: native GEMM result beats to tagged streamed GATE groups", "section_gate_packer", "fpga/sim/section_gate_packer", &section_gate_packer_rtl, .section);

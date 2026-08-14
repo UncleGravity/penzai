@@ -7,8 +7,9 @@
 //   word = { odd_row, even_row }
 //
 // GEMM emits [rowblock][token][row-pair], with 16 rows per rowblock.  The write
-// sink consumes that stream directly; no transpose or token-major copy is needed.
-// The read side returns all four banks at one address as eight adjacent FP32s.
+// sink consumes that stream directly; the RMSNorm loader can instead write R in
+// token-major order. The read side returns all four banks at one address as eight
+// adjacent FP32s.
 //
 // Roles are encoded as 0=R, 1=X0, 2=X1, 3=X2.  A section controller must not
 // schedule a read of the same physical group that is being written.  Such a
@@ -42,6 +43,16 @@ module section_f32_scratch (
     output wire          wr_commit_valid,
     output wire [1:0]    wr_commit_bank,
     output wire [13:0]   wr_commit_address,
+
+    // Token-major direct writes into R. The section RMSNorm loader supplies
+    // the already-mapped bank/address and owns framing/accounting. This port
+    // is accepted only while the legacy GEMM-order writer is idle.
+    input  wire          r_wr_valid,
+    output wire          r_wr_ready,
+    input  wire [1:0]    r_wr_bank,
+    input  wire [13:0]   r_wr_address,
+    input  wire [63:0]   r_wr_data,
+    output wire          r_wr_error,
 
     // One role-local row group request.  group zero denotes rows 0..7.
     input  wire          rd_req_valid,
@@ -120,7 +131,7 @@ module section_f32_scratch (
                         (wr_cfg_tokens <= 3'd4);
     wire cfg_accept = wr_cfg_valid && wr_cfg_ready;
 
-    assign wr_cfg_ready = rst_n && !wr_busy_q && !wr_abort;
+    assign wr_cfg_ready = rst_n && !wr_busy_q && !wr_abort && !r_wr_valid;
     assign wr_busy      = wr_busy_q;
     // Abort wins combinationally so a beat presented in the abort cycle is not
     // accidentally committed before the controller observes completion.
@@ -151,6 +162,20 @@ module section_f32_scratch (
     assign wr_commit_valid   = wr_mem_write;
     assign wr_commit_bank    = wr_bank;
     assign wr_commit_address = wr_address;
+
+    // R occupies physical addresses 0..2047. Invalid direct writes handshake
+    // and report an error without mutating storage, so the loader terminates
+    // rather than hanging on a malformed command.
+    assign r_wr_ready = rst_n && !wr_busy_q && !wr_abort;
+    wire r_wr_accept = r_wr_valid && r_wr_ready;
+    wire r_wr_bad = r_wr_address >= 14'd2048;
+    assign r_wr_error = r_wr_accept && r_wr_bad;
+    wire r_wr_mem_write = r_wr_accept && !r_wr_bad;
+
+    wire mem_write = wr_mem_write || r_wr_mem_write;
+    wire [1:0] mem_write_bank = r_wr_mem_write ? r_wr_bank : wr_bank;
+    wire [13:0] mem_write_address = r_wr_mem_write ? r_wr_address : wr_address;
+    wire [63:0] mem_write_data = r_wr_mem_write ? r_wr_data : s_axis_tdata;
 
     // ---- Elastic synchronous 256-bit group read ----
 
@@ -218,10 +243,10 @@ module section_f32_scratch (
     assign rd_req_ready = rst_n && !rd_pending_q && !rd_result_pending_q &&
                           (!rd_rsp_valid_q || rd_rsp_ready);
     wire rd_accept = rd_req_valid && rd_req_ready;
-    wire rd_accept_collision = rd_accept && !rd_request_bad && wr_mem_write &&
-                               (rd_address == wr_address);
+    wire rd_accept_collision = rd_accept && !rd_request_bad && mem_write &&
+                               (rd_address == mem_write_address);
     wire rd_issue_collision = rd_pending_q &&
-                              wr_mem_write && (rd_address_q == wr_address);
+                              mem_write && (rd_address_q == mem_write_address);
 
     assign rd_rsp_valid = rd_rsp_valid_q;
     assign rd_issue_valid = rd_accept;
@@ -233,12 +258,12 @@ module section_f32_scratch (
     // bank-selecting write port and one synchronous read port per bank.  The
     // memories themselves are intentionally not reset.
     always @(posedge clk) begin
-        if (wr_mem_write) begin
-            case (wr_bank)
-                2'd0: bank0_mem[wr_address] <= s_axis_tdata;
-                2'd1: bank1_mem[wr_address] <= s_axis_tdata;
-                2'd2: bank2_mem[wr_address] <= s_axis_tdata;
-                default: bank3_mem[wr_address] <= s_axis_tdata;
+        if (mem_write) begin
+            case (mem_write_bank)
+                2'd0: bank0_mem[mem_write_address] <= mem_write_data;
+                2'd1: bank1_mem[mem_write_address] <= mem_write_data;
+                2'd2: bank2_mem[mem_write_address] <= mem_write_data;
+                default: bank3_mem[mem_write_address] <= mem_write_data;
             endcase
         end
 

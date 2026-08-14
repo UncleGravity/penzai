@@ -17,6 +17,7 @@ void dut_set_rst_n(Dut *d, int value);
 void dut_set_write_config(Dut *d, int valid, uint8_t role, uint16_t rows, uint8_t tokens);
 void dut_set_write_abort(Dut *d, int value);
 void dut_set_write_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int last);
+void dut_set_r_write(Dut *d, int valid, uint8_t bank, uint16_t address, uint64_t data);
 void dut_set_read_request(Dut *d, int valid, uint8_t role, uint8_t token, uint16_t group);
 void dut_set_read_ready(Dut *d, int value);
 
@@ -28,6 +29,8 @@ int dut_write_stream_ready(Dut *d);
 int dut_write_commit_valid(Dut *d);
 uint8_t dut_write_commit_bank(Dut *d);
 uint16_t dut_write_commit_address(Dut *d);
+int dut_r_write_ready(Dut *d);
+int dut_r_write_error(Dut *d);
 int dut_read_request_ready(Dut *d);
 int dut_read_issue_valid(Dut *d);
 uint16_t dut_read_issue_address(Dut *d);

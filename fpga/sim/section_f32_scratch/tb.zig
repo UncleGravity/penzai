@@ -48,6 +48,7 @@ const Dut = struct {
         c.dut_set_write_config(self.handle, 0, 0, 0, 0);
         c.dut_set_write_abort(self.handle, 0);
         c.dut_set_write_stream(self.handle, 0, 0, 0, 0);
+        c.dut_set_r_write(self.handle, 0, 0, 0, 0);
         c.dut_set_read_request(self.handle, 0, 0, 0, 0);
         c.dut_set_read_ready(self.handle, 0);
         c.dut_set_clk(self.handle, 0);
@@ -85,6 +86,24 @@ fn valueBits(tag: u8, role: Role, token: u32, row: u32) u32 {
 fn pairWord(tag: u8, role: Role, token: u32, even_row: u32) u64 {
     return @as(u64, valueBits(tag, role, token, even_row)) |
         (@as(u64, valueBits(tag, role, token, even_row + 1)) << 32);
+}
+
+fn directWrite(
+    dut: *Dut,
+    bank: u8,
+    address: u16,
+    data: u64,
+    expect_error: bool,
+) !void {
+    c.dut_set_r_write(dut.handle, 1, bank, address, data);
+    dut.eval();
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) != 0);
+    try std.testing.expectEqual(expect_error, c.dut_r_write_error(dut.handle) != 0);
+    // Direct ownership wins admission over a simultaneous legacy config.
+    try std.testing.expect(c.dut_write_config_ready(dut.handle) == 0);
+    dut.step();
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    dut.eval();
 }
 
 fn configure(dut: *Dut, role: Role, rows: u32, tokens: u32) !void {
@@ -381,6 +400,119 @@ fn testAbort(dut: *Dut) !void {
     try std.testing.expect(c.dut_write_busy(dut.handle) == 0);
 }
 
+fn testDirectResidualWrites(dut: *Dut) !void {
+    // The loader supplies token-major physical R locations directly. Two token
+    // groups establish both the four-bank packing and the 512-address stride.
+    for (0..2) |token_usize| {
+        const token: u32 = @intCast(token_usize);
+        for (0..4) |bank_usize| {
+            const bank: u32 = @intCast(bank_usize);
+            try directWrite(
+                dut,
+                @intCast(bank),
+                @intCast(token * 512),
+                pairWord(@intCast(10 + token), .residual, token, bank * 2),
+                false,
+            );
+        }
+        try expectGroup(dut, .residual, token, 0, @intCast(10 + token), token_usize);
+    }
+
+    // Abort suppresses direct acceptance and leaves the committed group intact.
+    c.dut_set_r_write(dut.handle, 1, 1, 0, pairWord(14, .residual, 0, 2));
+    c.dut_set_write_abort(dut.handle, 1);
+    dut.eval();
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_r_write_error(dut.handle) == 0);
+    dut.step();
+    c.dut_set_write_abort(dut.handle, 0);
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    dut.eval();
+    try expectGroup(dut, .residual, 0, 0, 10, 1);
+
+    // A live GEMM-order writer owns the physical write port. Direct valid must
+    // backpressure without perturbing either stream.
+    try configure(dut, .x0, 8, 1);
+    c.dut_set_r_write(dut.handle, 1, 0, 512, pairWord(14, .residual, 1, 0));
+    dut.eval();
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_r_write_error(dut.handle) == 0);
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    for (0..4) |pair| {
+        try sendMappedBeat(
+            dut,
+            .x0,
+            0,
+            @intCast(pair * 2),
+            pairWord(1, .x0, 0, @intCast(pair * 2)),
+            0xff,
+            pair == 3,
+        );
+    }
+    try expectGroup(dut, .residual, 1, 0, 11, 1);
+
+    // Address 2048 is outside R even though it is a valid physical X0 address.
+    // The handshake reports an error and must not overwrite the existing X0 word.
+    try directWrite(dut, 0, 2048, pairWord(15, .x0, 0, 0), true);
+    try expectGroup(dut, .x0, 0, 0, 1, 1);
+
+    // Same-cycle request/write collision is diagnosed, but the direct write
+    // itself commits. A subsequent read observes only the selected bank update.
+    c.dut_set_read_ready(dut.handle, 0);
+    c.dut_set_read_request(dut.handle, 1, roleCode(.residual), 0, 0);
+    c.dut_set_r_write(dut.handle, 1, 0, 0, pairWord(12, .residual, 0, 0));
+    dut.eval();
+    try std.testing.expect(c.dut_read_issue_valid(dut.handle) != 0);
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) != 0);
+    dut.step();
+    c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    dut.step();
+    dut.step();
+    dut.eval();
+    const accepted_collision = try consumeCurrentRead(dut, 2);
+    try std.testing.expect(accepted_collision.is_error);
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, accepted_collision.lanes);
+
+    var updated = try readGroup(dut, .residual, 0, 0, 1);
+    try std.testing.expect(!updated.is_error);
+    try std.testing.expectEqual(pairWord(12, .residual, 0, 0), updated.lanes[0]);
+    for (1..4) |bank| {
+        try std.testing.expectEqual(
+            pairWord(10, .residual, 0, @intCast(bank * 2)),
+            updated.lanes[bank],
+        );
+    }
+
+    // The second collision window is the cycle where a registered request
+    // reaches the physical memories.
+    c.dut_set_read_ready(dut.handle, 0);
+    c.dut_set_read_request(dut.handle, 1, roleCode(.residual), 0, 0);
+    dut.step();
+    c.dut_set_read_request(dut.handle, 0, 0, 0, 0);
+    c.dut_set_r_write(dut.handle, 1, 1, 0, pairWord(13, .residual, 0, 2));
+    dut.eval();
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) != 0);
+    dut.step();
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    dut.step();
+    dut.eval();
+    const issue_collision = try consumeCurrentRead(dut, 2);
+    try std.testing.expect(issue_collision.is_error);
+    try std.testing.expectEqual([_]u64{ 0, 0, 0, 0 }, issue_collision.lanes);
+
+    updated = try readGroup(dut, .residual, 0, 0, 1);
+    try std.testing.expect(!updated.is_error);
+    try std.testing.expectEqual(pairWord(12, .residual, 0, 0), updated.lanes[0]);
+    try std.testing.expectEqual(pairWord(13, .residual, 0, 2), updated.lanes[1]);
+    for (2..4) |bank| {
+        try std.testing.expectEqual(
+            pairWord(10, .residual, 0, @intCast(bank * 2)),
+            updated.lanes[bank],
+        );
+    }
+}
+
 fn consumeCurrentRead(dut: *Dut, stalls: usize) !ReadResult {
     try std.testing.expect(c.dut_read_response_valid(dut.handle) != 0);
     var result: ReadResult = .{
@@ -510,6 +642,7 @@ pub fn main() !void {
     try testBounds(&dut);
     try testFraming(&dut);
     try testAbort(&dut);
+    try testDirectResidualWrites(&dut);
 
     // A successful half-final-rowblock shape complements the malformed framing
     // cases above.  The later full X1 pass overwrites it before isolation checks.
@@ -539,7 +672,7 @@ pub fn main() !void {
 
     std.debug.print(
         "\n  section F32 scratch cosim: {d} GEMM beats, {d} 256-bit groups checked\n" ++
-            "  X0/X1 no-transpose mapping, roles/bounds, framing, collisions, backpressure: passed\n" ++
+            "  direct R + X0/X1 mapping, ownership, bounds, framing, collisions, backpressure: passed\n" ++
             "  storage geometry: 4 x 16384 x 64 = 512 KiB (16 URAM288 target)\n\n",
         .{ beats, groups },
     );
