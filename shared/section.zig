@@ -25,6 +25,113 @@ pub const f32_values_per_word: u32 = 2;
 pub const f32_word_bytes: u32 = f32_values_per_word * @sizeOf(f32);
 pub const f32_rows_per_group: u32 = f32_banks_per_role * f32_values_per_word;
 
+/// Diagnostic status bits shared with `section_rmsnorm_sumsq.v`.
+pub const RmsNormSumsqStatus = struct {
+    pub const bad_cfg: u7 = 1 << 0;
+    pub const nonfinite: u7 = 1 << 1;
+    pub const max_mismatch: u7 = 1 << 2;
+    pub const frame: u7 = 1 << 3;
+    pub const scratch: u7 = 1 << 4;
+    pub const internal: u7 = 1 << 5;
+    pub const subnormal_warning: u7 = 1 << 6;
+    pub const fatal_mask: u7 = bad_cfg | nonfinite | max_mismatch | frame | scratch | internal;
+};
+
+pub const rmsnorm_sumsq_synthetic_model_relative_limit: f64 = 3e-5;
+pub const rmsnorm_sumsq_adversarial_relative_limit: f64 = 1e-3;
+
+pub const RmsNormSumsqError = error{
+    InvalidShape,
+    InvalidMaxExponent,
+    Nonfinite,
+    MaxMismatch,
+    InternalOverflow,
+};
+
+pub const RmsNormSumsqResult = struct {
+    sum_sq: u48,
+    subnormal_warning: bool,
+};
+
+/// Exact integer oracle for the deliberately truncated P3d slice-1 reduction.
+/// `max_exp` is the configured raw binary32 exponent field for one token.
+pub fn rmsNormSumsqFixed(
+    values: []const u32,
+    rows: u32,
+    max_exp: u8,
+) RmsNormSumsqError!RmsNormSumsqResult {
+    if (rows < 8 or rows > model_dim_max or rows % f32_rows_per_group != 0 or
+        values.len != rows)
+        return error.InvalidShape;
+    if (max_exp == 0xff) return error.InvalidMaxExponent;
+
+    var sum: u48 = 0;
+    var subnormal_warning = false;
+    var saw_max_exp = false;
+    for (values) |bits| {
+        const exponent: u8 = @truncate(bits >> 23);
+        const mantissa: u23 = @truncate(bits);
+        if (exponent == 0xff) return error.Nonfinite;
+        if (exponent == 0) {
+            if (mantissa != 0) subnormal_warning = true;
+            continue;
+        }
+        if (max_exp == 0 or exponent > max_exp) return error.MaxMismatch;
+        if (exponent == max_exp) saw_max_exp = true;
+
+        const delta: u8 = max_exp - exponent;
+        const significand: u24 = (@as(u24, 1) << 23) | mantissa;
+        const quant: u18 = if (delta >= 18)
+            0
+        else
+            @truncate(significand >> @intCast(6 + delta));
+        const product: u36 = @as(u36, quant) * @as(u36, quant);
+        const added = @addWithOverflow(sum, @as(u48, product));
+        if (added[1] != 0) return error.InternalOverflow;
+        sum = added[0];
+    }
+    if (max_exp != 0 and !saw_max_exp) return error.MaxMismatch;
+    return .{ .sum_sq = sum, .subnormal_warning = subnormal_warning };
+}
+
+/// Decode the fixed reduction identity into a host-side characterization value.
+pub fn rmsNormSumsqMeanF64(sum_sq: u48, rows: u32, max_exp: u8) f64 {
+    if (sum_sq == 0 or rows == 0) return 0;
+    const scaled = @as(f64, @floatFromInt(sum_sq)) /
+        @as(f64, @floatFromInt(rows));
+    return std.math.ldexp(scaled, 2 * (@as(i32, max_exp) - 144));
+}
+
+/// High-precision-enough characterization of the exact-real input sum. Every
+/// individual binary32 square is exact in f64; only the positive accumulation
+/// can round, far below the diagnostic approximation bound used here.
+pub fn rmsNormSumsqExactMeanF64(values: []const u32) f64 {
+    if (values.len == 0) return 0;
+    var sum: f64 = 0;
+    for (values) |bits| {
+        const exponent: u8 = @truncate(bits >> 23);
+        const mantissa: u23 = @truncate(bits);
+        if (exponent == 0xff) return std.math.nan(f64);
+        if (exponent == 0 and mantissa == 0) continue;
+        const value = if (exponent == 0)
+            std.math.ldexp(@as(f64, @floatFromInt(mantissa)), -149)
+        else
+            std.math.ldexp(
+                @as(f64, @floatFromInt((@as(u24, 1) << 23) | mantissa)),
+                @as(i32, exponent) - 150,
+            );
+        sum += value * value;
+    }
+    return sum / @as(f64, @floatFromInt(values.len));
+}
+
+/// Conservative error envelope for prior-maximum 18-bit quantization plus the
+/// 48-bit aligned accumulation. It is below 0.001 for every legal row count.
+pub fn rmsNormSumsqRelativeErrorBound(rows: u32) f64 {
+    const n = @as(f64, @floatFromInt(rows));
+    return 2.0 * @sqrt(n) / 131072.0 + n / 17179869184.0;
+}
+
 /// Named storage roles. These are schedule contracts, not host-addressable banks.
 pub const F32Role = enum(u8) {
     residual,
@@ -442,6 +549,71 @@ test "P3 FFN pair native ingress reorders into canonical token blocks" {
         error.InvalidSubblock,
         ffnPairNativeTag(4, q8_buffer_block_capacity * 4 * ffn_pair_groups_per_block),
     );
+}
+
+test "P3d RMSNorm sumsq status and fixed integer oracle are explicit" {
+    try std.testing.expectEqual(@as(u7, 0x3f), RmsNormSumsqStatus.fatal_mask);
+    try std.testing.expectEqual(@as(u7, 0x40), RmsNormSumsqStatus.subnormal_warning);
+
+    const ones = [_]u32{0x3f80_0000} ** 8;
+    const one_result = try rmsNormSumsqFixed(&ones, 8, 127);
+    try std.testing.expectEqual(@as(u48, 8) << 34, one_result.sum_sq);
+    try std.testing.expect(!one_result.subnormal_warning);
+    try std.testing.expectEqual(@as(f64, 1), rmsNormSumsqMeanF64(one_result.sum_sq, 8, 127));
+    try std.testing.expectEqual(@as(f64, 1), rmsNormSumsqExactMeanF64(&ones));
+
+    const signed_zero = [_]u32{
+        0, 0x8000_0000, 0, 0x8000_0000,
+        0, 0x8000_0000, 0, 0x8000_0000,
+    };
+    const zero_result = try rmsNormSumsqFixed(&signed_zero, 8, 0);
+    try std.testing.expectEqual(@as(u48, 0), zero_result.sum_sq);
+    try std.testing.expect(!zero_result.subnormal_warning);
+
+    var subnormal = signed_zero;
+    subnormal[3] = 1;
+    const subnormal_result = try rmsNormSumsqFixed(&subnormal, 8, 0);
+    try std.testing.expectEqual(@as(u48, 0), subnormal_result.sum_sq);
+    try std.testing.expect(subnormal_result.subnormal_warning);
+
+    var bad = ones;
+    bad[4] = 0x7f80_0000;
+    try std.testing.expectError(error.Nonfinite, rmsNormSumsqFixed(&bad, 8, 127));
+    bad[4] = 0x4000_0000;
+    try std.testing.expectError(error.MaxMismatch, rmsNormSumsqFixed(&bad, 8, 127));
+    try std.testing.expectError(error.MaxMismatch, rmsNormSumsqFixed(&ones, 8, 128));
+    try std.testing.expectError(error.InvalidMaxExponent, rmsNormSumsqFixed(&ones, 8, 0xff));
+    try std.testing.expectError(error.InvalidShape, rmsNormSumsqFixed(ones[0..7], 7, 127));
+}
+
+test "P3d RMSNorm sumsq oracle covers every exponent-alignment class" {
+    const max_exp: u8 = 140;
+    for (0..20) |delta_usize| {
+        const delta: u8 = @intCast(delta_usize);
+        const exponent = max_exp - delta;
+        const bits = (@as(u32, exponent) << 23) | 0x007f_ffff;
+        var values = [_]u32{0} ** 8;
+        values[0] = (@as(u32, max_exp) << 23) | 0x007f_ffff;
+        values[1] = bits;
+        const got = try rmsNormSumsqFixed(&values, 8, max_exp);
+        const significand: u24 = 0x00ff_ffff;
+        const max_quant: u18 = @truncate(significand >> 6);
+        const quant: u18 = if (delta >= 18)
+            0
+        else
+            @truncate(significand >> @intCast(6 + delta));
+        const max_product: u36 = @as(u36, max_quant) * @as(u36, max_quant);
+        const product: u36 = @as(u36, quant) * @as(u36, quant);
+        try std.testing.expectEqual(
+            @as(u48, max_product) + @as(u48, product),
+            got.sum_sq,
+        );
+    }
+
+    try std.testing.expect(rmsNormSumsqRelativeErrorBound(4096) <
+        rmsnorm_sumsq_adversarial_relative_limit);
+    try std.testing.expect(rmsNormSumsqRelativeErrorBound(2048) <
+        rmsnorm_sumsq_adversarial_relative_limit);
 }
 
 test "v1 Bonsai section shapes and capacities are explicit" {
