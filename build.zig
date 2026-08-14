@@ -283,7 +283,7 @@ fn addFormalSteps(b: *std.Build) void {
     });
     const decode_ffn_step = b.step(
         "formal-decode-ffn",
-        "Model-check v15 section ownership, traversal accounting, abort, and terminal invalidation",
+        "Model-check v16 section ownership, traversal accounting, abort, and terminal invalidation",
     );
     decode_ffn_step.dependOn(&decode_ffn_run.step);
 
@@ -393,6 +393,9 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/q8_quantizer.v",
     "fpga/rtl/section_swiglu.v",
     "fpga/rtl/section_f32_scratch.v",
+    "fpga/rtl/section_gate_packer.v",
+    "fpga/rtl/section_ffn_pairer.v",
+    "fpga/rtl/section_q8_buffer.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
@@ -401,7 +404,7 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_swiglu.v fpga/rtl/section_f32_scratch.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fmul.v fpga/rtl/numeric/fadd.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_swiglu.v fpga/rtl/section_f32_scratch.v fpga/rtl/section_gate_packer.v fpga/rtl/section_ffn_pairer.v fpga/rtl/section_q8_buffer.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fmul.v fpga/rtl/numeric/fadd.v fpga/rtl/numeric/fma.v";
 
 // Exact canonical FP32 -> Q8_0 activation quantizer. Kept standalone until its
 // numerical and routed-cost gates justify attaching it to the GEMM activation RAM.

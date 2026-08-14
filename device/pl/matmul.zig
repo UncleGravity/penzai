@@ -79,6 +79,8 @@ const SCRATCH_SECTION_DONE: u32 = 1 << 12;
 const SCRATCH_FFN_PRODUCER_BUSY: u32 = SCRATCH_CONSUMER_BUSY;
 const SCRATCH_FFN_PRODUCER_DONE: u32 = SCRATCH_CONSUMER_DONE;
 const SCRATCH_FFN_GATE_READY: u32 = 1 << 13;
+const SCRATCH_STREAMING_RESTART_BUSY: u32 = SCRATCH_WRITER_BUSY | SCRATCH_DRAIN_BUSY |
+    SCRATCH_FFN_PRODUCER_BUSY | SCRATCH_SECTION_ACTIVE;
 
 const ActivationMode = enum(u32) {
     packed_load = 0,
@@ -113,12 +115,28 @@ pub const version_with_ffn_section: u32 = 15;
 pub const version_with_streaming_ffn: u32 = 16;
 
 const FfnSectionSchedule = enum { legacy_scratch, streaming_q8 };
+const StreamingFfnWaitState = enum { pending, kernel_done, scratch_error };
 
 fn ffnSectionSchedule(version: u32) FfnSectionSchedule {
     return if (version >= version_with_streaming_ffn)
         .streaming_q8
     else
         .legacy_scratch;
+}
+
+fn streamingFfnRestartSafe(scratch_status: u32) bool {
+    return scratch_status & SCRATCH_STREAMING_RESTART_BUSY == 0;
+}
+
+fn classifyStreamingFfnWait(
+    scratch_status: u32,
+    kernel_status: u32,
+    terminal_scratch_status: u32,
+) StreamingFfnWaitState {
+    if (scratch_status & SCRATCH_ANY_ERROR != 0) return .scratch_error;
+    if (kernel_status & STATUS_DONE == 0) return .pending;
+    if (terminal_scratch_status & SCRATCH_ANY_ERROR != 0) return .scratch_error;
+    return .kernel_done;
 }
 /// Identity/shape the driver requires of the loaded kernel, sourced from the regmap
 /// reset column (the gateware's self-described values) so the runtime check and the
@@ -232,16 +250,51 @@ pub const Kernel = struct {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
             if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0) {
-                if (self.hasActivationReuse() and
-                    self.win.rd(regmap.offsetOf("ACT_STATE")) & ACT_STATE_ERROR != 0)
-                {
-                    if (self.quantStatus() != 0) return error.ActivationQuantization;
-                    return error.ActivationState;
-                }
-                return;
+                return self.checkDoneState();
             }
         }
         return error.KernelTimeout;
+    }
+
+    /// A streaming FFN run can fail in a section leaf before the kernel reaches
+    /// its terminal state. Prefer that precise fault while also bounding the
+    /// kernel wait; RTL drives every section fault into activation_abort.
+    pub fn waitFfnKernelDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasStreamingFfn());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const scratch_status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            const kernel_status = self.win.rd(regmap.offsetOf("STATUS"));
+            const terminal_scratch_status = if (kernel_status & STATUS_DONE != 0)
+                self.win.rd(regmap.offsetOf("SCRATCH_STATUS"))
+            else
+                scratch_status;
+            switch (classifyStreamingFfnWait(
+                scratch_status,
+                kernel_status,
+                terminal_scratch_status,
+            )) {
+                .pending => continue,
+                .kernel_done => return self.checkDoneState(),
+                .scratch_error => {
+                    std.debug.print("pl: streaming FFN failed status=0x{x} error=0x{x}\n", .{
+                        terminal_scratch_status,
+                        self.win.rd(regmap.offsetOf("SCRATCH_ERROR")),
+                    });
+                    return error.ScratchState;
+                },
+            }
+        }
+        return error.KernelTimeout;
+    }
+
+    fn checkDoneState(self: *Kernel) KernelError!void {
+        if (self.hasActivationReuse() and
+            self.win.rd(regmap.offsetOf("ACT_STATE")) & ACT_STATE_ERROR != 0)
+        {
+            if (self.quantStatus() != 0) return error.ActivationQuantization;
+            return error.ActivationState;
+        }
     }
 
     pub fn residentMatches(self: Kernel, epoch: u32, q1_blocks: u32, cols: u32) bool {
@@ -380,6 +433,25 @@ pub const Kernel = struct {
             self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_ABORT);
         }
         self.selectDdrResult();
+    }
+
+    /// Abort a v16 section and wait until every retained owner has drained.
+    /// SCRATCH_ANY_ERROR is sticky across abort and is intentionally ignored.
+    pub fn finishStreamingFfnSection(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasStreamingFfn());
+        self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_ABORT);
+        defer self.selectDdrResult();
+
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            if (streamingFfnRestartSafe(status)) return;
+        }
+        std.debug.print("pl: streaming FFN abort cleanup timed out status=0x{x} error=0x{x}\n", .{
+            self.win.rd(regmap.offsetOf("SCRATCH_STATUS")),
+            self.win.rd(regmap.offsetOf("SCRATCH_ERROR")),
+        });
+        return error.ScratchTimeout;
     }
 
     pub fn cycles(self: Kernel) u32 {
@@ -580,10 +652,13 @@ pub fn Backend(comptime Heap: type) type {
             comptime std.debug.assert(dma_w_bases.len == layout.weight_ports);
             var kernel = try Kernel.open(kernel_base);
             errdefer kernel.deinit();
-            // Userspace can restart without reconfiguring PL. Restore the
-            // legacy-safe mode before any optional seq.v command can run.
+            // Userspace can restart without reconfiguring PL. Restore the safe
+            // idle mode before any optional seq.v command can run.
             kernel.selectPackedActivation();
-            kernel.finishScratchDiagnostic();
+            if (kernel.hasStreamingFfn())
+                try kernel.finishStreamingFfnSection()
+            else
+                kernel.finishScratchDiagnostic();
 
             const scratch_requested = envEnabled("PENZAI_PL_SCRATCH_VERIFY");
             const scratch_verify = scratch_requested and kernel.hasScratch();
@@ -1060,6 +1135,7 @@ pub fn Backend(comptime Heap: type) type {
             };
             var section_started = false;
             var dmas_armed = false;
+            var scratch_cleanup_safe = true;
             defer {
                 if (section_started) self.kernel.finishScratchDiagnostic();
                 self.kernel.selectPackedActivation();
@@ -1068,10 +1144,17 @@ pub fn Backend(comptime Heap: type) type {
                 // Release scratch/kernel ownership before resetting movers that
                 // may still be connected to an active section command.
                 if (section_started) {
-                    self.kernel.finishScratchDiagnostic();
+                    if (streaming_ffn) {
+                        self.kernel.finishStreamingFfnSection() catch |cleanup_err| {
+                            scratch_cleanup_safe = false;
+                            std.debug.print("pl: streaming FFN cleanup failed: {s}\n", .{@errorName(cleanup_err)});
+                        };
+                    } else {
+                        self.kernel.finishScratchDiagnostic();
+                    }
                     section_started = false;
                 }
-                if (dmas_armed) self.abortProjectionDmas();
+                if (dmas_armed and scratch_cleanup_safe) self.abortProjectionDmas();
             }
 
             var col0: usize = 0;
@@ -1137,7 +1220,10 @@ pub fn Backend(comptime Heap: type) type {
                         epoch,
                     );
                     result.gate_up.setup_ns +|= profile.lap(ctx, &last);
-                    try self.kernel.waitDone();
+                    if (streaming_ffn)
+                        try self.kernel.waitFfnKernelDone()
+                    else
+                        try self.kernel.waitDone();
                     if (projection_index == 1 and streaming_ffn)
                         try self.kernel.waitFfnProducerDone()
                     else
@@ -1171,7 +1257,10 @@ pub fn Backend(comptime Heap: type) type {
                     self.takeActivationEpoch(),
                 );
                 result.down.setup_ns +|= profile.lap(ctx, &last);
-                try self.kernel.waitDone();
+                if (streaming_ffn)
+                    try self.kernel.waitFfnKernelDone()
+                else
+                    try self.kernel.waitDone();
                 if (!streaming_ffn)
                     try self.kernel.waitFfnConsumerDone();
                 try self.kernel.waitFfnSectionDone();
@@ -1555,6 +1644,35 @@ test "FFN section schedule switches only at kernel v16" {
     try std.testing.expectEqual(
         FfnSectionSchedule.streaming_q8,
         ffnSectionSchedule(version_with_streaming_ffn + 1),
+    );
+}
+
+test "streaming FFN restart waits for all retained owner classes" {
+    try std.testing.expect(streamingFfnRestartSafe(0));
+    try std.testing.expect(streamingFfnRestartSafe(SCRATCH_ANY_ERROR));
+    try std.testing.expect(!streamingFfnRestartSafe(SCRATCH_WRITER_BUSY));
+    try std.testing.expect(!streamingFfnRestartSafe(SCRATCH_DRAIN_BUSY));
+    try std.testing.expect(!streamingFfnRestartSafe(SCRATCH_FFN_PRODUCER_BUSY));
+    try std.testing.expect(!streamingFfnRestartSafe(SCRATCH_SECTION_ACTIVE));
+    try std.testing.expect(!streamingFfnRestartSafe(SCRATCH_STREAMING_RESTART_BUSY));
+}
+
+test "streaming FFN wait gives scratch faults terminal precedence" {
+    try std.testing.expectEqual(
+        StreamingFfnWaitState.pending,
+        classifyStreamingFfnWait(0, 0, SCRATCH_ANY_ERROR),
+    );
+    try std.testing.expectEqual(
+        StreamingFfnWaitState.scratch_error,
+        classifyStreamingFfnWait(SCRATCH_ANY_ERROR, 0, SCRATCH_ANY_ERROR),
+    );
+    try std.testing.expectEqual(
+        StreamingFfnWaitState.kernel_done,
+        classifyStreamingFfnWait(0, STATUS_DONE, 0),
+    );
+    try std.testing.expectEqual(
+        StreamingFfnWaitState.scratch_error,
+        classifyStreamingFfnWait(0, STATUS_DONE, SCRATCH_ANY_ERROR),
     );
 }
 

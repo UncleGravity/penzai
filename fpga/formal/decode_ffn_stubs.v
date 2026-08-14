@@ -60,9 +60,9 @@ module q8_ingress (
                 end else if (scalar_count == 6'd31) begin
                     scalar_count <= 6'd0;
                     emit_count <= 3'd0;
-                    // Model the canonical quantizer's nontrivial block latency so
-                    // the controller proof exercises multiple queued blocks.
-                    quant_wait <= 7'd64;
+                    // Retain a nonzero quantizer boundary without dominating the
+                    // bounded integration proof depth.
+                    quant_wait <= 7'd2;
                 end else begin
                     scalar_count <= scalar_count + 1'b1;
                 end
@@ -150,13 +150,16 @@ module section_f32_scratch (
 );
     reg wr_busy_q;
     reg rd_valid_q;
+    reg rd_pending_q;
+    reg [2:0] rd_delay_q;
     assign wr_cfg_ready = rst_n && !wr_busy_q && !wr_abort;
     assign wr_busy = wr_busy_q;
     assign s_axis_tready = wr_busy_q && !wr_abort;
     assign wr_commit_valid = 1'b0;
     assign wr_commit_bank = 2'd0;
     assign wr_commit_address = 14'd0;
-    assign rd_req_ready = rst_n && (!rd_valid_q || rd_rsp_ready);
+    assign rd_req_ready = rst_n && !rd_pending_q &&
+                          (!rd_valid_q || rd_rsp_ready);
     assign rd_issue_valid = rd_req_valid && rd_req_ready;
     assign rd_issue_address = {3'd0, rd_req_group};
     assign rd_rsp_valid = rd_valid_q;
@@ -168,6 +171,8 @@ module section_f32_scratch (
             wr_done <= 1'b0;
             wr_error <= 1'b0;
             rd_valid_q <= 1'b0;
+            rd_pending_q <= 1'b0;
+            rd_delay_q <= 3'd0;
             rd_rsp_error <= 1'b0;
         end else begin
             wr_done <= 1'b0;
@@ -184,8 +189,16 @@ module section_f32_scratch (
             end
             if (rd_rsp_ready) rd_valid_q <= 1'b0;
             if (rd_req_valid && rd_req_ready) begin
-                rd_valid_q <= 1'b1;
+                rd_pending_q <= 1'b1;
+                rd_delay_q <= 3'd5;
                 rd_rsp_error <= 1'b0;
+            end else if (rd_pending_q) begin
+                if (rd_delay_q == 1) begin
+                    rd_pending_q <= 1'b0;
+                    rd_valid_q <= 1'b1;
+                end else begin
+                    rd_delay_q <= rd_delay_q - 1'b1;
+                end
             end
         end
     end
@@ -219,20 +232,28 @@ module gemm_kernel #(
     output wire [7:0] m_axis_tkeep, output wire [3:0] dbg_state
 );
     reg busy_q;
+    reg [1:0] mode_q;
     reg [8:0] wait_count;
+    reg [15:0] result_beats_left_q;
+    reg [15:0] act_beats_left_q;
     assign busy = busy_q;
     assign s_axis_tready = busy_q;
-    assign s_axis_acts_tready = busy_q;
+    assign s_axis_acts_tready = busy_q && (mode_q == 2'd0) &&
+                                (act_beats_left_q != 0);
     assign m_axis_tdata = 64'd0;
-    assign m_axis_tvalid = 1'b0;
-    assign m_axis_tlast = 1'b0;
+    assign m_axis_tvalid = busy_q && (mode_q == 2'd1) &&
+                           (result_beats_left_q != 0);
+    assign m_axis_tlast = m_axis_tvalid && (result_beats_left_q == 1);
     assign m_axis_tkeep = 8'hff;
     assign dbg_state = busy_q ? 4'd1 : 4'd0;
 
     always @(posedge clk) begin
         if (!rst_n) begin
             busy_q <= 1'b0;
+            mode_q <= 2'd0;
             wait_count <= 9'd0;
+            result_beats_left_q <= 16'd0;
+            act_beats_left_q <= 16'd0;
             kernel_done <= 1'b0;
             activation_error <= 1'b0;
             activation_valid <= 1'b0;
@@ -243,10 +264,12 @@ module gemm_kernel #(
             kernel_done <= 1'b0;
             if (start_kernel && !busy_q) begin
                 busy_q <= 1'b1;
-                // Internal activation production owns completion ordering. Keep
-                // this control stub busy beyond the proof horizon so it cannot
-                // retire before the buffered Q8 source has delivered its records.
-                wait_count <= (act_epoch == 32'd2) ? 9'd500 : 9'd3;
+                mode_q <= act_mode;
+                wait_count <= 9'd3;
+                result_beats_left_q <= (act_mode == 2'd1) ?
+                    (num_rowblocks * num_cols * 16'd8) : 16'd0;
+                act_beats_left_q <= (act_mode == 2'd0) ?
+                    (num_q1_blocks * num_cols * 16'd20) : 16'd0;
                 activation_error <= 1'b0;
                 if (act_mode == 2'd2) begin
                     activation_valid <= 1'b1;
@@ -259,11 +282,29 @@ module gemm_kernel #(
                 kernel_done <= 1'b1;
                 activation_error <= 1'b1;
                 activation_valid <= 1'b0;
+                result_beats_left_q <= 16'd0;
+                act_beats_left_q <= 16'd0;
             end else if (busy_q) begin
-                if (wait_count == 0) begin
+                if (m_axis_tvalid && m_axis_tready) begin
+                    result_beats_left_q <= result_beats_left_q - 1'b1;
+                    if (result_beats_left_q == 1) begin
+                        busy_q <= 1'b0;
+                        kernel_done <= 1'b1;
+                    end
+                end else if (s_axis_acts_tvalid && s_axis_acts_tready) begin
+                    act_beats_left_q <= act_beats_left_q - 1'b1;
+                    if (act_beats_left_q == 1) begin
+                        busy_q <= 1'b0;
+                        kernel_done <= 1'b1;
+                        activation_valid <= 1'b1;
+                        loaded_act_epoch <= act_epoch;
+                        loaded_act_q1_blocks <= num_q1_blocks;
+                        loaded_act_cols <= num_cols;
+                    end
+                end else if ((mode_q == 2'd2) && (wait_count == 0)) begin
                     busy_q <= 1'b0;
                     kernel_done <= 1'b1;
-                end else begin
+                end else if (mode_q == 2'd2) begin
                     wait_count <= wait_count - 1'b1;
                 end
             end

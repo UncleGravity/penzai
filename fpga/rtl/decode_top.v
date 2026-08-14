@@ -125,6 +125,43 @@ module decode_top #(
     input  wire         m_axis_tready,
     (* X_INTERFACE_INFO = "xilinx.com:interface:axis:1.0 M_AXIS TLAST" *)
     output wire         m_axis_tlast
+`ifdef VERILATOR
+    , input wire         sim_inject_q8_numeric_error
+`endif
+`ifdef FORMAL
+    , output wire [2:0]  formal_ffn_phase
+    , output wire        formal_ffn_gate_ready
+    , output wire [1:0]  formal_scratch_rd_owner
+    , output wire        formal_scratch_rd_rsp_valid
+    , output wire        formal_scratch_rd_rsp_ready
+    , output wire        formal_section_active
+    , output wire        formal_section_done
+    , output wire        formal_abort_cleanup
+    , output wire [6:0]  formal_scratch_error
+    , output wire        formal_capture_fire
+    , output wire        formal_capture_record_done
+    , output wire [10:0] formal_bank0_record_count
+    , output wire        formal_replay_fire
+    , output wire        formal_replay_complete
+    , output wire        formal_down_kernel_done
+    , output wire        formal_kernel_done
+    , output wire        formal_abort_strobe
+    , output wire        formal_ffn_fault
+    , output wire        formal_section_begin_ok
+    , output wire        formal_up_start
+    , output wire        formal_gate_start
+    , output wire        formal_gate_drain_ready
+    , output wire        formal_seal_done
+    , output wire        formal_down_start
+    , output wire        formal_down_complete_ready
+    , output wire        formal_producer_done
+    , output wire [1:0]  formal_capture_token
+    , output wire [8:0]  formal_capture_block
+    , output wire [2:0]  formal_capture_beat
+    , output wire [1:0]  formal_replay_token
+    , output wire [8:0]  formal_replay_block
+    , output wire [2:0]  formal_replay_beat
+`endif
 );
     localparam integer ROWS = 16;
 
@@ -201,6 +238,49 @@ module decode_top #(
     reg [255:0] scratch_consumer_gate_q;
     reg [255:0] scratch_consumer_up_q;
 
+    // V16 streaming FFN lifecycle. The existing section registers remain the
+    // software contract; these snapshots and counters own one accepted section.
+    reg [13:0] ffn_rows_q;
+    reg [2:0]  ffn_tokens_q;
+    reg [8:0]  ffn_blocks_q;
+    reg        ffn_gate_start_q;
+    reg        ffn_down_start_q;
+    reg        ffn_gate_run_q;
+    reg        ffn_producer_busy_q;
+    reg        ffn_producer_done_q;
+    reg [1:0]  ffn_capture_token_q;
+    reg [8:0]  ffn_capture_block_q;
+    reg        ffn_seal_pending_q;
+    reg        ffn_replay_active_q;
+    reg        ffn_replay_inflight_q;
+    reg [1:0]  ffn_replay_token_q;
+    reg [8:0]  ffn_replay_block_q;
+    reg [2:0]  ffn_capture_beat_q;
+    reg [2:0]  ffn_replay_beat_q;
+    reg        ffn_capture_complete_q;
+    reg        ffn_replay_complete_q;
+    reg        ffn_gate_kernel_done_q;
+    reg        ffn_gate_packer_done_q;
+    reg        ffn_gate_pairer_done_q;
+    reg        ffn_down_kernel_done_q;
+
+    localparam [2:0] FFN_IDLE      = 3'd0;
+    localparam [2:0] FFN_WAIT_UP   = 3'd1;
+    localparam [2:0] FFN_UP_RUN    = 3'd2;
+    localparam [2:0] FFN_WAIT_GATE = 3'd3;
+    localparam [2:0] FFN_GATE_RUN  = 3'd4;
+    localparam [2:0] FFN_SEAL      = 3'd5;
+    localparam [2:0] FFN_WAIT_DOWN = 3'd6;
+    localparam [2:0] FFN_DOWN_RUN  = 3'd7;
+    reg [2:0] ffn_phase_q;
+    reg       ffn_fault_q;
+    reg       ffn_abort_cleanup_q;
+
+    localparam [1:0] SCRATCH_RD_NONE   = 2'd0;
+    localparam [1:0] SCRATCH_RD_DRAIN  = 2'd1;
+    localparam [1:0] SCRATCH_RD_PAIRER = 2'd2;
+    reg [1:0] scratch_rd_owner_q;
+
     // Fixed-point window floor: a constant of the f16 format (min contribution exponent
     // e_ws+e_as = -24 + -24), NOT a runtime register. Wired straight to the kernel; the
     // 104-bit accumulator (gemm_kernel ACC_W) covers the full f16 range with no calibration.
@@ -257,15 +337,28 @@ module decode_top #(
     wire swiglu_out_last;
     wire [1:0] swiglu_out_status;
 
+    wire section_abort_now = scratch_abort_strobe;
+    wire qualified_kernel_start = kernel_start_q && !section_abort_now &&
+                                  !ffn_fault_q;
+    wire q8_ingress_start = ffn_gate_start_q ||
+                            (qualified_kernel_start && raw_activation_mode &&
+                             !ffn_down_start_q);
+    wire q8_ingress_internal_mode = ffn_gate_start_q;
+    wire [15:0] q8_ingress_blocks = ffn_gate_start_q ?
+                                     {9'd0, ffn_rows_q[13:7]} :
+                                     num_q1_blocks_q;
+    wire [15:0] q8_ingress_cols = ffn_gate_start_q ?
+                                   {13'd0, ffn_tokens_q} : num_cols_q;
+
     q8_ingress u_q8_ingress (
         .clk(clk),
         .rst_n(rst_n),
-        .start(kernel_start),
+        .start(q8_ingress_start),
         .abort(q8_ingress_abort),
-        .raw_mode(raw_activation_mode),
-        .internal_mode(internal_activation_mode),
-        .num_q1_blocks(num_q1_blocks_q),
-        .num_cols(num_cols_q),
+        .raw_mode(raw_activation_mode || ffn_gate_start_q),
+        .internal_mode(q8_ingress_internal_mode),
+        .num_q1_blocks(q8_ingress_blocks),
+        .num_cols(q8_ingress_cols),
         .s_axis_tdata(s_axis_acts_tdata),
         .s_axis_tvalid(s_axis_acts_tvalid),
         .s_axis_tready(raw_acts_tready),
@@ -283,11 +376,45 @@ module decode_top #(
         .quantizer_status(quantizer_status)
     );
 
-    wire [63:0] kernel_acts_tdata = raw_activation_mode ? native_acts_tdata : s_axis_acts_tdata;
-    wire kernel_acts_tvalid = raw_activation_mode ? native_acts_tvalid : s_axis_acts_tvalid;
-    assign native_acts_tready = raw_activation_mode && kernel_acts_tready;
+    wire [63:0] q8_buffer_m_axis_tdata;
+    wire q8_buffer_m_axis_tvalid;
+    wire q8_buffer_m_axis_tready;
+    wire q8_buffer_m_axis_tlast;
+    wire q8_buffer_m_axis_error;
+    wire q8_buffer_m_axis_bank;
+    wire [1:0] q8_buffer_m_axis_token;
+    wire [8:0] q8_buffer_m_axis_block;
+    wire q8_buffer_replay_selected = ffn_replay_active_q ||
+                                     ffn_replay_inflight_q;
+
+    wire q8_buffer_replay_tag_ok = !q8_buffer_m_axis_bank &&
+                                   (q8_buffer_m_axis_token ==
+                                    ffn_replay_token_q) &&
+                                   (q8_buffer_m_axis_block ==
+                                    ffn_replay_block_q) &&
+                                   (q8_buffer_m_axis_tlast ==
+                                    (ffn_replay_beat_q == 3'd4));
+    wire q8_buffer_replay_healthy = !q8_buffer_m_axis_error &&
+                                     q8_buffer_replay_tag_ok;
+
+    wire [63:0] kernel_acts_tdata = q8_buffer_replay_selected ?
+                                    q8_buffer_m_axis_tdata :
+                                    (raw_activation_mode ?
+                                     native_acts_tdata : s_axis_acts_tdata);
+    wire kernel_acts_tvalid = q8_buffer_replay_selected ?
+                              (q8_buffer_m_axis_tvalid &&
+                               q8_buffer_replay_healthy) :
+                              (raw_activation_mode ?
+                               native_acts_tvalid : s_axis_acts_tvalid);
+    assign native_acts_tready = ffn_producer_busy_q ? q8_buffer_s_axis_tready :
+                                (raw_activation_mode && !q8_buffer_replay_selected ?
+                                 kernel_acts_tready : 1'b0);
+    assign q8_buffer_m_axis_tready = q8_buffer_replay_selected &&
+                                     q8_buffer_replay_healthy &&
+                                     kernel_acts_tready;
     assign s_axis_acts_tready = internal_activation_mode ? 1'b0 :
-                                (raw_activation_mode ? raw_acts_tready : kernel_acts_tready);
+                                (raw_activation_mode ? raw_acts_tready :
+                                 kernel_acts_tready);
 
     wire [63:0] kernel_m_axis_tdata;
     wire        kernel_m_axis_tvalid;
@@ -313,21 +440,6 @@ module decode_top #(
                                 (num_rows_q == {18'd0, scratch_rows_q}) &&
                                 (num_cols_q == {13'd0, scratch_tokens_q}) &&
                                 (num_rowblocks_q == {6'd0, scratch_rows_q[13:4]});
-    wire scratch_only_order_ok = ((scratch_role_q == 2'd2) &&
-                                  !scratch_valid_q[2] && !scratch_valid_q[1]) ||
-                                 ((scratch_role_q == 2'd1) &&
-                                  scratch_valid_q[2] && !scratch_valid_q[1]);
-    wire scratch_only_shape_ok = (scratch_mode_q == SCRATCH_MODE_ONLY) &&
-                                 scratch_section_active_q && scratch_only_order_ok &&
-                                 ((scratch_role_q == 2'd1) || (scratch_role_q == 2'd2)) &&
-                                 (scratch_rows_q != 14'd0) &&
-                                 (scratch_rows_q <= 14'd12288) &&
-                                 (scratch_rows_q[3:0] == 4'd0) &&
-                                 (scratch_tokens_q != 3'd0) &&
-                                 (scratch_tokens_q <= 3'd4) &&
-                                 (num_rows_q == {18'd0, scratch_rows_q}) &&
-                                 (num_cols_q == {13'd0, scratch_tokens_q}) &&
-                                 (num_rowblocks_q == {6'd0, scratch_rows_q[13:4]});
     wire scratch_wr_cfg_ready;
     wire scratch_wr_busy;
     wire scratch_wr_done;
@@ -348,10 +460,34 @@ module decode_top #(
     wire [255:0] scratch_rd_rsp_data;
     wire scratch_rd_rsp_error;
 
+    wire gate_packer_start_ready;
+    wire gate_packer_busy;
+    wire gate_packer_done;
+    wire gate_packer_error;
+    wire ffn_pairer_start_ready;
+    wire ffn_pairer_busy;
+    wire ffn_pairer_done;
+    wire ffn_pairer_error;
+    wire q8_buffer_cfg_ready;
+    wire q8_buffer_seal_ready;
+    wire q8_buffer_seal_done;
+    wire q8_buffer_seal_error;
+    wire [1:0] q8_buffer_bank_clearing;
+    wire [1:0] q8_buffer_bank_active;
+    wire [1:0] q8_buffer_bank_valid;
+    wire [1:0] q8_buffer_bank_error;
+    wire q8_buffer_s_axis_tready;
+    wire q8_buffer_cap_record_done;
+    wire q8_buffer_cap_record_error;
+    wire [10:0] q8_buffer_bank0_record_count;
+
     wire scratch_idle = !kernel_busy && !kernel_start_q &&
                         !scratch_tee_run_q && !scratch_only_run_q &&
                         !scratch_wr_busy && !scratch_drain_busy_q &&
-                        !scratch_consumer_busy_q && !scratch_rd_rsp_valid &&
+                        !scratch_consumer_busy_q && !ffn_gate_run_q &&
+                        !ffn_producer_busy_q && !ffn_replay_active_q &&
+                        !ffn_replay_inflight_q && !scratch_rd_rsp_valid &&
+                        (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
                         scratch_rd_req_ready;
     wire scratch_consumer_metadata_ok = scratch_valid_q[1] && scratch_valid_q[2] &&
                                         (scratch_valid_rows_q[1] == scratch_rows_q) &&
@@ -369,25 +505,86 @@ module decode_top #(
                                      (scratch_tokens_q <= 3'd4) &&
                                      (num_q1_blocks_q == {9'd0, scratch_rows_q[13:7]}) &&
                                      (num_cols_q == {13'd0, scratch_tokens_q});
+    wire ffn_gate_ready = (ffn_phase_q == FFN_WAIT_GATE) &&
+                          scratch_valid_q[2] &&
+                          (scratch_valid_rows_q[2] == ffn_rows_q) &&
+                          (scratch_valid_tokens_q[2] == ffn_tokens_q) &&
+                          q8_buffer_bank_active[0] &&
+                          !q8_buffer_bank_valid[0] &&
+                          !q8_buffer_bank_error[0] &&
+                          !ffn_producer_busy_q && !ffn_producer_done_q;
+    wire ffn_up_candidate = (ffn_phase_q == FFN_WAIT_UP) &&
+                            scratch_section_active_q &&
+                            (scratch_mode_q == SCRATCH_MODE_ONLY) &&
+                            (scratch_role_q == 2'd2);
+    wire ffn_up_shape_ok = ffn_up_candidate &&
+                           (act_mode_q == 2'd2) &&
+                           (scratch_rows_q == ffn_rows_q) &&
+                           (scratch_tokens_q == ffn_tokens_q) &&
+                           (num_rows_q == {18'd0, ffn_rows_q}) &&
+                           (num_cols_q == {13'd0, ffn_tokens_q}) &&
+                           (num_rowblocks_q == {6'd0, ffn_rows_q[13:4]});
+    wire ffn_up_preflight_ok = ffn_up_shape_ok && scratch_wr_cfg_ready &&
+                               scratch_idle;
+
+    wire ffn_gate_candidate = (ffn_phase_q == FFN_WAIT_GATE) &&
+                              scratch_section_active_q &&
+                              (scratch_mode_q == SCRATCH_MODE_ONLY) &&
+                              (scratch_role_q == 2'd1);
+    wire ffn_gate_shape_ok = ffn_gate_candidate && ffn_gate_ready &&
+                             (act_mode_q == 2'd1) &&
+                             (scratch_rows_q == ffn_rows_q) &&
+                             (scratch_tokens_q == ffn_tokens_q) &&
+                             (num_rows_q == {18'd0, ffn_rows_q}) &&
+                             (num_cols_q == {13'd0, ffn_tokens_q}) &&
+                             (num_rowblocks_q == {6'd0, ffn_rows_q[13:4]});
+    wire ffn_gate_preflight_ok = ffn_gate_shape_ok && scratch_idle &&
+                                 gate_packer_start_ready &&
+                                 ffn_pairer_start_ready;
+
+    wire ffn_down_candidate = (ffn_phase_q == FFN_WAIT_DOWN) &&
+                              internal_activation_mode &&
+                              scratch_section_active_q &&
+                              (scratch_mode_q == SCRATCH_MODE_DDR);
+    wire ffn_down_shape_ok = ffn_down_candidate && ffn_producer_done_q &&
+                             q8_buffer_bank_valid[0] &&
+                             !q8_buffer_bank_error[0] &&
+                             (scratch_rows_q == ffn_rows_q) &&
+                             (scratch_tokens_q == ffn_tokens_q) &&
+                             (num_q1_blocks_q == {9'd0, ffn_rows_q[13:7]}) &&
+                             (num_cols_q == {13'd0, ffn_tokens_q});
+    wire ffn_down_preflight_ok = ffn_down_shape_ok && scratch_idle;
+
     wire scratch_ddr_preflight_ok = (scratch_mode_q == SCRATCH_MODE_DDR) &&
                                     scratch_idle &&
-                                    (internal_activation_mode ? scratch_consumer_shape_ok :
-                                     !scratch_section_active_q);
+                                    (ffn_down_candidate ? ffn_down_shape_ok :
+                                     (!scratch_section_active_q &&
+                                      !internal_activation_mode));
     wire scratch_tee_preflight_ok = scratch_tee_shape_ok && scratch_wr_cfg_ready &&
                                     scratch_idle && !scratch_section_active_q;
-    wire scratch_only_preflight_ok = scratch_only_shape_ok && scratch_wr_cfg_ready && scratch_idle;
     wire scratch_launch_ok = scratch_ddr_preflight_ok ||
                              scratch_tee_preflight_ok ||
-                             scratch_only_preflight_ok;
+                             ffn_up_preflight_ok ||
+                             ffn_gate_preflight_ok ||
+                             ffn_down_preflight_ok;
     wire scratch_tee_start = scratch_tee_start_q;
     wire scratch_only_start = scratch_only_start_q;
     wire scratch_consumer_start = scratch_consumer_start_q;
-    assign kernel_start = kernel_start_q;
+    assign kernel_start = qualified_kernel_start;
     wire scratch_start_rejected = start_strobe && !scratch_launch_ok;
+    wire scratch_section_shape_ok = (scratch_rows_q != 14'd0) &&
+                                    (scratch_rows_q <= 14'd12288) &&
+                                    (scratch_rows_q[6:0] == 7'd0) &&
+                                    (scratch_tokens_q != 3'd0) &&
+                                    (scratch_tokens_q <= 3'd4);
     wire scratch_section_begin_ok = scratch_section_begin_strobe &&
+                                    !scratch_abort_strobe &&
                                     (scratch_mode_q == SCRATCH_MODE_DDR) &&
-                                    scratch_idle && !scratch_section_active_q;
+                                    scratch_section_shape_ok &&
+                                    q8_buffer_cfg_ready && scratch_idle &&
+                                    !scratch_section_active_q;
     wire scratch_section_begin_bad = scratch_section_begin_strobe &&
+                                     !scratch_abort_strobe &&
                                      !scratch_section_begin_ok;
 
     // Complete shape/ownership preflight before presenting a launch to GEMM.
@@ -399,13 +596,20 @@ module decode_top #(
             scratch_tee_start_q      <= 1'b0;
             scratch_only_start_q     <= 1'b0;
             scratch_consumer_start_q <= 1'b0;
+            ffn_gate_start_q         <= 1'b0;
+            ffn_down_start_q         <= 1'b0;
         end else begin
-            kernel_start_q <= start_strobe && scratch_launch_ok;
-            scratch_tee_start_q <= start_strobe && scratch_tee_preflight_ok;
-            scratch_only_start_q <= start_strobe && scratch_only_preflight_ok;
-            scratch_consumer_start_q <= start_strobe &&
-                                        scratch_ddr_preflight_ok &&
-                                        internal_activation_mode;
+            kernel_start_q <= start_strobe && scratch_launch_ok &&
+                              !scratch_abort_strobe && !ffn_fault_q;
+            scratch_tee_start_q <= start_strobe && scratch_tee_preflight_ok &&
+                                   !scratch_abort_strobe && !ffn_fault_q;
+            scratch_only_start_q <= start_strobe && ffn_up_preflight_ok &&
+                                    !scratch_abort_strobe && !ffn_fault_q;
+            scratch_consumer_start_q <= 1'b0;
+            ffn_gate_start_q <= start_strobe && ffn_gate_preflight_ok &&
+                                !scratch_abort_strobe && !ffn_fault_q;
+            ffn_down_start_q <= start_strobe && ffn_down_preflight_ok &&
+                                !scratch_abort_strobe && !ffn_fault_q;
         end
     end
 
@@ -417,16 +621,100 @@ module decode_top #(
     wire scratch_sink_valid = scratch_writer_active && kernel_m_axis_tvalid &&
                               (scratch_only_active || m_axis_tready);
     wire ddr_kernel_valid = kernel_m_axis_tvalid && !scratch_only_active &&
+                            !ffn_gate_run_q &&
                             (!scratch_tee_active || scratch_wr_tready);
-    assign kernel_m_axis_tready = scratch_only_active ? scratch_wr_tready :
+    wire gate_packer_s_axis_tready;
+    assign kernel_m_axis_tready = ffn_gate_run_q ? gate_packer_s_axis_tready :
+                                  (scratch_only_active ? scratch_wr_tready :
                                   (scratch_tee_active ?
                                    (m_axis_tready && scratch_wr_tready) :
-                                   (scratch_drain_busy_q ? 1'b0 : m_axis_tready));
+                                   (scratch_drain_busy_q ? 1'b0 : m_axis_tready)));
 
     wire scratch_writer_abort = scratch_abort_strobe ||
                                 (scratch_writer_active &&
                                  (q8_activation_abort || activation_error ||
                                   (kernel_done && scratch_wr_busy)));
+
+    wire [255:0] gate_packer_m_axis_tdata;
+    wire gate_packer_m_axis_tvalid;
+    wire gate_packer_m_axis_tready;
+    wire gate_packer_m_axis_tlast;
+    wire [1:0] gate_packer_m_axis_token;
+    wire [8:0] gate_packer_m_axis_block;
+    wire [1:0] gate_packer_m_axis_group;
+    wire ffn_pipeline_abort = section_abort_now;
+
+    section_gate_packer u_section_gate_packer (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start_valid(ffn_gate_start_q),
+        .start_ready(gate_packer_start_ready),
+        .start_tokens(ffn_tokens_q),
+        .start_blocks(ffn_blocks_q),
+        .abort_run(ffn_pipeline_abort),
+        .busy(gate_packer_busy),
+        .done(gate_packer_done),
+        .error(gate_packer_error),
+        .s_axis_tdata(kernel_m_axis_tdata),
+        .s_axis_tkeep(kernel_m_axis_tkeep),
+        .s_axis_tvalid(ffn_gate_run_q && kernel_m_axis_tvalid),
+        .s_axis_tready(gate_packer_s_axis_tready),
+        .s_axis_tlast(kernel_m_axis_tlast),
+        .m_axis_tdata(gate_packer_m_axis_tdata),
+        .m_axis_tvalid(gate_packer_m_axis_tvalid),
+        .m_axis_tready(gate_packer_m_axis_tready),
+        .m_axis_tlast(gate_packer_m_axis_tlast),
+        .m_axis_token(gate_packer_m_axis_token),
+        .m_axis_block(gate_packer_m_axis_block),
+        .m_axis_group(gate_packer_m_axis_group)
+    );
+
+    wire ffn_pairer_rd_req_valid;
+    wire ffn_pairer_rd_req_ready;
+    wire [1:0] ffn_pairer_rd_req_role;
+    wire [2:0] ffn_pairer_rd_req_token;
+    wire [10:0] ffn_pairer_rd_req_group;
+    wire ffn_pairer_rd_rsp_valid;
+    wire ffn_pairer_rd_rsp_ready;
+    wire ffn_pairer_out_valid;
+    wire ffn_pairer_out_ready;
+    wire [31:0] ffn_pairer_out_gate;
+    wire [31:0] ffn_pairer_out_up;
+    wire ffn_pairer_out_last;
+
+    section_ffn_pairer u_section_ffn_pairer (
+        .clk(clk),
+        .rst_n(rst_n),
+        .start_valid(ffn_gate_start_q),
+        .start_ready(ffn_pairer_start_ready),
+        .start_tokens(ffn_tokens_q),
+        .start_blocks(ffn_blocks_q),
+        .abort_run(ffn_pipeline_abort),
+        .busy(ffn_pairer_busy),
+        .done(ffn_pairer_done),
+        .error(ffn_pairer_error),
+        .s_axis_tdata(gate_packer_m_axis_tdata),
+        .s_axis_tvalid(gate_packer_m_axis_tvalid),
+        .s_axis_tready(gate_packer_m_axis_tready),
+        .s_axis_tlast(gate_packer_m_axis_tlast),
+        .s_axis_token(gate_packer_m_axis_token),
+        .s_axis_block(gate_packer_m_axis_block),
+        .s_axis_group(gate_packer_m_axis_group),
+        .rd_req_valid(ffn_pairer_rd_req_valid),
+        .rd_req_ready(ffn_pairer_rd_req_ready),
+        .rd_req_role(ffn_pairer_rd_req_role),
+        .rd_req_token(ffn_pairer_rd_req_token),
+        .rd_req_group(ffn_pairer_rd_req_group),
+        .rd_rsp_valid(ffn_pairer_rd_rsp_valid),
+        .rd_rsp_ready(ffn_pairer_rd_rsp_ready),
+        .rd_rsp_data(scratch_rd_rsp_data),
+        .rd_rsp_error(scratch_rd_rsp_error),
+        .out_valid(ffn_pairer_out_valid),
+        .out_ready(ffn_pairer_out_ready),
+        .out_gate(ffn_pairer_out_gate),
+        .out_up(ffn_pairer_out_up),
+        .out_last(ffn_pairer_out_last)
+    );
 
     section_f32_scratch u_section_scratch (
         .clk(clk),
@@ -476,60 +764,90 @@ module decode_top #(
                                     (scratch_valid_rows_q[scratch_role_q] == scratch_rows_q) &&
                                     (scratch_valid_tokens_q[scratch_role_q] == scratch_tokens_q);
     wire scratch_drain_start_ok = scratch_drain_start_strobe &&
+                                  !scratch_abort_strobe &&
                                   scratch_drain_shape_ok && scratch_role_metadata_ok &&
                                   scratch_idle && !scratch_section_active_q;
-    wire scratch_drain_start_bad = scratch_drain_start_strobe && !scratch_drain_start_ok;
+    wire scratch_drain_start_bad = scratch_drain_start_strobe &&
+                                   !scratch_abort_strobe &&
+                                   !scratch_drain_start_ok;
 
+    // Scratch returns are untagged. Latch the accepted request owner until its
+    // response handshakes so an aborting pairer cannot leak a stale UP group into
+    // a later diagnostic drain.
+    wire scratch_drain_req_valid = scratch_drain_busy_q &&
+                                   !scratch_drain_have_group_q;
+    // Retained declarations keep the legacy controller structurally quiescent
+    // in this v16 image; no request from it participates in arbitration.
     wire scratch_consumer_req_gate = scratch_consumer_busy_q &&
                                      (scratch_consumer_state_q == CONSUMER_REQ_GATE);
     wire scratch_consumer_req_up = scratch_consumer_busy_q &&
                                    (scratch_consumer_state_q == CONSUMER_REQ_UP);
-    wire scratch_consumer_req_valid = scratch_consumer_req_gate || scratch_consumer_req_up;
-    assign scratch_rd_req_valid = scratch_consumer_req_valid ||
-                                  (scratch_drain_busy_q && !scratch_drain_have_group_q);
-    assign scratch_rd_req_role  = scratch_consumer_req_gate ? 2'd1 :
-                                  (scratch_consumer_req_up ? 2'd2 : scratch_drain_role_q);
-    assign scratch_rd_req_token = scratch_consumer_req_valid ?
-                                  scratch_consumer_token_q : scratch_drain_token_q;
-    assign scratch_rd_req_group = scratch_consumer_req_valid ?
-                                  scratch_consumer_group_q : scratch_drain_group_q;
-    // Consume an orphaned response while idle (possible after abort), and consume
-    // an errored response without exposing its zero payload on M_AXIS.
+    wire scratch_consumer_req_valid = scratch_consumer_req_gate ||
+                                      scratch_consumer_req_up;
     wire scratch_consumer_wait_rsp = scratch_consumer_busy_q &&
                                      ((scratch_consumer_state_q == CONSUMER_WAIT_GATE) ||
                                       (scratch_consumer_state_q == CONSUMER_WAIT_UP));
     wire scratch_consumer_record_accounting_ok =
         (scratch_consumer_records_q < scratch_consumer_blocks_q) &&
         (scratch_consumer_records_q < scratch_consumer_total_blocks_q);
-    assign scratch_rd_rsp_ready = scratch_consumer_wait_rsp ||
-                                  ((!scratch_consumer_busy_q && !scratch_drain_busy_q) &&
-                                   scratch_rd_rsp_valid) ||
-                                  (scratch_drain_have_group_q &&
-                                   (scratch_rd_rsp_error ||
-                                    (scratch_drain_emit_valid_q &&
-                                     (scratch_drain_bank_q == 2'd3) &&
-                                     m_axis_tready)));
+    wire scratch_select_pairer = (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+                                  ffn_pairer_rd_req_valid;
+    wire scratch_select_drain = (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+                                !ffn_pairer_rd_req_valid &&
+                                scratch_drain_req_valid;
+    assign scratch_rd_req_valid = scratch_select_pairer || scratch_select_drain;
+    assign scratch_rd_req_role = scratch_select_pairer ? ffn_pairer_rd_req_role :
+                                 scratch_drain_role_q;
+    assign scratch_rd_req_token = scratch_select_pairer ? ffn_pairer_rd_req_token :
+                                  scratch_drain_token_q;
+    assign scratch_rd_req_group = scratch_select_pairer ? ffn_pairer_rd_req_group :
+                                  scratch_drain_group_q;
+    assign ffn_pairer_rd_req_ready = scratch_select_pairer &&
+                                     scratch_rd_req_ready;
 
-    assign swiglu_in_valid = scratch_consumer_busy_q &&
-                             (scratch_consumer_state_q == CONSUMER_ISSUE);
-    assign swiglu_in_gate = scratch_consumer_gate_q[
-                             {scratch_consumer_lane_q, 5'b00000} +: 32];
-    assign swiglu_in_up = scratch_consumer_up_q[
-                           {scratch_consumer_lane_q, 5'b00000} +: 32];
-    assign swiglu_in_last = (scratch_consumer_group_q[1:0] == 2'd3) &&
-                            (scratch_consumer_lane_q == 3'd7);
+    wire scratch_drain_rsp_valid = scratch_rd_rsp_valid &&
+                                   (scratch_rd_owner_q == SCRATCH_RD_DRAIN);
+    assign ffn_pairer_rd_rsp_valid = scratch_rd_rsp_valid &&
+                                     (scratch_rd_owner_q == SCRATCH_RD_PAIRER);
+    wire scratch_drain_rsp_ready = !scratch_drain_busy_q ? 1'b1 :
+                                   (scratch_drain_have_group_q &&
+                                    (scratch_rd_rsp_error ||
+                                     (scratch_drain_emit_valid_q &&
+                                      (scratch_drain_bank_q == 2'd3) &&
+                                      m_axis_tready)));
+    assign scratch_rd_rsp_ready =
+        (scratch_rd_owner_q == SCRATCH_RD_PAIRER) ? ffn_pairer_rd_rsp_ready :
+        (scratch_rd_owner_q == SCRATCH_RD_DRAIN) ? scratch_drain_rsp_ready :
+        scratch_rd_rsp_valid;
+
+    wire scratch_rd_req_accept = scratch_rd_req_valid && scratch_rd_req_ready;
+    wire scratch_rd_rsp_accept = scratch_rd_rsp_valid && scratch_rd_rsp_ready;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            scratch_rd_owner_q <= SCRATCH_RD_NONE;
+        end else if (scratch_rd_req_accept) begin
+            scratch_rd_owner_q <= scratch_select_pairer ?
+                                  SCRATCH_RD_PAIRER : SCRATCH_RD_DRAIN;
+        end else if (scratch_rd_rsp_accept) begin
+            scratch_rd_owner_q <= SCRATCH_RD_NONE;
+        end
+    end
+
+    assign swiglu_in_valid = ffn_pairer_out_valid;
+    assign swiglu_in_gate = ffn_pairer_out_gate;
+    assign swiglu_in_up = ffn_pairer_out_up;
+    assign swiglu_in_last = ffn_pairer_out_last;
+    assign ffn_pairer_out_ready = swiglu_in_ready;
 
     // Section abort is a lifecycle boundary for every stage that can retain
     // work. A traversal failure also kills any scalar, quantization, or native
     // record still owned by the section before software starts another run.
-    assign q8_ingress_abort = raw_activation_mode &&
-                              (scratch_abort_strobe ||
-                               (internal_activation_mode && scratch_error_q[5]));
+    assign q8_ingress_abort = section_abort_now;
 
     section_swiglu u_section_swiglu (
         .clk(clk),
         .rst_n(rst_n),
-        .abort(scratch_abort_strobe || q8_activation_abort || scratch_error_q[5]),
+        .abort(ffn_pipeline_abort),
         .in_valid(swiglu_in_valid),
         .in_ready(swiglu_in_ready),
         .in_gate(swiglu_in_gate),
@@ -540,6 +858,62 @@ module decode_top #(
         .out_data(swiglu_out_data),
         .out_last(swiglu_out_last),
         .out_status(swiglu_out_status)
+    );
+
+    wire q8_buffer_cfg_valid = scratch_section_begin_ok;
+    wire q8_buffer_seal_valid = ffn_seal_pending_q;
+    wire q8_buffer_abort_valid = section_abort_now;
+    wire q8_buffer_rd_req_valid = ffn_replay_active_q &&
+                                  !ffn_replay_inflight_q;
+    wire q8_buffer_rd_req_ready;
+
+    section_q8_buffer u_section_q8_buffer (
+        .clk(clk),
+        .rst_n(rst_n),
+        .cfg_valid(q8_buffer_cfg_valid),
+        .cfg_ready(q8_buffer_cfg_ready),
+        .cfg_bank(1'b0),
+        .cfg_tokens(scratch_tokens_q),
+        .cfg_blocks(scratch_rows_q[13:5]),
+        .seal_valid(q8_buffer_seal_valid),
+        .seal_ready(q8_buffer_seal_ready),
+        .seal_bank(1'b0),
+        .seal_done(q8_buffer_seal_done),
+        .seal_error(q8_buffer_seal_error),
+        .abort_valid(q8_buffer_abort_valid),
+        .abort_bank(1'b0),
+        .bank_clearing(q8_buffer_bank_clearing),
+        .bank_active(q8_buffer_bank_active),
+        .bank_valid(q8_buffer_bank_valid),
+        .bank_error(q8_buffer_bank_error),
+        .bank0_record_count(q8_buffer_bank0_record_count),
+        .bank1_record_count(),
+        .s_axis_tdata(native_acts_tdata),
+        .s_axis_tvalid(ffn_producer_busy_q && native_acts_tvalid),
+        .s_axis_tready(q8_buffer_s_axis_tready),
+        .s_axis_tlast(ffn_capture_beat_q == 3'd4),
+        .s_axis_bank(1'b0),
+        .s_axis_token(ffn_capture_token_q),
+        .s_axis_block(ffn_capture_block_q),
+        .cap_record_done(q8_buffer_cap_record_done),
+        .cap_record_error(q8_buffer_cap_record_error),
+        .cap_commit_valid(),
+        .cap_commit_address(),
+        .rd_req_valid(q8_buffer_rd_req_valid),
+        .rd_req_ready(q8_buffer_rd_req_ready),
+        .rd_req_bank(1'b0),
+        .rd_req_token(ffn_replay_token_q),
+        .rd_req_block(ffn_replay_block_q),
+        .rd_issue_valid(),
+        .rd_issue_address(),
+        .m_axis_tdata(q8_buffer_m_axis_tdata),
+        .m_axis_tvalid(q8_buffer_m_axis_tvalid),
+        .m_axis_tready(q8_buffer_m_axis_tready),
+        .m_axis_tlast(q8_buffer_m_axis_tlast),
+        .m_axis_error(q8_buffer_m_axis_error),
+        .m_axis_bank(q8_buffer_m_axis_bank),
+        .m_axis_token(q8_buffer_m_axis_token),
+        .m_axis_block(q8_buffer_m_axis_block)
     );
 
     wire scratch_drain_tvalid = scratch_drain_busy_q && !scratch_abort_strobe &&
@@ -559,6 +933,43 @@ module decode_top #(
     assign m_axis_tkeep  = scratch_drain_busy_q ?
                            8'hff : kernel_m_axis_tkeep;
 
+    wire q8_capture_fire = ffn_producer_busy_q && native_acts_tvalid &&
+                           q8_buffer_s_axis_tready;
+    wire q8_replay_fire = q8_buffer_m_axis_tvalid &&
+                          q8_buffer_m_axis_tready &&
+                          q8_buffer_replay_healthy;
+    wire q8_replay_fault = q8_buffer_replay_selected &&
+                           q8_buffer_m_axis_tvalid &&
+                           !q8_buffer_replay_healthy;
+    wire up_run_fault = (ffn_phase_q == FFN_UP_RUN) &&
+                        (scratch_wr_error || activation_error ||
+                         (kernel_done &&
+                          !(scratch_valid_q[2] ||
+                            (scratch_wr_done && scratch_writer_active &&
+                             (scratch_write_role_q == 2'd2) &&
+                             !scratch_wr_error))));
+    wire q8_numeric_fault = ffn_producer_busy_q &&
+                            ((quantizer_status != 6'd0)
+`ifdef VERILATOR
+                             || sim_inject_q8_numeric_error
+`endif
+                            );
+    wire producer_leaf_fault = (ffn_phase_q == FFN_GATE_RUN) &&
+                               (gate_packer_error || ffn_pairer_error ||
+                                q8_numeric_fault ||
+                                q8_buffer_cap_record_error ||
+                                q8_buffer_bank_error[0] || activation_error);
+    wire section_fault_event = scratch_section_active_q &&
+                               !ffn_abort_cleanup_q &&
+                               (up_run_fault || producer_leaf_fault ||
+                                ((ffn_phase_q == FFN_DOWN_RUN) &&
+                                 activation_error) ||
+                                q8_replay_fault ||
+                                ((ffn_phase_q == FFN_SEAL) &&
+                                 q8_buffer_seal_error));
+    wire kernel_section_abort = scratch_abort_strobe || ffn_fault_q ||
+                                section_fault_event;
+
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(512)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
@@ -568,12 +979,12 @@ module decode_top #(
         .num_rows(num_rows_q),
         .num_cols(num_cols_q),
         .weight_fmt(weight_fmt_q),
-        .act_mode(internal_activation_mode ? 2'd2 : act_mode_q),
+        .act_mode(ffn_down_start_q ? 2'd0 : act_mode_q),
         .act_epoch(act_epoch_q),
-        .activation_abort(q8_activation_abort || q8_ingress_abort ||
+        .activation_abort(kernel_section_abort || q8_activation_abort ||
+                          q8_ingress_abort ||
                           (scratch_writer_active && scratch_abort_strobe) ||
-                          (scratch_consumer_busy_q && scratch_abort_strobe) ||
-                          (internal_activation_mode && |scratch_error_q[6:5])),
+                          (scratch_consumer_busy_q && scratch_abort_strobe)),
         .emin(EMIN_FLOOR),
         .kernel_done(kernel_done),
         .activation_error(activation_error),
@@ -620,6 +1031,30 @@ module decode_top #(
             scratch_consumer_blocks_q  <= 16'd0;
             scratch_consumer_records_q <= 16'd0;
             scratch_consumer_total_blocks_q <= 16'd0;
+            ffn_rows_q                 <= 14'd0;
+            ffn_tokens_q               <= 3'd0;
+            ffn_blocks_q               <= 9'd0;
+            ffn_phase_q                <= FFN_IDLE;
+            ffn_fault_q                <= 1'b0;
+            ffn_abort_cleanup_q        <= 1'b0;
+            ffn_gate_run_q             <= 1'b0;
+            ffn_producer_busy_q        <= 1'b0;
+            ffn_producer_done_q        <= 1'b0;
+            ffn_capture_token_q        <= 2'd0;
+            ffn_capture_block_q        <= 9'd0;
+            ffn_capture_beat_q         <= 3'd0;
+            ffn_capture_complete_q     <= 1'b0;
+            ffn_gate_kernel_done_q     <= 1'b0;
+            ffn_gate_packer_done_q     <= 1'b0;
+            ffn_gate_pairer_done_q     <= 1'b0;
+            ffn_down_kernel_done_q     <= 1'b0;
+            ffn_seal_pending_q         <= 1'b0;
+            ffn_replay_active_q        <= 1'b0;
+            ffn_replay_inflight_q      <= 1'b0;
+            ffn_replay_token_q         <= 2'd0;
+            ffn_replay_block_q         <= 9'd0;
+            ffn_replay_beat_q          <= 3'd0;
+            ffn_replay_complete_q      <= 1'b0;
             scratch_drain_busy_q       <= 1'b0;
             scratch_drain_done_q       <= 1'b0;
             scratch_drain_role_q       <= 2'd0;
@@ -644,6 +1079,21 @@ module decode_top #(
                 scratch_drain_done_q     <= 1'b0;
                 scratch_error_q          <= 7'd0;
                 scratch_valid_q          <= 4'd0;
+                ffn_rows_q               <= scratch_rows_q;
+                ffn_tokens_q             <= scratch_tokens_q;
+                ffn_blocks_q             <= scratch_rows_q[13:5];
+                ffn_phase_q              <= FFN_WAIT_UP;
+                ffn_fault_q              <= 1'b0;
+                ffn_abort_cleanup_q      <= 1'b0;
+                ffn_gate_run_q           <= 1'b0;
+                ffn_producer_busy_q      <= 1'b0;
+                ffn_producer_done_q      <= 1'b0;
+                ffn_capture_complete_q   <= 1'b0;
+                ffn_seal_pending_q       <= 1'b0;
+                ffn_replay_active_q      <= 1'b0;
+                ffn_replay_inflight_q    <= 1'b0;
+                ffn_replay_complete_q    <= 1'b0;
+                ffn_down_kernel_done_q    <= 1'b0;
             end else if (scratch_section_begin_bad) begin
                 scratch_section_done_q <= 1'b1;
                 scratch_error_q[0] <= 1'b1;
@@ -659,6 +1109,8 @@ module decode_top #(
                 if (scratch_tee_start)
                     scratch_error_q    <= 7'd0;
                 scratch_valid_q[scratch_role_q] <= 1'b0;
+                if (scratch_only_start && (ffn_phase_q == FFN_WAIT_UP))
+                    ffn_phase_q <= FFN_UP_RUN;
             end else if (scratch_start_rejected) begin
                 // Includes invalid/busy tee, DRAIN/unknown-mode CTRL.START, and
                 // a DDR start attempted while either scratch direction is active.
@@ -688,11 +1140,154 @@ module decode_top #(
             if (kernel_done) begin
                 scratch_tee_run_q <= 1'b0;
                 scratch_only_run_q <= 1'b0;
-                if (internal_activation_mode && scratch_section_active_q) begin
-                    scratch_section_active_q <= 1'b0;
-                    scratch_section_done_q <= 1'b1;
-                    scratch_valid_q <= 4'd0;
+            end
+
+            // Streaming section phase and exact capture/replay accounting.
+            if (ffn_gate_start_q) begin
+                ffn_phase_q              <= FFN_GATE_RUN;
+                ffn_gate_run_q           <= 1'b1;
+                ffn_producer_busy_q      <= 1'b1;
+                ffn_producer_done_q      <= 1'b0;
+                ffn_capture_token_q      <= 2'd0;
+                ffn_capture_block_q      <= 9'd0;
+                ffn_capture_beat_q       <= 3'd0;
+                ffn_capture_complete_q   <= 1'b0;
+                ffn_gate_kernel_done_q   <= 1'b0;
+                ffn_gate_packer_done_q   <= 1'b0;
+                ffn_gate_pairer_done_q   <= 1'b0;
+                ffn_seal_pending_q       <= 1'b0;
+            end
+
+            if ((ffn_phase_q == FFN_UP_RUN) && kernel_done) begin
+                if (activation_error ||
+                    !(scratch_valid_q[2] ||
+                      (scratch_wr_done && scratch_writer_active &&
+                       (scratch_write_role_q == 2'd2) &&
+                       !scratch_wr_error))) begin
+                    ffn_fault_q <= 1'b1;
+                    scratch_error_q[5] <= 1'b1;
+                end else begin
+                    ffn_phase_q <= FFN_WAIT_GATE;
                 end
+            end
+
+            if (ffn_phase_q == FFN_GATE_RUN) begin
+                if (kernel_done) begin
+                    ffn_gate_kernel_done_q <= 1'b1;
+                    ffn_gate_run_q <= 1'b0;
+                end
+                if (gate_packer_done)
+                    ffn_gate_packer_done_q <= 1'b1;
+                if (ffn_pairer_done)
+                    ffn_gate_pairer_done_q <= 1'b1;
+
+                if (q8_capture_fire) begin
+                    if ((ffn_capture_beat_q == 3'd4) !=
+                        q8_internal_record_done) begin
+                        ffn_fault_q <= 1'b1;
+                        scratch_error_q[5] <= 1'b1;
+                    end
+                    if (ffn_capture_beat_q == 3'd4) begin
+                        ffn_capture_beat_q <= 3'd0;
+                        if ((ffn_capture_block_q + 1'b1 == ffn_blocks_q) &&
+                            ({1'b0, ffn_capture_token_q} + 1'b1 ==
+                             ffn_tokens_q)) begin
+                            ffn_capture_complete_q <= 1'b1;
+                        end else if ({1'b0, ffn_capture_token_q} + 1'b1 ==
+                                     ffn_tokens_q) begin
+                            ffn_capture_token_q <= 2'd0;
+                            ffn_capture_block_q <=
+                                ffn_capture_block_q + 1'b1;
+                        end else begin
+                            ffn_capture_token_q <=
+                                ffn_capture_token_q + 1'b1;
+                        end
+                    end else begin
+                        ffn_capture_beat_q <= ffn_capture_beat_q + 1'b1;
+                    end
+                end
+
+                if ((ffn_gate_kernel_done_q || kernel_done) &&
+                    (ffn_gate_packer_done_q || gate_packer_done) &&
+                    (ffn_gate_pairer_done_q || ffn_pairer_done) &&
+                    ffn_capture_complete_q && !section_fault_event &&
+                    !ffn_fault_q) begin
+                    ffn_phase_q <= FFN_SEAL;
+                    ffn_seal_pending_q <= 1'b1;
+                    ffn_gate_run_q <= 1'b0;
+                end
+            end
+
+            if ((ffn_phase_q == FFN_SEAL) &&
+                ffn_seal_pending_q && q8_buffer_seal_ready)
+                ffn_seal_pending_q <= 1'b0;
+
+            if ((ffn_phase_q == FFN_SEAL) && q8_buffer_seal_done) begin
+                if (q8_buffer_seal_error || !q8_buffer_bank_valid[0]) begin
+                    ffn_fault_q <= 1'b1;
+                    scratch_error_q[5] <= 1'b1;
+                end else begin
+                    ffn_phase_q <= FFN_WAIT_DOWN;
+                    ffn_producer_busy_q <= 1'b0;
+                    ffn_producer_done_q <= 1'b1;
+                end
+            end
+
+            if (ffn_down_start_q) begin
+                ffn_phase_q             <= FFN_DOWN_RUN;
+                ffn_replay_active_q     <= 1'b1;
+                ffn_replay_inflight_q   <= 1'b0;
+                ffn_replay_token_q      <= 2'd0;
+                ffn_replay_block_q      <= 9'd0;
+                ffn_replay_beat_q       <= 3'd0;
+                ffn_replay_complete_q   <= 1'b0;
+                ffn_down_kernel_done_q  <= 1'b0;
+            end
+
+            if ((ffn_phase_q == FFN_DOWN_RUN) && kernel_done)
+                ffn_down_kernel_done_q <= 1'b1;
+
+            if ((ffn_phase_q == FFN_DOWN_RUN) && q8_buffer_rd_req_valid &&
+                q8_buffer_rd_req_ready)
+                ffn_replay_inflight_q <= 1'b1;
+
+            if ((ffn_phase_q == FFN_DOWN_RUN) && q8_replay_fire) begin
+                if (ffn_replay_beat_q == 3'd4) begin
+                    ffn_replay_beat_q <= 3'd0;
+                    ffn_replay_inflight_q <= 1'b0;
+                    if ((ffn_replay_block_q + 1'b1 == ffn_blocks_q) &&
+                        ({1'b0, ffn_replay_token_q} + 1'b1 ==
+                         ffn_tokens_q)) begin
+                        ffn_replay_active_q <= 1'b0;
+                        ffn_replay_complete_q <= 1'b1;
+                    end else if (ffn_replay_block_q + 1'b1 ==
+                                 ffn_blocks_q) begin
+                        ffn_replay_block_q <= 9'd0;
+                        ffn_replay_token_q <= ffn_replay_token_q + 1'b1;
+                    end else begin
+                        ffn_replay_block_q <= ffn_replay_block_q + 1'b1;
+                    end
+                end else begin
+                    ffn_replay_beat_q <= ffn_replay_beat_q + 1'b1;
+                end
+            end
+
+            if ((ffn_phase_q == FFN_DOWN_RUN) &&
+                (ffn_down_kernel_done_q || kernel_done) &&
+                ffn_replay_complete_q && !activation_error &&
+                !ffn_fault_q) begin
+                ffn_phase_q <= FFN_IDLE;
+                scratch_section_active_q <= 1'b0;
+                scratch_section_done_q <= 1'b1;
+                scratch_valid_q <= 4'd0;
+            end
+
+            if (section_fault_event) begin
+                ffn_fault_q <= 1'b1;
+                scratch_error_q[5] <= 1'b1;
+                if (q8_numeric_fault)
+                    scratch_error_q[6] <= 1'b1;
+                ffn_seal_pending_q <= 1'b0;
             end
 
             if (scratch_drain_start_ok) begin
@@ -844,7 +1439,7 @@ module decode_top #(
                     scratch_drain_emit_valid_q <= 1'b0;
                 end
 
-                if (scratch_drain_have_group_q && scratch_rd_rsp_valid) begin
+                if (scratch_drain_have_group_q && scratch_drain_rsp_valid) begin
                     if (scratch_rd_rsp_error) begin
                         scratch_drain_busy_q       <= 1'b0;
                         scratch_drain_done_q       <= 1'b1;
@@ -887,6 +1482,15 @@ module decode_top #(
             end
 
             if (scratch_abort_strobe) begin
+                ffn_abort_cleanup_q <= scratch_section_active_q;
+                ffn_fault_q <= 1'b0;
+                ffn_gate_run_q <= 1'b0;
+                ffn_producer_done_q <= 1'b0;
+                ffn_seal_pending_q <= 1'b0;
+                ffn_replay_active_q <= 1'b0;
+                ffn_replay_inflight_q <= 1'b0;
+                scratch_tee_run_q <= 1'b0;
+                scratch_only_run_q <= 1'b0;
                 if (scratch_writer_active || scratch_wr_busy) begin
                     scratch_valid_q[scratch_write_role_q] <= 1'b0;
                     scratch_error_q[2] <= 1'b1;
@@ -903,11 +1507,21 @@ module decode_top #(
                     scratch_consumer_busy_q  <= 1'b0;
                     scratch_consumer_done_q  <= 1'b1;
                     scratch_consumer_state_q <= CONSUMER_IDLE;
-                    scratch_section_active_q <= 1'b0;
                     scratch_section_done_q   <= 1'b1;
                     scratch_valid_q          <= 4'd0;
                     scratch_error_q[2]       <= 1'b1;
                 end
+            end
+
+            if (ffn_abort_cleanup_q && !kernel_busy && !gate_packer_busy &&
+                !ffn_pairer_busy &&
+                (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+                !scratch_rd_rsp_valid) begin
+                ffn_abort_cleanup_q <= 1'b0;
+                ffn_phase_q <= FFN_IDLE;
+                ffn_producer_busy_q <= 1'b0;
+                ffn_producer_done_q <= 1'b0;
+                scratch_section_active_q <= 1'b0;
             end
         end
     end
@@ -930,16 +1544,20 @@ module decode_top #(
     // beat the sink wasn't ready for. util = (CYCLES - max stall) / CYCLES.
     reg [31:0] w_stall_q, a_stall_q, r_stall_q;
     reg [31:0] w_beats_q, a_beats_q, r_beats_q;
+    wire perf_a_valid = q8_buffer_replay_selected ?
+                        kernel_acts_tvalid : s_axis_acts_tvalid;
+    wire perf_a_ready = q8_buffer_replay_selected ?
+                        kernel_acts_tready : s_axis_acts_tready;
     always @(posedge clk) begin
         if (!rst_n || start_strobe) begin
             w_stall_q <= 32'd0; a_stall_q <= 32'd0; r_stall_q <= 32'd0;
             w_beats_q <= 32'd0; a_beats_q <= 32'd0; r_beats_q <= 32'd0;
         end else if (kernel_busy) begin
             if (weight_tvalid && weight_tready)           w_beats_q <= w_beats_q + 32'd1;
-            if (s_axis_acts_tvalid && s_axis_acts_tready) a_beats_q <= a_beats_q + 32'd1;
+            if (perf_a_valid && perf_a_ready) a_beats_q <= a_beats_q + 32'd1;
             if (m_axis_tvalid && m_axis_tready)           r_beats_q <= r_beats_q + 32'd1;
             if (weight_tready && !weight_tvalid)           w_stall_q <= w_stall_q + 32'd1;
-            if (s_axis_acts_tready && !s_axis_acts_tvalid) a_stall_q <= a_stall_q + 32'd1;
+            if (perf_a_ready && !perf_a_valid) a_stall_q <= a_stall_q + 32'd1;
             if (m_axis_tvalid && !m_axis_tready)           r_stall_q <= r_stall_q + 32'd1;
         end
     end
@@ -1082,10 +1700,13 @@ module decode_top #(
                     MATMUL_OFF_SCRATCH_ROWS[7:0]:  rdata_q <= {18'd0, scratch_rows_q};
                     MATMUL_OFF_SCRATCH_TOKENS[7:0]: rdata_q <= {29'd0, scratch_tokens_q};
                     MATMUL_OFF_SCRATCH_STATUS[7:0]: rdata_q <= {
-                        19'd0, scratch_section_done_q, scratch_section_active_q,
-                        scratch_consumer_done_q, scratch_consumer_busy_q,
+                        18'd0, ffn_gate_ready,
+                        scratch_section_done_q, scratch_section_active_q,
+                        ffn_producer_done_q, ffn_producer_busy_q,
                         scratch_valid_q, |scratch_error_q,
-                        scratch_drain_done_q, scratch_drain_busy_q,
+                        scratch_drain_done_q,
+                        (scratch_drain_busy_q ||
+                         (scratch_rd_owner_q == SCRATCH_RD_DRAIN)),
                         scratch_writer_done_q, scratch_wr_busy
                     };
                     MATMUL_OFF_SCRATCH_ERROR[7:0]: rdata_q <= {25'd0, scratch_error_q};
@@ -1117,47 +1738,73 @@ module decode_top #(
     assign s_axi_rvalid  = rvalid_q;
 
 `ifdef FORMAL
-    reg        f_decode_past_valid = 1'b0;
-    reg [3:0]  f_reads_per_block = 4'd0;
-    reg [5:0]  f_scalars_per_block = 6'd0;
+    assign formal_ffn_phase = ffn_phase_q;
+    assign formal_ffn_gate_ready = ffn_gate_ready;
+    assign formal_scratch_rd_owner = scratch_rd_owner_q;
+    assign formal_scratch_rd_rsp_valid = scratch_rd_rsp_valid;
+    assign formal_scratch_rd_rsp_ready = scratch_rd_rsp_ready;
+    assign formal_section_active = scratch_section_active_q;
+    assign formal_section_done = scratch_section_done_q;
+    assign formal_abort_cleanup = ffn_abort_cleanup_q;
+    assign formal_scratch_error = scratch_error_q;
+    assign formal_capture_fire = q8_capture_fire;
+    assign formal_capture_record_done = q8_buffer_cap_record_done;
+    assign formal_bank0_record_count = q8_buffer_bank0_record_count;
+    assign formal_replay_fire = q8_replay_fire;
+    assign formal_replay_complete = ffn_replay_complete_q;
+    assign formal_down_kernel_done = ffn_down_kernel_done_q;
+    assign formal_kernel_done = kernel_done;
+    assign formal_abort_strobe = scratch_abort_strobe;
+    assign formal_ffn_fault = ffn_fault_q;
+    assign formal_section_begin_ok = scratch_section_begin_ok;
+    assign formal_up_start = scratch_only_start &&
+                             (ffn_phase_q == FFN_WAIT_UP);
+    assign formal_gate_start = ffn_gate_start_q;
+    assign formal_gate_drain_ready =
+        (ffn_gate_kernel_done_q || kernel_done) &&
+        (ffn_gate_packer_done_q || gate_packer_done) &&
+        (ffn_gate_pairer_done_q || ffn_pairer_done) &&
+        ffn_capture_complete_q && !section_fault_event && !ffn_fault_q;
+    assign formal_seal_done = q8_buffer_seal_done &&
+                              !q8_buffer_seal_error;
+    assign formal_down_start = ffn_down_start_q;
+    assign formal_down_complete_ready =
+        (ffn_down_kernel_done_q || kernel_done) &&
+        ffn_replay_complete_q && !activation_error && !ffn_fault_q;
+    assign formal_producer_done = ffn_producer_done_q;
+    assign formal_capture_token = ffn_capture_token_q;
+    assign formal_capture_block = ffn_capture_block_q;
+    assign formal_capture_beat = ffn_capture_beat_q;
+    assign formal_replay_token = ffn_replay_token_q;
+    assign formal_replay_block = ffn_replay_block_q;
+    assign formal_replay_beat = ffn_replay_beat_q;
 
-    wire f_swiglu_input_fire = swiglu_in_valid && swiglu_in_ready;
-    wire f_swiglu_block_last = f_swiglu_input_fire &&
-                               (scratch_consumer_lane_q == 3'd7) &&
-                               (scratch_consumer_group_q[1:0] == 2'd3);
+    reg        f_decode_past_valid = 1'b0;
 
     always @(posedge clk) begin
         f_decode_past_valid <= 1'b1;
-        if (!rst_n || scratch_consumer_start || scratch_abort_strobe) begin
-            f_reads_per_block <= 4'd0;
-            f_scalars_per_block <= 6'd0;
-        end else if (scratch_consumer_busy_q) begin
-            if (scratch_rd_req_valid && scratch_rd_req_ready)
-                f_reads_per_block <= f_reads_per_block + 1'b1;
-            if (f_swiglu_input_fire) begin
-                if (f_swiglu_block_last) begin
-                    assert(f_reads_per_block == 4'd8);
-                    assert(f_scalars_per_block == 6'd31);
-                    f_reads_per_block <= 4'd0;
-                    f_scalars_per_block <= 6'd0;
-                end else begin
-                    f_scalars_per_block <= f_scalars_per_block + 1'b1;
-                end
-            end
-            if (q8_internal_record_done)
-                assert(scratch_consumer_records_q <
-                       scratch_consumer_blocks_q);
-        end
 
         if (rst_n) begin
-            assert(scratch_consumer_state_q <= CONSUMER_DRAIN);
-            assert(scratch_consumer_records_q <= scratch_consumer_blocks_q);
-            assert(scratch_consumer_blocks_q <= scratch_consumer_total_blocks_q);
-            assert(scratch_consumer_blocks_q <=
-                   scratch_consumer_records_q + 16'd3);
-            assert(scratch_consumer_total_blocks_q <= 16'd1536);
-            assert(f_reads_per_block <= 4'd8);
-            assert(f_scalars_per_block <= 6'd31);
+            assert(ffn_phase_q <= FFN_DOWN_RUN);
+            assert(ffn_capture_beat_q <= 3'd4);
+            assert(ffn_replay_beat_q <= 3'd4);
+            assert(ffn_capture_block_q <
+                   (ffn_blocks_q == 0 ? 9'd1 : ffn_blocks_q));
+            assert(ffn_replay_block_q <
+                   (ffn_blocks_q == 0 ? 9'd1 : ffn_blocks_q));
+            assert({1'b0, ffn_capture_token_q} <
+                   (ffn_tokens_q == 0 ? 3'd1 : ffn_tokens_q));
+            assert({1'b0, ffn_replay_token_q} <
+                   (ffn_tokens_q == 0 ? 3'd1 : ffn_tokens_q));
+
+            if (scratch_rd_owner_q == SCRATCH_RD_PAIRER)
+                assert(!scratch_drain_rsp_valid);
+            if (scratch_rd_owner_q == SCRATCH_RD_DRAIN)
+                assert(!ffn_pairer_rd_rsp_valid);
+            if (ffn_pairer_rd_rsp_valid)
+                assert(scratch_rd_owner_q == SCRATCH_RD_PAIRER);
+            if (scratch_drain_rsp_valid)
+                assert(scratch_rd_owner_q == SCRATCH_RD_DRAIN);
 
             if (scratch_only_run_q) begin
                 assert(scratch_section_active_q);
@@ -1165,6 +1812,13 @@ module decode_top #(
             end
             if (internal_activation_mode)
                 assert(!s_axis_acts_tready);
+            if (scratch_section_active_q &&
+                (scratch_mode_q == SCRATCH_MODE_ONLY))
+                assert(scratch_launch_ok ==
+                       (ffn_up_preflight_ok || ffn_gate_preflight_ok));
+            if (!scratch_section_active_q && internal_activation_mode &&
+                (scratch_mode_q == SCRATCH_MODE_DDR))
+                assert(!scratch_ddr_preflight_ok);
 
             if (q8_ingress_abort) begin
                 assert(!raw_acts_tready);
@@ -1174,40 +1828,10 @@ module decode_top #(
                 assert(quantizer_status == 6'd0);
             end
 
-            if (scratch_section_active_q && scratch_valid_q[1])
-                assert(scratch_valid_q[2]);
-
-            if (scratch_consumer_busy_q) begin
+            if (ffn_producer_busy_q) begin
                 assert(scratch_section_active_q);
-                assert(internal_activation_mode);
-                assert(scratch_valid_q[1] && scratch_valid_q[2]);
-                assert(!scratch_drain_busy_q && !scratch_writer_active);
-                assert(scratch_consumer_group_q < scratch_consumer_groups_q);
-                assert(scratch_consumer_token_q < scratch_tokens_q);
-                assert(scratch_consumer_lane_q <= 3'd7);
-            end
-
-            if (scratch_consumer_req_gate)
-                assert(scratch_rd_req_valid && scratch_rd_req_role == 2'd1);
-            if (scratch_consumer_req_up)
-                assert(scratch_rd_req_valid && scratch_rd_req_role == 2'd2);
-            if (scratch_consumer_state_q == CONSUMER_DRAIN) begin
-                assert(!scratch_rd_req_valid);
-                assert(!swiglu_in_valid);
-            end
-
-            if (scratch_consumer_start) begin
-                assert(scratch_consumer_shape_ok);
-                assert(({7'd0, scratch_rows_q[13:5]} *
-                        {13'd0, scratch_tokens_q}) <= 16'd1536);
-            end
-
-            if (f_decode_past_valid && $past(rst_n && scratch_consumer_start)) begin
-                assert(scratch_consumer_busy_q);
-                assert(scratch_consumer_state_q == CONSUMER_REQ_GATE);
-                assert(scratch_consumer_total_blocks_q ==
-                       ({7'd0, $past(scratch_rows_q[13:5])} *
-                        {13'd0, $past(scratch_tokens_q)}));
+                assert((ffn_phase_q == FFN_GATE_RUN) ||
+                       (ffn_phase_q == FFN_SEAL) || ffn_abort_cleanup_q);
             end
 
             if (f_decode_past_valid &&
@@ -1216,46 +1840,68 @@ module decode_top #(
                 assert(!scratch_section_done_q);
                 assert(scratch_valid_q == 4'd0);
                 assert(scratch_error_q == 7'd0);
+                assert(ffn_phase_q == FFN_WAIT_UP);
             end
 
             if (f_decode_past_valid &&
                 $past(rst_n && scratch_abort_strobe &&
-                      (scratch_consumer_busy_q || scratch_section_active_q))) begin
-                assert(!scratch_consumer_busy_q && !scratch_section_active_q);
+                      scratch_section_active_q)) begin
+                assert(ffn_abort_cleanup_q || !scratch_section_active_q);
                 assert(scratch_consumer_done_q && scratch_section_done_q);
                 assert(scratch_valid_q == 4'd0);
                 assert(scratch_error_q[2]);
             end
 
+            assert(!(scratch_abort_strobe &&
+                     (scratch_section_begin_ok || scratch_section_begin_bad ||
+                      scratch_drain_start_ok || scratch_drain_start_bad)));
             if (f_decode_past_valid &&
-                $past(rst_n && kernel_done && internal_activation_mode &&
-                      scratch_section_active_q)) begin
-                assert(!scratch_section_active_q && scratch_section_done_q);
-                assert(scratch_valid_q == 4'd0);
+                $past(rst_n && scratch_abort_strobe &&
+                      scratch_section_begin_strobe &&
+                      !scratch_section_active_q)) begin
+                assert(!scratch_section_active_q);
+                assert(ffn_phase_q == FFN_IDLE);
+                assert(!ffn_abort_cleanup_q);
             end
-
             if (f_decode_past_valid &&
-                $past(rst_n && internal_activation_mode && q8_activation_abort)) begin
-                assert(!scratch_consumer_busy_q && scratch_consumer_done_q);
-                assert(scratch_valid_q == 4'd0);
+                $past(rst_n && scratch_abort_strobe &&
+                      scratch_drain_start_strobe &&
+                      !scratch_drain_busy_q))
+                assert(!scratch_drain_busy_q);
+            if (f_decode_past_valid &&
+                $past(rst_n && section_fault_event && q8_numeric_fault))
                 assert(scratch_error_q[6]);
+
+            if (q8_replay_fault) begin
+                assert(!kernel_acts_tvalid);
+                assert(!q8_buffer_m_axis_tready);
+            end
+            if (ffn_producer_done_q) begin
+                assert(q8_buffer_bank_valid[0] || |scratch_error_q);
+                assert(!ffn_producer_busy_q);
+            end
+            if (scratch_section_done_q && !scratch_section_active_q &&
+                !(|scratch_error_q)) begin
+                assert(!ffn_producer_busy_q);
+                assert(scratch_rd_owner_q == SCRATCH_RD_NONE);
+                assert(!scratch_rd_rsp_valid);
             end
         end
 
-        cover(rst_n && scratch_section_active_q &&
-              scratch_valid_q[2] && !scratch_valid_q[1]);
-        cover(rst_n && scratch_section_active_q &&
-              scratch_valid_q[2] && scratch_valid_q[1]);
-        cover(rst_n && scratch_consumer_busy_q &&
-              scratch_consumer_state_q == CONSUMER_DRAIN);
-        cover(rst_n && scratch_consumer_busy_q &&
-              (scratch_consumer_blocks_q >=
-               scratch_consumer_records_q + 16'd2));
-        cover(rst_n && scratch_section_done_q && !scratch_section_active_q &&
-              scratch_consumer_done_q && scratch_valid_q == 4'd0);
-        cover(rst_n && scratch_error_q[2] && scratch_section_done_q &&
-              !scratch_section_active_q && !scratch_consumer_busy_q &&
-              scratch_valid_q == 4'd0);
+`ifndef FORMAL_DECODE_INTEGRATION
+        cover(rst_n && ffn_phase_q == FFN_WAIT_GATE && ffn_gate_ready);
+        cover(rst_n && ffn_phase_q == FFN_GATE_RUN &&
+              ffn_capture_beat_q == 3'd4);
+        cover(rst_n && ffn_phase_q == FFN_SEAL);
+        cover(rst_n && ffn_phase_q == FFN_WAIT_DOWN &&
+              ffn_producer_done_q);
+        cover(rst_n && ffn_phase_q == FFN_DOWN_RUN &&
+              ffn_replay_beat_q == 3'd4);
+        cover(rst_n && scratch_section_done_q &&
+              !scratch_section_active_q && ffn_phase_q == FFN_IDLE);
+        cover(rst_n && ffn_abort_cleanup_q &&
+              scratch_rd_owner_q == SCRATCH_RD_PAIRER);
+`endif
     end
 `endif
 

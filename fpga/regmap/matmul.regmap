@@ -7,7 +7,7 @@
 #
 # offset  name            access  reset        description
 0x00      ID              ro      0xB05A2000   kernel identifier
-0x04      VERSION         ro      0x0000000F   v15 = same-command section FFN pipeline
+0x04      VERSION         ro      0x00000010   v16 = streamed GATE/SwiGLU/native-Q8 section FFN
 0x08      CTRL            wo      0x00000000   bit0 = start strobe (pulse)
 0x0C      STATUS          ro      0x00000000   bit0 = busy, bit1 = done_latched
 0x10      NUM_Q1_BLOCKS   rw      0x00000000   K / 128
@@ -48,8 +48,8 @@
 0x70      SCRATCH_ROWS    rw      0x00000000   logical rows; integrated tee requires NUM_ROWS equality and 16-row alignment
 0x74      SCRATCH_TOKENS  rw      0x00000000   token/column count; tee requires NUM_COLS equality, valid range 1..4
 0x78      SCRATCH_CTRL    wo      0x00000000   bit0 = start drain, bit1 = abort active operation/section, bit2 = begin section
-0x7C      SCRATCH_STATUS  ro      0x00000000   v14 bits [8:0]; consumer busy/done [10:9], section active/done [12:11]
-0x80      SCRATCH_ERROR   ro      0x00000000   v14 bits [4:0]; consumer read/framing bit5, SwiGLU/Q8 bit6
+0x7C      SCRATCH_STATUS  ro      0x00000000   v16 producer busy/done [10:9], section active/done [12:11], GATE ready bit13
+0x80      SCRATCH_ERROR   ro      0x00000000   v14 bits [4:0]; v16 section pipeline/traversal bit5, SwiGLU/Q8 bit6
 #
 # (v8 had a writable EMIN window-floor register at 0x44. v9 bakes the window floor in as a
 # constant of the f16 format — decode_top.EMIN_FLOOR — so there is no EMIN register and no

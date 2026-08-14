@@ -92,11 +92,12 @@ module section_q8_buffer (
     localparam integer TOTAL_RECORDS = 3072;
     localparam [8:0] BLOCK_CAPACITY = 9'd384;
 `ifdef FORMAL_REDUCED_STORAGE
-    // Formal lifecycle/storage proofs exercise bank zero, tokens 0..1 and
-    // blocks 0..1. Production geometry and all address arithmetic stay fixed.
-    localparam integer PAYLOAD_DEPTH = 8;
-    localparam integer SEEN_DEPTH = 8;
-    localparam [10:0] LAST_CLEAR_ADDRESS = 11'd7;
+    // Formal lifecycle/storage proofs exercise the minimum legal integrated
+    // section (F=128), whose four blocks occupy addresses 0,4,8,12. Production
+    // geometry and all address arithmetic stay fixed.
+    localparam integer PAYLOAD_DEPTH = 16;
+    localparam integer SEEN_DEPTH = 16;
+    localparam [10:0] LAST_CLEAR_ADDRESS = 11'd15;
 `else
     localparam integer PAYLOAD_DEPTH = TOTAL_RECORDS;
     localparam integer SEEN_DEPTH = BANK_RECORDS;

@@ -34,14 +34,14 @@ uint64_t dut_m_data(Dut *);
 int dut_dbg_scratch_read_fire(Dut *);
 int dut_dbg_swiglu_input_fire(Dut *);
 int dut_dbg_internal_record_done(Dut *);
-int dut_dbg_q8_state(Dut *);
-int dut_dbg_q8_scalar_index(Dut *);
-int dut_dbg_q8_emit_index(Dut *);
-int dut_dbg_q8_quantizer_state(Dut *);
-uint32_t dut_dbg_q8_handshakes(Dut *);
-int dut_dbg_scratch_consumer_state(Dut *);
-uint32_t dut_dbg_scratch_total_blocks(Dut *);
-void dut_dbg_seed_scratch_roles(Dut *, uint32_t rows, uint32_t tokens);
+int dut_dbg_capture_fire(Dut *);
+int dut_dbg_replay_fire(Dut *);
+int dut_dbg_ffn_phase(Dut *);
+uint32_t dut_dbg_capture_tag(Dut *);
+uint32_t dut_dbg_replay_tag(Dut *);
+uint32_t dut_dbg_ffn_lifecycle(Dut *);
+uint32_t dut_dbg_scratch_error(Dut *);
+void dut_set_gate_q8_numeric_error(Dut *, int);
 
 #ifdef __cplusplus
 }

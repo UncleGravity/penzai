@@ -18,6 +18,7 @@ extern "C" {
 Dut *dut_new(void) {
     Dut *d = new Dut();
     d->t = new Vdecode_top();
+    d->t->sim_inject_q8_numeric_error = 0;
     return d;
 }
 void dut_free(Dut *d) {
@@ -117,48 +118,53 @@ int dut_dbg_scratch_read_fire(Dut *d) {
            d->t->rootp->decode_top__DOT__scratch_rd_req_ready;
 }
 int dut_dbg_swiglu_input_fire(Dut *d) {
-    return d->t->rootp->decode_top__DOT__scratch_consumer_state_q == 5 &&
+    return d->t->rootp->decode_top__DOT__u_section_ffn_pairer__DOT__out_valid_q &&
            d->t->rootp->decode_top__DOT__swiglu_in_ready;
 }
 int dut_dbg_internal_record_done(Dut *d) {
-    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__state == 5 &&
-           d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__emit_index == 4 &&
-           d->t->rootp->decode_top__DOT__native_acts_tready;
+    return d->t->rootp->decode_top__DOT__q8_internal_record_done;
 }
-int dut_dbg_q8_state(Dut *d) {
-    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__state;
+int dut_dbg_capture_fire(Dut *d) {
+    return d->t->rootp->decode_top__DOT__q8_capture_fire;
 }
-int dut_dbg_q8_scalar_index(Dut *d) {
-    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__scalar_index;
+int dut_dbg_replay_fire(Dut *d) {
+    return d->t->rootp->decode_top__DOT__q8_buffer_m_axis_tvalid &&
+           d->t->rootp->decode_top__DOT__q8_buffer_replay_healthy &&
+           d->t->rootp->decode_top__DOT__kernel_acts_tready;
 }
-int dut_dbg_q8_emit_index(Dut *d) {
-    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__emit_index;
+int dut_dbg_ffn_phase(Dut *d) {
+    return d->t->rootp->decode_top__DOT__ffn_phase_q;
 }
-int dut_dbg_q8_quantizer_state(Dut *d) {
-    return d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__u_quantizer__DOT__state;
+uint32_t dut_dbg_capture_tag(Dut *d) {
+    return d->t->rootp->decode_top__DOT__ffn_capture_beat_q |
+           (d->t->rootp->decode_top__DOT__ffn_capture_token_q << 3) |
+           (d->t->rootp->decode_top__DOT__ffn_capture_block_q << 5);
 }
-uint32_t dut_dbg_q8_handshakes(Dut *d) {
-    return (d->t->s_axis_acts_tready ? 1u : 0u) |
-           (d->t->rootp->decode_top__DOT__u_q8_ingress__DOT__internal_source_accept ? 2u : 0u) |
-           (d->t->rootp->decode_top__DOT__native_acts_tvalid ? 4u : 0u) |
-           (d->t->rootp->decode_top__DOT__q8_internal_record_done ? 8u : 0u) |
-           (d->t->rootp->decode_top__DOT__q8_activation_abort ? 16u : 0u) |
-           (d->t->rootp->decode_top__DOT__q8_ingress_abort ? 0x80000000u : 0u);
+uint32_t dut_dbg_replay_tag(Dut *d) {
+    return d->t->rootp->decode_top__DOT__ffn_replay_beat_q |
+           (d->t->rootp->decode_top__DOT__ffn_replay_token_q << 3) |
+           (d->t->rootp->decode_top__DOT__ffn_replay_block_q << 5);
 }
-int dut_dbg_scratch_consumer_state(Dut *d) {
-    return d->t->rootp->decode_top__DOT__scratch_consumer_state_q;
+uint32_t dut_dbg_ffn_lifecycle(Dut *d) {
+    auto *r = d->t->rootp;
+    return (r->decode_top__DOT__scratch_section_active_q ? 1u : 0u) |
+           (r->decode_top__DOT__ffn_producer_busy_q ? 2u : 0u) |
+           (r->decode_top__DOT__ffn_abort_cleanup_q ? 4u : 0u) |
+           (r->decode_top__DOT__scratch_rd_owner_q << 3) |
+           (r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_valid_q ? 0x20u : 0u) |
+           (r->decode_top__DOT__u_section_ffn_pairer__DOT__orphan_q ? 0x40u : 0u) |
+           (r->decode_top__DOT__u_section_ffn_pairer__DOT__busy_q ? 0x80u : 0u) |
+           (r->decode_top__DOT__u_kernel__DOT__busy_q ? 0x100u : 0u) |
+           (r->decode_top__DOT__u_section_gate_packer__DOT__busy_q ? 0x200u : 0u) |
+           (r->decode_top__DOT__scratch_section_done_q ? 0x400u : 0u) |
+           (r->decode_top__DOT__scratch_error_q ? 0x800u : 0u) |
+           (r->decode_top__DOT__u_section_ffn_pairer__DOT__reorder_to_req ? 0x1000u : 0u);
 }
-uint32_t dut_dbg_scratch_total_blocks(Dut *d) {
-    return d->t->rootp->decode_top__DOT__scratch_consumer_total_blocks_q;
+uint32_t dut_dbg_scratch_error(Dut *d) {
+    return d->t->rootp->decode_top__DOT__scratch_error_q;
 }
-void dut_dbg_seed_scratch_roles(Dut *d, uint32_t rows, uint32_t tokens) {
-    // Test-only metadata setup for production-width arithmetic and lifecycle
-    // relaunch checks. The ordinary FFN path populates it through real writes.
-    d->t->rootp->decode_top__DOT__scratch_valid_q = 0x6;
-    d->t->rootp->decode_top__DOT__scratch_valid_rows_q[1] = rows;
-    d->t->rootp->decode_top__DOT__scratch_valid_rows_q[2] = rows;
-    d->t->rootp->decode_top__DOT__scratch_valid_tokens_q[1] = tokens;
-    d->t->rootp->decode_top__DOT__scratch_valid_tokens_q[2] = tokens;
+void dut_set_gate_q8_numeric_error(Dut *d, int v) {
+    d->t->sim_inject_q8_numeric_error = v;
 }
 int dut_axi_rvalid(Dut *d) { return d->t->s_axi_rvalid; }
 uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }
