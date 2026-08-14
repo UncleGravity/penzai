@@ -248,6 +248,19 @@ fn addFormalSteps(b: *std.Build) void {
     );
     section_rmsnorm_maxexp_step.dependOn(&section_rmsnorm_maxexp_run.step);
 
+    const section_rmsnorm_loader_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_rmsnorm_loader",
+        "fpga/formal/section_rmsnorm_loader.sby",
+    });
+    const section_rmsnorm_loader_step = b.step(
+        "formal-section-rmsnorm-loader",
+        "Prove RMSNorm residual loading, R mapping, grouping, faults, and restart",
+    );
+    section_rmsnorm_loader_step.dependOn(&section_rmsnorm_loader_run.step);
+
     const section_rmsnorm_sumsq_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -323,6 +336,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_f32_scratch_step);
     formal.dependOn(section_q8_buffer_step);
     formal.dependOn(section_swiglu_step);
+    formal.dependOn(section_rmsnorm_loader_step);
     formal.dependOn(section_rmsnorm_maxexp_step);
     formal.dependOn(section_rmsnorm_sumsq_step);
     formal.dependOn(section_ffn_pairer_step);
@@ -474,6 +488,10 @@ const section_rmsnorm_maxexp_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_maxexp.v",
 };
 
+const section_rmsnorm_loader_rtl = [_][]const u8{
+    "fpga/rtl/section_rmsnorm_loader.v",
+};
+
 const section_rmsnorm_sumsq_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_sumsq.v",
 };
@@ -536,6 +554,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",                 "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_maxexp",
         "fpga/rtl/section_rmsnorm_maxexp.v",
     });
+    const section_rmsnorm_loader_lint = b.addSystemCommand(&.{
+        "verilator",                         "--lint-only",      "-Wall",        "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",                 "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_loader",
+        "fpga/rtl/section_rmsnorm_loader.v",
+    });
     const section_rmsnorm_sumsq_lint = b.addSystemCommand(&.{
         "verilator",                        "--lint-only",      "-Wall",        "-Wno-DECLFILENAME",
         "-Wno-UNUSEDSIGNAL",                "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_sumsq",
@@ -546,6 +569,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     lint_step.dependOn(&section_q8_buffer_lint.step);
     lint_step.dependOn(&section_ffn_pairer_lint.step);
     lint_step.dependOn(&section_gate_packer_lint.step);
+    lint_step.dependOn(&section_rmsnorm_loader_lint.step);
     lint_step.dependOn(&section_rmsnorm_maxexp_lint.step);
     lint_step.dependOn(&section_rmsnorm_sumsq_lint.step);
 
@@ -563,6 +587,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const section_ffn_pairer_cosim = addCosim(b, target, optimize, "test-rtl-section-ffn-pairer", "Verilator cosim: tagged streamed GATE groups paired with resident X1/UP", "section_ffn_pairer", "fpga/sim/section_ffn_pairer", &section_ffn_pairer_rtl, .section);
     const section_gate_packer_cosim = addCosim(b, target, optimize, "test-rtl-section-gate-packer", "Verilator cosim: native GEMM result beats to tagged streamed GATE groups", "section_gate_packer", "fpga/sim/section_gate_packer", &section_gate_packer_rtl, .section);
     const section_swiglu_cosim = addCosim(b, target, optimize, "test-rtl-section-swiglu", "Verilator cosim: bit-exact PWL section SwiGLU with elastic stream", "section_swiglu", "fpga/sim/section_swiglu", &section_swiglu_rtl, .swiglu);
+    const section_rmsnorm_loader_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-loader", "Verilator cosim: token-major residual writes and exponent-scan group packing", "section_rmsnorm_loader", "fpga/sim/section_rmsnorm_loader", &section_rmsnorm_loader_rtl, .section);
     const section_rmsnorm_maxexp_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-maxexp", "Verilator cosim: exact token-local RMSNorm maximum-exponent scan", "section_rmsnorm_maxexp", "fpga/sim/section_rmsnorm_maxexp", &section_rmsnorm_maxexp_rtl, .section);
     const section_rmsnorm_sumsq_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-sumsq", "Verilator cosim: exact prior-max fixed RMSNorm sumsq reduction", "section_rmsnorm_sumsq", "fpga/sim/section_rmsnorm_sumsq", &section_rmsnorm_sumsq_rtl, .section);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
@@ -582,6 +607,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(section_ffn_pairer_cosim);
     rtl_cosim.dependOn(section_gate_packer_cosim);
     rtl_cosim.dependOn(section_swiglu_cosim);
+    rtl_cosim.dependOn(section_rmsnorm_loader_cosim);
     rtl_cosim.dependOn(section_rmsnorm_maxexp_cosim);
     rtl_cosim.dependOn(section_rmsnorm_sumsq_cosim);
 }

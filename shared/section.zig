@@ -25,6 +25,15 @@ pub const f32_values_per_word: u32 = 2;
 pub const f32_word_bytes: u32 = f32_values_per_word * @sizeOf(f32);
 pub const f32_rows_per_group: u32 = f32_banks_per_role * f32_values_per_word;
 
+/// Diagnostic status bits shared with `section_rmsnorm_loader.v`.
+pub const RmsNormLoaderStatus = struct {
+    pub const bad_cfg: u4 = 1 << 0;
+    pub const frame: u4 = 1 << 1;
+    pub const sink: u4 = 1 << 2;
+    pub const internal: u4 = 1 << 3;
+    pub const fatal_mask: u4 = bad_cfg | frame | sink | internal;
+};
+
 /// Diagnostic status bits shared with `section_rmsnorm_maxexp.v`.
 pub const RmsNormMaxExpStatus = struct {
     pub const bad_cfg: u6 = 1 << 0;
@@ -265,6 +274,20 @@ pub fn f32PhysicalLocation(role: F32Role, token: u32, even_row: u32) Error!F32Lo
         .bank = local.bank,
         .address = f32RoleBase(role) + local.address,
     };
+}
+
+/// Map one token-major 64-bit residual input word to the direct R scratch port.
+pub fn rmsNormResidualWordLocation(rows: u32, tokens: u32, ordinal: u32) Error!F32Location {
+    if (rows < f32_rows_per_group or rows > model_dim_max or
+        rows % f32_rows_per_group != 0)
+        return error.InvalidModelDim;
+    if (tokens == 0 or tokens > query_tile_max)
+        return error.InvalidTokenCount;
+    const words_per_token = rows / f32_values_per_word;
+    if (ordinal >= words_per_token * tokens) return error.InvalidRowPair;
+    const token = ordinal / words_per_token;
+    const word = ordinal % words_per_token;
+    return f32PhysicalLocation(.residual, token, word * f32_values_per_word);
 }
 
 /// The Q8 activation is the GEMM kernel's native pair of memories: 32 int8
@@ -669,6 +692,33 @@ test "P3d RMSNorm max exponent scan rejects shape and nonfinite input" {
     try std.testing.expectError(error.Nonfinite, rmsNormMaxExp(&values, values.len));
     values[5] = 0x7fc0_0001;
     try std.testing.expectError(error.Nonfinite, rmsNormMaxExp(&values, values.len));
+}
+
+test "P3d residual loader maps token-major words into R scratch" {
+    try std.testing.expectEqual(@as(u4, 0xf), RmsNormLoaderStatus.fatal_mask);
+    for (1..query_tile_max + 1) |tokens| {
+        const rows: u32 = model_dim_max;
+        const words = rows / f32_values_per_word;
+        for (0..tokens * words) |ordinal| {
+            const got = try rmsNormResidualWordLocation(
+                rows,
+                @intCast(tokens),
+                @intCast(ordinal),
+            );
+            const token: u32 = @intCast(ordinal / words);
+            const word: u32 = @intCast(ordinal % words);
+            const expected = try f32PhysicalLocation(
+                .residual,
+                token,
+                word * f32_values_per_word,
+            );
+            try std.testing.expectEqual(expected, got);
+        }
+    }
+
+    try std.testing.expectError(error.InvalidModelDim, rmsNormResidualWordLocation(7, 1, 0));
+    try std.testing.expectError(error.InvalidTokenCount, rmsNormResidualWordLocation(8, 0, 0));
+    try std.testing.expectError(error.InvalidRowPair, rmsNormResidualWordLocation(8, 1, 4));
 }
 
 test "P3d RMSNorm sumsq oracle covers every exponent-alignment class" {
