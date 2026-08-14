@@ -52,17 +52,20 @@ module section_rmsnorm_inv (
 
     localparam [3:0] ST_IDLE         = 4'd0;
     localparam [3:0] ST_INPUT        = 4'd1;
-    localparam [3:0] ST_ADD_ISSUE    = 4'd2;
-    localparam [3:0] ST_ADD_WAIT     = 4'd3;
-    localparam [3:0] ST_SQ_ISSUE     = 4'd4;
-    localparam [3:0] ST_SQ_WAIT      = 4'd5;
-    localparam [3:0] ST_SCALE_ISSUE  = 4'd6;
-    localparam [3:0] ST_SCALE_WAIT   = 4'd7;
-    localparam [3:0] ST_CORR_ISSUE   = 4'd8;
-    localparam [3:0] ST_CORR_WAIT    = 4'd9;
-    localparam [3:0] ST_REFINE_ISSUE = 4'd10;
-    localparam [3:0] ST_REFINE_WAIT  = 4'd11;
-    localparam [3:0] ST_RESULT       = 4'd12;
+    localparam [3:0] ST_MEAN_SCAN    = 4'd2;
+    localparam [3:0] ST_MEAN_SHIFT   = 4'd3;
+    localparam [3:0] ST_MEAN_FINAL   = 4'd4;
+    localparam [3:0] ST_ADD_ISSUE    = 4'd5;
+    localparam [3:0] ST_ADD_WAIT     = 4'd6;
+    localparam [3:0] ST_SQ_ISSUE     = 4'd7;
+    localparam [3:0] ST_SQ_WAIT      = 4'd8;
+    localparam [3:0] ST_SCALE_ISSUE  = 4'd9;
+    localparam [3:0] ST_SCALE_WAIT   = 4'd10;
+    localparam [3:0] ST_CORR_ISSUE   = 4'd11;
+    localparam [3:0] ST_CORR_WAIT    = 4'd12;
+    localparam [3:0] ST_REFINE_ISSUE = 4'd13;
+    localparam [3:0] ST_REFINE_WAIT  = 4'd14;
+    localparam [3:0] ST_RESULT       = 4'd15;
 
     localparam [31:0] FP32_ONE_POINT_FIVE = 32'h3fc0_0000;
     localparam [31:0] INV_SQRT_MAGIC = 32'h5f37_59df;
@@ -71,9 +74,17 @@ module section_rmsnorm_inv (
     reg [13:0] run_rows_q;
     reg [2:0] run_tokens_q;
     reg [31:0] run_eps_q;
+    reg [3:0] run_row_shift_q;
     reg [1:0] token_q;
     reg [1:0] record_token_q;
     reg record_final_q;
+    reg [47:0] mean_sum_q;
+    reg [7:0] mean_max_exp_q;
+    reg [5:0] mean_msb_q;
+    reg [5:0] mean_shift_q;
+    reg [23:0] mean_sig_base_q;
+    reg mean_round_up_q;
+    reg signed [11:0] mean_biased_pre_q;
     reg [31:0] mean_q;
     reg [31:0] half_adjusted_q;
     reg [31:0] estimate_q;
@@ -135,40 +146,48 @@ module section_rmsnorm_inv (
                             (s_max_exp == 8'hff) ||
                             ((s_sum_sq == 48'd0) != (s_max_exp == 8'd0));
 
-    // Exact positive integer-to-binary32 RNE for the fixed mean identity.
-    wire [5:0] mean_msb = lead_one48(s_sum_sq);
-    wire [5:0] mean_shift = mean_msb > 6'd23 ? mean_msb - 6'd23 : 6'd0;
-    wire [63:0] sum_ext = {16'd0, s_sum_sq};
-    wire [63:0] mean_sig_base = mean_msb <= 6'd23 ?
-                                (sum_ext << (6'd23 - mean_msb)) :
-                                (sum_ext >> mean_shift);
-    wire [63:0] mean_remainder_mask = mean_shift == 0 ? 64'd0 :
-                                      ((64'd1 << mean_shift) - 1'b1);
-    wire [63:0] mean_remainder = sum_ext & mean_remainder_mask;
-    wire [63:0] mean_halfway = mean_shift == 0 ? 64'd0 :
-                                (64'd1 << (mean_shift - 1'b1));
-    wire mean_round_up = mean_shift != 0 &&
-                         ((mean_remainder > mean_halfway) ||
-                          ((mean_remainder == mean_halfway) &&
-                           mean_sig_base[0]));
-    wire [24:0] mean_sig_rounded = {1'b0, mean_sig_base[23:0]} +
-                                    mean_round_up;
+    // Exact positive integer-to-binary32 RNE for the fixed mean identity. The
+    // scan, variable shift/round decision, and final carry are separate scalar
+    // stages so none of them sits on the section control-enable path.
+    wire [5:0] mean_scan_msb = lead_one48(mean_sum_q);
+    wire [5:0] mean_scan_shift = mean_scan_msb > 6'd23 ?
+                                 mean_scan_msb - 6'd23 : 6'd0;
+    wire signed [11:0] mean_scan_msb_signed = {6'd0, mean_scan_msb};
+    wire signed [11:0] mean_scan_exp_signed = {4'd0, mean_max_exp_q};
+    wire signed [11:0] mean_scan_row_signed = {8'd0, run_row_shift_q};
+    wire signed [11:0] mean_scan_biased =
+        mean_scan_msb_signed +
+        ((mean_scan_exp_signed - 12'sd144) <<< 1) -
+        mean_scan_row_signed + 12'sd127;
+
+    wire [63:0] mean_sum_ext = {16'd0, mean_sum_q};
+    wire [63:0] mean_shifted = mean_msb_q <= 6'd23 ?
+                               (mean_sum_ext << (6'd23 - mean_msb_q)) :
+                               (mean_sum_ext >> mean_shift_q);
+    wire [47:0] mean_remainder_mask = mean_shift_q == 0 ? 48'd0 :
+                                      ((48'd1 << mean_shift_q) - 1'b1);
+    wire [47:0] mean_remainder = mean_sum_q & mean_remainder_mask;
+    wire [47:0] mean_halfway = mean_shift_q == 0 ? 48'd0 :
+                                (48'd1 << (mean_shift_q - 1'b1));
+    wire mean_shift_round_up = mean_shift_q != 0 &&
+                               ((mean_remainder > mean_halfway) ||
+                                ((mean_remainder == mean_halfway) &&
+                                 mean_shifted[0]));
+
+    wire [24:0] mean_sig_rounded = {1'b0, mean_sig_base_q} +
+                                    mean_round_up_q;
     wire mean_renormalize = mean_sig_rounded[24];
     wire [23:0] mean_sig_normalized = mean_renormalize ?
                                       mean_sig_rounded[24:1] :
                                       mean_sig_rounded[23:0];
-    wire [3:0] mean_row_shift = log2_rows(s_rows);
-    wire signed [11:0] mean_msb_signed = {6'd0, mean_msb};
-    wire signed [11:0] mean_exp_signed = {4'd0, s_max_exp};
-    wire signed [11:0] mean_row_signed = {8'd0, mean_row_shift};
-    wire signed [11:0] mean_unbiased =
-        mean_msb_signed + ((mean_exp_signed - 12'sd144) <<< 1) -
-        mean_row_signed +
-        (mean_renormalize ? 12'sd1 : 12'sd0);
-    wire signed [11:0] mean_biased = mean_unbiased + 12'sd127;
-    wire mean_overflow = (s_sum_sq != 0) && (mean_biased >= 12'sd255);
-    wire [31:0] mean_bits = (s_sum_sq == 0) || (mean_biased <= 0) ? 32'd0 :
-                            {1'b0, mean_biased[7:0], mean_sig_normalized[22:0]};
+    wire signed [11:0] mean_biased = mean_biased_pre_q +
+                                     (mean_renormalize ? 12'sd1 : 12'sd0);
+    wire mean_overflow = (mean_sum_q != 0) &&
+                         (mean_biased >= 12'sd255);
+    wire [31:0] mean_bits = (mean_sum_q == 0) || (mean_biased <= 0) ?
+                            32'd0 :
+                            {1'b0, mean_biased[7:0],
+                             mean_sig_normalized[22:0]};
 
     wire add_issue = (state_q == ST_ADD_ISSUE) ||
                      (state_q == ST_CORR_ISSUE);
@@ -222,9 +241,17 @@ module section_rmsnorm_inv (
             run_rows_q <= 14'd0;
             run_tokens_q <= 3'd0;
             run_eps_q <= 32'd0;
+            run_row_shift_q <= 4'd0;
             token_q <= 2'd0;
             record_token_q <= 2'd0;
             record_final_q <= 1'b0;
+            mean_sum_q <= 48'd0;
+            mean_max_exp_q <= 8'd0;
+            mean_msb_q <= 6'd0;
+            mean_shift_q <= 6'd0;
+            mean_sig_base_q <= 24'd0;
+            mean_round_up_q <= 1'b0;
+            mean_biased_pre_q <= 12'sd0;
             mean_q <= 32'd0;
             half_adjusted_q <= 32'd0;
             estimate_q <= 32'd0;
@@ -242,6 +269,13 @@ module section_rmsnorm_inv (
             token_q <= 2'd0;
             record_token_q <= 2'd0;
             record_final_q <= 1'b0;
+            mean_sum_q <= 48'd0;
+            mean_max_exp_q <= 8'd0;
+            mean_msb_q <= 6'd0;
+            mean_shift_q <= 6'd0;
+            mean_sig_base_q <= 24'd0;
+            mean_round_up_q <= 1'b0;
+            mean_biased_pre_q <= 12'sd0;
             result_q <= 32'd0;
             iteration_q <= 1'b0;
             wait_age_q <= 4'd0;
@@ -268,6 +302,7 @@ module section_rmsnorm_inv (
                         run_rows_q <= cfg_rows;
                         run_tokens_q <= cfg_tokens;
                         run_eps_q <= cfg_eps;
+                        run_row_shift_q <= log2_rows(cfg_rows);
                         state_q <= ST_INPUT;
                     end
                 end
@@ -275,11 +310,32 @@ module section_rmsnorm_inv (
                 ST_INPUT: if (s_accept) begin
                     if (record_frame_bad) begin
                         fail_run(STATUS_FRAME);
-                    end else if (mean_overflow) begin
-                        fail_run(STATUS_ARITHMETIC);
                     end else begin
                         record_token_q <= s_token;
                         record_final_q <= s_final;
+                        mean_sum_q <= s_sum_sq;
+                        mean_max_exp_q <= s_max_exp;
+                        state_q <= ST_MEAN_SCAN;
+                    end
+                end
+
+                ST_MEAN_SCAN: begin
+                    mean_msb_q <= mean_scan_msb;
+                    mean_shift_q <= mean_scan_shift;
+                    mean_biased_pre_q <= mean_scan_biased;
+                    state_q <= ST_MEAN_SHIFT;
+                end
+
+                ST_MEAN_SHIFT: begin
+                    mean_sig_base_q <= mean_shifted[23:0];
+                    mean_round_up_q <= mean_shift_round_up;
+                    state_q <= ST_MEAN_FINAL;
+                end
+
+                ST_MEAN_FINAL: begin
+                    if (mean_overflow) begin
+                        fail_run(STATUS_ARITHMETIC);
+                    end else begin
                         mean_q <= mean_bits;
                         state_q <= ST_ADD_ISSUE;
                     end

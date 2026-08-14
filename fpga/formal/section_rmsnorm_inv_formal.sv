@@ -15,10 +15,10 @@ module section_rmsnorm_inv_formal(input wire clk);
     localparam [3:0] STATUS_ARITHMETIC = 4'b0100;
 
     localparam [3:0] DUT_ST_INPUT     = 4'd1;
-    localparam [3:0] DUT_ST_ADD_WAIT  = 4'd3;
-    localparam [3:0] DUT_ST_SQ_WAIT   = 4'd5;
-    localparam [3:0] DUT_ST_CORR_WAIT = 4'd9;
-    localparam [3:0] DUT_ST_RESULT    = 4'd12;
+    localparam [3:0] DUT_ST_ADD_WAIT  = 4'd6;
+    localparam [3:0] DUT_ST_SQ_WAIT   = 4'd8;
+    localparam [3:0] DUT_ST_CORR_WAIT = 4'd12;
+    localparam [3:0] DUT_ST_RESULT    = 4'd15;
 
     (* anyseq *) reg rst_n;
     (* anyseq *) reg input_allow_any;
