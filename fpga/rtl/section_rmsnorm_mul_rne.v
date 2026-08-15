@@ -125,44 +125,128 @@ module section_rmsnorm_mul_rne (
 
     reg [23:0] shift_base_comb;
     reg        shift_round_up_comb;
-    reg [48:0] shift_quotient_comb;
-    reg [48:0] shift_remainder_mask_comb;
-    reg [48:0] shift_remainder_comb;
-    reg [48:0] shift_halfway_comb;
-    reg [48:0] shift_left_comb;
+    reg [47:0] shift_right_comb;
+    reg [23:0] shift_quotient_comb;
+    reg [23:0] shift_left_comb;
+    reg [7:0]  shift_round_byte_comb;
+    reg        shift_round_below_comb;
+    reg        shift_guard_comb;
+    reg        shift_sticky_comb;
+
+    // A right shift by d rounds from guard P[d-1], sticky |P[d-2:0],
+    // and the retained quotient LSB. Selecting those bits by byte avoids the
+    // wide mask, subtract, and magnitude comparison of a literal remainder.
+    wire [5:0] shift_round_index = shift_amount_q[5:0] - 6'd1;
+    wire [5:0] product_byte_any = {
+        |product_q[47:40], |product_q[39:32], |product_q[31:24],
+        |product_q[23:16], |product_q[15:8],  |product_q[7:0]
+    };
+    wire product_low_16_any = product_byte_any[1] |
+                              product_byte_any[0];
+    wire product_low_32_any = (product_byte_any[3] |
+                               product_byte_any[2]) |
+                              product_low_16_any;
     always @(*) begin
         shift_base_comb = 24'd0;
         shift_round_up_comb = 1'b0;
-        shift_quotient_comb = 49'd0;
-        shift_remainder_mask_comb = 49'd0;
-        shift_remainder_comb = 49'd0;
-        shift_halfway_comb = 49'd0;
-        shift_left_comb = 49'd0;
+        shift_right_comb = 48'd0;
+        shift_quotient_comb = 24'd0;
+        shift_left_comb = 24'd0;
+        shift_round_byte_comb = 8'd0;
+        shift_round_below_comb = 1'b0;
+        shift_guard_comb = 1'b0;
+        shift_sticky_comb = 1'b0;
 
         if (shift_left_q) begin
-            // The reachable normal left shift is at most 23. The wide guard
-            // keeps the explicitly handled signed-subnormal branch bounded too.
-            if (shift_amount_q >= 9'd49) begin
-                shift_base_comb = product_q == 48'd0 ? 24'd0 : 24'h80_0000;
-            end else begin
-                shift_left_comb = {1'b0, product_q} << shift_amount_q;
-                shift_base_comb = |shift_left_comb[48:24] ?
-                                  24'h80_0000 : shift_left_comb[23:0];
-            end
+            // Normal left shifts move the product lead to bit 23. A subnormal
+            // left shift can reach at most bit 22, so both cases fit exactly.
+            shift_left_comb = product_q[23:0] << shift_amount_q[4:0];
+            shift_base_comb = shift_left_comb;
         end else if (shift_amount_q == 9'd0) begin
             shift_base_comb = product_q[23:0];
         end else if (shift_amount_q <= 9'd48) begin
-            shift_quotient_comb = {1'b0, product_q} >> shift_amount_q;
-            shift_remainder_mask_comb =
-                (49'd1 << shift_amount_q) - 1'b1;
-            shift_remainder_comb = {1'b0, product_q} &
-                                   shift_remainder_mask_comb;
-            shift_halfway_comb = 49'd1 << (shift_amount_q - 1'b1);
-            shift_base_comb = shift_quotient_comb[23:0];
-            shift_round_up_comb =
-                (shift_remainder_comb > shift_halfway_comb) ||
-                ((shift_remainder_comb == shift_halfway_comb) &&
-                 shift_quotient_comb[0]);
+            shift_right_comb = product_q >> shift_amount_q[5:0];
+            shift_quotient_comb = shift_right_comb[23:0];
+            shift_base_comb = shift_quotient_comb;
+
+            case (shift_round_index[5:3])
+                3'd0: begin
+                    shift_round_byte_comb = product_q[7:0];
+                    shift_round_below_comb = 1'b0;
+                end
+                3'd1: begin
+                    shift_round_byte_comb = product_q[15:8];
+                    shift_round_below_comb = product_byte_any[0];
+                end
+                3'd2: begin
+                    shift_round_byte_comb = product_q[23:16];
+                    shift_round_below_comb = product_low_16_any;
+                end
+                3'd3: begin
+                    shift_round_byte_comb = product_q[31:24];
+                    shift_round_below_comb = product_low_16_any |
+                                             product_byte_any[2];
+                end
+                3'd4: begin
+                    shift_round_byte_comb = product_q[39:32];
+                    shift_round_below_comb = product_low_32_any;
+                end
+                3'd5: begin
+                    shift_round_byte_comb = product_q[47:40];
+                    shift_round_below_comb = product_low_32_any |
+                                             product_byte_any[4];
+                end
+                default: begin
+                    shift_round_byte_comb = 8'd0;
+                    shift_round_below_comb = 1'b0;
+                end
+            endcase
+
+            case (shift_round_index[2:0])
+                3'd0: begin
+                    shift_guard_comb = shift_round_byte_comb[0];
+                    shift_sticky_comb = shift_round_below_comb;
+                end
+                3'd1: begin
+                    shift_guard_comb = shift_round_byte_comb[1];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        shift_round_byte_comb[0];
+                end
+                3'd2: begin
+                    shift_guard_comb = shift_round_byte_comb[2];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[1:0]);
+                end
+                3'd3: begin
+                    shift_guard_comb = shift_round_byte_comb[3];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[2:0]);
+                end
+                3'd4: begin
+                    shift_guard_comb = shift_round_byte_comb[4];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[3:0]);
+                end
+                3'd5: begin
+                    shift_guard_comb = shift_round_byte_comb[5];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[4:0]);
+                end
+                3'd6: begin
+                    shift_guard_comb = shift_round_byte_comb[6];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[5:0]);
+                end
+                3'd7: begin
+                    shift_guard_comb = shift_round_byte_comb[7];
+                    shift_sticky_comb = shift_round_below_comb |
+                                        (|shift_round_byte_comb[6:0]);
+                end
+            endcase
+
+            shift_round_up_comb = shift_guard_comb &&
+                                  (shift_sticky_comb ||
+                                   shift_quotient_comb[0]);
         end
         // A right shift above the exact 48-bit product rounds to zero.
     end
