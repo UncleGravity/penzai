@@ -308,6 +308,19 @@ fn addFormalSteps(b: *std.Build) void {
     );
     section_rmsnorm_inv_step.dependOn(&section_rmsnorm_inv_run.step);
 
+    const section_rmsnorm_mul_rne_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/section_rmsnorm_mul_rne",
+        "fpga/formal/section_rmsnorm_mul_rne.sby",
+    });
+    const section_rmsnorm_mul_rne_step = b.step(
+        "formal-section-rmsnorm-mul-rne",
+        "Prove exact finite binary32 RNE multiplication, fixed latency, stalls, abort, and restart",
+    );
+    section_rmsnorm_mul_rne_step.dependOn(&section_rmsnorm_mul_rne_run.step);
+
     const section_rmsnorm_reduce_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -388,6 +401,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_rmsnorm_sumsq_step);
     formal.dependOn(section_rmsnorm_frontend_step);
     formal.dependOn(section_rmsnorm_inv_step);
+    formal.dependOn(section_rmsnorm_mul_rne_step);
     formal.dependOn(section_rmsnorm_reduce_step);
     formal.dependOn(section_ffn_pairer_step);
     formal.dependOn(section_gate_packer_step);
@@ -559,6 +573,10 @@ const section_rmsnorm_inv_rtl = [_][]const u8{
     "fpga/rtl/numeric/fadd.v",
 };
 
+const section_rmsnorm_mul_rne_rtl = [_][]const u8{
+    "fpga/rtl/section_rmsnorm_mul_rne.v",
+};
+
 const section_rmsnorm_reduce_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_reduce.v",
     "fpga/rtl/section_rmsnorm_frontend.v",
@@ -648,6 +666,11 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",   "-Wno-UNUSEDPARAM",               "+incdir+fpga/rtl/numeric", "--top-module",
         "section_rmsnorm_inv", "fpga/rtl/section_rmsnorm_inv.v", "fpga/rtl/numeric/fmul.v",  "fpga/rtl/numeric/fadd.v",
     });
+    const section_rmsnorm_mul_rne_lint = b.addSystemCommand(&.{
+        "verilator",                          "--lint-only",      "-Wall",        "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",                  "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_mul_rne",
+        "fpga/rtl/section_rmsnorm_mul_rne.v",
+    });
     const section_rmsnorm_reduce_lint = b.addSystemCommand(&.{
         "verilator",                         "--lint-only",                       "-Wall",                               "-Wno-DECLFILENAME",
         "-Wno-UNUSEDSIGNAL",                 "-Wno-UNUSEDPARAM",                  "+incdir+fpga/rtl/numeric",            "--top-module",
@@ -665,6 +688,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     lint_step.dependOn(&section_rmsnorm_sumsq_lint.step);
     lint_step.dependOn(&section_rmsnorm_frontend_lint.step);
     lint_step.dependOn(&section_rmsnorm_inv_lint.step);
+    lint_step.dependOn(&section_rmsnorm_mul_rne_lint.step);
     lint_step.dependOn(&section_rmsnorm_reduce_lint.step);
 
     _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
@@ -686,6 +710,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const section_rmsnorm_sumsq_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-sumsq", "Verilator cosim: exact prior-max fixed RMSNorm sumsq reduction", "section_rmsnorm_sumsq", "fpga/sim/section_rmsnorm_sumsq", &section_rmsnorm_sumsq_rtl, .section);
     const section_rmsnorm_frontend_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-frontend", "Verilator cosim: residual load, max-exponent scan, R replay, and fixed sumsq", "section_rmsnorm_frontend", "fpga/sim/section_rmsnorm_frontend", &section_rmsnorm_frontend_rtl, .section);
     const section_rmsnorm_inv_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-inv", "Verilator cosim: deterministic fixed-mean and two-step inverse RMS", "section_rmsnorm_inv", "fpga/sim/section_rmsnorm_inv", &section_rmsnorm_inv_rtl, .section);
+    const section_rmsnorm_mul_rne_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-mul-rne", "Verilator cosim: exact finite binary32 RNE RMSNorm multiplier", "section_rmsnorm_mul_rne", "fpga/sim/section_rmsnorm_mul_rne", &section_rmsnorm_mul_rne_rtl, .section);
     const section_rmsnorm_reduce_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-reduce", "Verilator cosim: scratch-backed RMSNorm reduction through buffered inverse scalars", "section_rmsnorm_reduce", "fpga/sim/section_rmsnorm_reduce", &section_rmsnorm_reduce_rtl, .section);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
@@ -709,6 +734,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(section_rmsnorm_sumsq_cosim);
     rtl_cosim.dependOn(section_rmsnorm_frontend_cosim);
     rtl_cosim.dependOn(section_rmsnorm_inv_cosim);
+    rtl_cosim.dependOn(section_rmsnorm_mul_rne_cosim);
     rtl_cosim.dependOn(section_rmsnorm_reduce_cosim);
 }
 

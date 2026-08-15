@@ -118,6 +118,18 @@ pub const RmsNormInvStatus = struct {
     pub const fatal_mask: u4 = bad_cfg | frame | arithmetic | internal;
 };
 
+/// Per-result diagnostics shared with `section_rmsnorm_mul_rne.v`.
+pub const RmsNormMulStatus = struct {
+    pub const nonfinite_input: u2 = 1 << 0;
+    pub const overflow: u2 = 1 << 1;
+    pub const fatal_mask: u2 = nonfinite_input | overflow;
+};
+
+pub const RmsNormMulResult = struct {
+    bits: u32,
+    status: u2,
+};
+
 /// Diagnostics shared with `section_rmsnorm_reduce.v`. Child status layouts are
 /// preserved verbatim so the eventual v17 controller can distinguish scratch,
 /// framing, subnormal, and arithmetic failures without re-decoding a coarse bit.
@@ -144,6 +156,83 @@ pub const RmsNormInvError = error{
     InvalidRecord,
     ArithmeticOverflow,
 };
+
+fn roundRightEvenU48(value: u64, shift: u16) u64 {
+    if (shift == 0) return value;
+    if (shift > 48) return 0;
+
+    const amount: u6 = @intCast(shift);
+    const quotient = value >> amount;
+    const remainder_mask = (@as(u64, 1) << amount) - 1;
+    const remainder = value & remainder_mask;
+    const halfway = @as(u64, 1) << @as(u6, @intCast(shift - 1));
+    const round_up = remainder > halfway or
+        (remainder == halfway and (quotient & 1) != 0);
+    return quotient + @intFromBool(round_up);
+}
+
+/// Integer-only oracle for the serialized exact finite binary32 multiplier.
+/// Non-finite inputs are rejected as deterministic +0; every finite input uses
+/// gradual underflow and round-to-nearest-even.
+pub fn rmsNormMulRneBits(a_bits: u32, b_bits: u32) RmsNormMulResult {
+    const sign = (a_bits ^ b_bits) & 0x8000_0000;
+    const exponent_a: u8 = @truncate(a_bits >> 23);
+    const exponent_b: u8 = @truncate(b_bits >> 23);
+    const fraction_a: u23 = @truncate(a_bits);
+    const fraction_b: u23 = @truncate(b_bits);
+
+    if (exponent_a == 0xff or exponent_b == 0xff)
+        return .{ .bits = 0, .status = RmsNormMulStatus.nonfinite_input };
+    if ((exponent_a == 0 and fraction_a == 0) or
+        (exponent_b == 0 and fraction_b == 0))
+        return .{ .bits = sign, .status = 0 };
+
+    const significand_a: u24 =
+        (@as(u24, @intFromBool(exponent_a != 0)) << 23) | fraction_a;
+    const significand_b: u24 =
+        (@as(u24, @intFromBool(exponent_b != 0)) << 23) | fraction_b;
+    const effective_a: u16 = if (exponent_a == 0) 1 else exponent_a;
+    const effective_b: u16 = if (exponent_b == 0) 1 else exponent_b;
+    const exponent_sum: u16 = effective_a + effective_b;
+    const product: u64 = @as(u64, significand_a) * significand_b;
+    const lead: u6 = @intCast(63 - @clz(product));
+    var biased: i16 = @as(i16, @intCast(exponent_sum)) +
+        @as(i16, lead) - 173;
+
+    if (biased >= 1) {
+        var retained = if (lead >= 23)
+            roundRightEvenU48(product, lead - 23)
+        else
+            product << @as(u6, @intCast(23 - lead));
+        if (retained >= (@as(u64, 1) << 24)) {
+            retained >>= 1;
+            biased += 1;
+        }
+        if (biased >= 255)
+            return .{
+                .bits = sign | 0x7f80_0000,
+                .status = RmsNormMulStatus.overflow,
+            };
+        return .{
+            .bits = sign |
+                (@as(u32, @intCast(biased)) << 23) |
+                (@as(u32, @truncate(retained)) & 0x007f_ffff),
+            .status = 0,
+        };
+    }
+
+    const subnormal_shift = @as(i16, 151) - @as(i16, @intCast(exponent_sum));
+    const fraction = if (subnormal_shift > 0)
+        roundRightEvenU48(product, @intCast(subnormal_shift))
+    else blk: {
+        const left_shift: u16 = @intCast(-subnormal_shift);
+        if (left_shift >= 64) break :blk std.math.maxInt(u64);
+        break :blk product << @as(u6, @intCast(left_shift));
+    };
+    if (fraction >= (@as(u64, 1) << 23))
+        return .{ .bits = sign | 0x0080_0000, .status = 0 };
+    return .{ .bits = sign | @as(u32, @truncate(fraction)), .status = 0 };
+}
 
 pub const RmsNormInvResult = struct {
     mean_bits: u32,
@@ -1002,6 +1091,110 @@ test "P3d RMSNorm reduction composition preserves child diagnostics" {
     );
     try std.testing.expectEqual(@as(u13, 0x1000), RmsNormReduceStatus.internal);
     try std.testing.expectEqual(@as(u13, 1), RmsNormReduceStatus.bad_cfg);
+}
+
+test "P3d exact finite multiplier covers IEEE rounding boundaries" {
+    try std.testing.expectEqual(@as(u2, 0x3), RmsNormMulStatus.fatal_mask);
+    const cases = [_]struct {
+        a: u32,
+        b: u32,
+        bits: u32,
+        status: u2 = 0,
+    }{
+        .{ .a = 0x3f80_0000, .b = 0x3f80_0000, .bits = 0x3f80_0000 },
+        .{ .a = 0xc000_0000, .b = 0x3f00_0000, .bits = 0xbf80_0000 },
+        .{ .a = 0x0000_0000, .b = 0xbf80_0000, .bits = 0x8000_0000 },
+        .{ .a = 0x8000_0000, .b = 0xbf80_0000, .bits = 0x0000_0000 },
+        .{ .a = 0x3f8b_593f, .b = 0x3fb6_227b, .bits = 0x3fc6_486f },
+        .{ .a = 0x3fdf_9fbe, .b = 0x3fe6_5296, .bits = 0x4049_31a9 },
+        .{ .a = 0x3fe0_0000, .b = 0x3fd7_539c, .bits = 0x403c_6928 },
+        .{ .a = 0x3ffd_f200, .b = 0x3f93_c000, .bits = 0x4012_906c },
+        .{ .a = 0x3fc0_0000, .b = 0x3f80_0001, .bits = 0x3fc0_0002 },
+        .{ .a = 0x3fc0_0000, .b = 0x3f80_0003, .bits = 0x3fc0_0004 },
+        .{ .a = 0x3fff_f830, .b = 0x3f80_03e8, .bits = 0x4000_0000 },
+        .{ .a = 0x7f7f_ffff, .b = 0x3f80_0000, .bits = 0x7f7f_ffff },
+        .{
+            .a = 0x7f7f_ffff,
+            .b = 0x3f80_0001,
+            .bits = 0x7f80_0000,
+            .status = RmsNormMulStatus.overflow,
+        },
+        .{
+            .a = 0xff7f_ffff,
+            .b = 0x3f80_0001,
+            .bits = 0xff80_0000,
+            .status = RmsNormMulStatus.overflow,
+        },
+        .{ .a = 0x0080_0000, .b = 0x3f00_0000, .bits = 0x0040_0000 },
+        .{ .a = 0x0000_0001, .b = 0x3f80_0000, .bits = 0x0000_0001 },
+        .{ .a = 0x0000_0001, .b = 0x3f00_0000, .bits = 0x0000_0000 },
+        .{ .a = 0x8000_0001, .b = 0x3f00_0000, .bits = 0x8000_0000 },
+        .{ .a = 0x0000_0003, .b = 0x3f00_0000, .bits = 0x0000_0002 },
+        .{ .a = 0x0000_0005, .b = 0x3f00_0000, .bits = 0x0000_0002 },
+        .{ .a = 0x0000_0001, .b = 0x3f00_0001, .bits = 0x0000_0001 },
+        .{ .a = 0x007f_ffff, .b = 0x3f80_0001, .bits = 0x0080_0000 },
+        .{ .a = 0x007f_ffff, .b = 0x4000_0000, .bits = 0x00ff_fffe },
+        .{ .a = 0x0000_0001, .b = 0x7f7f_ffff, .bits = 0x34ff_ffff },
+        .{ .a = 0x007f_ffff, .b = 0x007f_ffff, .bits = 0x0000_0000 },
+        .{ .a = 0x19ff_ffff, .b = 0x1a7f_ffff, .bits = 0x0000_0001 },
+        .{ .a = 0x197f_ffff, .b = 0x1a7f_ffff, .bits = 0x0000_0000 },
+        .{ .a = 0x997f_ffff, .b = 0x1a7f_ffff, .bits = 0x8000_0000 },
+        .{
+            .a = 0x5f61_2000,
+            .b = 0x5f91_8e00,
+            .bits = 0x7f80_0000,
+            .status = RmsNormMulStatus.overflow,
+        },
+        .{
+            .a = 0x7f80_0000,
+            .b = 0x3f80_0000,
+            .bits = 0,
+            .status = RmsNormMulStatus.nonfinite_input,
+        },
+        .{
+            .a = 0,
+            .b = 0x7f80_0000,
+            .bits = 0,
+            .status = RmsNormMulStatus.nonfinite_input,
+        },
+        .{
+            .a = 0x7fc1_2345,
+            .b = 0xff80_0000,
+            .bits = 0,
+            .status = RmsNormMulStatus.nonfinite_input,
+        },
+    };
+
+    for (cases) |case| {
+        const got = rmsNormMulRneBits(case.a, case.b);
+        try std.testing.expectEqual(case.bits, got.bits);
+        try std.testing.expectEqual(case.status, got.status);
+        const swapped = rmsNormMulRneBits(case.b, case.a);
+        try std.testing.expectEqual(got.bits, swapped.bits);
+        try std.testing.expectEqual(got.status, swapped.status);
+    }
+}
+
+test "P3d weighted RMSNorm multiplication order is explicit" {
+    const x: u32 = 0x3730_b2f5;
+    const inverse: u32 = 0x451c_6e2e;
+    const gamma: u32 = 0x3ffa_b1b6;
+    const normalized = rmsNormMulRneBits(x, inverse);
+    const weighted = rmsNormMulRneBits(normalized.bits, gamma);
+    const reassociated_scale = rmsNormMulRneBits(inverse, gamma);
+    const reassociated = rmsNormMulRneBits(x, reassociated_scale.bits);
+    try std.testing.expectEqual(@as(u2, 0), normalized.status);
+    try std.testing.expectEqual(@as(u32, 0x3d53_786f), weighted.bits);
+    try std.testing.expectEqual(@as(u32, 0x3d53_786e), reassociated.bits);
+
+    // A normal first-stage input may produce a subnormal which the gamma stage
+    // must consume rather than flush.
+    const tiny_normalized = rmsNormMulRneBits(0x0080_0000, 0x3f00_0000);
+    try std.testing.expectEqual(@as(u32, 0x0040_0000), tiny_normalized.bits);
+    try std.testing.expectEqual(
+        @as(u32, 0x3fff_ffff),
+        rmsNormMulRneBits(tiny_normalized.bits, 0x7f7f_ffff).bits,
+    );
 }
 
 test "P3d RMSNorm two-step inverse square root has a bounded scalar error" {
