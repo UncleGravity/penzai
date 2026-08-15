@@ -1,6 +1,6 @@
 // Scratch-backed weighted RMSNorm scalar source.
 //
-// Gamma is sealed in one logical 4096x32 true-dual-port BRAM before a run
+// Gamma is sealed in one logical 2048x64 simple-dual-port BRAM before a run
 // starts. A run first buffers one inverse-RMS scalar per token, then replays
 // token-major R scratch groups. One exact FP32 multiplier is time-multiplexed
 // in the PS-compatible order RNE(RNE(x * inv_rms) * gamma). Only healthy
@@ -122,13 +122,13 @@ module section_rmsnorm_weighted_source #(
 
     reg         read_owned_q;
     reg [255:0] rsp_group_q;
-    reg [31:0]  gamma_scalar_q;
+    reg [63:0]  gamma_pair_q;
     reg [31:0]  mul_op_a_q;
     reg [31:0]  mul_op_b_q;
     reg         cleanup_report_error_q;
     reg         mul_abort_q;
 
-    (* ram_style = "block" *) reg [31:0] gamma_mem [0:4095];
+    (* ram_style = "block" *) reg [63:0] gamma_pair_mem [0:2047];
 
     wire [13:0] selected_cfg_rows = gamma_cfg_valid ? gamma_cfg_rows :
                                     cfg_rows;
@@ -245,18 +245,18 @@ module section_rmsnorm_weighted_source #(
     wire run_final_group = run_group_q == run_last_group;
     wire run_final_token = ({1'b0, run_token_q} + 3'd1) == run_tokens_q;
 
-    // The two gamma-loader writes use both BRAM ports. Once sealed, port A is
-    // reused for the registered scalar read needed by the second multiply.
+    // The sealed gamma store has one write-only loader port and one synchronous
+    // read-only run port, matching the block-RAM simple-dual-port template.
     always @(posedge clk) begin
         if (gamma_fire && gamma_input_ok)
-            gamma_mem[{gamma_word_q, 1'b0}] <= gamma_tdata[31:0];
-        else if ((state_q == ST_MUL1_REQ) && mul_s_fire)
-            gamma_scalar_q <= gamma_mem[{run_group_q[8:0], run_lane_q}];
+            gamma_pair_mem[gamma_word_q] <= gamma_tdata;
     end
 
     always @(posedge clk) begin
-        if (gamma_fire && gamma_input_ok)
-            gamma_mem[{gamma_word_q, 1'b1}] <= gamma_tdata[63:32];
+        if ((state_q == ST_MUL1_REQ) && mul_s_fire)
+            gamma_pair_q <= gamma_pair_mem[
+                {run_group_q[8:0], run_lane_q[2:1]}
+            ];
     end
 
     task automatic fail_run(input [8:0] failure_status);
@@ -433,7 +433,8 @@ module section_rmsnorm_weighted_source #(
                         fail_run({3'd0, mul_result_status, 4'd0});
                     end else begin
                         mul_op_a_q <= mul_result_data;
-                        mul_op_b_q <= gamma_scalar_q;
+                        mul_op_b_q <= run_lane_q[0] ? gamma_pair_q[63:32] :
+                                                     gamma_pair_q[31:0];
                         state_q <= ST_MUL2_REQ;
                     end
                 end
