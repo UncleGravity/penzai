@@ -118,6 +118,26 @@ pub const RmsNormInvStatus = struct {
     pub const fatal_mask: u4 = bad_cfg | frame | arithmetic | internal;
 };
 
+/// Diagnostics shared with `section_rmsnorm_reduce.v`. Child status layouts are
+/// preserved verbatim so the eventual v17 controller can distinguish scratch,
+/// framing, subnormal, and arithmetic failures without re-decoding a coarse bit.
+pub const RmsNormReduceStatus = struct {
+    pub const bad_cfg: u13 = 1 << 0;
+    pub const frontend_shift: u4 = 1;
+    pub const inverse_shift: u4 = 8;
+    pub const internal: u13 = 1 << 12;
+
+    pub fn frontend(status: u7) u13 {
+        return @as(u13, status) << frontend_shift;
+    }
+
+    pub fn inverse(status: u4) u13 {
+        return @as(u13, status) << inverse_shift;
+    }
+
+    pub const fatal_mask: u13 = 0x1fff;
+};
+
 pub const RmsNormInvError = error{
     InvalidShape,
     InvalidEpsilon,
@@ -964,6 +984,24 @@ test "P3d RMSNorm inverse scalar fixes mean rounding and request bounds" {
     try std.testing.expectError(error.InvalidRecord, rmsNormFixedMeanBits(0, 8, 127));
     try std.testing.expectError(error.InvalidEpsilon, rmsNormInvFixed(one_sum, 8, 127, 0));
     try std.testing.expectError(error.InvalidEpsilon, rmsNormInvFixed(one_sum, 8, 127, 0xbf80_0000));
+}
+
+test "P3d RMSNorm reduction composition preserves child diagnostics" {
+    try std.testing.expectEqual(@as(u13, 0x1fff), RmsNormReduceStatus.fatal_mask);
+    try std.testing.expectEqual(
+        @as(u13, RmsNormFrontendStatus.scratch) << 1,
+        RmsNormReduceStatus.frontend(RmsNormFrontendStatus.scratch),
+    );
+    try std.testing.expectEqual(
+        @as(u13, RmsNormFrontendStatus.subnormal) << 1,
+        RmsNormReduceStatus.frontend(RmsNormFrontendStatus.subnormal),
+    );
+    try std.testing.expectEqual(
+        @as(u13, RmsNormInvStatus.arithmetic) << 8,
+        RmsNormReduceStatus.inverse(RmsNormInvStatus.arithmetic),
+    );
+    try std.testing.expectEqual(@as(u13, 0x1000), RmsNormReduceStatus.internal);
+    try std.testing.expectEqual(@as(u13, 1), RmsNormReduceStatus.bad_cfg);
 }
 
 test "P3d RMSNorm two-step inverse square root has a bounded scalar error" {
