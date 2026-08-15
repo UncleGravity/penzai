@@ -22,13 +22,13 @@ module section_rmsnorm_maxexp_formal(input wire clk);
     (* anyseq *) reg input_allow;
     (* anyseq *) reg result_ready_any;
     (* anyconst *) reg [3:0] scenario;
-    (* anyconst *) reg abort_phase;
-    (* anyconst *) reg [255:0] arbitrary_data0;
-    (* anyconst *) reg [255:0] arbitrary_data1;
-    (* anyconst *) reg [255:0] arbitrary_data2;
-    (* anyconst *) reg [255:0] arbitrary_data3;
+    (* anyconst *) reg [1:0] abort_phase;
+    (* anyconst *) reg [71:0] arbitrary_fields0;
+    (* anyconst *) reg [71:0] arbitrary_fields1;
 
 `ifdef FORMAL_BMC
+    wire [3:0] active_scenario = SC_CLEAN;
+`elsif FORMAL_STALLS
     wire [3:0] active_scenario = SC_CLEAN;
 `else
     wire [3:0] active_scenario = scenario;
@@ -37,13 +37,23 @@ module section_rmsnorm_maxexp_formal(input wire clk);
     reg cfg_pending_q;
     reg [2:0] sent_groups_q;
     reg [2:0] accepted_results_q;
+    reg [1:0] drain_age_q;
     reg aborted_q;
     reg restarted_q;
     reg f_past_valid = 1'b0;
 
     wire cfg_valid = cfg_pending_q && rst_n;
     wire cfg_ready;
+`ifdef FORMAL_BMC
+    wire [13:0] cfg_rows = 14'd16;
+    wire [2:0] cfg_tokens = 3'd2;
+`elsif FORMAL_STALLS
+    wire [13:0] cfg_rows = 14'd16;
+    wire [2:0] cfg_tokens = 3'd2;
+`else
     wire [13:0] cfg_rows = active_scenario == SC_BAD_CFG ? 14'd7 : 14'd8;
+    wire [2:0] cfg_tokens = 3'd4;
+`endif
     wire busy;
     wire done;
     wire error;
@@ -72,12 +82,24 @@ module section_rmsnorm_maxexp_formal(input wire clk);
         end
     endfunction
 
-    function automatic [255:0] arbitrary_group(input [1:0] token);
-        case (token)
-            2'd0: arbitrary_group = arbitrary_data0;
-            2'd1: arbitrary_group = arbitrary_data1;
-            2'd2: arbitrary_group = arbitrary_data2;
-            default: arbitrary_group = arbitrary_data3;
+    function automatic [255:0] expand_group(input [71:0] fields);
+        reg [255:0] value;
+        integer lane;
+        begin
+            value = 256'd0;
+            for (lane = 0; lane < 8; lane = lane + 1)
+                value[lane*32 +: 32] = {
+                    1'b0, fields[lane*9 +: 8], 22'd0, fields[lane*9 + 8]
+                };
+            expand_group = value;
+        end
+    endfunction
+
+    function automatic [255:0] arbitrary_group(input [1:0] group_index);
+        case (group_index)
+            2'd0: arbitrary_group = expand_group(arbitrary_fields0);
+            2'd1: arbitrary_group = expand_group(arbitrary_fields1);
+            default: arbitrary_group = healthy_group(group_index);
         endcase
     endfunction
 
@@ -115,6 +137,10 @@ module section_rmsnorm_maxexp_formal(input wire clk);
         end
     endfunction
 
+    function automatic [7:0] max2(input [7:0] a, input [7:0] b);
+        max2 = a > b ? a : b;
+    endfunction
+
     function automatic has_nonfinite(input [255:0] value);
         reg found;
         integer lane;
@@ -143,10 +169,9 @@ module section_rmsnorm_maxexp_formal(input wire clk);
     endfunction
 
 `ifdef FORMAL_BMC
-    wire clean_has_subnormal = has_subnormal(arbitrary_data0) ||
-                               has_subnormal(arbitrary_data1) ||
-                               has_subnormal(arbitrary_data2) ||
-                               has_subnormal(arbitrary_data3);
+    wire clean_has_subnormal =
+        has_subnormal(expand_group(arbitrary_fields0)) ||
+        has_subnormal(expand_group(arbitrary_fields1));
 `else
     wire clean_has_subnormal =
         has_subnormal(scenario_group(SC_CLEAN, 2'd0)) ||
@@ -159,6 +184,9 @@ module section_rmsnorm_maxexp_formal(input wire clk);
         active_scenario, sent_groups_q[1:0]
     );
 `ifdef FORMAL_BMC
+    wire group_valid = busy && (sent_groups_q < 4);
+    wire result_ready = 1'b1;
+`elsif FORMAL_STALLS
     wire group_valid = busy && (sent_groups_q < 4) && input_allow;
     wire result_ready = result_ready_any;
 `else
@@ -172,10 +200,11 @@ module section_rmsnorm_maxexp_formal(input wire clk);
     wire group_error = (active_scenario == SC_SCRATCH) &&
                        (sent_groups_q == 0);
 
-    wire abort_point = abort_phase ?
-                       (busy && sent_groups_q == 1 &&
-                        accepted_results_q == 0) :
-                       (busy && sent_groups_q == 0);
+    wire abort_point = (abort_phase == 0) ?
+                       (busy && sent_groups_q == 0) :
+                       (abort_phase == 1) ?
+                       (busy && drain_age_q == 1) :
+                       (busy && drain_age_q == 2);
 `ifdef FORMAL_COVER
     wire abort_run = (active_scenario == SC_ABORT) && !aborted_q && abort_point;
 `else
@@ -189,7 +218,7 @@ module section_rmsnorm_maxexp_formal(input wire clk);
     section_rmsnorm_maxexp dut (
         .clk(clk), .rst_n(rst_n),
         .cfg_valid(cfg_valid), .cfg_ready(cfg_ready),
-        .cfg_rows(cfg_rows), .cfg_tokens(3'd4),
+        .cfg_rows(cfg_rows), .cfg_tokens(cfg_tokens),
         .abort_run(abort_run), .busy(busy), .done(done),
         .error(error), .status(status),
         .s_group_data(group_data), .s_group_error(group_error),
@@ -213,21 +242,21 @@ module section_rmsnorm_maxexp_formal(input wire clk);
         assume(scenario >= SC_EARLY_LAST && scenario <= SC_BAD_CFG);
 `elsif FORMAL_COVER
         assume(scenario <= SC_ABORT);
+        assume(abort_phase <= 2);
 `else
         assume(scenario == SC_CLEAN);
 `endif
 
 `ifdef FORMAL_BMC
-        assume(!has_nonfinite(arbitrary_data0));
-        assume(!has_nonfinite(arbitrary_data1));
-        assume(!has_nonfinite(arbitrary_data2));
-        assume(!has_nonfinite(arbitrary_data3));
+        assume(!has_nonfinite(expand_group(arbitrary_fields0)));
+        assume(!has_nonfinite(expand_group(arbitrary_fields1)));
 `endif
 
         if (!rst_n) begin
             cfg_pending_q <= 1'b1;
             sent_groups_q <= 3'd0;
             accepted_results_q <= 3'd0;
+            drain_age_q <= 2'd0;
             aborted_q <= 1'b0;
             restarted_q <= 1'b0;
         end else begin
@@ -235,34 +264,78 @@ module section_rmsnorm_maxexp_formal(input wire clk);
                 cfg_pending_q <= 1'b0;
                 sent_groups_q <= 3'd0;
                 accepted_results_q <= 3'd0;
+                drain_age_q <= 2'd0;
                 if (aborted_q) restarted_q <= 1'b1;
             end
             if (abort_run) begin
                 cfg_pending_q <= 1'b1;
                 sent_groups_q <= 3'd0;
                 accepted_results_q <= 3'd0;
+                drain_age_q <= 2'd0;
                 aborted_q <= 1'b1;
             end else begin
-                if (group_fire)
+                if (group_fire) begin
                     sent_groups_q <= sent_groups_q + 1'b1;
-                if (result_fire)
+                    drain_age_q <= 2'd1;
+                end else if (result_fire) begin
                     accepted_results_q <= accepted_results_q + 1'b1;
+                    drain_age_q <= 2'd0;
+                end else if (busy && drain_age_q != 0 && drain_age_q != 3) begin
+                    drain_age_q <= drain_age_q + 1'b1;
+                end
             end
         end
 
         if (rst_n) begin
-            assert(accepted_results_q <= 4);
+            assert(accepted_results_q <= cfg_tokens);
             assert(!status[4]);
             if (result_valid) begin
                 assert(result_token == accepted_results_q[1:0]);
+`ifdef FORMAL_BMC
+                if (result_token == 0) begin
+                    assert(result_max_exp == max2(
+                        expected_max(expand_group(arbitrary_fields0)),
+                        expected_max(expand_group(arbitrary_fields1))
+                    ));
+                    assert(result_subnormal_warning ==
+                           (has_subnormal(expand_group(arbitrary_fields0)) ||
+                            has_subnormal(expand_group(arbitrary_fields1))));
+                end else begin
+                    assert(result_token == 1);
+                    assert(result_max_exp == max2(
+                        expected_max(healthy_group(2'd2)),
+                        expected_max(healthy_group(2'd3))
+                    ));
+                    assert(result_subnormal_warning ==
+                           (has_subnormal(healthy_group(2'd2)) ||
+                            has_subnormal(healthy_group(2'd3))));
+                end
+`elsif FORMAL_STALLS
+                if (result_token == 0) begin
+                    assert(result_max_exp == max2(
+                        expected_max(healthy_group(2'd0)),
+                        expected_max(healthy_group(2'd1))
+                    ));
+                    assert(!result_subnormal_warning);
+                end else begin
+                    assert(result_token == 1);
+                    assert(result_max_exp == max2(
+                        expected_max(healthy_group(2'd2)),
+                        expected_max(healthy_group(2'd3))
+                    ));
+                    assert(!result_subnormal_warning);
+                end
+`else
                 assert(result_max_exp == expected_max(
                     scenario_group(active_scenario, result_token)
                 ));
-                assert(result_rows == 8);
                 assert(result_subnormal_warning == has_subnormal(
                     scenario_group(active_scenario, result_token)
                 ));
-                assert(result_final == (result_token == 3));
+`endif
+                assert(result_rows == cfg_rows);
+                assert(result_final ==
+                       ({1'b0, result_token} + 1'b1 == cfg_tokens));
             end
             if (done) begin
                 if ((active_scenario == SC_CLEAN) ||
@@ -273,7 +346,7 @@ module section_rmsnorm_maxexp_formal(input wire clk);
                     assert(error);
             end
             if (done && !error) begin
-                assert(accepted_results_q == 4);
+                assert(accepted_results_q == cfg_tokens);
                 if (active_scenario == SC_SUBNORMAL)
                     assert(status == ST_SUBNORMAL);
                 if (active_scenario == SC_CLEAN)
@@ -320,10 +393,13 @@ module section_rmsnorm_maxexp_formal(input wire clk);
         cover(rst_n && (active_scenario == SC_SUBNORMAL) && done && !error &&
               status == ST_SUBNORMAL);
         cover(rst_n && (active_scenario == SC_BAD_CFG) && done && error);
-        cover(rst_n && (active_scenario == SC_ABORT) && !abort_phase &&
+        cover(rst_n && (active_scenario == SC_ABORT) && abort_phase == 0 &&
               aborted_q && restarted_q && done && !error &&
               accepted_results_q == 4);
-        cover(rst_n && (active_scenario == SC_ABORT) && abort_phase &&
+        cover(rst_n && (active_scenario == SC_ABORT) && abort_phase == 1 &&
+              aborted_q && restarted_q && done && !error &&
+              accepted_results_q == 4);
+        cover(rst_n && (active_scenario == SC_ABORT) && abort_phase == 2 &&
               aborted_q && restarted_q && done && !error &&
               accepted_results_q == 4);
     end

@@ -18,6 +18,7 @@ const RunStats = struct {
     cycles: usize,
     group_stalls: usize,
     result_stalls: usize,
+    consecutive_group_accepts: usize,
 };
 
 const Dut = struct {
@@ -114,6 +115,8 @@ fn runSuccess(
     var cycle: usize = 0;
     var group_stalls: usize = 0;
     var result_stalls: usize = 0;
+    var consecutive_group_accepts: usize = 0;
+    var previous_group_fire = false;
 
     while (received < token_count) : (cycle += 1) {
         if (cycle > total_groups * 6 + 1024) return error.StreamTimeout;
@@ -141,6 +144,8 @@ fn runSuccess(
         const result_valid = c.dut_result_valid(dut.handle) != 0;
         const result_fire = result_valid and result_ready;
         if (presenting and !group_fire) group_stalls += 1;
+        if (group_fire and previous_group_fire) consecutive_group_accepts += 1;
+        previous_group_fire = group_fire;
         if (result_valid and !result_ready) {
             result_stalls += 1;
             const payload = readResult(dut);
@@ -182,6 +187,7 @@ fn runSuccess(
         .cycles = cycle,
         .group_stalls = group_stalls,
         .result_stalls = result_stalls,
+        .consecutive_group_accepts = consecutive_group_accepts,
     };
 }
 
@@ -291,6 +297,8 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
     dut.step();
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+    dut.step();
     try std.testing.expect(c.dut_result_valid(dut.handle) != 0);
     try std.testing.expectEqual(@as(u8, 127), c.dut_result_max_exp(dut.handle));
     dut.step();
@@ -322,6 +330,8 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.eval();
     dut.step();
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+    dut.step();
     try std.testing.expect(c.dut_result_valid(dut.handle) != 0);
     c.dut_set_abort(dut.handle, 1);
     dut.step();
@@ -330,7 +340,88 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
 
     const stats = try runSuccess(dut, &ones, 8, 1, false, 0);
-    try std.testing.expectEqual(@as(usize, 3), stats.cycles);
+    try std.testing.expectEqual(@as(usize, 4), stats.cycles);
+}
+
+fn verifyFatalTreeBackpressure(dut: *Dut) !void {
+    const ones = [_]u32{0x3f80_0000} ** 8;
+    var subnormal = ones;
+    subnormal[2] = 0x0000_0001;
+    var nonfinite = ones;
+    nonfinite[6] = 0x7fc0_0001;
+
+    try configure(dut, 24, 1);
+    c.dut_set_group(dut.handle, 1, &subnormal, 0, 0);
+    c.dut_set_result_ready(dut.handle, 1);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+    dut.step();
+
+    c.dut_set_group(dut.handle, 1, &nonfinite, 0, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+    dut.step();
+
+    // The younger group remains presented while the fatal tree entry retires.
+    // The older healthy summary still contributes its sticky warning status.
+    c.dut_set_group(dut.handle, 1, &ones, 0, 1);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_done(dut.handle) == 0);
+    dut.step();
+    try std.testing.expect(c.dut_done(dut.handle) != 0);
+    try std.testing.expect(c.dut_error(dut.handle) != 0);
+    try std.testing.expectEqual(
+        section.RmsNormMaxExpStatus.nonfinite |
+            section.RmsNormMaxExpStatus.subnormal_warning,
+        @as(u6, @truncate(c.dut_status(dut.handle))),
+    );
+    c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
+    dut.step();
+}
+
+fn verifyDrainAbortAndRestart(dut: *Dut) !void {
+    const ones = [_]u32{0x3f80_0000} ** 8;
+
+    // Abort with the final group resident in the new tree stage.
+    try configure(dut, 8, 1);
+    c.dut_set_group(dut.handle, 1, &ones, 0, 1);
+    c.dut_set_result_ready(dut.handle, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+    dut.step();
+    c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
+    c.dut_set_abort(dut.handle, 1);
+    dut.step();
+    c.dut_set_abort(dut.handle, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+    try std.testing.expect(c.dut_error(dut.handle) == 0);
+    try std.testing.expectEqual(@as(u6, 0), @as(u6, @truncate(c.dut_status(dut.handle))));
+    const tree_restart = try runSuccess(dut, &ones, 8, 1, false, 0);
+    try std.testing.expectEqual(@as(usize, 4), tree_restart.cycles);
+
+    // Abort one drain cycle later with the final group in the summary stage.
+    try configure(dut, 8, 1);
+    c.dut_set_group(dut.handle, 1, &ones, 0, 1);
+    c.dut_set_result_ready(dut.handle, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+    dut.step();
+    c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
+    dut.step();
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+    c.dut_set_abort(dut.handle, 1);
+    dut.step();
+    c.dut_set_abort(dut.handle, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+    try std.testing.expect(c.dut_error(dut.handle) == 0);
+    try std.testing.expectEqual(@as(u6, 0), @as(u6, @truncate(c.dut_status(dut.handle))));
+    const summary_restart = try runSuccess(dut, &ones, 8, 1, false, 0);
+    try std.testing.expectEqual(@as(usize, 4), summary_restart.cycles);
 }
 
 fn fillRandom(values: []u32, rows: usize, tokens: usize, seed: u64) void {
@@ -367,16 +458,27 @@ pub fn main() !void {
     const directed_stats = try runSuccess(&dut, &directed, 8, 1, true, 0x51ca_0001);
     try std.testing.expect(directed_stats.group_stalls > 0 or directed_stats.result_stalls > 0);
 
+    var pipeline_values = [_]u32{0x3f80_0000} ** (16 * 2);
+    pipeline_values[0] = @as(u32, 200) << 23;
+    pipeline_values[8] = @as(u32, 150) << 23;
+    pipeline_values[16] = @as(u32, 140) << 23;
+    pipeline_values[24] = @as(u32, 220) << 23;
+    const pipeline_stats = try runSuccess(&dut, &pipeline_values, 16, 2, false, 0);
+    try std.testing.expectEqual(@as(usize, 10), pipeline_stats.cycles);
+    try std.testing.expectEqual(@as(usize, 2), pipeline_stats.consecutive_group_accepts);
+
     var max_values: [4096 * 4]u32 = undefined;
     fillRandom(&max_values, 4096, 4, 0x4096_0004);
     const max_stats = try runSuccess(&dut, &max_values, 4096, 4, false, 0);
-    try std.testing.expectEqual(@as(usize, max_values.len / 8 + 8), max_stats.cycles);
+    try std.testing.expectEqual(@as(usize, max_values.len / 8 + 12), max_stats.cycles);
 
+    try verifyFatalTreeBackpressure(&dut);
+    try verifyDrainAbortAndRestart(&dut);
     try verifyFaultsAndRestart(&dut);
 
     std.debug.print(
         "section RMSNorm max-exp scan: 4096x4 in {d} cycles, " ++
-            "one accepted group/cycle within tokens; stalls/faults/abort/restart passed\n",
+            "two-stage tree accepts one group/cycle; stalls/faults/abort/restart passed\n",
         .{max_stats.cycles},
     );
 }

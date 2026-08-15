@@ -59,6 +59,13 @@ module section_rmsnorm_maxexp (
     reg [9:0] group_q;
     reg [7:0] token_max_exp_q;
     reg token_subnormal_q;
+    reg tree_valid_q;
+    reg [7:0] tree_max03_q;
+    reg [7:0] tree_max47_q;
+    reg tree_nonfinite_q;
+    reg tree_subnormal_q;
+    reg tree_frame_bad_q;
+    reg tree_scratch_q;
     reg summary_valid_q;
     reg [7:0] summary_max_exp_q;
     reg summary_nonfinite_q;
@@ -75,11 +82,14 @@ module section_rmsnorm_maxexp (
     wire summary_fatal = summary_valid_q &&
                          (summary_scratch_q || summary_frame_bad_q ||
                           summary_nonfinite_q);
+    wire tree_fatal = tree_valid_q &&
+                      (tree_scratch_q || tree_frame_bad_q ||
+                       tree_nonfinite_q);
 
     assign cfg_ready = rst_n && !abort_run && (state_q == ST_IDLE);
     assign busy = state_q != ST_IDLE;
     assign s_group_ready = rst_n && !abort_run && (state_q == ST_INPUT) &&
-                           !summary_fatal;
+                           !tree_fatal && !summary_fatal;
     assign result_valid = rst_n && !abort_run && (state_q == ST_RESULT);
     assign result_token = token_q;
     assign result_rows = run_rows_q;
@@ -118,10 +128,10 @@ module section_rmsnorm_maxexp (
     wire [7:0] max67 = max2(exp6, exp7);
     wire [7:0] max03 = max2(max01, max23);
     wire [7:0] max47 = max2(max45, max67);
-    wire [7:0] group_max_exp = max2(max03, max47);
-    // The group tree is registered before the token feedback comparison. A
-    // prior summary retires while the next group is accepted, preserving one
-    // accepted group per cycle within a token without a four-comparator path.
+    // Split the three-comparator group tree after its second level. The tree
+    // and summary stages advance together, retaining one accepted group per
+    // cycle while keeping the loader boundary to two comparator levels.
+    wire [7:0] tree_max_exp = max2(tree_max03_q, tree_max47_q);
     wire [7:0] next_max_exp = max2(token_max_exp_q, summary_max_exp_q);
 
     wire group_nonfinite = (exp0 == 8'hff) || (exp1 == 8'hff) ||
@@ -145,6 +155,7 @@ module section_rmsnorm_maxexp (
             status <= status | failure;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            tree_valid_q <= 1'b0;
             summary_valid_q <= 1'b0;
         end
     endtask
@@ -159,6 +170,13 @@ module section_rmsnorm_maxexp (
             group_q <= 10'd0;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            tree_valid_q <= 1'b0;
+            tree_max03_q <= 8'd0;
+            tree_max47_q <= 8'd0;
+            tree_nonfinite_q <= 1'b0;
+            tree_subnormal_q <= 1'b0;
+            tree_frame_bad_q <= 1'b0;
+            tree_scratch_q <= 1'b0;
             summary_valid_q <= 1'b0;
             summary_max_exp_q <= 8'd0;
             summary_nonfinite_q <= 1'b0;
@@ -176,6 +194,13 @@ module section_rmsnorm_maxexp (
             group_q <= 10'd0;
             token_max_exp_q <= 8'd0;
             token_subnormal_q <= 1'b0;
+            tree_valid_q <= 1'b0;
+            tree_max03_q <= 8'd0;
+            tree_max47_q <= 8'd0;
+            tree_nonfinite_q <= 1'b0;
+            tree_subnormal_q <= 1'b0;
+            tree_frame_bad_q <= 1'b0;
+            tree_scratch_q <= 1'b0;
             summary_valid_q <= 1'b0;
             summary_max_exp_q <= 8'd0;
             summary_nonfinite_q <= 1'b0;
@@ -198,6 +223,13 @@ module section_rmsnorm_maxexp (
                     group_q <= 10'd0;
                     token_max_exp_q <= 8'd0;
                     token_subnormal_q <= 1'b0;
+                    tree_valid_q <= 1'b0;
+                    tree_max03_q <= 8'd0;
+                    tree_max47_q <= 8'd0;
+                    tree_nonfinite_q <= 1'b0;
+                    tree_subnormal_q <= 1'b0;
+                    tree_frame_bad_q <= 1'b0;
+                    tree_scratch_q <= 1'b0;
                     summary_valid_q <= 1'b0;
                     summary_max_exp_q <= 8'd0;
                     summary_nonfinite_q <= 1'b0;
@@ -227,8 +259,22 @@ module section_rmsnorm_maxexp (
                             fail_run(STATUS_FRAME);
                         else
                             fail_run(STATUS_NONFINITE);
+                    end else if (tree_fatal) begin
+                        if (tree_scratch_q)
+                            fail_run(STATUS_SCRATCH |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
+                        else if (tree_frame_bad_q)
+                            fail_run(STATUS_FRAME |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
+                        else
+                            fail_run(STATUS_NONFINITE |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
                     end else begin
-                        summary_valid_q <= group_accept;
+                        tree_valid_q <= group_accept;
+                        summary_valid_q <= tree_valid_q;
                         if (summary_valid_q) begin
                             token_max_exp_q <= next_max_exp;
                             if (summary_subnormal_q) begin
@@ -236,12 +282,20 @@ module section_rmsnorm_maxexp (
                                 status <= status | STATUS_SUBNORMAL_WARNING;
                             end
                         end
+                        if (tree_valid_q) begin
+                            summary_max_exp_q <= tree_max_exp;
+                            summary_nonfinite_q <= tree_nonfinite_q;
+                            summary_subnormal_q <= tree_subnormal_q;
+                            summary_frame_bad_q <= tree_frame_bad_q;
+                            summary_scratch_q <= tree_scratch_q;
+                        end
                         if (group_accept) begin
-                            summary_max_exp_q <= group_max_exp;
-                            summary_nonfinite_q <= group_nonfinite;
-                            summary_subnormal_q <= group_subnormal;
-                            summary_frame_bad_q <= group_frame_bad;
-                            summary_scratch_q <= s_group_error;
+                            tree_max03_q <= max03;
+                            tree_max47_q <= max47;
+                            tree_nonfinite_q <= group_nonfinite;
+                            tree_subnormal_q <= group_subnormal;
+                            tree_frame_bad_q <= group_frame_bad;
+                            tree_scratch_q <= s_group_error;
                             if (group_final)
                                 state_q <= ST_DRAIN;
                             else
@@ -251,8 +305,42 @@ module section_rmsnorm_maxexp (
                 end
 
                 ST_DRAIN: begin
-                    summary_valid_q <= 1'b0;
-                    if (!summary_valid_q) begin
+                    tree_valid_q <= 1'b0;
+                    if (summary_fatal) begin
+                        if (summary_scratch_q)
+                            fail_run(STATUS_SCRATCH);
+                        else if (summary_frame_bad_q)
+                            fail_run(STATUS_FRAME);
+                        else
+                            fail_run(STATUS_NONFINITE);
+                    end else if (tree_fatal) begin
+                        if (tree_scratch_q)
+                            fail_run(STATUS_SCRATCH |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
+                        else if (tree_frame_bad_q)
+                            fail_run(STATUS_FRAME |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
+                        else
+                            fail_run(STATUS_NONFINITE |
+                                     (summary_valid_q && summary_subnormal_q ?
+                                      STATUS_SUBNORMAL_WARNING : 6'd0));
+                    end else if (tree_valid_q) begin
+                        summary_valid_q <= 1'b1;
+                        summary_max_exp_q <= tree_max_exp;
+                        summary_nonfinite_q <= tree_nonfinite_q;
+                        summary_subnormal_q <= tree_subnormal_q;
+                        summary_frame_bad_q <= tree_frame_bad_q;
+                        summary_scratch_q <= tree_scratch_q;
+                        if (summary_valid_q) begin
+                            token_max_exp_q <= next_max_exp;
+                            if (summary_subnormal_q) begin
+                                token_subnormal_q <= 1'b1;
+                                status <= status | STATUS_SUBNORMAL_WARNING;
+                            end
+                        end
+                    end else if (!summary_valid_q) begin
                         fail_run(STATUS_INTERNAL);
                     end else if (summary_scratch_q) begin
                         fail_run(STATUS_SCRATCH);
@@ -261,6 +349,7 @@ module section_rmsnorm_maxexp (
                     end else if (summary_nonfinite_q) begin
                         fail_run(STATUS_NONFINITE);
                     end else begin
+                        summary_valid_q <= 1'b0;
                         result_max_exp <= next_max_exp;
                         result_subnormal_warning <=
                             token_subnormal_q || summary_subnormal_q;
@@ -281,6 +370,7 @@ module section_rmsnorm_maxexp (
                         group_q <= 10'd0;
                         token_max_exp_q <= 8'd0;
                         token_subnormal_q <= 1'b0;
+                        tree_valid_q <= 1'b0;
                         summary_valid_q <= 1'b0;
                         state_q <= ST_INPUT;
                     end
@@ -305,6 +395,8 @@ module section_rmsnorm_maxexp (
                 assert(token_q < run_tokens_q);
                 assert(group_q < run_groups_q);
             end
+            if (tree_valid_q || summary_valid_q)
+                assert(state_q == ST_INPUT || state_q == ST_DRAIN);
             if (result_valid) begin
                 assert(result_token < run_tokens_q);
                 assert(result_rows == run_rows_q);
