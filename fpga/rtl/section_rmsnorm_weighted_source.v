@@ -122,7 +122,8 @@ module section_rmsnorm_weighted_source #(
     reg         read_owned_q;
     reg [255:0] rsp_group_q;
     reg [255:0] gamma_group_q;
-    reg [31:0]  mul1_result_q;
+    reg [31:0]  mul_op_a_q;
+    reg [31:0]  mul_op_b_q;
     reg         cleanup_report_error_q;
     reg         mul_abort_q;
 
@@ -204,17 +205,14 @@ module section_rmsnorm_weighted_source #(
         end
     endfunction
 
-    wire [31:0] residual_lane = lane32(rsp_group_q, run_lane_q);
     wire [31:0] gamma_lane = lane32(gamma_group_q, run_lane_q);
 
     wire mul_busy;
     wire mul_s_ready;
     wire mul_s_valid = !abort_run &&
         ((state_q == ST_MUL1_REQ) || (state_q == ST_MUL2_REQ));
-    wire [31:0] mul_s_a = state_q == ST_MUL1_REQ ?
-                          residual_lane : mul1_result_q;
-    wire [31:0] mul_s_b = state_q == ST_MUL1_REQ ?
-                          inv_table_q[run_token_q] : gamma_lane;
+    wire [31:0] mul_s_a = mul_op_a_q;
+    wire [31:0] mul_s_b = mul_op_b_q;
     wire mul_s_fire = mul_s_valid && mul_s_ready;
     wire mul_result_valid;
     wire [31:0] mul_result_data;
@@ -279,7 +277,8 @@ module section_rmsnorm_weighted_source #(
             read_owned_q <= 1'b0;
             rsp_group_q <= 256'd0;
             gamma_group_q <= 256'd0;
-            mul1_result_q <= 32'd0;
+            mul_op_a_q <= 32'd0;
+            mul_op_b_q <= 32'd0;
             cleanup_report_error_q <= 1'b0;
             mul_abort_q <= 1'b0;
             gamma_done <= 1'b0;
@@ -423,6 +422,8 @@ module section_rmsnorm_weighted_source #(
                     end else begin
                         rsp_group_q <= rd_rsp_data;
                         run_lane_q <= 3'd0;
+                        mul_op_a_q <= rd_rsp_data[31:0];
+                        mul_op_b_q <= inv_table_q[run_token_q];
                         state_q <= ST_MUL1_REQ;
                     end
                 end
@@ -434,7 +435,8 @@ module section_rmsnorm_weighted_source #(
                     if (mul_result_status != 2'd0) begin
                         fail_run({3'd0, mul_result_status, 4'd0});
                     end else begin
-                        mul1_result_q <= mul_result_data;
+                        mul_op_a_q <= mul_result_data;
+                        mul_op_b_q <= gamma_lane;
                         state_q <= ST_MUL2_REQ;
                     end
                 end
@@ -447,6 +449,10 @@ module section_rmsnorm_weighted_source #(
                         fail_run({1'd0, mul_result_status, 6'd0});
                     end else if (run_lane_q != 3'd7) begin
                         run_lane_q <= run_lane_q + 1'b1;
+                        mul_op_a_q <= lane32(
+                            rsp_group_q, run_lane_q + 1'b1
+                        );
+                        mul_op_b_q <= inv_table_q[run_token_q];
                         state_q <= ST_MUL1_REQ;
                     end else if (!run_final_group) begin
                         run_lane_q <= 3'd0;
