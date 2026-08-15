@@ -1,0 +1,148 @@
+[tasks]
+structural
+faults
+clean_bmc
+reuse_bmc
+restart_scratch
+restart_mul1
+restart_mul2
+restart_abort0
+restart_abort1
+restart_abort2
+restart_abort3
+restart_abort4
+restart_abort5
+restart_abort6
+cover_clean
+cover_reuse
+cover_faults
+cover_restart_scratch
+cover_restart_mul1
+cover_restart_mul2
+cover_restart_abort0
+cover_restart_abort1
+cover_restart_abort2
+cover_restart_abort3
+cover_restart_abort4
+cover_restart_abort5
+cover_restart_abort6
+
+[options]
+structural: mode bmc
+structural: depth 42
+faults: mode bmc
+faults: depth 64
+clean_bmc: mode bmc
+clean_bmc: depth 1000
+reuse_bmc: mode bmc
+reuse_bmc: depth 1000
+restart_scratch: mode bmc
+restart_scratch: depth 650
+restart_mul1: mode bmc
+restart_mul1: depth 650
+restart_mul2: mode bmc
+restart_mul2: depth 650
+restart_abort0: mode bmc
+restart_abort0: depth 650
+restart_abort1: mode bmc
+restart_abort1: depth 650
+restart_abort2: mode bmc
+restart_abort2: depth 650
+restart_abort3: mode bmc
+restart_abort3: depth 650
+restart_abort4: mode bmc
+restart_abort4: depth 650
+restart_abort5: mode bmc
+restart_abort5: depth 650
+restart_abort6: mode bmc
+restart_abort6: depth 650
+cover_clean: mode cover
+cover_clean: depth 1000
+cover_reuse: mode cover
+cover_reuse: depth 1000
+cover_faults: mode cover
+cover_faults: depth 64
+cover_restart_scratch: mode cover
+cover_restart_scratch: depth 650
+cover_restart_mul1: mode cover
+cover_restart_mul1: depth 650
+cover_restart_mul2: mode cover
+cover_restart_mul2: depth 650
+cover_restart_abort0: mode cover
+cover_restart_abort0: depth 650
+cover_restart_abort1: mode cover
+cover_restart_abort1: depth 650
+cover_restart_abort2: mode cover
+cover_restart_abort2: depth 650
+cover_restart_abort3: mode cover
+cover_restart_abort3: depth 650
+cover_restart_abort4: mode cover
+cover_restart_abort4: depth 650
+cover_restart_abort5: mode cover
+cover_restart_abort5: depth 650
+cover_restart_abort6: mode cover
+cover_restart_abort6: depth 650
+
+[engines]
+structural: abc bmc3
+faults: smtbmc boolector
+clean_bmc: smtbmc boolector
+reuse_bmc: smtbmc boolector
+restart_scratch: smtbmc boolector
+restart_mul1: smtbmc boolector
+restart_mul2: smtbmc boolector
+restart_abort0: smtbmc boolector
+restart_abort1: smtbmc boolector
+restart_abort2: smtbmc boolector
+restart_abort3: smtbmc boolector
+restart_abort4: smtbmc boolector
+restart_abort5: smtbmc boolector
+restart_abort6: smtbmc boolector
+cover_clean: smtbmc boolector
+cover_reuse: smtbmc boolector
+cover_faults: smtbmc boolector
+cover_restart_scratch: smtbmc boolector
+cover_restart_mul1: smtbmc boolector
+cover_restart_mul2: smtbmc boolector
+cover_restart_abort0: smtbmc boolector
+cover_restart_abort1: smtbmc boolector
+cover_restart_abort2: smtbmc boolector
+cover_restart_abort3: smtbmc boolector
+cover_restart_abort4: smtbmc boolector
+cover_restart_abort5: smtbmc boolector
+cover_restart_abort6: smtbmc boolector
+
+[script]
+structural: read -formal -D FORMAL -D FORMAL_STRUCTURAL section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+faults: read -formal -D FORMAL -D FORMAL_FAULTS section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+clean_bmc: read -formal -D FORMAL -D FORMAL_CLEAN section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+reuse_bmc: read -formal -D FORMAL -D FORMAL_REUSE section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_scratch: read -formal -D FORMAL -D FORMAL_RESTART_SCRATCH section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_mul1: read -formal -D FORMAL -D FORMAL_RESTART_MUL1 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_mul2: read -formal -D FORMAL -D FORMAL_RESTART_MUL2 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort0: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_0 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort1: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_1 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort2: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_2 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort3: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_3 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort4: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_4 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort5: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_5 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+restart_abort6: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_6 section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_clean: read -formal -D FORMAL -D FORMAL_CLEAN -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_reuse: read -formal -D FORMAL -D FORMAL_REUSE -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_faults: read -formal -D FORMAL -D FORMAL_FAULT_COVER -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_scratch: read -formal -D FORMAL -D FORMAL_RESTART_SCRATCH -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_mul1: read -formal -D FORMAL -D FORMAL_RESTART_MUL1 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_mul2: read -formal -D FORMAL -D FORMAL_RESTART_MUL2 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort0: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_0 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort1: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_1 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort2: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_2 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort3: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_3 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort4: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_4 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort5: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_5 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+cover_restart_abort6: read -formal -D FORMAL -D FORMAL_RESTART_ABORT -D FORMAL_ABORT_PHASE_6 -D FORMAL_COVER section_rmsnorm_weighted_source_stubs.v section_rmsnorm_weighted_source.v section_rmsnorm_weighted_source_formal.sv
+prep -top section_rmsnorm_weighted_source_formal -flatten
+
+[files]
+fpga/formal/section_rmsnorm_weighted_source_stubs.v
+fpga/rtl/section_rmsnorm_weighted_source.v
+fpga/formal/section_rmsnorm_weighted_source_formal.sv

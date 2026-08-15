@@ -130,6 +130,42 @@ pub const RmsNormMulResult = struct {
     status: u2,
 };
 
+/// Diagnostics shared with `section_rmsnorm_weighted_source.v`.
+pub const RmsNormGammaStatus = struct {
+    pub const bad_cfg: u4 = 1 << 0;
+    pub const frame: u4 = 1 << 1;
+    pub const nonfinite: u4 = 1 << 2;
+    pub const internal: u4 = 1 << 3;
+    pub const fatal_mask: u4 = bad_cfg | frame | nonfinite | internal;
+};
+
+pub const RmsNormWeightedSourceStatus = struct {
+    pub const bad_cfg: u9 = 1 << 0;
+    pub const gamma: u9 = 1 << 1;
+    pub const inverse_frame: u9 = 1 << 2;
+    pub const scratch: u9 = 1 << 3;
+    pub const mul1_shift: u4 = 4;
+    pub const mul2_shift: u4 = 6;
+    pub const internal: u9 = 1 << 8;
+
+    pub fn mul1(status: u2) u9 {
+        return @as(u9, status) << mul1_shift;
+    }
+
+    pub fn mul2(status: u2) u9 {
+        return @as(u9, status) << mul2_shift;
+    }
+
+    pub const fatal_mask: u9 = 0x1ff;
+};
+
+pub const RmsNormWeightedResult = struct {
+    normalized_bits: u32,
+    bits: u32,
+    mul1_status: u2,
+    mul2_status: u2,
+};
+
 /// Diagnostics shared with `section_rmsnorm_reduce.v`. Child status layouts are
 /// preserved verbatim so the eventual v17 controller can distinguish scratch,
 /// framing, subnormal, and arithmetic failures without re-decoding a coarse bit.
@@ -232,6 +268,38 @@ pub fn rmsNormMulRneBits(a_bits: u32, b_bits: u32) RmsNormMulResult {
     if (fraction >= (@as(u64, 1) << 23))
         return .{ .bits = sign | 0x0080_0000, .status = 0 };
     return .{ .bits = sign | @as(u32, @truncate(fraction)), .status = 0 };
+}
+
+/// Exact PS-order weighted RMSNorm scalar oracle. The second multiply is not
+/// evaluated after a diagnosed first-stage result because hardware suppresses
+/// that scalar and aborts the surrounding tentative Q8 run.
+pub fn rmsNormWeightedBits(
+    x_bits: u32,
+    inverse_bits: u32,
+    gamma_bits: u32,
+) RmsNormWeightedResult {
+    const normalized = rmsNormMulRneBits(x_bits, inverse_bits);
+    if (normalized.status != 0) return .{
+        .normalized_bits = normalized.bits,
+        .bits = 0,
+        .mul1_status = normalized.status,
+        .mul2_status = 0,
+    };
+    const weighted = rmsNormMulRneBits(normalized.bits, gamma_bits);
+    return .{
+        .normalized_bits = normalized.bits,
+        .bits = weighted.bits,
+        .mul1_status = 0,
+        .mul2_status = weighted.status,
+    };
+}
+
+pub fn rmsNormGammaBank(pair_word: u11) u2 {
+    return @truncate(pair_word);
+}
+
+pub fn rmsNormGammaAddress(pair_word: u11) u9 {
+    return @truncate(pair_word >> 2);
 }
 
 pub const RmsNormInvResult = struct {
@@ -1179,11 +1247,11 @@ test "P3d weighted RMSNorm multiplication order is explicit" {
     const x: u32 = 0x3730_b2f5;
     const inverse: u32 = 0x451c_6e2e;
     const gamma: u32 = 0x3ffa_b1b6;
-    const normalized = rmsNormMulRneBits(x, inverse);
-    const weighted = rmsNormMulRneBits(normalized.bits, gamma);
+    const weighted = rmsNormWeightedBits(x, inverse, gamma);
     const reassociated_scale = rmsNormMulRneBits(inverse, gamma);
     const reassociated = rmsNormMulRneBits(x, reassociated_scale.bits);
-    try std.testing.expectEqual(@as(u2, 0), normalized.status);
+    try std.testing.expectEqual(@as(u2, 0), weighted.mul1_status);
+    try std.testing.expectEqual(@as(u2, 0), weighted.mul2_status);
     try std.testing.expectEqual(@as(u32, 0x3d53_786f), weighted.bits);
     try std.testing.expectEqual(@as(u32, 0x3d53_786e), reassociated.bits);
 
@@ -1194,6 +1262,49 @@ test "P3d weighted RMSNorm multiplication order is explicit" {
     try std.testing.expectEqual(
         @as(u32, 0x3fff_ffff),
         rmsNormMulRneBits(tiny_normalized.bits, 0x7f7f_ffff).bits,
+    );
+}
+
+test "P3d weighted source status and gamma bank mapping are exact" {
+    try std.testing.expectEqual(@as(u2, 0), rmsNormGammaBank(0));
+    try std.testing.expectEqual(@as(u2, 3), rmsNormGammaBank(3));
+    try std.testing.expectEqual(@as(u2, 0), rmsNormGammaBank(4));
+    try std.testing.expectEqual(@as(u9, 0), rmsNormGammaAddress(3));
+    try std.testing.expectEqual(@as(u9, 1), rmsNormGammaAddress(4));
+    try std.testing.expectEqual(@as(u9, 511), rmsNormGammaAddress(2047));
+
+    try std.testing.expectEqual(
+        @as(u9, 0x010),
+        RmsNormWeightedSourceStatus.mul1(
+            RmsNormMulStatus.nonfinite_input,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u9, 0x080),
+        RmsNormWeightedSourceStatus.mul2(RmsNormMulStatus.overflow),
+    );
+
+    const first_fault = rmsNormWeightedBits(
+        0x7f80_0000,
+        0x3f80_0000,
+        0x3f80_0000,
+    );
+    try std.testing.expectEqual(
+        RmsNormMulStatus.nonfinite_input,
+        first_fault.mul1_status,
+    );
+    try std.testing.expectEqual(@as(u2, 0), first_fault.mul2_status);
+    try std.testing.expectEqual(@as(u32, 0), first_fault.bits);
+
+    const second_fault = rmsNormWeightedBits(
+        0x7f7f_ffff,
+        0x3f80_0000,
+        0x4000_0000,
+    );
+    try std.testing.expectEqual(@as(u2, 0), second_fault.mul1_status);
+    try std.testing.expectEqual(
+        RmsNormMulStatus.overflow,
+        second_fault.mul2_status,
     );
 }
 
