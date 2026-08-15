@@ -1,10 +1,11 @@
 // Scratch-backed weighted RMSNorm scalar source.
 //
-// Gamma is sealed in four 512x64 BRAM banks before a run starts. A run first
-// buffers one inverse-RMS scalar per token, then replays token-major R scratch
-// groups. One exact FP32 multiplier is time-multiplexed in the PS-compatible
-// order RNE(RNE(x * inv_rms) * gamma). Only healthy scalars are published;
-// every output remains tentative until the surrounding section closes cleanly.
+// Gamma is sealed in one logical 4096x32 true-dual-port BRAM before a run
+// starts. A run first buffers one inverse-RMS scalar per token, then replays
+// token-major R scratch groups. One exact FP32 multiplier is time-multiplexed
+// in the PS-compatible order RNE(RNE(x * inv_rms) * gamma). Only healthy
+// scalars are published; every output remains tentative until the surrounding
+// section closes cleanly.
 
 `default_nettype none
 
@@ -121,28 +122,24 @@ module section_rmsnorm_weighted_source #(
 
     reg         read_owned_q;
     reg [255:0] rsp_group_q;
-    reg [255:0] gamma_group_q;
+    reg [31:0]  gamma_scalar_q;
     reg [31:0]  mul_op_a_q;
     reg [31:0]  mul_op_b_q;
     reg         cleanup_report_error_q;
     reg         mul_abort_q;
 
-    (* ram_style = "block" *) reg [63:0] gamma_bank0 [0:511];
-    (* ram_style = "block" *) reg [63:0] gamma_bank1 [0:511];
-    (* ram_style = "block" *) reg [63:0] gamma_bank2 [0:511];
-    (* ram_style = "block" *) reg [63:0] gamma_bank3 [0:511];
+    (* ram_style = "block" *) reg [31:0] gamma_mem [0:4095];
 
-    wire gamma_rows_power_two = (gamma_cfg_rows != 14'd0) &&
-        ((gamma_cfg_rows & (gamma_cfg_rows - 1'b1)) == 14'd0);
-    wire gamma_shape_ok = (gamma_cfg_rows >= MIN_ROWS) &&
-        (gamma_cfg_rows >= HARD_MIN_ROWS) &&
-        (gamma_cfg_rows <= MAX_ROWS) &&
-        (gamma_cfg_rows <= HARD_MAX_ROWS) && gamma_rows_power_two;
-    wire run_rows_power_two = (cfg_rows != 14'd0) &&
-        ((cfg_rows & (cfg_rows - 1'b1)) == 14'd0);
-    wire run_shape_ok = (cfg_rows >= MIN_ROWS) &&
-        (cfg_rows >= HARD_MIN_ROWS) && (cfg_rows <= MAX_ROWS) &&
-        (cfg_rows <= HARD_MAX_ROWS) && run_rows_power_two &&
+    wire [13:0] selected_cfg_rows = gamma_cfg_valid ? gamma_cfg_rows :
+                                    cfg_rows;
+    wire selected_rows_power_two = (selected_cfg_rows != 14'd0) &&
+        ((selected_cfg_rows & (selected_cfg_rows - 1'b1)) == 14'd0);
+    wire selected_shape_ok = (selected_cfg_rows >= MIN_ROWS) &&
+        (selected_cfg_rows >= HARD_MIN_ROWS) &&
+        (selected_cfg_rows <= MAX_ROWS) &&
+        (selected_cfg_rows <= HARD_MAX_ROWS) && selected_rows_power_two;
+    wire gamma_shape_ok = selected_shape_ok;
+    wire run_shape_ok = selected_shape_ok &&
         (cfg_tokens != 3'd0) && (cfg_tokens <= 3'd4);
 
     assign gamma_cfg_ready = rst_n && !abort_run && (state_q == ST_IDLE);
@@ -205,8 +202,6 @@ module section_rmsnorm_weighted_source #(
         end
     endfunction
 
-    wire [31:0] gamma_lane = lane32(gamma_group_q, run_lane_q);
-
     wire mul_busy;
     wire mul_s_ready;
     wire mul_s_valid = !abort_run &&
@@ -250,6 +245,20 @@ module section_rmsnorm_weighted_source #(
     wire run_final_group = run_group_q == run_last_group;
     wire run_final_token = ({1'b0, run_token_q} + 3'd1) == run_tokens_q;
 
+    // The two gamma-loader writes use both BRAM ports. Once sealed, port A is
+    // reused for the registered scalar read needed by the second multiply.
+    always @(posedge clk) begin
+        if (gamma_fire && gamma_input_ok)
+            gamma_mem[{gamma_word_q, 1'b0}] <= gamma_tdata[31:0];
+        else if ((state_q == ST_MUL1_REQ) && mul_s_fire)
+            gamma_scalar_q <= gamma_mem[{run_group_q[8:0], run_lane_q}];
+    end
+
+    always @(posedge clk) begin
+        if (gamma_fire && gamma_input_ok)
+            gamma_mem[{gamma_word_q, 1'b1}] <= gamma_tdata[63:32];
+    end
+
     task automatic fail_run(input [8:0] failure_status);
         begin
             error <= 1'b1;
@@ -276,7 +285,6 @@ module section_rmsnorm_weighted_source #(
             run_lane_q <= 3'd0;
             read_owned_q <= 1'b0;
             rsp_group_q <= 256'd0;
-            gamma_group_q <= 256'd0;
             mul_op_a_q <= 32'd0;
             mul_op_b_q <= 32'd0;
             cleanup_report_error_q <= 1'b0;
@@ -372,13 +380,6 @@ module section_rmsnorm_weighted_source #(
                                         (!gamma_finite ? GAMMA_NONFINITE : 4'd0);
                         state_q <= ST_IDLE;
                     end else begin
-                        case (gamma_word_q[1:0])
-                            2'd0: gamma_bank0[gamma_word_q[10:2]] <= gamma_tdata;
-                            2'd1: gamma_bank1[gamma_word_q[10:2]] <= gamma_tdata;
-                            2'd2: gamma_bank2[gamma_word_q[10:2]] <= gamma_tdata;
-                            default:
-                                gamma_bank3[gamma_word_q[10:2]] <= gamma_tdata;
-                        endcase
                         if (gamma_expected_last) begin
                             gamma_valid_q <= 1'b1;
                             gamma_done <= 1'b1;
@@ -408,10 +409,6 @@ module section_rmsnorm_weighted_source #(
 
                 ST_REQ: if (rd_req_fire) begin
                     read_owned_q <= 1'b1;
-                    gamma_group_q[63:0] <= gamma_bank0[run_group_q[8:0]];
-                    gamma_group_q[127:64] <= gamma_bank1[run_group_q[8:0]];
-                    gamma_group_q[191:128] <= gamma_bank2[run_group_q[8:0]];
-                    gamma_group_q[255:192] <= gamma_bank3[run_group_q[8:0]];
                     state_q <= ST_WAIT_RSP;
                 end
 
@@ -436,7 +433,7 @@ module section_rmsnorm_weighted_source #(
                         fail_run({3'd0, mul_result_status, 4'd0});
                     end else begin
                         mul_op_a_q <= mul_result_data;
-                        mul_op_b_q <= gamma_lane;
+                        mul_op_b_q <= gamma_scalar_q;
                         state_q <= ST_MUL2_REQ;
                     end
                 end
