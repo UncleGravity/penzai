@@ -5,7 +5,7 @@
 //! controller assigns these fixed roles and addresses internally.
 
 const std = @import("std");
-const layout = @import("layout.zig");
+pub const layout = @import("layout.zig");
 
 pub const version: u16 = 1;
 pub const ffn_kernel_version: u32 = 15;
@@ -157,6 +157,25 @@ pub const RmsNormWeightedSourceStatus = struct {
     }
 
     pub const fatal_mask: u9 = 0x1ff;
+};
+
+/// Aggregate diagnostics shared with `section_rmsnorm_q8_source.v`. Both child
+/// layouts remain verbatim so software can attribute a failed tentative stream
+/// without reinterpreting either leaf's raw status.
+pub const RmsNormQ8SourceStatus = struct {
+    pub const weighted_shift: u4 = 0;
+    pub const q8_shift: u4 = 9;
+    pub const internal: u16 = 1 << 15;
+
+    pub fn weighted(status: u9) u16 {
+        return @as(u16, status) << weighted_shift;
+    }
+
+    pub fn q8(status: u6) u16 {
+        return @as(u16, status) << q8_shift;
+    }
+
+    pub const fatal_mask: u16 = 0xffff;
 };
 
 pub const RmsNormWeightedResult = struct {
@@ -1305,6 +1324,39 @@ test "P3d weighted source status and gamma bank mapping are exact" {
     try std.testing.expectEqual(
         RmsNormMulStatus.overflow,
         second_fault.mul2_status,
+    );
+}
+
+test "P3d RMSNorm Q8 source preserves both raw child status layouts" {
+    try std.testing.expectEqual(
+        @as(u16, 0x0001),
+        RmsNormQ8SourceStatus.weighted(
+            RmsNormWeightedSourceStatus.bad_cfg,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0x0100),
+        RmsNormQ8SourceStatus.weighted(
+            RmsNormWeightedSourceStatus.internal,
+        ),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0x0200),
+        RmsNormQ8SourceStatus.q8(0x01),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0x4000),
+        RmsNormQ8SourceStatus.q8(0x20),
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0xffff),
+        RmsNormQ8SourceStatus.weighted(0x1ff) |
+            RmsNormQ8SourceStatus.q8(0x3f) |
+            RmsNormQ8SourceStatus.internal,
+    );
+    try std.testing.expectEqual(
+        @as(u16, 0xffff),
+        RmsNormQ8SourceStatus.fatal_mask,
     );
 }
 

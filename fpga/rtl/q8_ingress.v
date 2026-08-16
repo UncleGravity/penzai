@@ -37,6 +37,14 @@ module q8_ingress (
 
     output wire        activation_abort,
     output wire [5:0]  quantizer_status
+`ifdef FORMAL
+    , output wire [3:0] formal_state
+    , output wire [5:0] formal_scalar_index
+    , output wire [2:0] formal_emit_index
+    , output wire       formal_staged_valid
+    , output wire       formal_quant_input_fire
+    , output wire       formal_quant_output_valid
+`endif
 );
     localparam [3:0] ST_IDLE  = 4'd0;
     localparam [3:0] ST_INPUT = 4'd1;
@@ -305,6 +313,13 @@ module q8_ingress (
     end
 
 `ifdef FORMAL
+    assign formal_state = state;
+    assign formal_scalar_index = scalar_index;
+    assign formal_emit_index = emit_index;
+    assign formal_staged_valid = internal_valid_q;
+    assign formal_quant_input_fire = q_in_valid && q_in_ready;
+    assign formal_quant_output_valid = q_out_valid;
+
     reg        f_past_valid = 1'b0;
     reg [5:0]  f_scalar_count = 6'd0;
     reg [2:0]  f_native_beat = 3'd0;

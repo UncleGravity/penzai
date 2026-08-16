@@ -350,6 +350,22 @@ fn addFormalSteps(b: *std.Build) void {
         &section_rmsnorm_weighted_source_run.step,
     );
 
+    const section_rmsnorm_q8_source_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--sequential",
+        "--prefix",
+        ".zig-cache/sby/section_rmsnorm_q8_source",
+        "fpga/formal/section_rmsnorm_q8_source.sby",
+    });
+    const section_rmsnorm_q8_source_step = b.step(
+        "formal-section-rmsnorm-q8-source",
+        "Prove weighted RMSNorm to native-Q8 ordering, cleanup, abort, and restart",
+    );
+    section_rmsnorm_q8_source_step.dependOn(
+        &section_rmsnorm_q8_source_run.step,
+    );
+
     const section_ffn_pairer_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -420,6 +436,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_rmsnorm_mul_rne_step);
     formal.dependOn(section_rmsnorm_reduce_step);
     formal.dependOn(section_rmsnorm_weighted_source_step);
+    formal.dependOn(section_rmsnorm_q8_source_step);
     formal.dependOn(section_ffn_pairer_step);
     formal.dependOn(section_gate_packer_step);
     formal.dependOn(q8_internal_ingress_step);
@@ -610,6 +627,14 @@ const section_rmsnorm_weighted_source_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_mul_rne.v",
 };
 
+const section_rmsnorm_q8_source_rtl = [_][]const u8{
+    "fpga/rtl/section_rmsnorm_q8_source.v",
+    "fpga/rtl/section_rmsnorm_weighted_source.v",
+    "fpga/rtl/section_rmsnorm_mul_rne.v",
+    "fpga/rtl/q8_ingress.v",
+    "fpga/rtl/q8_quantizer.v",
+};
+
 fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     // regmap -> the generated bitstream-contract files (single source: the
     // matmul regmap module). One emitter, two artifacts: the Verilog register
@@ -705,6 +730,12 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",                          "-Wno-UNUSEDPARAM",                   "--top-module", "section_rmsnorm_weighted_source",
         "fpga/rtl/section_rmsnorm_weighted_source.v", "fpga/rtl/section_rmsnorm_mul_rne.v",
     });
+    const section_rmsnorm_q8_source_lint = b.addSystemCommand(&.{
+        "verilator",                            "--lint-only",                                "-Wall",                              "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",                    "-Wno-UNUSEDPARAM",                           "--top-module",                       "section_rmsnorm_q8_source",
+        "fpga/rtl/section_rmsnorm_q8_source.v", "fpga/rtl/section_rmsnorm_weighted_source.v", "fpga/rtl/section_rmsnorm_mul_rne.v", "fpga/rtl/q8_ingress.v",
+        "fpga/rtl/q8_quantizer.v",
+    });
     const lint_step = b.step("lint-rtl", "Verilator lint the deployable GEMM RTL and section leaves");
     lint_step.dependOn(&lint.step);
     lint_step.dependOn(&section_q8_buffer_lint.step);
@@ -718,6 +749,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     lint_step.dependOn(&section_rmsnorm_mul_rne_lint.step);
     lint_step.dependOn(&section_rmsnorm_reduce_lint.step);
     lint_step.dependOn(&section_rmsnorm_weighted_source_lint.step);
+    lint_step.dependOn(&section_rmsnorm_q8_source_lint.step);
 
     _ = addCosim(b, target, optimize, "test-rtl-fma", "Verilator cosim: numeric/fma fixed-point MAC vs matmul_ref.windowedRow", "fma_top", "fpga/sim/numeric_fma", &numeric_fma_rtl, .matmul);
     _ = addCosim(b, target, optimize, "test-rtl-gemm", "Verilator cosim: gemm decode datapath (decompose + reduce + fma lanes) vs matmul_ref.windowedRow", "gemm_top", "fpga/sim/gemm", &numeric_gemm_rtl, .matmul);
@@ -741,6 +773,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const section_rmsnorm_mul_rne_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-mul-rne", "Verilator cosim: exact finite binary32 RNE RMSNorm multiplier", "section_rmsnorm_mul_rne", "fpga/sim/section_rmsnorm_mul_rne", &section_rmsnorm_mul_rne_rtl, .section);
     const section_rmsnorm_reduce_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-reduce", "Verilator cosim: scratch-backed RMSNorm reduction through buffered inverse scalars", "section_rmsnorm_reduce", "fpga/sim/section_rmsnorm_reduce", &section_rmsnorm_reduce_rtl, .section);
     const section_rmsnorm_weighted_source_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-weighted-source", "Verilator cosim: sealed gamma, scratch replay, and exact PS-order weighted RMSNorm scalars", "section_rmsnorm_weighted_source", "fpga/sim/section_rmsnorm_weighted_source", &section_rmsnorm_weighted_source_rtl, .section);
+    const section_rmsnorm_q8_source_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-q8-source", "Verilator cosim: exact weighted RMSNorm scalars through native Q8_0 publication", "section_rmsnorm_q8_source", "fpga/sim/section_rmsnorm_q8_source", &section_rmsnorm_q8_source_rtl, .section);
     _ = addCosim(b, target, optimize, "test-rtl-seq", "Verilator cosim: seq_core command executor (write-replay/WAIT/timeout/watchdog)", "seq_core", "fpga/sim/seq_core", &seq_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-reg-master", "Verilator cosim: seq_reg_master (req/gnt -> AXI-Lite master)", "seq_reg_master", "fpga/sim/seq_reg_master", &seq_reg_master_rtl, .seq);
     _ = addCosim(b, target, optimize, "test-rtl-seq-top", "Verilator cosim: seq_top end-to-end (control slave + CMD BRAM + core + reg master)", "seq_top", "fpga/sim/seq_top", &seq_top_rtl, .seq);
@@ -766,6 +799,7 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(section_rmsnorm_mul_rne_cosim);
     rtl_cosim.dependOn(section_rmsnorm_reduce_cosim);
     rtl_cosim.dependOn(section_rmsnorm_weighted_source_cosim);
+    rtl_cosim.dependOn(section_rmsnorm_q8_source_cosim);
 }
 
 // Which software model the cosim tb checks against; selects the module imports.
