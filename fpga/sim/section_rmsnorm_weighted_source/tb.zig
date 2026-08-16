@@ -605,7 +605,15 @@ fn reloadGamma(dut: *Dut, gamma: []const u32, seed: u64) !void {
     _ = try loadGamma(dut, gamma, @intCast(gamma.len), .{}, seed);
 }
 
-fn verifyGammaFaults(dut: *Dut, gamma: []const u32) !void {
+fn verifyGammaFaults(
+    dut: *Dut,
+    gamma: []const u32,
+    replacement_gamma: []const u32,
+    inverses: []const u32,
+) !void {
+    try std.testing.expectEqual(gamma.len, replacement_gamma.len);
+    try std.testing.expect(!std.mem.eql(u32, gamma, replacement_gamma));
+
     try reloadGamma(dut, gamma, 0x1000);
     _ = try loadGamma(dut, gamma, 120, .{
         .expected_status = GammaStatus.bad_cfg,
@@ -630,6 +638,36 @@ fn verifyGammaFaults(dut: *Dut, gamma: []const u32) !void {
         .nonfinite_scalar = 3,
         .expected_status = GammaStatus.nonfinite,
     }, 0x1006);
+
+    // A late malformed replacement may overwrite tentative RAM words, but it
+    // cannot leave a readable table. Reject a run, then prove a different full
+    // reload is the exact table observed by every emitted scalar.
+    try reloadGamma(dut, gamma, 0x1010);
+    _ = try loadGamma(dut, replacement_gamma, 128, .{
+        .early_last_word = gamma.len / 2 - 2,
+        .expected_status = GammaStatus.frame,
+    }, 0x1011);
+    _ = try runSource(dut, replacement_gamma, inverses, 128, 1, .{
+        .expected_status = RunStatus.gamma,
+        .expected_requests = 0,
+        .expected_scalars = 0,
+    }, 0x1012);
+    try std.testing.expect(c.dut_read_request_valid(dut.handle) == 0);
+    try reloadGamma(dut, replacement_gamma, 0x1013);
+    _ = try runSource(dut, replacement_gamma, inverses, 128, 1, .{}, 0x1014);
+
+    _ = try loadGamma(dut, gamma, 128, .{
+        .omit_final_last = true,
+        .expected_status = GammaStatus.frame,
+    }, 0x1015);
+    _ = try runSource(dut, gamma, inverses, 128, 1, .{
+        .expected_status = RunStatus.gamma,
+        .expected_requests = 0,
+        .expected_scalars = 0,
+    }, 0x1016);
+    try std.testing.expect(c.dut_read_request_valid(dut.handle) == 0);
+    try reloadGamma(dut, gamma, 0x1017);
+    _ = try runSource(dut, gamma, inverses, 128, 1, .{}, 0x1018);
 }
 
 fn verifyRunFaults(dut: *Dut, gamma: []u32) !void {
@@ -802,6 +840,7 @@ fn deliverResponse(dut: *Dut, request: Request, options: RunOptions) !void {
 fn expectAbortIdle(dut: *Dut, max_cycles: usize) !void {
     c.dut_set_abort(dut.handle, 1);
     dut.eval();
+    try std.testing.expect(c.dut_gamma_stream_ready(dut.handle) == 0);
     try std.testing.expect(c.dut_scalar_valid(dut.handle) == 0);
     dut.step();
     c.dut_set_abort(dut.handle, 0);
@@ -871,7 +910,17 @@ fn verifyAbortGammaLoad(
         try std.testing.expect(c.dut_gamma_stream_ready(dut.handle) != 0);
         dut.step();
     }
-    c.dut_set_gamma_stream(dut.handle, 0, 0, 0, 0);
+    // Present the next word without clocking it. Abort must withdraw ready
+    // combinationally, so this beat is never accepted or written.
+    c.dut_set_gamma_stream(
+        dut.handle,
+        1,
+        gammaWord(gamma, 3, null),
+        0xff,
+        0,
+    );
+    dut.eval();
+    try std.testing.expect(c.dut_gamma_stream_ready(dut.handle) != 0);
     try expectAbortIdle(dut, 16);
     try restartAfterAbort(dut, gamma, inverses, 0x3011);
 }
@@ -1015,7 +1064,12 @@ pub fn main() !void {
     defer allocator.free(gamma4096);
     const inverses = makeInverses(4, 0x51a);
 
-    try verifyGammaFaults(&dut, gamma128);
+    try verifyGammaFaults(
+        &dut,
+        gamma128,
+        gamma4096[0..gamma128.len],
+        inverses[0..1],
+    );
 
     const gamma128_stats = try loadGamma(&dut, gamma128, 128, .{}, 0x4100);
     const compact_one = try runSource(

@@ -164,6 +164,24 @@ fn normalValue(rnd: std.Random, min_exp: u8, max_exp: u8) f32 {
     return @bitCast(sign | (exponent << 23) | fraction);
 }
 
+fn expectZeroResult(got: Result, expected_status: u8) !void {
+    try std.testing.expectEqual(expected_status, got.status);
+    try std.testing.expectEqual(@as(u16, 0), got.scale_bits);
+    for (got.quants) |quant|
+        try std.testing.expectEqual(@as(i8, 0), quant);
+}
+
+fn loadPrefixThenReset(dut: *Dut, values: []const f32) !void {
+    for (values) |value| {
+        if (c.dut_in_ready(dut.handle) == 0) return error.InputNotReady;
+        c.dut_set_input(dut.handle, 1, @bitCast(value), 0);
+        dut.step();
+    }
+    dut.reset();
+    if (c.dut_in_ready(dut.handle) == 0) return error.InputNotReadyAfterReset;
+    if (c.dut_out_valid(dut.handle) != 0) return error.OutputValidAfterReset;
+}
+
 pub fn main() !void {
     var dut = Dut.init();
     defer dut.deinit();
@@ -172,8 +190,88 @@ pub fn main() !void {
     var cases: usize = 0;
     var max_cycles: usize = 0;
 
+    // Reset must discard both a partially loaded amax and its class flags.
+    const reset_prefix = [_]f32{
+        1.0,
+        @bitCast(@as(u32, 0x007f_ffff)),
+        -2.0,
+        std.math.inf(f32),
+    };
+    try loadPrefixThenReset(&dut, &reset_prefix);
+
     var zero = [_]f32{0} ** block;
     max_cycles = @max(max_cycles, try expectCanonical(&dut, &zero, 0, null, 5));
+    cases += 1;
+
+    // Finite subnormals are nonzero but cannot enter the exact-normal divider.
+    // Exercise both signs and make the final accepted lane subnormal too.
+    var all_subnormal = [_]f32{0} ** block;
+    all_subnormal[0] = @bitCast(@as(u32, 0x0000_0001));
+    all_subnormal[15] = @bitCast(@as(u32, 0x807f_ffff));
+    all_subnormal[31] = @bitCast(@as(u32, 0x007f_ffff));
+    const all_subnormal_got = try runBlock(&dut, &all_subnormal, 0x5ab0, null, 2);
+    try expectZeroResult(all_subnormal_got, status_arith);
+    max_cycles = @max(max_cycles, all_subnormal_got.cycles);
+    cases += 1;
+
+    // A normal final lane must dominate prior subnormals. Running immediately
+    // after the rejected block also proves held-record retirement clears class.
+    var subnormal_then_normal = [_]f32{0} ** block;
+    subnormal_then_normal[0] = @bitCast(@as(u32, 0x007f_ffff));
+    subnormal_then_normal[31] = 1.0;
+    max_cycles = @max(max_cycles, try expectCanonical(
+        &dut,
+        &subnormal_then_normal,
+        0,
+        0x5ab1,
+        0,
+    ));
+    cases += 1;
+
+    // The inverse ordering proves the normal classification remains sticky
+    // when the current final lane is only subnormal.
+    var normal_then_subnormal = [_]f32{0} ** block;
+    normal_then_subnormal[0] = 1.0;
+    normal_then_subnormal[31] = @bitCast(@as(u32, 0x807f_ffff));
+    max_cycles = @max(max_cycles, try expectCanonical(
+        &dut,
+        &normal_then_subnormal,
+        0,
+        0x5ab2,
+        0,
+    ));
+    cases += 1;
+
+    // Non-finite values set diagnostics but do not make an otherwise-zero
+    // block numerically nonzero or normal, including on the current final lane.
+    // This immediately follows a normal-class block, proving record retirement
+    // clears both sticky class predicates before accepting the next record.
+    var nonfinite_zero = [_]f32{0} ** block;
+    nonfinite_zero[0] = std.math.nan(f32);
+    nonfinite_zero[31] = -std.math.inf(f32);
+    const nonfinite_zero_got = try runBlock(&dut, &nonfinite_zero, null, null, 0);
+    try expectZeroResult(nonfinite_zero_got, status_nonfinite);
+    max_cycles = @max(max_cycles, nonfinite_zero_got.cycles);
+    cases += 1;
+
+    // Non-finite lanes are diagnostic-only, while finite subnormals still make
+    // the block nonzero but unsupported by the exact-normal divider.
+    var nonfinite_subnormal = [_]f32{0} ** block;
+    nonfinite_subnormal[0] = std.math.nan(f32);
+    nonfinite_subnormal[7] = @bitCast(@as(u32, 0x007f_ffff));
+    nonfinite_subnormal[31] = @bitCast(@as(u32, 0x8000_0001));
+    const nonfinite_subnormal_got = try runBlock(
+        &dut,
+        &nonfinite_subnormal,
+        0x5ab3,
+        null,
+        1,
+    );
+    try expectZeroResult(
+        nonfinite_subnormal_got,
+        status_nonfinite | status_arith,
+    );
+    max_cycles = @max(max_cycles, nonfinite_subnormal_got.cycles);
     cases += 1;
 
     var ties = [_]f32{0} ** block;

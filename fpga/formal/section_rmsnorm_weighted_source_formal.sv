@@ -40,7 +40,7 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
 `elsif FORMAL_RESTART_ABORT
     wire [3:0] scenario = SC_ABORT;
 `elsif FORMAL_RESTART
-    wire [3:0] scenario = scenario_any;
+    wire [3:0] scenario = SC_GAMMA_FRAME;
 `else
     wire [3:0] scenario = scenario_any;
 `endif
@@ -83,6 +83,7 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
     reg [1:0] run_ordinal_q = 0;
     reg completed_q = 1'b0;
     reg fault_seen_q = 1'b0;
+    reg rejected_run_q = 1'b0;
     reg abort_seen_q = 1'b0;
     reg restarted_q = 1'b0;
     reg saw_reuse_q = 1'b0;
@@ -341,9 +342,6 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
 `ifdef FORMAL_FAULTS
         assume(scenario >= SC_GAMMA_BAD && scenario <= SC_BAD_REPLACE);
 `endif
-`ifdef FORMAL_RESTART
-        assume(scenario >= SC_GAMMA_BAD && scenario <= SC_ABORT);
-`endif
 `ifdef FORMAL_FAULT_COVER
         assume(scenario >= SC_GAMMA_BAD && scenario <= SC_BAD_REPLACE);
 `endif
@@ -357,6 +355,7 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
             run_ordinal_q <= 0;
             completed_q <= 0;
             fault_seen_q <= 0;
+            rejected_run_q <= 0;
             abort_seen_q <= 0;
             restarted_q <= 0;
             saw_reuse_q <= 0;
@@ -476,9 +475,20 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
 
             if ((gamma_done && gamma_error) || (done && error)) begin
                 fault_seen_q <= 1;
-                recovery_pending_q <= 1;
                 sticky_age_q <= 0;
                 model_gamma_valid_q <= 0;
+`ifdef FORMAL_RESTART
+                if (initial_attempt && gamma_done && gamma_error) begin
+                    want_run_q <= 1;
+                    recovery_pending_q <= 0;
+                end else begin
+                    if (initial_attempt && done && error)
+                        rejected_run_q <= 1;
+                    recovery_pending_q <= 1;
+                end
+`else
+                recovery_pending_q <= 1;
+`endif
             end
             if (error && !fault_seen_q)
                 model_gamma_valid_q <= 0;
@@ -595,6 +605,34 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
             if (initial_attempt && done && error &&
                 expected_run_fault != 0)
                 assert(status == expected_run_fault);
+`ifdef FORMAL_RESTART
+            if (initial_attempt && gamma_done && gamma_error) begin
+                assert(gamma_status == GAMMA_FRAME);
+                assert(!gamma_valid);
+            end
+            if (initial_attempt && cfg_fire) begin
+                assert(fault_seen_q);
+                assert(!gamma_valid);
+            end
+            if (initial_attempt && done && error) begin
+                assert(status == STATUS_GAMMA);
+                assert(inverse_count_q == 0);
+                assert(request_count_q == 0);
+                assert(response_count_q == 0);
+                assert(scalar_count_q == 0);
+            end
+            if (recovery_pending_q || recovery_q)
+                assert(rejected_run_q);
+            if (recovery_q && gamma_done && !gamma_error) begin
+                assert(gamma_word_q == gamma_words);
+                assert(model_gamma_valid_q);
+                assert(loaded_epoch_q == gamma_epoch_q);
+            end
+            if (completed_q) begin
+                assert(fault_seen_q && rejected_run_q && restarted_q);
+                assert(gamma_epoch_q == 2 && loaded_epoch_q == 2);
+            end
+`endif
             if (fault_seen_q && recovery_pending_q && !abort_run) begin
                 if (error)
                     assert(status != 0);
@@ -677,6 +715,11 @@ module section_rmsnorm_weighted_source_formal(input wire clk);
               abort_seen_q && saw_scalar_stall_q);
         cover(rst_n && scenario == SC_ABORT && abort_phase == 6 &&
               abort_seen_q && saw_abort_response_fire_q);
+`elsif FORMAL_RESTART
+        cover(rst_n && scenario == SC_GAMMA_FRAME && fault_seen_q &&
+              rejected_run_q && recovery_q && gamma_epoch_q == 2 &&
+              loaded_epoch_q == 2 && model_gamma_valid_q && restarted_q &&
+              completed_q);
 `elsif FORMAL_RESTART_SCRATCH
         cover(rst_n && scenario == SC_SCRATCH && restarted_q && completed_q);
 `elsif FORMAL_RESTART_MUL1

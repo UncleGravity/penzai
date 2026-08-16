@@ -187,6 +187,8 @@ module q8_quantizer (
     reg [5:0] quant_index;
     reg [31:0] values [0:31];
     reg [30:0] amax;
+    reg        seen_finite_nonzero_q;
+    reg        seen_finite_normal_q;
     reg [31:0] scale_f32;
     reg [31:0] inv_scale;
     reg [31:0] quant_value_q;
@@ -194,6 +196,11 @@ module q8_quantizer (
     wire input_finite = in_data[30:23] != 8'hff;
     wire [30:0] input_abs = in_data[30:0];
     wire [30:0] amax_next = input_finite && input_abs > amax ? input_abs : amax;
+    wire seen_finite_nonzero_next = seen_finite_nonzero_q ||
+                                    (input_finite && (input_abs != 31'd0));
+    wire seen_finite_normal_next = seen_finite_normal_q ||
+                                   (input_finite &&
+                                    (input_abs[30:23] != 8'd0));
     wire frame_error = in_last != (load_index == 6'd31);
     wire [3:0] load_status_next = out_status |
         (!input_finite ? STATUS_NONFINITE : 4'd0) |
@@ -370,6 +377,8 @@ module q8_quantizer (
             load_index  <= 6'd0;
             quant_index <= 6'd0;
             amax        <= 31'd0;
+            seen_finite_nonzero_q <= 1'b0;
+            seen_finite_normal_q <= 1'b0;
             out_valid   <= 1'b0;
             out_status  <= 4'd0;
         end else begin
@@ -379,16 +388,18 @@ module q8_quantizer (
                     if (in_valid) begin
                         values[load_index[4:0]] <= in_data;
                         amax <= amax_next;
+                        seen_finite_nonzero_q <= seen_finite_nonzero_next;
+                        seen_finite_normal_q <= seen_finite_normal_next;
                         out_status <= load_status_next;
 
                         if (load_index == 6'd31) begin
                             out_quants <= 256'd0;
                             load_index <= 6'd0;
-                            if (amax_next == 31'd0) begin
+                            if (!seen_finite_nonzero_next) begin
                                 out_scale <= 16'd0;
                                 out_valid <= 1'b1;
                                 state <= ST_HOLD;
-                            end else if (amax_next[30:23] == 8'd0) begin
+                            end else if (!seen_finite_normal_next) begin
                                 out_scale <= 16'd0;
                                 out_status <= load_status_next | STATUS_ARITH;
                                 out_valid <= 1'b1;
@@ -494,6 +505,8 @@ module q8_quantizer (
                 ST_HOLD: if (out_valid && out_ready) begin
                     state <= ST_LOAD;
                     amax <= 31'd0;
+                    seen_finite_nonzero_q <= 1'b0;
+                    seen_finite_normal_q <= 1'b0;
                     out_status <= 4'd0;
                     out_valid <= 1'b0;
                 end
@@ -502,12 +515,23 @@ module q8_quantizer (
                     state <= ST_LOAD;
                     load_index <= 6'd0;
                     amax <= 31'd0;
+                    seen_finite_nonzero_q <= 1'b0;
+                    seen_finite_normal_q <= 1'b0;
                     out_status <= 4'd0;
                     out_valid <= 1'b0;
                 end
             endcase
         end
     end
+
+`ifdef FORMAL
+    always @(posedge clk) begin
+        if (rst_n) begin
+            assert(seen_finite_nonzero_q == (amax != 31'd0));
+            assert(seen_finite_normal_q == (amax[30:23] != 8'd0));
+        end
+    end
+`endif
 endmodule
 
 /* verilator lint_on DECLFILENAME */

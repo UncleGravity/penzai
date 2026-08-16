@@ -245,10 +245,11 @@ module section_rmsnorm_weighted_source #(
     wire run_final_group = run_group_q == run_last_group;
     wire run_final_token = ({1'b0, run_token_q} + 3'd1) == run_tokens_q;
 
-    // The sealed gamma store has one write-only loader port and one synchronous
-    // read-only run port, matching the block-RAM simple-dual-port template.
+    // Accepted gamma words are tentative. gamma_valid_q seals only a complete
+    // frame and gates entry to every read-side state. The write-only loader and
+    // synchronous run port match the block-RAM simple-dual-port template.
     always @(posedge clk) begin
-        if (gamma_fire && gamma_input_ok)
+        if (gamma_fire)
             gamma_pair_mem[gamma_word_q] <= gamma_tdata;
     end
 
@@ -529,6 +530,8 @@ module section_rmsnorm_weighted_source #(
                      (state_q != ST_CLEANUP)));
             assert(scale_count_q <= run_tokens_q || state_q == ST_IDLE ||
                    state_q == ST_GAMMA);
+            if ((state_q == ST_MUL1_REQ) && mul_s_fire)
+                assert(gamma_valid_q);
             if (scalar_valid) begin
                 assert(scalar_status == 0);
                 assert(run_token_q < run_tokens_q);
