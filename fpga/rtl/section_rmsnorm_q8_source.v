@@ -451,6 +451,8 @@ module section_rmsnorm_q8_source #(
     wire [3:0] debug_weighted_state /* verilator public_flat_rd */ =
         u_weighted.state_q;
     wire [3:0] debug_q8_state /* verilator public_flat_rd */ = u_q8.state;
+    wire [3:0] debug_q8_quantizer_state /* verilator public_flat_rd */ =
+        u_q8.u_quantizer.state;
     wire [2:0] debug_q8_emit_index /* verilator public_flat_rd */ =
         u_q8.emit_index;
     wire debug_weighted_scalar_fire /* verilator public_flat_rd */ =

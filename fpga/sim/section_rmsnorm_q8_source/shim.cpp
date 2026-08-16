@@ -125,6 +125,9 @@ uint8_t dut_debug_source_state(Dut *d) {
 uint8_t dut_debug_q8_state(Dut *d) {
     return d->top->rootp->section_rmsnorm_q8_source__DOT__debug_q8_state;
 }
+uint8_t dut_debug_q8_quantizer_state(Dut *d) {
+    return d->top->rootp->section_rmsnorm_q8_source__DOT__debug_q8_quantizer_state;
+}
 uint8_t dut_debug_q8_emit_index(Dut *d) {
     return d->top->rootp->section_rmsnorm_q8_source__DOT__debug_q8_emit_index;
 }

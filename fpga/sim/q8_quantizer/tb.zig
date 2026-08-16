@@ -210,6 +210,18 @@ pub fn main() !void {
     max_cycles = @max(max_cycles, try expectCanonical(&dut, &broad, 0, 0xb10c, 7));
     cases += 1;
 
+    // The cascade split adds exactly one ownership cycle for each normal lane.
+    // Keep that +32 contract explicit rather than hiding it in a broad timeout.
+    const pre_pipeline_all_normal_cycles: usize = 256;
+    var all_normal = [_]f32{1.0} ** block;
+    const all_normal_cycles = try expectCanonical(&dut, &all_normal, 0, null, 0);
+    try std.testing.expectEqual(
+        pre_pipeline_all_normal_cycles + block,
+        all_normal_cycles,
+    );
+    max_cycles = @max(max_cycles, all_normal_cycles);
+    cases += 1;
+
     var random = std.Random.DefaultPrng.init(0x0a80_f32f_16ee_0001);
     const rnd = random.random();
     for (0..1024) |case_index| {

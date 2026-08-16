@@ -175,6 +175,7 @@ module q8_quantizer (
     localparam [3:0] ST_SCALE_CVT  = 4'd10;
     localparam [3:0] ST_SCALE_STAT = 4'd11;
     localparam [3:0] ST_QUANT_FETCH = 4'd12;
+    localparam [3:0] ST_QUANT_PIPE = 4'd13;
 
     localparam [3:0] STATUS_NONFINITE = 4'b0001;
     localparam [3:0] STATUS_SCALE      = 4'b0010;
@@ -325,7 +326,10 @@ module q8_quantizer (
         $signed({3'b000, quant_value_q[30:23]}) +
         $signed({3'b000, inv_scale[30:23]}) - 11'sd127;
 
-    (* use_dsp = "yes" *) reg [47:0] quant_product;
+    // A pure register after the inferred 24x24 product lets Vivado place a
+    // pipeline boundary inside the two-DSP cascade without changing the value.
+    (* use_dsp = "yes" *) reg [47:0] quant_product_raw;
+    reg [47:0] quant_product;
     reg quant_sign;
     reg signed [10:0] quant_product_exp;
     reg [23:0] quant_rounded_sig;
@@ -351,6 +355,14 @@ module q8_quantizer (
     wire [7:0] quant_byte = !quant_sign ?
         (quant_magnitude > 9'd127 ? 8'h7f : quant_magnitude[7:0]) :
         (quant_magnitude >= 9'd128 ? 8'h80 : (~quant_magnitude[7:0]) + 8'd1);
+
+    // Product data is intentionally valid-owned and unreset. The FSM waits for
+    // both registers before observing quant_product.
+    always @(posedge clk) begin
+        quant_product_raw <= {1'b1, quant_value_q[22:0]} *
+                             {1'b1, inv_scale[22:0]};
+        quant_product <= quant_product_raw;
+    end
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -446,13 +458,13 @@ module q8_quantizer (
                             state <= ST_QUANT_FETCH;
                         end
                     end else begin
-                        quant_product <= {1'b1, quant_value_q[22:0]} *
-                                         {1'b1, inv_scale[22:0]};
                         quant_sign <= quant_value_q[31];
                         quant_product_exp <= quant_exp_pre;
-                        state <= ST_QUANT_NORM;
+                        state <= ST_QUANT_PIPE;
                     end
                 end
+
+                ST_QUANT_PIPE: state <= ST_QUANT_NORM;
 
                 ST_QUANT_NORM: begin
                     quant_rounded_sig <= product_rounded_sig;

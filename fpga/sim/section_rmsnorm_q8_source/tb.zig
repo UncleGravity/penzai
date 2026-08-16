@@ -518,12 +518,12 @@ fn runSource(
                 max_record_cycles = @max(max_record_cycles, interval);
                 last_record_cycle = cycle;
                 if (options.measure_cadence)
-                    try std.testing.expect(interval <= 750);
+                    try std.testing.expect(interval <= 720);
                 if (source_done_cycle) |source_cycle| {
                     if (record_count == rows / 32 * tokens) {
                         final_flush_cycles = cycle - source_cycle;
                         if (options.measure_cadence)
-                            try std.testing.expect(final_flush_cycles <= 281);
+                            try std.testing.expect(final_flush_cycles <= 259);
                     }
                 }
             }
@@ -568,7 +568,7 @@ fn runSource(
         try std.testing.expectEqualSlices(usize, &([_]usize{0} ** 5), &forced_holds);
     if (options.measure_cadence) {
         try std.testing.expect(source_done_cycle != null);
-        try std.testing.expect(final_flush_cycles <= 281);
+        try std.testing.expect(final_flush_cycles <= 259);
     }
 
     dut.clearInputs();
@@ -656,6 +656,7 @@ const AbortTarget = enum {
     mul1,
     mul2,
     q8_wait,
+    q8_pipe,
     beat0,
     beat1,
     beat2,
@@ -682,6 +683,7 @@ fn abortReached(dut: *Dut, target: AbortTarget, owner_pending: bool) bool {
         .mul1 => c.dut_debug_source_state(dut.handle) == 6,
         .mul2 => c.dut_debug_source_state(dut.handle) == 8,
         .q8_wait => c.dut_debug_q8_state(dut.handle) == 4,
+        .q8_pipe => c.dut_debug_q8_quantizer_state(dut.handle) == 13,
         .q8_drain => c.dut_debug_wrapper_state(dut.handle) == 2 and
             c.dut_debug_q8_state(dut.handle) == 4,
         else => false,
@@ -938,6 +940,7 @@ fn verifyAborts(dut: *Dut, gamma: []const u32) !void {
         .beat4,
         .q8_drain,
         .final_edge,
+        .q8_pipe,
     };
     for (targets, 0..) |target, index|
         try verifyAbortPhase(dut, gamma, target, 0x3000 + index);
@@ -1105,7 +1108,7 @@ pub fn main() !void {
         "section_rmsnorm_q8_source cosim:\n" ++
             "  legal shapes=24, exact scalars={d}, records={d}, native beats={d}\n" ++
             "  randomized lifecycle cycles={d}, cadence max={d}/record, final flush={d}\n" ++
-            "  priority, reuse, tags, TLAST, faults, quarantine, abort phases=13: passed\n\n",
+            "  priority, reuse, tags, TLAST, faults, quarantine, abort phases=14: passed\n\n",
         .{
             total_scalars,
             total_records,

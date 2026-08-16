@@ -58,6 +58,7 @@ int dut_debug_source_done(Dut *d);
 uint8_t dut_debug_wrapper_state(Dut *d);
 uint8_t dut_debug_source_state(Dut *d);
 uint8_t dut_debug_q8_state(Dut *d);
+uint8_t dut_debug_q8_quantizer_state(Dut *d);
 uint8_t dut_debug_q8_emit_index(Dut *d);
 int dut_debug_q8_record_done(Dut *d);
 
