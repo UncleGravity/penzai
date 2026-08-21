@@ -23,6 +23,7 @@ Dut *dut_new(void) {
     d->t->sim_inject_residual_numeric_error = 0;
     d->t->sim_inject_down_activation_error = 0;
     d->t->sim_hold_p3d_rd_rsp = 0;
+    d->t->sim_force_scratch_abort_strobe = 0;
     return d;
 }
 void dut_free(Dut *d) {
@@ -181,6 +182,15 @@ uint32_t dut_dbg_p3d_lifecycle(Dut *d) {
            (r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_valid_q ?
                 0x1000u : 0u);
 }
+uint32_t dut_dbg_p3d_launch(Dut *d) {
+    auto *r = d->t->rootp;
+    return (r->decode_top__DOT__p3d_section_begin_ok ? 1u : 0u) |
+           (r->decode_top__DOT__p3d_leaf_start_q ? 2u : 0u) |
+           (r->decode_top__DOT__p3d_leaf_start ? 4u : 0u) |
+           (r->decode_top__DOT__q8_ingress_start ? 8u : 0u) |
+           (r->decode_top__DOT__scratch_abort_strobe ? 0x10u : 0u) |
+           (r->decode_top__DOT__rms_busy ? 0x20u : 0u);
+}
 uint32_t dut_dbg_shared_activation(Dut *d) {
     auto *r = d->t->rootp;
     return (r->decode_top__DOT__compute_s_axis_acts_tvalid ? 1u : 0u) |
@@ -203,6 +213,10 @@ void dut_set_down_activation_error(Dut *d, int v) {
 }
 void dut_set_p3d_read_response_hold(Dut *d, int v) {
     d->t->sim_hold_p3d_rd_rsp = v;
+}
+void dut_force_scratch_abort_strobe(Dut *d, int v) {
+    d->t->sim_force_scratch_abort_strobe = v;
+    d->t->rootp->decode_top__DOT__scratch_abort_strobe = v;
 }
 int dut_axi_rvalid(Dut *d) { return d->t->s_axi_rvalid; }
 uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }

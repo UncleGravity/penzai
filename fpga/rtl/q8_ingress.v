@@ -130,8 +130,11 @@ module q8_ingress (
 
     assign m_axis_tvalid = !abort && (state == ST_EMIT);
     assign m_axis_tdata = emit_data;
-    assign activation_abort = !abort && (state == ST_ERROR);
-    assign quantizer_status = abort ? 6'd0 : error_status;
+    // Start is the new owner's lifecycle boundary. Hide a retained diagnostic
+    // during that reset cycle so no top-level consumer can attribute the old
+    // run's error to the run being launched.
+    assign activation_abort = !start && !abort && (state == ST_ERROR);
+    assign quantizer_status = (start || abort) ? 6'd0 : error_status;
 
     wire final_block = (block_sub == 2'd3) &&
                        (block_q1 == last_q1) &&
@@ -378,6 +381,10 @@ module q8_ingress (
                 assert(!q_in_valid);
                 assert(!q_out_ready);
                 assert(!m_axis_tvalid);
+                assert(!activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
+            if (start) begin
                 assert(!activation_abort);
                 assert(quantizer_status == 6'd0);
             end

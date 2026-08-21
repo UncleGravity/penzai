@@ -51,6 +51,7 @@ module section_f32_scratch_direct_formal(input wire clk);
     reg f_past_valid = 1'b0;
     reg [4:0] phase = PH_R0_WRITE;
     reg [1:0] index = 2'd0;
+    reg read_owned_q = 1'b0;
 
     wire wr_cfg_valid = phase == PH_X0_CFG;
     wire wr_cfg_ready;
@@ -97,6 +98,7 @@ module section_f32_scratch_direct_formal(input wire clk);
                         (phase == PH_ISSUE_REQ) ||
                         (phase == PH_ISSUE_CHECK_REQ);
     wire rd_req_ready;
+    wire rd_quiescent;
     wire [1:0] rd_req_role = (phase == PH_X0_REQ) ? ROLE_X0 : ROLE_R;
     wire [2:0] rd_req_token = ((phase == PH_R1_REQ) ||
                                (phase == PH_ABORT_REQ)) ? 3'd1 : 3'd0;
@@ -123,6 +125,7 @@ module section_f32_scratch_direct_formal(input wire clk);
         .r_wr_bank(r_wr_bank), .r_wr_address(r_wr_address),
         .r_wr_data(r_wr_data), .r_wr_error(r_wr_error),
         .rd_req_valid(rd_req_valid), .rd_req_ready(rd_req_ready),
+        .rd_quiescent(rd_quiescent),
         .rd_req_role(rd_req_role), .rd_req_token(rd_req_token),
         .rd_req_group(11'd0),
         .rd_issue_valid(rd_issue_valid), .rd_issue_address(rd_issue_address),
@@ -138,7 +141,12 @@ module section_f32_scratch_direct_formal(input wire clk);
         if (!rst_n) begin
             phase <= PH_R0_WRITE;
             index <= 2'd0;
+            read_owned_q <= 1'b0;
         end else begin
+            if (rd_issue_valid)
+                read_owned_q <= 1'b1;
+            else if (rd_rsp_valid)
+                read_owned_q <= 1'b0;
             case (phase)
                 PH_R0_WRITE: if (r_wr_fire) begin
                     if (index == 2'd3) begin phase <= PH_R1_WRITE; index <= 2'd0; end
@@ -182,9 +190,16 @@ module section_f32_scratch_direct_formal(input wire clk);
             assert(!wr_busy && !wr_done && !wr_error);
             assert(!wr_commit_valid && !r_wr_error);
             assert(!rd_issue_valid && !rd_rsp_valid);
+            assert(rd_quiescent);
         end
 
+        if (!rst_n)
+            assert(!rd_quiescent);
+
         if (rst_n && f_past_valid && $past(rst_n)) begin
+            assert(rd_quiescent == !read_owned_q);
+            if (rd_quiescent)
+                assert(rd_req_ready);
             assert(r_wr_ready == (!wr_busy && !wr_abort));
             assert(r_wr_error == (r_wr_valid && r_wr_ready &&
                                   r_wr_address >= 14'd2048));

@@ -118,6 +118,13 @@ const DBG_P3D_SUBOWNER_RMS: u32 = 1 << 10;
 const DBG_P3D_SUBOWNER_RESIDUAL: u32 = 2 << 10;
 const DBG_P3D_RSP_VALID: u32 = 1 << 12;
 
+const DBG_P3D_BEGIN_OK: u32 = 1 << 0;
+const DBG_P3D_LEAF_START_Q: u32 = 1 << 1;
+const DBG_P3D_LEAF_START: u32 = 1 << 2;
+const DBG_P3D_LAUNCH_Q8: u32 = 1 << 3;
+const DBG_P3D_ABORT_STROBE: u32 = 1 << 4;
+const DBG_P3D_RMS_BUSY: u32 = 1 << 5;
+
 const DBG_FFN_ACTIVE: u32 = 1 << 0;
 const DBG_FFN_PRODUCER_BUSY: u32 = 1 << 1;
 const DBG_FFN_ABORT_CLEANUP: u32 = 1 << 2;
@@ -1002,6 +1009,71 @@ fn beginP3dSection(
         return error.P3dSectionBeginPhaseMismatch;
     if (resident and c.dut_a_ready(dut.h) != 0)
         return error.P3dResidentOpenedResidualIngress;
+}
+
+fn abortP3dImmediatelyAfterBegin(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+) !void {
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(model_rows));
+    axiWrite(dut, REG_NORM_EPS, 0x3586_37bd);
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+
+    // Stop between controller acceptance and the delayed leaf handshake. The
+    // direct strobe drive models the already-decoded AXI abort pulse without
+    // spending another AXI transaction's cycles before reaching this boundary.
+    c.dut_set_axi_write(dut.h, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN, 1);
+    var saw_begin = false;
+    for (0..8) |_| {
+        dut.step();
+        const launch = c.dut_dbg_p3d_launch(dut.h);
+        if (launch & DBG_P3D_BEGIN_OK != 0) {
+            if (launch & (DBG_P3D_LEAF_START_Q | DBG_P3D_LEAF_START |
+                DBG_P3D_LAUNCH_Q8 | DBG_P3D_ABORT_STROBE |
+                DBG_P3D_RMS_BUSY) != 0)
+                return error.P3dBeginLaunchedLeafSameCycle;
+            saw_begin = true;
+            break;
+        }
+    }
+    if (!saw_begin) return error.P3dImmediateAbortBeginTimeout;
+
+    dut.step();
+    var launch = c.dut_dbg_p3d_launch(dut.h);
+    if (launch & (DBG_P3D_LEAF_START_Q | DBG_P3D_LEAF_START |
+        DBG_P3D_LAUNCH_Q8) != (DBG_P3D_LEAF_START_Q |
+        DBG_P3D_LEAF_START | DBG_P3D_LAUNCH_Q8) or
+        launch & (DBG_P3D_BEGIN_OK | DBG_P3D_RMS_BUSY) != 0)
+        return error.P3dDelayedLeafLaunchMismatch;
+
+    c.dut_set_axi_idle(dut.h);
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    launch = c.dut_dbg_p3d_launch(dut.h);
+    if (launch & (DBG_P3D_LEAF_START_Q | DBG_P3D_ABORT_STROBE) !=
+        (DBG_P3D_LEAF_START_Q | DBG_P3D_ABORT_STROBE) or
+        launch & (DBG_P3D_LEAF_START | DBG_P3D_LAUNCH_Q8 |
+            DBG_P3D_RMS_BUSY) != 0 or
+        c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+    {
+        std.debug.print(
+            "P3d immediate-abort quarantine mismatch: launch=0x{x} a_ready={d} m_valid={d}\n",
+            .{ launch, c.dut_a_ready(dut.h), c.dut_m_valid(dut.h) },
+        );
+        return error.P3dImmediateAbortDidNotSuppressLeaf;
+    }
+
+    dut.step();
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    try waitP3dTerminal(dut, false, SCRATCH_ERROR_ABORT);
+    if (try axiRead(dut, REG_NORM_STATUS) != NORM_GLOBAL_IDLE or
+        try axiRead(dut, REG_NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) != 0)
+        return error.P3dImmediateAbortStatusMismatch;
 }
 
 fn sendP3dResidual(dut: *Dut, residual_beats: []const u64) !void {
@@ -1913,6 +1985,118 @@ fn runP3dDown(
     };
 }
 
+fn abortP3dAtStalledResidualOutput(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+) !void {
+    c.dut_set_m_ready(dut.h, 0);
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_FA19,
+    );
+
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    var wi = [_]usize{0} ** PORTS;
+    var held_data: u64 = 0;
+    var held_last: c_int = 0;
+    var saw_stalled_output = false;
+    for (0..CYCLE_LIMIT) |_| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(
+                dut.h,
+                @intCast(port),
+                &words,
+                @intFromBool(valid),
+            );
+        }
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        c.dut_set_m_ready(dut.h, 0);
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0)
+            return error.P3dStalledAbortAcceptedExternalActivation;
+        if (c.dut_m_valid(dut.h) != 0) {
+            if (c.dut_m_keep(dut.h) != 0xff or
+                c.dut_dbg_p3d_lifecycle(dut.h) &
+                    DBG_P3D_RESIDUAL_STARTED == 0)
+                return error.P3dStalledAbortOutputMismatch;
+            held_data = c.dut_m_data(dut.h);
+            held_last = c.dut_m_last(dut.h);
+            saw_stalled_output = true;
+            break;
+        }
+
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+    }
+    if (!saw_stalled_output) return error.P3dStalledAbortOutputTimeout;
+
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    for (0..3) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) == 0 or
+            c.dut_m_keep(dut.h) != 0xff or
+            c.dut_m_data(dut.h) != held_data or
+            c.dut_m_last(dut.h) != held_last)
+            return error.P3dStalledOutputWasNotStable;
+        dut.step();
+    }
+
+    c.dut_set_axi_write(dut.h, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT, 1);
+    var saw_abort_strobe = false;
+    for (0..16) |_| {
+        c.dut_eval(dut.h);
+        const abort_now = c.dut_dbg_p3d_launch(dut.h) &
+            DBG_P3D_ABORT_STROBE != 0;
+        if (abort_now) {
+            if (c.dut_m_valid(dut.h) != 0 or c.dut_a_ready(dut.h) != 0)
+                return error.P3dStalledAbortEscapedSameCycle;
+            saw_abort_strobe = true;
+            dut.step();
+            break;
+        }
+        if (c.dut_m_valid(dut.h) == 0 or
+            c.dut_m_data(dut.h) != held_data or
+            c.dut_m_last(dut.h) != held_last)
+            return error.P3dStalledOutputChangedBeforeAbort;
+        dut.step();
+    }
+    if (!saw_abort_strobe) return error.P3dStalledAbortStrobeTimeout;
+
+    c.dut_set_axi_idle(dut.h);
+    c.dut_set_m_ready(dut.h, 1);
+    dut.step();
+    try waitP3dTerminal(dut, false, SCRATCH_ERROR_ABORT);
+    if (try axiRead(dut, REG_NORM_STATUS) != NORM_GLOBAL_IDLE or
+        try axiRead(dut, REG_NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) != 0)
+        return error.P3dStalledAbortStatusMismatch;
+}
+
 fn faultP3dResidual(
     dut: *Dut,
     model_rows: usize,
@@ -2321,7 +2505,51 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
     reset(&dut);
     try loadP3dGamma(&dut, model_rows, &gamma_beats);
 
+    // Acceptance snapshots the section, but an abort in the following launch
+    // cycle must prevent every RMS/Q8 leaf handshake and still restart cleanly.
+    try abortP3dImmediatelyAfterBegin(
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Leave the shared Q8 ingress in its real legacy/raw framing-error state.
+    // The delayed P3d launch must clear it atomically when claiming RMS
+    // ownership, without a device reset or another Q8 launch in between.
+    const stale_q8 = try runProjection(
+        a,
+        &dut,
+        model_rows,
+        model_rows,
+        q1_blocks,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_RAW_LOAD,
+        0xF15F_D000,
+        port_views[0],
+        &residual_beats,
+        1,
+        .early_last,
+        false,
+        true,
+    );
+    defer a.free(stale_q8.result);
+    if (stale_q8.quant_status != QUANT_FRAME)
+        return error.P3dStaleQ8SetupDidNotFault;
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    if (try axiRead(&dut, REG_QUANT_STATUS) != QUANT_FRAME)
+        return error.P3dStaleQ8DidNotPersist;
+
     try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    const stale_restart = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (stale_restart & (DBG_P3D_ACTIVE | DBG_P3D_Q8_OWNER_MASK) !=
+        (DBG_P3D_ACTIVE | DBG_P3D_Q8_OWNER_RMS) or
+        stale_restart & DBG_P3D_CLEANUP != 0 or
+        try axiRead(&dut, REG_QUANT_STATUS) != 0)
+        return error.P3dStaleQ8WasAttributedToNewSection;
     try sendP3dResidual(&dut, &residual_beats);
     try runScratchOnlyProjection(
         &dut,
@@ -2555,6 +2783,38 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
     try faultP3dDownActivation(&dut, model_rows, ffn_rows, tokens);
     try loadP3dGamma(&dut, model_rows, &gamma_beats);
 
+    // Hold a committed residual beat at the external boundary, then abort via
+    // AXI. The beat must stay stable before the strobe and disappear in the
+    // strobe cycle without a transfer.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_FA05,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_FA05,
+        port_views[1],
+    );
+    try abortP3dAtStalledResidualOutput(
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
     // Hold a real RMS response at the untagged scratch boundary while ABORT is
     // accepted. Outer and P3d subownership must survive until response drain.
     try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
@@ -2600,7 +2860,7 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         (SCRATCH_SECTION_DONE | SCRATCH_R_VALID))
         return error.P3dNoResetRestartDidNotResealR;
     std.debug.print(
-        "decode_top v17 P3d 128x128x1: nonzero external/resident; gamma exclusion; RMS/GATE Q8 and section faults; no-reset restart exact\n",
+        "decode_top v17 P3d 128x128x1: delayed-launch and stalled-output aborts; nonzero external/resident; gamma exclusion; RMS/GATE Q8 and section faults; no-reset restart exact\n",
         .{},
     );
 }

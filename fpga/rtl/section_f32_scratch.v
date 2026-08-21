@@ -57,6 +57,7 @@ module section_f32_scratch (
     // One role-local row group request.  group zero denotes rows 0..7.
     input  wire          rd_req_valid,
     output wire          rd_req_ready,
+    output wire          rd_quiescent,
     input  wire [1:0]    rd_req_role,
     input  wire [2:0]    rd_req_token,
     input  wire [10:0]   rd_req_group,
@@ -242,6 +243,8 @@ module section_f32_scratch (
     // request in flight preserves the single elastic response slot.
     assign rd_req_ready = rst_n && !rd_pending_q && !rd_result_pending_q &&
                           (!rd_rsp_valid_q || rd_rsp_ready);
+    assign rd_quiescent = rst_n && !rd_pending_q && !rd_result_pending_q &&
+                          !rd_rsp_valid_q;
     wire rd_accept = rd_req_valid && rd_req_ready;
     wire rd_accept_collision = rd_accept && !rd_request_bad && mem_write &&
                                (rd_address == mem_write_address);

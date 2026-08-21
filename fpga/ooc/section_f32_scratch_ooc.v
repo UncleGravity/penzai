@@ -113,6 +113,7 @@ module section_f32_scratch_ooc (
         .r_wr_bank(r_wr_bank_i), .r_wr_address(r_wr_address_i),
         .r_wr_data(r_wr_data_i), .r_wr_error(r_wr_error),
         .rd_req_valid(rd_req_valid_i), .rd_req_ready(rd_req_ready),
+        .rd_quiescent(),
         .rd_req_role(rd_req_role_i), .rd_req_token(rd_req_token_i),
         .rd_req_group(rd_req_group_i),
         .rd_issue_valid(rd_issue_valid), .rd_issue_address(rd_issue_address),

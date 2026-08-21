@@ -31,8 +31,9 @@ module q8_ingress (
                             (raw_run && s_axis_tvalid));
     assign internal_record_done = m_axis_tvalid && m_axis_tready &&
                                   (emit_count == 3'd4);
-    assign activation_abort = !abort && error_q;
-    assign quantizer_status = (!abort && error_q) ? 6'b000100 : 6'd0;
+    assign activation_abort = !start && !abort && error_q;
+    assign quantizer_status = (!start && !abort && error_q) ?
+                              6'b000100 : 6'd0;
 
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -149,6 +150,7 @@ module section_f32_scratch (
     input wire [1:0] r_wr_bank, input wire [13:0] r_wr_address,
     input wire [63:0] r_wr_data, output wire r_wr_error,
     input wire rd_req_valid, output wire rd_req_ready,
+    output wire rd_quiescent,
     input wire [1:0] rd_req_role, input wire [2:0] rd_req_token,
     input wire [10:0] rd_req_group, output wire rd_issue_valid,
     output wire [13:0] rd_issue_address, output wire rd_rsp_valid,
@@ -169,6 +171,7 @@ module section_f32_scratch (
     assign r_wr_error = 1'b0;
     assign rd_req_ready = rst_n && !rd_pending_q &&
                           (!rd_valid_q || rd_rsp_ready);
+    assign rd_quiescent = rst_n && !rd_pending_q && !rd_valid_q;
     assign rd_issue_valid = rd_req_valid && rd_req_ready;
     assign rd_issue_address = {3'd0, rd_req_group};
     assign rd_rsp_valid = rd_valid_q;

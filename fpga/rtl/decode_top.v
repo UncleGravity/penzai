@@ -131,6 +131,7 @@ module decode_top #(
     , input wire         sim_inject_residual_numeric_error
     , input wire         sim_inject_down_activation_error
     , input wire         sim_hold_p3d_rd_rsp
+    , input wire         sim_force_scratch_abort_strobe
 `endif
 `ifdef FORMAL
     , output wire [2:0]  formal_ffn_phase
@@ -320,6 +321,7 @@ module decode_top #(
     reg [2:0]  p3d_tokens_q;
     reg [31:0] p3d_eps_q;
     reg        p3d_resident_q;
+    reg        p3d_leaf_start_q;
     reg        p3d_active_q;
     reg        p3d_cleanup_q;
     reg        p3d_cleanup_is_abort_q;
@@ -383,7 +385,7 @@ module decode_top #(
     wire [5:0] quantizer_status;
     wire q8_activation_abort;
     wire q8_ingress_abort;
-    wire kernel_start;
+    wire kernel_start /* verilator public_flat_rd */;
     wire weight_tready;
     wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid &&
                          s_axis_w2_tvalid && s_axis_w3_tvalid;
@@ -430,7 +432,7 @@ module decode_top #(
     wire [3:0] rms_gamma_status;
     wire rms_gamma_valid;
     wire rms_cfg_ready;
-    wire rms_busy;
+    wire rms_busy /* verilator public_flat_rd */;
     wire rms_done;
     wire rms_error;
     wire [22:0] rms_status;
@@ -479,7 +481,7 @@ module decode_top #(
 
     wire norm_global_idle;
     wire gamma_load_accept;
-    wire p3d_section_begin_ok;
+    wire p3d_section_begin_ok /* verilator public_flat_rd */;
     wire p3d_fault_event;
     // Gamma loading exclusively owns S_AXIS_ACTS.  Every compute launch and
     // direct activation ingress uses this one predicate, so a busy loader can
@@ -488,24 +490,31 @@ module decode_top #(
     wire compute_s_axis_acts_tvalid /* verilator public_flat_rd */ =
         s_axis_acts_tvalid && shared_activation_idle;
 
-    wire section_abort_now = scratch_abort_strobe;
-    wire p3d_abort_now = scratch_abort_strobe || p3d_kill_q;
+    wire section_abort_now = scratch_abort_strobe
+`ifdef VERILATOR
+                             || sim_force_scratch_abort_strobe
+`endif
+                             ;
+    wire p3d_abort_now = section_abort_now || p3d_kill_q;
+    wire p3d_leaf_start /* verilator public_flat_rd */ =
+                          p3d_leaf_start_q && p3d_active_q &&
+                          !p3d_cleanup_q && !p3d_abort_now;
     wire qualified_kernel_start = kernel_start_q && !section_abort_now &&
                                   !ffn_fault_q && !p3d_kill_q &&
                                   shared_activation_idle;
     wire q8_ingress_start /* verilator public_flat_rd */ =
                             shared_activation_idle &&
-                            (p3d_section_begin_ok || ffn_gate_start_q ||
+                            (p3d_leaf_start || ffn_gate_start_q ||
                              (qualified_kernel_start && raw_activation_mode &&
                               !ffn_down_start_q && !p3d_active_q));
-    wire q8_ingress_internal_mode = p3d_section_begin_ok || ffn_gate_start_q;
-    wire [15:0] q8_ingress_blocks = p3d_section_begin_ok ?
-                                     {9'd0, model_rows_q[13:7]} :
+    wire q8_ingress_internal_mode = p3d_leaf_start || ffn_gate_start_q;
+    wire [15:0] q8_ingress_blocks = p3d_leaf_start ?
+                                     {9'd0, p3d_model_rows_q[13:7]} :
                                      (ffn_gate_start_q ?
                                       {9'd0, ffn_rows_q[13:7]} :
                                       num_q1_blocks_q);
-    wire [15:0] q8_ingress_cols = p3d_section_begin_ok ?
-                                   {13'd0, scratch_tokens_q} :
+    wire [15:0] q8_ingress_cols = p3d_leaf_start ?
+                                   {13'd0, p3d_tokens_q} :
                                    (ffn_gate_start_q ?
                                     {13'd0, ffn_tokens_q} : num_cols_q);
     wire [31:0] q8_internal_data = (q8_owner_q == Q8_OWNER_RMS) ?
@@ -634,6 +643,7 @@ module decode_top #(
     wire [13:0] scratch_wr_commit_address;
     wire scratch_rd_req_valid;
     wire scratch_rd_req_ready;
+    wire scratch_rd_quiescent;
     wire [1:0] scratch_rd_req_role;
     wire [2:0] scratch_rd_req_token;
     wire [10:0] scratch_rd_req_group;
@@ -672,7 +682,7 @@ module decode_top #(
                         !ffn_producer_busy_q && !ffn_replay_active_q &&
                         !ffn_replay_inflight_q && !scratch_rd_rsp_valid &&
                         (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
-                        scratch_rd_req_ready;
+                        scratch_rd_quiescent;
     assign norm_global_idle = scratch_idle &&
                               (ffn_phase_q == FFN_IDLE) &&
                               !scratch_section_active_q &&
@@ -862,6 +872,7 @@ module decode_top #(
             scratch_consumer_start_q <= 1'b0;
             ffn_gate_start_q         <= 1'b0;
             ffn_down_start_q         <= 1'b0;
+            p3d_leaf_start_q         <= 1'b0;
         end else begin
             kernel_start_q <= start_strobe && scratch_launch_ok &&
                               !scratch_abort_strobe && !ffn_fault_q;
@@ -878,6 +889,7 @@ module decode_top #(
             ffn_down_start_q <= start_strobe && ffn_down_preflight_ok &&
                                 shared_activation_idle &&
                                 !scratch_abort_strobe && !ffn_fault_q;
+            p3d_leaf_start_q <= p3d_section_begin_ok;
         end
     end
 
@@ -1028,12 +1040,12 @@ module decode_top #(
         .gamma_error(rms_gamma_error),
         .gamma_status(rms_gamma_status),
         .gamma_valid(rms_gamma_valid),
-        .cfg_valid(p3d_section_begin_ok),
+        .cfg_valid(p3d_leaf_start),
         .cfg_ready(rms_cfg_ready),
-        .cfg_rows(model_rows_q),
-        .cfg_tokens(scratch_tokens_q),
-        .cfg_eps(norm_eps_q),
-        .cfg_resident(scratch_section_resident_strobe),
+        .cfg_rows(p3d_model_rows_q),
+        .cfg_tokens(p3d_tokens_q),
+        .cfg_eps(p3d_eps_q),
+        .cfg_resident(p3d_resident_q),
         .busy(rms_busy),
         .done(rms_done),
         .error(rms_error),
@@ -1149,6 +1161,7 @@ module decode_top #(
         .r_wr_error(scratch_r_wr_error),
         .rd_req_valid(scratch_rd_req_valid),
         .rd_req_ready(scratch_rd_req_ready),
+        .rd_quiescent(scratch_rd_quiescent),
         .rd_req_role(scratch_rd_req_role),
         .rd_req_token(scratch_rd_req_token),
         .rd_req_group(scratch_rd_req_group),
@@ -1331,7 +1344,12 @@ module decode_top #(
         .out_status(swiglu_out_status)
     );
 
-    wire q8_buffer_cfg_valid = scratch_section_begin_ok;
+    wire q8_buffer_cfg_p3d = p3d_leaf_start;
+    wire q8_buffer_cfg_valid = legacy_section_begin_ok || q8_buffer_cfg_p3d;
+    wire [2:0] q8_buffer_cfg_tokens = q8_buffer_cfg_p3d ?
+                                      ffn_tokens_q : scratch_tokens_q;
+    wire [8:0] q8_buffer_cfg_blocks = q8_buffer_cfg_p3d ?
+                                      ffn_blocks_q : scratch_rows_q[13:5];
     wire q8_buffer_seal_valid = ffn_seal_pending_q;
     wire q8_buffer_abort_valid = section_abort_now || p3d_kill_q;
     wire q8_buffer_rd_req_valid = ffn_replay_active_q &&
@@ -1347,8 +1365,8 @@ module decode_top #(
         .cfg_valid(q8_buffer_cfg_valid),
         .cfg_ready(q8_buffer_cfg_ready),
         .cfg_bank(1'b0),
-        .cfg_tokens(scratch_tokens_q),
-        .cfg_blocks(scratch_rows_q[13:5]),
+        .cfg_tokens(q8_buffer_cfg_tokens),
+        .cfg_blocks(q8_buffer_cfg_blocks),
         .seal_valid(q8_buffer_seal_valid),
         .seal_ready(q8_buffer_seal_ready),
         .seal_bank(1'b0),
@@ -2759,6 +2777,12 @@ module decode_top #(
                 assert(scratch_rd_owner_q == SCRATCH_RD_PAIRER);
             if (scratch_drain_rsp_valid)
                 assert(scratch_rd_owner_q == SCRATCH_RD_DRAIN);
+            if (scratch_rd_quiescent) begin
+                assert(!scratch_rd_rsp_valid);
+                assert(scratch_rd_req_ready);
+            end
+            if (scratch_idle)
+                assert(scratch_rd_quiescent);
 
             if (scratch_only_run_q) begin
                 assert(scratch_section_active_q);
@@ -2856,6 +2880,73 @@ module decode_top #(
                 assert(!ffn_producer_busy_q);
                 assert(scratch_rd_owner_q == SCRATCH_RD_NONE);
                 assert(!scratch_rd_rsp_valid);
+            end
+
+            // P3d acceptance only snapshots controller state. The leaves launch
+            // from that snapshot one cycle later, unless an intervening abort
+            // quarantines the pending launch.
+            if (f_decode_past_valid && $past(rst_n)) begin
+                assert(p3d_leaf_start_q == $past(p3d_section_begin_ok));
+                if ($past(p3d_section_begin_ok)) begin
+                    assert(p3d_model_rows_q == $past(model_rows_q));
+                    assert(p3d_tokens_q == $past(scratch_tokens_q));
+                    assert(p3d_eps_q == $past(norm_eps_q));
+                    assert(p3d_resident_q ==
+                           $past(scratch_section_resident_strobe));
+                    assert(ffn_tokens_q == $past(scratch_tokens_q));
+                    assert(ffn_blocks_q == $past(scratch_rows_q[13:5]));
+                end
+            end
+            if (p3d_section_begin_ok) begin
+                assert(!p3d_leaf_start);
+                assert(!q8_buffer_cfg_p3d);
+            end
+            assert(!(p3d_leaf_start && legacy_section_begin_ok));
+            assert(!(p3d_leaf_start && ffn_gate_start_q));
+            if (p3d_leaf_start) begin
+                assert(p3d_active_q && !p3d_cleanup_q && !p3d_abort_now);
+                assert(shared_activation_idle);
+                assert(rms_cfg_ready && q8_buffer_cfg_ready);
+                assert(q8_owner_q == Q8_OWNER_RMS);
+                assert(!p3d_q8_fault_now);
+                assert(!q8_fault_live && (quantizer_status == 6'd0));
+                assert(q8_ingress_start && q8_ingress_internal_mode);
+                assert(q8_ingress_blocks ==
+                       {9'd0, p3d_model_rows_q[13:7]});
+                assert(q8_ingress_cols == {13'd0, p3d_tokens_q});
+                assert(q8_buffer_cfg_p3d && q8_buffer_cfg_valid);
+                assert(q8_buffer_cfg_tokens == ffn_tokens_q);
+                assert(q8_buffer_cfg_blocks == ffn_blocks_q);
+            end
+            if (q8_ingress_start) begin
+                assert(!q8_activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
+            if (legacy_section_begin_ok) begin
+                assert(q8_buffer_cfg_valid && !q8_buffer_cfg_p3d);
+                assert(q8_buffer_cfg_tokens == scratch_tokens_q);
+                assert(q8_buffer_cfg_blocks == scratch_rows_q[13:5]);
+            end
+            if (scratch_section_begin_ok && (model_rows_q == 14'd0)) begin
+                assert(legacy_section_begin_ok);
+                assert(!p3d_section_begin_ok);
+                assert(!p3d_leaf_start_q && !p3d_leaf_start);
+            end
+            if (f_decode_past_valid &&
+                $past(rst_n && legacy_section_begin_ok)) begin
+                assert(!p3d_leaf_start_q);
+                assert(!p3d_leaf_start);
+            end
+            if (p3d_leaf_start_q && p3d_abort_now) begin
+                assert(!p3d_leaf_start);
+                assert(!q8_buffer_cfg_p3d);
+                assert(!q8_ingress_start);
+            end
+
+            if (p3d_abort_now && p3d_residual_output_selected) begin
+                assert(!m_axis_tvalid);
+                assert(!kernel_m_axis_tready);
+                assert(!scratch_r_wr_valid);
             end
 
             // P3d scratch reads are untagged at both arbitration levels.  Each

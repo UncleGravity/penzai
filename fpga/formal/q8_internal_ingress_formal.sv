@@ -34,6 +34,7 @@ module q8_internal_ingress_formal(input wire clk);
     wire m_axis_tvalid;
     wire activation_abort;
     wire [5:0] quantizer_status;
+    wire [3:0] formal_state;
 
     q8_ingress dut (
         .clk(clk), .rst_n(rst_n), .start(start), .abort(abort),
@@ -47,7 +48,7 @@ module q8_internal_ingress_formal(input wire clk);
         .internal_record_done(internal_record_done),
         .m_axis_tdata(m_axis_tdata), .m_axis_tvalid(m_axis_tvalid),
         .m_axis_tready(m_axis_tready), .activation_abort(activation_abort),
-        .quantizer_status(quantizer_status)
+        .quantizer_status(quantizer_status), .formal_state(formal_state)
     );
 
     wire internal_accept = internal_valid && internal_ready;
@@ -67,10 +68,9 @@ module q8_internal_ingress_formal(input wire clk);
             else if (internal_accept) begin
                 if (source_lane == 6'd31) source_lane <= 6'd0;
                 else source_lane <= source_lane + 1'b1;
-                if ((internal_status != 0) ||
-                    (internal_last != (source_lane == 6'd31)))
-                    fault_seen <= 1'b1;
             end
+            if (activation_abort)
+                fault_seen <= 1'b1;
             if (abort) begin
                 explicit_abort_seen <= 1'b1;
             end
@@ -95,6 +95,10 @@ module q8_internal_ingress_formal(input wire clk);
                 assert(!activation_abort);
                 assert(quantizer_status == 6'd0);
             end
+            if (start) begin
+                assert(!activation_abort);
+                assert(quantizer_status == 6'd0);
+            end
             if (activation_abort) begin
                 assert(fault_mode != 2'd0);
                 assert(!m_axis_tvalid && !internal_ready);
@@ -113,6 +117,7 @@ module q8_internal_ingress_formal(input wire clk);
 
         cover(rst_n && (fault_mode == 2'd0) && internal_record_done);
         cover(rst_n && (fault_mode != 2'd0) && restarted && internal_accept);
+        cover(rst_n && start && (formal_state == 4'd7));
         cover(rst_n && (fault_mode == 2'd0) && post_abort_restart &&
               internal_record_done);
     end
