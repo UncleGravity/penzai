@@ -145,6 +145,30 @@ const DBG_SHARED_KERNEL_START: u32 = 1 << 2;
 const DBG_SHARED_GAMMA_BUSY: u32 = 1 << 3;
 const DBG_SHARED_GAMMA_READY: u32 = 1 << 6;
 
+const DBG_LEGACY_BEGIN_OK: u32 = 1 << 0;
+const DBG_LEGACY_CFG_PENDING: u32 = 1 << 1;
+const DBG_LEGACY_CFG_FIRE: u32 = 1 << 2;
+const DBG_LEGACY_CFG_VALID: u32 = 1 << 3;
+const DBG_LEGACY_CFG_P3D: u32 = 1 << 4;
+const DBG_LEGACY_CFG_ACCEPTED: u32 = 1 << 5;
+
+const DBG_RMS_Q8_ACCEPT: u32 = 1 << 0;
+const DBG_RMS_Q8_FIRE: u32 = 1 << 1;
+const DBG_RMS_Q8_FINAL: u32 = 1 << 2;
+const DBG_RMS_Q8_DONE: u32 = 1 << 3;
+const DBG_RMS_Q8_SEAL_EVENT: u32 = 1 << 4;
+const DBG_RMS_Q8_SEALED: u32 = 1 << 5;
+const DBG_RMS_Q8_OWNER: u32 = 1 << 6;
+const DBG_RMS_Q8_ACTIVE: u32 = 1 << 7;
+
+fn dbgRmsQ8Count(value: u32) u32 {
+    return (value >> 8) & 0x3ff;
+}
+
+fn dbgRmsQ8Expected(value: u32) u32 {
+    return (value >> 18) & 0x3ff;
+}
+
 const WEIGHT_FMT_BINARY: u32 = 1;
 const WEIGHT_FMT_TERNARY: u32 = 2;
 
@@ -153,8 +177,59 @@ comptime {
     if (ROWS_PER_PORT != 4) @compileError("top cosim expects four 4-row weight ports");
 }
 
+const RmsQ8Monitor = struct {
+    armed: bool = false,
+    failed: bool = false,
+    expected: u32 = 0,
+    accepts: u32 = 0,
+    fires: u32 = 0,
+    finals: u32 = 0,
+    seal_events: u32 = 0,
+
+    fn arm(self: *RmsQ8Monitor, state: u32, expected: u32) void {
+        self.* = .{ .armed = true, .expected = expected };
+        self.failed = dbgRmsQ8Count(state) != 0 or
+            dbgRmsQ8Expected(state) != expected or
+            state & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+                DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) != 0;
+    }
+
+    fn observe(self: *RmsQ8Monitor, before: u32, after: u32) void {
+        if (!self.armed) return;
+        if (before & DBG_RMS_Q8_ACTIVE != 0 and
+            dbgRmsQ8Expected(before) != self.expected)
+            self.failed = true;
+
+        if (before & DBG_RMS_Q8_ACCEPT != 0) {
+            self.accepts += 1;
+            if (before & (DBG_RMS_Q8_FIRE | DBG_RMS_Q8_DONE |
+                DBG_RMS_Q8_SEALED) != 0 or
+                after & DBG_RMS_Q8_FIRE == 0 or
+                dbgRmsQ8Count(after) != dbgRmsQ8Count(before))
+                self.failed = true;
+        }
+        if (before & DBG_RMS_Q8_FIRE != 0) {
+            self.fires += 1;
+            if (dbgRmsQ8Count(after) != dbgRmsQ8Count(before) + 1)
+                self.failed = true;
+            if (before & DBG_RMS_Q8_FINAL != 0) {
+                self.finals += 1;
+                if (after & DBG_RMS_Q8_DONE == 0 or
+                    after & DBG_RMS_Q8_OWNER != 0)
+                    self.failed = true;
+            }
+        }
+        if (before & DBG_RMS_Q8_SEAL_EVENT != 0) {
+            self.seal_events += 1;
+            if (after & DBG_RMS_Q8_SEALED == 0)
+                self.failed = true;
+        }
+    }
+};
+
 const Dut = struct {
     h: *c.Dut,
+    rms_q8_monitor: RmsQ8Monitor = .{},
     fn init() Dut {
         return .{ .h = c.dut_new().? };
     }
@@ -162,10 +237,25 @@ const Dut = struct {
         c.dut_free(self.h);
     }
     fn step(self: *Dut) void {
+        const rms_q8_before = if (self.rms_q8_monitor.armed)
+            c.dut_dbg_p3d_q8_accounting(self.h)
+        else
+            0;
         c.dut_set_clk(self.h, 1);
         c.dut_eval(self.h);
         c.dut_set_clk(self.h, 0);
         c.dut_eval(self.h);
+        if (self.rms_q8_monitor.armed) {
+            const rms_q8_after = c.dut_dbg_p3d_q8_accounting(self.h);
+            self.rms_q8_monitor.observe(rms_q8_before, rms_q8_after);
+        }
+    }
+    fn armRmsQ8Monitor(self: *Dut, expected: u32) void {
+        c.dut_eval(self.h);
+        self.rms_q8_monitor.arm(
+            c.dut_dbg_p3d_q8_accounting(self.h),
+            expected,
+        );
     }
 };
 
@@ -288,6 +378,99 @@ fn configureScratch(dut: *Dut, mode: u32, role: u32, rows: usize, tokens: usize)
     axiWrite(dut, REG_SCRATCH_ROWS, @intCast(rows));
     axiWrite(dut, REG_SCRATCH_TOKENS, @intCast(tokens));
     axiWrite(dut, REG_SCRATCH_MODE, mode);
+}
+
+fn beginLegacySectionChecked(dut: *Dut) !void {
+    c.dut_set_axi_write(
+        dut.h,
+        REG_SCRATCH_CTRL,
+        SCRATCH_CTRL_SECTION_BEGIN,
+        1,
+    );
+    var saw_begin = false;
+    for (0..8) |_| {
+        dut.step();
+        const cfg = c.dut_dbg_legacy_q8_cfg(dut.h);
+        if (cfg & DBG_LEGACY_BEGIN_OK != 0) {
+            if (cfg & (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+                DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_P3D) != 0)
+                return error.LegacyBeginConfiguredQ8SameCycle;
+            saw_begin = true;
+            break;
+        }
+    }
+    if (!saw_begin) return error.LegacyBeginTimingTimeout;
+
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    const delayed = c.dut_dbg_legacy_q8_cfg(dut.h);
+    if (delayed & (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+        DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_ACCEPTED) !=
+        (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+            DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_ACCEPTED) or
+        delayed & (DBG_LEGACY_BEGIN_OK | DBG_LEGACY_CFG_P3D) != 0)
+        return error.LegacyDelayedQ8ConfigMismatch;
+
+    dut.step();
+    if (c.dut_dbg_legacy_q8_cfg(dut.h) != 0)
+        return error.LegacyQ8ConfigWasNotSingleCycle;
+}
+
+fn abortLegacyAtPendingQ8Config(dut: *Dut) !void {
+    c.dut_set_axi_write(
+        dut.h,
+        REG_SCRATCH_CTRL,
+        SCRATCH_CTRL_SECTION_BEGIN,
+        1,
+    );
+    var saw_begin = false;
+    for (0..8) |_| {
+        dut.step();
+        const cfg = c.dut_dbg_legacy_q8_cfg(dut.h);
+        if (cfg & DBG_LEGACY_BEGIN_OK != 0) {
+            if (cfg & (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+                DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_P3D) != 0)
+                return error.LegacyAbortBeginConfiguredQ8SameCycle;
+            saw_begin = true;
+            break;
+        }
+    }
+    if (!saw_begin) return error.LegacyAbortBeginTimingTimeout;
+
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    const pending = c.dut_dbg_legacy_q8_cfg(dut.h);
+    if (pending & (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+        DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_ACCEPTED) !=
+        (DBG_LEGACY_CFG_PENDING | DBG_LEGACY_CFG_FIRE |
+            DBG_LEGACY_CFG_VALID | DBG_LEGACY_CFG_ACCEPTED))
+        return error.LegacyAbortPendingConfigMissing;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    const suppressed = c.dut_dbg_legacy_q8_cfg(dut.h);
+    if (suppressed & DBG_LEGACY_CFG_PENDING == 0 or
+        suppressed & (DBG_LEGACY_CFG_FIRE | DBG_LEGACY_CFG_VALID |
+            DBG_LEGACY_CFG_P3D) != 0)
+        return error.LegacyInterveningAbortDidNotSuppressConfig;
+
+    dut.step();
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    for (0..64) |_| {
+        if (c.dut_dbg_ffn_lifecycle(dut.h) &
+            (DBG_FFN_ACTIVE | DBG_FFN_ABORT_CLEANUP) == 0) break;
+        dut.step();
+    } else return error.LegacyPendingConfigAbortCleanupTimeout;
+
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (c.dut_dbg_legacy_q8_cfg(dut.h) != 0 or
+        status & (SCRATCH_SECTION_ACTIVE | SCRATCH_CONSUMER_BUSY) != 0 or
+        status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+        try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_ABORT == 0)
+        return error.LegacyPendingConfigAbortStatusMismatch;
 }
 
 fn verifyAbortDominatesCoencodedStarts() !void {
@@ -1104,6 +1287,157 @@ fn sendP3dResidual(dut: *Dut, residual_beats: []const u64) !void {
         if (!accepted) return error.P3dResidualReadyTimeout;
     }
     c.dut_set_a(dut.h, 0, 0, 0);
+}
+
+fn verifyP3dRmsQ8Accounting(dut: *Dut, expected_records: u32) !void {
+    for (0..CYCLE_LIMIT) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_dbg_p3d_q8_accounting(dut.h) &
+            DBG_RMS_Q8_SEALED != 0) break;
+        dut.step();
+    } else return error.P3dRmsQ8AccountingTimeout;
+
+    const state = c.dut_dbg_p3d_q8_accounting(dut.h);
+    const monitor = &dut.rms_q8_monitor;
+    if (!monitor.armed or monitor.failed or
+        monitor.expected != expected_records or
+        monitor.accepts != expected_records or
+        monitor.fires != expected_records or monitor.finals != 1 or
+        monitor.seal_events != 1 or
+        dbgRmsQ8Count(state) != expected_records or
+        state & (DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) !=
+            (DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) or
+        state & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+            DBG_RMS_Q8_OWNER) != 0)
+    {
+        std.debug.print(
+            "P3d RMS accounting mismatch: state=0x{x} failed={} accepts/fires/finals/seals={d}/{d}/{d}/{d}\n",
+            .{
+                state,
+                monitor.failed,
+                monitor.accepts,
+                monitor.fires,
+                monitor.finals,
+                monitor.seal_events,
+            },
+        );
+        return error.P3dRmsQ8AccountingMismatch;
+    }
+    monitor.armed = false;
+}
+
+fn abortP3dAtRmsRecord(
+    dut: *Dut,
+    residual_beats: []const u64,
+    rows: usize,
+    q1_blocks: usize,
+    tokens: usize,
+    epoch: u32,
+    ports: [PORTS][]const u8,
+    abort_after_capture: bool,
+) !void {
+    const initial = c.dut_dbg_p3d_q8_accounting(dut.h);
+    if (initial & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+        DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) != 0 or
+        dbgRmsQ8Count(initial) != 0)
+        return error.P3dRmsQ8AbortStartRetainedStaleEvent;
+
+    try sendP3dResidual(dut, residual_beats);
+    configureScratch(dut, SCRATCH_MODE_ONLY, SCRATCH_ROLE_X1, rows, tokens);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        q1_blocks,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_RAW_LOAD,
+        epoch,
+    );
+
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    var wi = [_]usize{0} ** PORTS;
+    var saw_pending = false;
+    for (0..CYCLE_LIMIT) |_| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(
+                dut.h,
+                @intCast(port),
+                &words,
+                @intFromBool(valid),
+            );
+        }
+        c.dut_set_a(dut.h, 0, 0, 0);
+        c.dut_eval(dut.h);
+        const pending = c.dut_dbg_p3d_q8_accounting(dut.h);
+        if (pending & DBG_RMS_Q8_ACCEPT != 0) {
+            if (pending & (DBG_RMS_Q8_FIRE | DBG_RMS_Q8_DONE |
+                DBG_RMS_Q8_SEALED) != 0 or dbgRmsQ8Count(pending) != 0)
+                return error.P3dRmsQ8AbortWasNotAtFirstRawCompletion;
+            saw_pending = true;
+            break;
+        }
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+    }
+    if (!saw_pending) {
+        std.debug.print(
+            "P3d RMS pending-abort timeout: accounting=0x{x} lifecycle=0x{x}\n",
+            .{
+                c.dut_dbg_p3d_q8_accounting(dut.h),
+                c.dut_dbg_p3d_lifecycle(dut.h),
+            },
+        );
+        return error.P3dRmsQ8AbortPendingTimeout;
+    }
+
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port|
+        c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    if (abort_after_capture) {
+        dut.step();
+        const registered = c.dut_dbg_p3d_q8_accounting(dut.h);
+        if (registered & DBG_RMS_Q8_FIRE == 0 or
+            registered & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_DONE |
+                DBG_RMS_Q8_SEALED) != 0 or
+            dbgRmsQ8Count(registered) != 0)
+            return error.P3dRmsQ8RegisteredEventWasNotPending;
+    }
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    const suppressed = c.dut_dbg_p3d_q8_accounting(dut.h);
+    if (suppressed & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE) != 0 or
+        dbgRmsQ8Count(suppressed) != 0)
+        return error.P3dRmsQ8InterveningAbortDidNotSuppressEvent;
+    dut.step();
+    const cleared = c.dut_dbg_p3d_q8_accounting(dut.h);
+    if (cleared & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+        DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) != 0 or
+        dbgRmsQ8Count(cleared) != 0)
+        return error.P3dRmsQ8AbortLatchedStaleEvent;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    try waitP3dTerminal(dut, false, SCRATCH_ERROR_ABORT);
+    const terminal = c.dut_dbg_p3d_q8_accounting(dut.h);
+    if (terminal & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+        DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED | DBG_RMS_Q8_OWNER |
+        DBG_RMS_Q8_ACTIVE) != 0 or dbgRmsQ8Count(terminal) != 0)
+        return error.P3dRmsQ8AbortWasNotRestartSafe;
 }
 
 fn waitP3dTerminal(
@@ -2376,7 +2710,12 @@ fn runFfnSectionCase(a: std.mem.Allocator) !void {
     defer dut.deinit();
     reset(&dut);
     configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
-    axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    try abortLegacyAtPendingQ8Config(&dut);
+
+    // No reset: the aborted pending pulse must not leak into this accepted
+    // section, whose legacy Q8 configuration remains exactly one cycle wide.
+    configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+    try beginLegacySectionChecked(&dut);
     if (try axiRead(&dut, REG_SCRATCH_STATUS) & SCRATCH_SECTION_ACTIVE == 0)
         return error.SectionBeginRejected;
     try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X1, ACT_RAW_LOAD, 0xF15F_0001, port_views[0], &raw_beats);
@@ -2410,14 +2749,14 @@ fn runFfnSectionCase(a: std.mem.Allocator) !void {
     // pairer scratch response outstanding. No reset occurs before the exact
     // section below, so stale ownership or buffered records corrupt the result.
     configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
-    axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    try beginLegacySectionChecked(&dut);
     if (try axiRead(&dut, REG_SCRATCH_STATUS) & SCRATCH_SECTION_ACTIVE == 0)
         return error.AbortSectionBeginRejected;
     try runScratchOnlyProjection(&dut, ffn_dim, q1_blocks, tokens, SCRATCH_ROLE_X1, ACT_RAW_LOAD, 0xF15F_A807, port_views[0], &raw_beats);
     try abortStreamingGateWithOutstandingRead(&dut, ffn_dim, tokens, 0xF15F_A807, port_views[1]);
 
     configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
-    axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    try beginLegacySectionChecked(&dut);
     const restart_status = try axiRead(&dut, REG_SCRATCH_STATUS);
     if (restart_status & SCRATCH_SECTION_ACTIVE == 0 or
         restart_status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR |
@@ -2551,6 +2890,9 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         try axiRead(&dut, REG_QUANT_STATUS) != 0)
         return error.P3dStaleQ8WasAttributedToNewSection;
     try sendP3dResidual(&dut, &residual_beats);
+    const rms_q8_records: u32 =
+        @intCast(tokens * ffn_rows / shared_layout.q8_block);
+    dut.armRmsQ8Monitor(rms_q8_records);
     try runScratchOnlyProjection(
         &dut,
         ffn_rows,
@@ -2562,6 +2904,7 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         port_views[0],
         &.{},
     );
+    try verifyP3dRmsQ8Accounting(&dut, rms_q8_records);
     const gate = try runStreamingGateProjection(
         &dut,
         ffn_rows,
@@ -2675,9 +3018,42 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
     try rejectEarlyP3dResidualFrame(&dut, residual_beats[0]);
     try loadP3dGamma(&dut, model_rows, &gamma_beats);
 
+    // Exercise both cancellation windows around the RMS accounting register:
+    // before it captures the raw completion and after Q is visible but before
+    // the qualified event can update count/done/seal on the following edge.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try abortP3dAtRmsRecord(
+        &dut,
+        &residual_beats,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        0xF15F_C001,
+        port_views[0],
+        false,
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try abortP3dAtRmsRecord(
+        &dut,
+        &residual_beats,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        0xF15F_C002,
+        port_views[0],
+        true,
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
     // Both destinations of the sole Q8 ingress retain the terminal diagnostic
     // across automatic P3d kill/cleanup, then clear it on the next gamma load.
     try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    const rms_restart = c.dut_dbg_p3d_q8_accounting(dut.h);
+    if (rms_restart & (DBG_RMS_Q8_ACCEPT | DBG_RMS_Q8_FIRE |
+        DBG_RMS_Q8_DONE | DBG_RMS_Q8_SEALED) != 0 or
+        dbgRmsQ8Count(rms_restart) != 0)
+        return error.P3dRmsQ8RestartRetainedStaleEvent;
     try faultP3dRmsQ8(&dut, &residual_beats);
     try loadP3dGamma(&dut, model_rows, &gamma_beats);
 

@@ -22,8 +22,8 @@ smtbmc boolector
 [script]
 clean_bmc: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
 abort_bmc: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION -D FORMAL_P3D_ABORT decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
-clean_cover: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
-abort_cover: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION -D FORMAL_P3D_ABORT decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
+clean_cover: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION -D FORMAL_P3D_COVER decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
+abort_cover: read -formal -D FORMAL -D FORMAL_REDUCED_STORAGE -D FORMAL_DECODE_INTEGRATION -D FORMAL_P3D_ABORT -D FORMAL_P3D_COVER decode_ffn_stubs.v section_gate_packer.v section_ffn_pairer.v section_q8_buffer.v decode_top.v decode_p3d_formal.sv
 prep -top decode_p3d_formal -flatten
 
 [files]

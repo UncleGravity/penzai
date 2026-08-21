@@ -44,6 +44,8 @@ uint32_t dut_dbg_scratch_error(Dut *);
 uint32_t dut_dbg_p3d_lifecycle(Dut *);
 uint32_t dut_dbg_p3d_launch(Dut *);
 uint32_t dut_dbg_shared_activation(Dut *);
+uint32_t dut_dbg_legacy_q8_cfg(Dut *);
+uint32_t dut_dbg_p3d_q8_accounting(Dut *);
 void dut_set_gate_q8_numeric_error(Dut *, int);
 void dut_set_p3d_scratch_error(Dut *, int);
 void dut_set_residual_numeric_error(Dut *, int);

@@ -199,6 +199,31 @@ uint32_t dut_dbg_shared_activation(Dut *d) {
            (r->decode_top__DOT__rms_gamma_busy ? 8u : 0u) |
            (r->decode_top__DOT__rms_gamma_tready ? 0x40u : 0u);
 }
+uint32_t dut_dbg_legacy_q8_cfg(Dut *d) {
+    auto *r = d->t->rootp;
+    return (r->decode_top__DOT__legacy_section_begin_ok ? 1u : 0u) |
+           (r->decode_top__DOT__legacy_q8_cfg_start_q ? 2u : 0u) |
+           (r->decode_top__DOT__q8_buffer_cfg_legacy ? 4u : 0u) |
+           (r->decode_top__DOT__q8_buffer_cfg_valid ? 8u : 0u) |
+           (r->decode_top__DOT__q8_buffer_cfg_p3d ? 0x10u : 0u) |
+           ((r->decode_top__DOT__q8_buffer_cfg_legacy &&
+             r->decode_top__DOT__q8_buffer_cfg_ready)
+                ? 0x20u
+                : 0u);
+}
+uint32_t dut_dbg_p3d_q8_accounting(Dut *d) {
+    auto *r = d->t->rootp;
+    return (r->decode_top__DOT__rms_q8_record_accept ? 1u : 0u) |
+           (r->decode_top__DOT__rms_q8_record_fire ? 2u : 0u) |
+           (r->decode_top__DOT__rms_q8_final_record_fire ? 4u : 0u) |
+           (r->decode_top__DOT__p3d_norm_q8_done_q ? 8u : 0u) |
+           (r->decode_top__DOT__p3d_norm_seal_event ? 0x10u : 0u) |
+           (r->decode_top__DOT__p3d_norm_sealed_q ? 0x20u : 0u) |
+           ((r->decode_top__DOT__q8_owner_q == 1) ? 0x40u : 0u) |
+           (r->decode_top__DOT__p3d_active_q ? 0x80u : 0u) |
+           (r->decode_top__DOT__p3d_q8_record_count_q << 8) |
+           (r->decode_top__DOT__p3d_q8_record_expected_q << 18);
+}
 void dut_set_gate_q8_numeric_error(Dut *d, int v) {
     d->t->sim_inject_q8_numeric_error = v;
 }

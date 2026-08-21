@@ -142,6 +142,30 @@ module decode_p3d_formal(input wire clk);
     wire formal_shared_activation_idle, formal_compute_acts_tvalid;
     wire formal_q8_ingress_start, formal_kernel_start;
     wire [5:0] formal_quant_status;
+    wire formal_abort_strobe;
+    wire formal_rms_q8_record_accept, formal_rms_q8_record_pending;
+    wire formal_rms_q8_record_fire;
+    wire formal_rms_q8_final_record_fire;
+    wire [9:0] formal_p3d_q8_record_count;
+    wire [9:0] formal_p3d_q8_record_expected;
+    wire formal_p3d_norm_q8_done, formal_p3d_norm_seal_event;
+`ifdef FORMAL_P3D_COVER
+    wire formal_inject_abort = 1'b0;
+`else
+    (* anyseq *) reg formal_inject_abort;
+    reg formal_injected_abort_q = 1'b0;
+    always @(posedge clk) begin
+        if (!rst_n)
+            formal_injected_abort_q <= 1'b0;
+        else if (formal_inject_abort)
+            formal_injected_abort_q <= 1'b1;
+    end
+    always @* begin
+        assume(!formal_inject_abort ||
+               (formal_rms_q8_record_pending &&
+                !formal_injected_abort_q));
+    end
+`endif
 
     reg [6:0] gamma_beat_q;
     reg [6:0] residual_beat_q;
@@ -179,6 +203,7 @@ module decode_p3d_formal(input wire clk);
         .m_axis_tdata(result_data), .m_axis_tkeep(result_keep),
         .m_axis_tvalid(result_valid), .m_axis_tready(1'b1),
         .m_axis_tlast(result_last),
+        .formal_inject_abort(formal_inject_abort),
         .formal_ffn_phase(formal_ffn_phase),
         .formal_ffn_gate_ready(formal_ffn_gate_ready),
         .formal_scratch_rd_owner(formal_scratch_rd_owner),
@@ -219,7 +244,17 @@ module decode_p3d_formal(input wire clk);
         .formal_compute_acts_tvalid(formal_compute_acts_tvalid),
         .formal_q8_ingress_start(formal_q8_ingress_start),
         .formal_kernel_start(formal_kernel_start),
-        .formal_quant_status(formal_quant_status)
+        .formal_quant_status(formal_quant_status),
+        .formal_abort_strobe(formal_abort_strobe),
+        .formal_rms_q8_record_accept(formal_rms_q8_record_accept),
+        .formal_rms_q8_record_pending(formal_rms_q8_record_pending),
+        .formal_rms_q8_record_fire(formal_rms_q8_record_fire),
+        .formal_rms_q8_final_record_fire(
+            formal_rms_q8_final_record_fire),
+        .formal_p3d_q8_record_count(formal_p3d_q8_record_count),
+        .formal_p3d_q8_record_expected(formal_p3d_q8_record_expected),
+        .formal_p3d_norm_q8_done(formal_p3d_norm_q8_done),
+        .formal_p3d_norm_seal_event(formal_p3d_norm_seal_event)
     );
 
     always @(posedge clk) begin
@@ -311,6 +346,9 @@ module decode_p3d_formal(input wire clk);
     reg saw_residual_output_q;
     reg saw_abort_cleanup_owner_q;
     reg saw_gamma_exclusion_q;
+    reg saw_rms_q8_accept_q;
+    reg saw_rms_q8_fire_q;
+    reg saw_rms_q8_final_q;
     always @(posedge clk) begin
         f_past_valid <= 1'b1;
         if (!rst_n) begin
@@ -323,6 +361,9 @@ module decode_p3d_formal(input wire clk);
             saw_residual_output_q <= 1'b0;
             saw_abort_cleanup_owner_q <= 1'b0;
             saw_gamma_exclusion_q <= 1'b0;
+            saw_rms_q8_accept_q <= 1'b0;
+            saw_rms_q8_fire_q <= 1'b0;
+            saw_rms_q8_final_q <= 1'b0;
         end else begin
             if (formal_p3d_begin_ok)
                 saw_begin_q <= 1'b1;
@@ -349,6 +390,12 @@ module decode_p3d_formal(input wire clk);
                 !formal_compute_acts_tvalid &&
                 !formal_q8_ingress_start && !formal_kernel_start)
                 saw_gamma_exclusion_q <= 1'b1;
+            if (formal_rms_q8_record_accept)
+                saw_rms_q8_accept_q <= 1'b1;
+            if (formal_rms_q8_record_fire)
+                saw_rms_q8_fire_q <= 1'b1;
+            if (formal_rms_q8_final_record_fire)
+                saw_rms_q8_final_q <= 1'b1;
 
             assert(!(formal_rms_rd_req && formal_residual_rd_req));
             assert(!(formal_rms_r_wr_valid && formal_residual_r_wr_valid));
@@ -366,6 +413,76 @@ module decode_p3d_formal(input wire clk);
                 assert(formal_residual_output_valid);
             if (formal_p3d_cleanup)
                 assert(!formal_r_valid);
+            if (formal_p3d_begin_ok) begin
+                assert(!formal_rms_q8_record_fire);
+            end
+            if (formal_p3d_cleanup || formal_p3d_kill)
+                assert(!formal_rms_q8_record_fire);
+            if (formal_inject_abort) begin
+                assert(formal_rms_q8_record_pending);
+                assert(formal_abort_strobe);
+                assert(!formal_rms_q8_record_fire);
+                assert(!formal_p3d_norm_seal_event);
+            end
+            if (formal_abort_strobe || formal_p3d_fault) begin
+                assert(!formal_rms_q8_record_fire);
+                assert(!formal_p3d_norm_seal_event);
+            end
+            if (formal_rms_q8_record_pending &&
+                (formal_abort_strobe || formal_p3d_cleanup ||
+                 formal_p3d_kill || formal_p3d_fault))
+                assert(!formal_rms_q8_record_fire);
+            if (formal_rms_q8_record_fire) begin
+                assert(formal_p3d_active && !formal_p3d_cleanup);
+                assert(formal_q8_owner == 2'd1);
+                assert(formal_p3d_q8_record_count <
+                       formal_p3d_q8_record_expected);
+            end
+            if (formal_rms_q8_final_record_fire) begin
+                assert(formal_rms_q8_record_fire);
+                assert(formal_p3d_q8_record_count + 1'b1 ==
+                       formal_p3d_q8_record_expected);
+            end
+            if (formal_p3d_norm_seal_event)
+                assert(formal_p3d_norm_q8_done ||
+                       formal_rms_q8_final_record_fire);
+            if (f_past_valid &&
+                $past(rst_n && formal_rms_q8_record_accept &&
+                      formal_p3d_active && !formal_p3d_cleanup &&
+                      !formal_p3d_fault && !formal_p3d_kill &&
+                      !formal_abort_strobe) &&
+                formal_p3d_active && !formal_p3d_cleanup &&
+                !formal_p3d_fault && !formal_p3d_kill &&
+                !formal_abort_strobe)
+                assert(formal_rms_q8_record_fire);
+            if (f_past_valid &&
+                $past(rst_n && formal_rms_q8_record_fire &&
+                      formal_p3d_active && !formal_p3d_cleanup)) begin
+                assert(formal_p3d_q8_record_count ==
+                       $past(formal_p3d_q8_record_count) + 1'b1);
+                if ($past(formal_rms_q8_final_record_fire)) begin
+                    assert(formal_p3d_norm_q8_done);
+                    assert(formal_q8_owner == 2'd0);
+                end
+            end
+            if (f_past_valid &&
+                $past(rst_n && formal_rms_q8_record_pending &&
+                      formal_p3d_active &&
+                      (formal_abort_strobe || formal_p3d_fault))) begin
+                assert(formal_p3d_q8_record_count ==
+                       $past(formal_p3d_q8_record_count));
+                assert(formal_p3d_norm_q8_done ==
+                       $past(formal_p3d_norm_q8_done));
+            end
+            if (f_past_valid &&
+                $past(rst_n && formal_p3d_norm_seal_event &&
+                      !formal_abort_strobe))
+                assert(formal_p3d_norm_sealed);
+            if (f_past_valid && $past(rst_n && formal_p3d_begin_ok)) begin
+                assert(!formal_rms_q8_record_fire);
+                assert(formal_p3d_q8_record_count == 10'd0);
+                assert(!formal_p3d_norm_q8_done);
+            end
             if (f_past_valid &&
                 $past(rst_n && formal_p3d_fault &&
                       formal_p3d_norm_sealed &&
@@ -387,7 +504,9 @@ module decode_p3d_formal(input wire clk);
               (formal_scratch_rd_owner == 2'd0));
 `else
         cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
-              saw_norm_seal_q && saw_gate_q8_q && saw_residual_start_q &&
+              saw_rms_q8_accept_q && saw_rms_q8_fire_q &&
+              saw_rms_q8_final_q && saw_norm_seal_q && saw_gate_q8_q &&
+              saw_residual_start_q &&
               saw_gamma_exclusion_q &&
               saw_residual_output_q && formal_section_done &&
               !formal_section_active && formal_r_valid);
@@ -400,6 +519,14 @@ module decode_p3d_formal(input wire clk);
                      formal_abort_cleanup, formal_p3d_clean_complete,
                      formal_scratch_r_wr_valid,
                      formal_kernel_output_valid, formal_quant_status,
+                     formal_abort_strobe, formal_rms_q8_record_accept,
+                     formal_rms_q8_record_pending,
+                     formal_rms_q8_record_fire,
+                     formal_rms_q8_final_record_fire,
+                     formal_p3d_q8_record_count,
+                     formal_p3d_q8_record_expected,
+                     formal_p3d_norm_q8_done,
+                     formal_p3d_norm_seal_event,
                      command_q, slot_phase_q};
 endmodule
 
