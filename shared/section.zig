@@ -205,6 +205,25 @@ pub const RmsNormReduceStatus = struct {
     pub const fatal_mask: u13 = 0x1fff;
 };
 
+/// Aggregate diagnostics shared with `section_rmsnorm_q8_pipeline.v`. Both
+/// child layouts remain verbatim; the top bit is reserved for wrapper ownership
+/// and lifecycle failures.
+pub const RmsNormQ8PipelineStatus = struct {
+    pub const reduce_shift: u5 = 0;
+    pub const source_shift: u5 = 13;
+    pub const internal: u30 = 1 << 29;
+
+    pub fn reduce(status: u13) u30 {
+        return @as(u30, status) << reduce_shift;
+    }
+
+    pub fn source(status: u16) u30 {
+        return @as(u30, status) << source_shift;
+    }
+
+    pub const fatal_mask: u30 = 0x3fff_ffff;
+};
+
 pub const RmsNormInvError = error{
     InvalidShape,
     InvalidEpsilon,
@@ -1357,6 +1376,23 @@ test "P3d RMSNorm Q8 source preserves both raw child status layouts" {
     try std.testing.expectEqual(
         @as(u16, 0xffff),
         RmsNormQ8SourceStatus.fatal_mask,
+    );
+}
+
+test "P3d RMSNorm Q8 pipeline preserves both composed child layouts" {
+    try std.testing.expectEqual(
+        @as(u30, 0x0000_1fff),
+        RmsNormQ8PipelineStatus.reduce(0x1fff),
+    );
+    try std.testing.expectEqual(
+        @as(u30, 0x1fff_e000),
+        RmsNormQ8PipelineStatus.source(0xffff),
+    );
+    try std.testing.expectEqual(
+        @as(u30, 0x3fff_ffff),
+        RmsNormQ8PipelineStatus.reduce(0x1fff) |
+            RmsNormQ8PipelineStatus.source(0xffff) |
+            RmsNormQ8PipelineStatus.internal,
     );
 }
 
