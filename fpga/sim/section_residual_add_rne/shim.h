@@ -24,6 +24,8 @@ int dut_result_valid(Dut *d);
 uint32_t dut_result_data(Dut *d);
 uint8_t dut_result_status(Dut *d);
 uint8_t dut_debug_state(Dut *d);
+uint32_t dut_debug_operand_a(Dut *d);
+uint32_t dut_debug_operand_b(Dut *d);
 uint8_t dut_debug_align_distance(Dut *d);
 uint16_t dut_debug_exponent(Dut *d);
 uint32_t dut_debug_small_ext(Dut *d);

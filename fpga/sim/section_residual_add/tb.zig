@@ -5,6 +5,8 @@ const std = @import("std");
 const section = @import("shared_section");
 const c = @cImport(@cInclude("shim.h"));
 
+const add_latency: usize = 15;
+
 const WrapperState = struct {
     const add_lo_request: u8 = 4;
     const add_lo_wait: u8 = 5;
@@ -14,20 +16,21 @@ const WrapperState = struct {
 
 const AddState = struct {
     const idle: u8 = 0;
-    const align16: u8 = 1;
-    const align8: u8 = 2;
-    const align4: u8 = 3;
-    const align2: u8 = 4;
-    const align1: u8 = 5;
-    const add: u8 = 6;
-    const norm16: u8 = 7;
-    const norm8: u8 = 8;
-    const norm4: u8 = 9;
-    const norm2: u8 = 10;
-    const norm1: u8 = 11;
-    const round: u8 = 12;
-    const final: u8 = 13;
-    const result: u8 = 14;
+    const capture: u8 = 1;
+    const align16: u8 = 2;
+    const align8: u8 = 3;
+    const align4: u8 = 4;
+    const align2: u8 = 5;
+    const align1: u8 = 6;
+    const add: u8 = 7;
+    const norm16: u8 = 8;
+    const norm8: u8 = 9;
+    const norm4: u8 = 10;
+    const norm2: u8 = 11;
+    const norm1: u8 = 12;
+    const round: u8 = 13;
+    const final: u8 = 14;
+    const result: u8 = 15;
 };
 
 const Dut = struct {
@@ -441,7 +444,7 @@ fn advanceToWrite(dut: *Dut, residual: [4]u64, down: u64) !void {
     try configure(dut, 128, 1);
     try primeInput(dut, residual, false);
     try sendFirstWord(dut, down, 0xff, false);
-    for (0..32) |_| {
+    for (0..2 * add_latency + 8) |_| {
         if (c.dut_write_valid(dut.handle) != 0) return;
         dut.step();
     }
@@ -584,6 +587,7 @@ fn verifyAbortPhases(dut: *Dut) !usize {
     try abortCurrentRun(dut);
 
     const add_states = [_]u8{
+        AddState.capture,
         AddState.align16,
         AddState.align8,
         AddState.align4,
@@ -612,7 +616,7 @@ fn verifyAbortPhases(dut: *Dut) !usize {
             WrapperState.add_lo_wait,
             c.dut_debug_state(dut.handle),
         );
-        for (0..14) |_| {
+        for (0..15) |_| {
             if (c.dut_debug_add_state(dut.handle) == target_state) break;
             dut.step();
         }
@@ -645,7 +649,7 @@ fn verifyAbortPhases(dut: *Dut) !usize {
     c.dut_set_output_ready(dut.handle, 1);
     try abortCurrentRun(dut);
 
-    return 17;
+    return 18;
 }
 
 fn verifyOrphanCollisions(dut: *Dut) !void {
@@ -732,7 +736,7 @@ fn verifyOrphanCollisions(dut: *Dut) !void {
     try primeInput(dut, zeros, false);
     try sendFirstWord(dut, 0, 0xff, false);
     dut.step();
-    for (0..14) |_| {
+    for (0..15) |_| {
         if (c.dut_debug_add_state(dut.handle) == AddState.result) break;
         dut.step();
     }

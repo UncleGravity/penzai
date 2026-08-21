@@ -45,6 +45,12 @@ uint8_t dut_result_status(Dut *d) { return d->top->result_status; }
 uint8_t dut_debug_state(Dut *d) {
     return d->top->rootp->section_residual_add_rne__DOT__state_q;
 }
+uint32_t dut_debug_operand_a(Dut *d) {
+    return d->top->rootp->section_residual_add_rne__DOT__operand_a_q;
+}
+uint32_t dut_debug_operand_b(Dut *d) {
+    return d->top->rootp->section_residual_add_rne__DOT__operand_b_q;
+}
 uint8_t dut_debug_align_distance(Dut *d) {
     return d->top->rootp->section_residual_add_rne__DOT__align_distance_q;
 }

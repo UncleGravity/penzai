@@ -5,8 +5,10 @@
 // Every finite operand, including subnormals and signed zero, is added with IEEE
 // round-to-nearest-even semantics. Non-finite operands are outside the section
 // contract and return deterministic +0 with status. A finite overflow returns
-// signed infinity with status. One request may be outstanding; the result holds
-// under backpressure and abort discards every stage.
+// signed infinity with status. Raw operands are captured before decode; an
+// accepted request reaches RESULT after 15 clocks. One request may be
+// outstanding; the result holds under backpressure and abort discards every
+// stage.
 
 `default_nettype none
 
@@ -31,22 +33,26 @@ module section_residual_add_rne (
     localparam [1:0] STATUS_OVERFLOW  = 2'b10;
 
     localparam [3:0] ST_IDLE    = 4'd0;
-    localparam [3:0] ST_ALIGN16 = 4'd1;
-    localparam [3:0] ST_ALIGN8  = 4'd2;
-    localparam [3:0] ST_ALIGN4  = 4'd3;
-    localparam [3:0] ST_ALIGN2  = 4'd4;
-    localparam [3:0] ST_ALIGN1  = 4'd5;
-    localparam [3:0] ST_ADD     = 4'd6;
-    localparam [3:0] ST_NORM16  = 4'd7;
-    localparam [3:0] ST_NORM8   = 4'd8;
-    localparam [3:0] ST_NORM4   = 4'd9;
-    localparam [3:0] ST_NORM2   = 4'd10;
-    localparam [3:0] ST_NORM1   = 4'd11;
-    localparam [3:0] ST_ROUND   = 4'd12;
-    localparam [3:0] ST_FINAL   = 4'd13;
-    localparam [3:0] ST_RESULT  = 4'd14;
+    localparam [3:0] ST_CAPTURE = 4'd1;
+    localparam [3:0] ST_ALIGN16 = 4'd2;
+    localparam [3:0] ST_ALIGN8  = 4'd3;
+    localparam [3:0] ST_ALIGN4  = 4'd4;
+    localparam [3:0] ST_ALIGN2  = 4'd5;
+    localparam [3:0] ST_ALIGN1  = 4'd6;
+    localparam [3:0] ST_ADD     = 4'd7;
+    localparam [3:0] ST_NORM16  = 4'd8;
+    localparam [3:0] ST_NORM8   = 4'd9;
+    localparam [3:0] ST_NORM4   = 4'd10;
+    localparam [3:0] ST_NORM2   = 4'd11;
+    localparam [3:0] ST_NORM1   = 4'd12;
+    localparam [3:0] ST_ROUND   = 4'd13;
+    localparam [3:0] ST_FINAL   = 4'd14;
+    localparam [3:0] ST_RESULT  = 4'd15;
 
     reg [3:0] state_q;
+
+    reg [31:0] operand_a_q;
+    reg [31:0] operand_b_q;
 
     reg        sign_q;
     reg        same_sign_q;
@@ -65,10 +71,13 @@ module section_residual_add_rne (
     reg [31:0] result_data_q;
     reg [1:0]  result_status_q;
 
-    wire [7:0] exp_a = s_a[30:23];
-    wire [7:0] exp_b = s_b[30:23];
-    wire [22:0] frac_a = s_a[22:0];
-    wire [22:0] frac_b = s_b[22:0];
+    // Capture the raw operands before any decode, ordering, or exponent
+    // distance logic. This boundary keeps the caller's control decode out of
+    // the adder's magnitude-ordering path.
+    wire [7:0] exp_a = operand_a_q[30:23];
+    wire [7:0] exp_b = operand_b_q[30:23];
+    wire [22:0] frac_a = operand_a_q[22:0];
+    wire [22:0] frac_b = operand_b_q[22:0];
     wire a_nonfinite = exp_a == 8'hff;
     wire b_nonfinite = exp_b == 8'hff;
     wire a_zero = (exp_a == 8'd0) && (frac_a == 23'd0);
@@ -197,13 +206,22 @@ module section_residual_add_rne (
         end else begin
             case (state_q)
                 ST_IDLE: if (s_valid) begin
-                    sign_q <= a_mag_ge_b ? s_a[31] : s_b[31];
-                    same_sign_q <= s_a[31] == s_b[31];
+                    operand_a_q <= s_a;
+                    operand_b_q <= s_b;
+                    result_data_q <= 32'd0;
+                    result_status_q <= 2'd0;
+                    state_q <= ST_CAPTURE;
+                end
+
+                ST_CAPTURE: begin
+                    sign_q <= a_mag_ge_b ? operand_a_q[31] :
+                                              operand_b_q[31];
+                    same_sign_q <= operand_a_q[31] == operand_b_q[31];
                     nonfinite_q <= a_nonfinite || b_nonfinite;
                     special_q <= a_zero || b_zero;
                     special_data_q <= (a_zero && b_zero) ?
-                        {s_a[31] & s_b[31], 31'd0} :
-                        (a_zero ? s_b : s_a);
+                        {operand_a_q[31] & operand_b_q[31], 31'd0} :
+                        (a_zero ? operand_b_q : operand_a_q);
                     exponent_q <= {1'b0, selected_exp_big};
                     align_distance_q <= ((|selected_exp_diff[7:5]) ||
                         (selected_exp_diff[4] && selected_exp_diff[3] &&
@@ -212,8 +230,6 @@ module section_residual_add_rne (
                                         5'd27 : selected_exp_diff[4:0];
                     big_ext_q <= {selected_sig_big, 3'b000};
                     small_ext_q <= {selected_sig_small, 3'b000};
-                    result_data_q <= 32'd0;
-                    result_status_q <= 2'd0;
                     state_q <= ST_ALIGN16;
                 end
 

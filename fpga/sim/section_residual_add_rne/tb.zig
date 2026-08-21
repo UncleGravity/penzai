@@ -4,7 +4,7 @@ const std = @import("std");
 const section = @import("shared_section");
 const c = @cImport(@cInclude("shim.h"));
 
-const expected_latency: usize = 14;
+const expected_latency: usize = 15;
 
 const Dut = struct {
     handle: *c.Dut,
@@ -49,20 +49,21 @@ const Vector = struct {
 };
 
 const State = struct {
-    const align16: u8 = 1;
-    const align8: u8 = 2;
-    const align4: u8 = 3;
-    const align2: u8 = 4;
-    const align1: u8 = 5;
-    const add: u8 = 6;
-    const norm16: u8 = 7;
-    const norm8: u8 = 8;
-    const norm4: u8 = 9;
-    const norm2: u8 = 10;
-    const norm1: u8 = 11;
-    const round: u8 = 12;
-    const final: u8 = 13;
-    const result: u8 = 14;
+    const capture: u8 = 1;
+    const align16: u8 = 2;
+    const align8: u8 = 3;
+    const align4: u8 = 4;
+    const align2: u8 = 5;
+    const align1: u8 = 6;
+    const add: u8 = 7;
+    const norm16: u8 = 8;
+    const norm8: u8 = 9;
+    const norm4: u8 = 10;
+    const norm2: u8 = 11;
+    const norm1: u8 = 12;
+    const round: u8 = 13;
+    const final: u8 = 14;
+    const result: u8 = 15;
 };
 
 fn effectiveExponent(bits: u32) u8 {
@@ -348,6 +349,11 @@ fn traceShiftCase(dut: *Dut, a: u32, b: u32) !void {
     dut.eval();
     try std.testing.expect(c.dut_input_ready(dut.handle) != 0);
     dut.step();
+    c.dut_set_input(dut.handle, 1, a ^ 0xa5a5_5a5a, b ^ 0x5a5a_a5a5);
+    try std.testing.expectEqual(State.capture, c.dut_debug_state(dut.handle));
+    try std.testing.expectEqual(a, c.dut_debug_operand_a(dut.handle));
+    try std.testing.expectEqual(b, c.dut_debug_operand_b(dut.handle));
+    dut.step();
     c.dut_set_input(dut.handle, 0, 0, 0);
     try std.testing.expectEqual(State.align16, c.dut_debug_state(dut.handle));
     try std.testing.expectEqual(distance, c.dut_debug_align_distance(dut.handle));
@@ -531,7 +537,7 @@ pub fn main() !void {
             "{d} random mantissas, {d} random nonfinite; " ++
             "{d} stage traces, {d} cancellation and {d} subnormal-boundary; " ++
             "classes z={d} s={d} n={d} o={d}; C0->valid {d} cycles, " ++
-            "hold and 14-position abort/restart passed\n",
+            "hold and {d}-position abort/restart passed\n",
         .{
             directed,
             random,
@@ -543,6 +549,7 @@ pub fn main() !void {
             exponent_coverage.subnormal,
             exponent_coverage.normal,
             exponent_coverage.overflow,
+            expected_latency,
             expected_latency,
         },
     );
