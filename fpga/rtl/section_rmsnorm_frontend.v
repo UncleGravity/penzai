@@ -16,6 +16,7 @@ module section_rmsnorm_frontend (
     output wire          cfg_ready,
     input  wire [13:0]   cfg_rows,
     input  wire [2:0]    cfg_tokens,
+    input  wire          cfg_resident,
 
     input  wire          abort_run,
     output wire          busy,
@@ -56,6 +57,19 @@ module section_rmsnorm_frontend (
     output wire [47:0]   result_sum_sq,
     output wire [13:0]   result_rows,
     output wire          result_final
+`ifdef FORMAL
+    ,
+    output wire          formal_maxexp_done,
+    output wire          formal_maxexp_error,
+    output wire          formal_maxexp_result_fire,
+    output wire [3:0]    formal_max_records_after,
+    output wire          formal_sum_done,
+    output wire          formal_sum_error,
+    output wire          formal_sum_result_fire,
+    output wire [3:0]    formal_sum_records_after,
+    output wire          formal_replay_complete_after,
+    output wire          formal_replay_outstanding_after
+`endif
 );
     localparam [6:0] STATUS_BAD_CFG   = 7'b0000001;
     localparam [6:0] STATUS_LOADER    = 7'b0000010;
@@ -76,6 +90,7 @@ module section_rmsnorm_frontend (
     reg [2:0] state_q;
     reg [13:0] run_rows_q;
     reg [2:0] run_tokens_q;
+    reg run_resident_q;
     reg [9:0] run_groups_q;
     reg [31:0] max_exp_q;
     reg [2:0] max_records_q;
@@ -106,9 +121,11 @@ module section_rmsnorm_frontend (
 
     wire loader_cfg_ready;
     wire maxexp_cfg_ready;
-    wire load_cfg_valid = (state_q == ST_LOAD_START) &&
-                          loader_cfg_ready && maxexp_cfg_ready;
-    wire load_cfg_fire = load_cfg_valid;
+    wire load_cfg_valid = (state_q == ST_LOAD_START) && maxexp_cfg_ready &&
+                          (run_resident_q || loader_cfg_ready);
+    wire loader_cfg_valid = load_cfg_valid && !run_resident_q;
+    wire maxexp_cfg_valid = load_cfg_valid;
+    wire load_cfg_fire = maxexp_cfg_valid;
     wire loader_busy;
     wire loader_done;
     wire loader_error;
@@ -117,22 +134,35 @@ module section_rmsnorm_frontend (
     wire loader_group_ready;
     wire [255:0] loader_group_data;
     wire loader_group_last;
+    wire loader_s_axis_tready;
+    wire loader_r_wr_valid;
+    wire [1:0] loader_r_wr_bank;
+    wire [13:0] loader_r_wr_address;
+    wire [63:0] loader_r_wr_data;
 
     section_rmsnorm_loader u_loader (
         .clk(clk), .rst_n(rst_n),
-        .cfg_valid(load_cfg_valid), .cfg_ready(loader_cfg_ready),
+        .cfg_valid(loader_cfg_valid), .cfg_ready(loader_cfg_ready),
         .cfg_rows(run_rows_q), .cfg_tokens(run_tokens_q),
         .abort_run(pipeline_abort),
         .busy(loader_busy), .done(loader_done),
         .error(loader_error), .status(loader_status),
         .s_axis_tdata(s_axis_tdata), .s_axis_tkeep(s_axis_tkeep),
-        .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(s_axis_tready),
+        .s_axis_tvalid(s_axis_tvalid && !run_resident_q),
+        .s_axis_tready(loader_s_axis_tready),
         .s_axis_tlast(s_axis_tlast),
-        .wr_valid(r_wr_valid), .wr_ready(r_wr_ready), .wr_error(r_wr_error),
-        .wr_bank(r_wr_bank), .wr_address(r_wr_address), .wr_data(r_wr_data),
+        .wr_valid(loader_r_wr_valid), .wr_ready(r_wr_ready),
+        .wr_error(r_wr_error), .wr_bank(loader_r_wr_bank),
+        .wr_address(loader_r_wr_address), .wr_data(loader_r_wr_data),
         .group_valid(loader_group_valid), .group_ready(loader_group_ready),
         .group_data(loader_group_data), .group_last(loader_group_last)
     );
+
+    assign s_axis_tready = !run_resident_q && loader_s_axis_tready;
+    assign r_wr_valid = !run_resident_q && loader_r_wr_valid;
+    assign r_wr_bank = loader_r_wr_bank;
+    assign r_wr_address = loader_r_wr_address;
+    assign r_wr_data = loader_r_wr_data;
 
     wire maxexp_busy;
     wire maxexp_done;
@@ -151,18 +181,36 @@ module section_rmsnorm_frontend (
                               (maxexp_result_rows != run_rows_q) ||
                               (maxexp_result_final !=
                                (max_records_q + 1'b1 == run_tokens_q)));
+    wire [3:0] max_records_after = {1'b0, max_records_q} +
+                                   maxexp_result_fire;
+    wire max_subnormal_after = max_subnormal_q ||
+                               (maxexp_result_fire &&
+                                maxexp_result_subnormal);
+
+    wire maxexp_group_ready;
+    wire maxexp_group_valid = run_resident_q ?
+        (rst_n && !pipeline_abort && (state_q == ST_LOAD) &&
+         replay_outstanding_q && rd_rsp_valid) : loader_group_valid;
+    wire [255:0] maxexp_group_data = run_resident_q ? rd_rsp_data :
+                                      loader_group_data;
+    wire maxexp_group_error = run_resident_q && rd_rsp_error;
+    wire maxexp_group_last = run_resident_q ?
+        (({1'b0, replay_token_q} + 3'd1 == run_tokens_q) &&
+         (replay_group_q + 1'b1 == run_groups_q)) : loader_group_last;
+    assign loader_group_ready = !run_resident_q && maxexp_group_ready;
 
     section_rmsnorm_maxexp u_maxexp (
         .clk(clk), .rst_n(rst_n),
-        .cfg_valid(load_cfg_valid), .cfg_ready(maxexp_cfg_ready),
+        .cfg_valid(maxexp_cfg_valid), .cfg_ready(maxexp_cfg_ready),
         .cfg_rows(run_rows_q), .cfg_tokens(run_tokens_q),
         .abort_run(pipeline_abort),
         .busy(maxexp_busy), .done(maxexp_done),
         .error(maxexp_error), .status(maxexp_status),
-        .s_group_data(loader_group_data), .s_group_error(1'b0),
-        .s_group_valid(loader_group_valid),
-        .s_group_ready(loader_group_ready),
-        .s_group_last(loader_group_last),
+        .s_group_data(maxexp_group_data),
+        .s_group_error(maxexp_group_error),
+        .s_group_valid(maxexp_group_valid),
+        .s_group_ready(maxexp_group_ready),
+        .s_group_last(maxexp_group_last),
         .result_valid(maxexp_result_valid),
         .result_ready(maxexp_result_ready),
         .result_token(maxexp_result_token),
@@ -200,9 +248,14 @@ module section_rmsnorm_frontend (
                            (sum_result_max_exp !=
                             max_exp_q[sum_result_token * 8 +: 8]));
 
-    assign rd_req_valid = rst_n && !pipeline_abort && (state_q == ST_SUM) &&
+    wire replay_load = run_resident_q && (state_q == ST_LOAD);
+    wire replay_sum = state_q == ST_SUM;
+    wire replay_consumer_ready = replay_load ? maxexp_group_ready :
+                                 sum_group_ready;
+    assign rd_req_valid = rst_n && !pipeline_abort &&
+                          (replay_load || replay_sum) &&
                           !replay_outstanding_q && !replay_complete_q &&
-                          sum_group_ready;
+                          replay_consumer_ready;
     assign rd_req_token = {1'b0, replay_token_q};
     assign rd_req_group = {1'b0, replay_group_q};
     wire rd_req_fire = rd_req_valid && rd_req_ready;
@@ -213,8 +266,30 @@ module section_rmsnorm_frontend (
                           (replay_group_q + 1'b1 == run_groups_q);
     assign rd_rsp_ready = rst_n && replay_outstanding_q &&
                           (abort_run || (state_q == ST_DRAIN) ||
-                           ((state_q == ST_SUM) && sum_group_ready));
+                           (replay_load && maxexp_group_ready) ||
+                           (replay_sum && sum_group_ready));
     wire rd_rsp_fire = rd_rsp_valid && rd_rsp_ready;
+    wire replay_terminal_fire = rd_rsp_fire &&
+        ((replay_load && maxexp_group_last) ||
+         (replay_sum && sum_group_last));
+    wire replay_complete_after = replay_complete_q ||
+                                 replay_terminal_fire;
+    wire replay_outstanding_after = replay_outstanding_q && !rd_rsp_fire;
+    wire [3:0] sum_records_after = {1'b0, sum_records_q} +
+                                   sum_result_fire;
+
+`ifdef FORMAL
+    assign formal_maxexp_done = maxexp_done;
+    assign formal_maxexp_error = maxexp_error;
+    assign formal_maxexp_result_fire = maxexp_result_fire;
+    assign formal_max_records_after = max_records_after;
+    assign formal_sum_done = sum_done;
+    assign formal_sum_error = sum_error;
+    assign formal_sum_result_fire = sum_result_fire;
+    assign formal_sum_records_after = sum_records_after;
+    assign formal_replay_complete_after = replay_complete_after;
+    assign formal_replay_outstanding_after = replay_outstanding_after;
+`endif
 
     section_rmsnorm_sumsq u_sumsq (
         .clk(clk), .rst_n(rst_n),
@@ -263,6 +338,7 @@ module section_rmsnorm_frontend (
             state_q <= ST_IDLE;
             run_rows_q <= 14'd0;
             run_tokens_q <= 3'd0;
+            run_resident_q <= 1'b0;
             run_groups_q <= 10'd0;
             max_exp_q <= 32'd0;
             max_records_q <= 3'd0;
@@ -324,6 +400,7 @@ module section_rmsnorm_frontend (
                     end else begin
                         run_rows_q <= cfg_rows;
                         run_tokens_q <= cfg_tokens;
+                        run_resident_q <= cfg_resident;
                         run_groups_q <= cfg_rows[12:3];
                         state_q <= ST_LOAD_START;
                     end
@@ -333,6 +410,19 @@ module section_rmsnorm_frontend (
                     state_q <= ST_LOAD;
 
                 ST_LOAD: begin
+                    if (rd_req_fire)
+                        replay_outstanding_q <= 1'b1;
+                    if (run_resident_q && rd_rsp_fire) begin
+                        replay_outstanding_q <= 1'b0;
+                        if (maxexp_group_last) begin
+                            replay_complete_q <= 1'b1;
+                        end else if (replay_group_q + 1'b1 == run_groups_q) begin
+                            replay_group_q <= 10'd0;
+                            replay_token_q <= replay_token_q + 1'b1;
+                        end else begin
+                            replay_group_q <= replay_group_q + 1'b1;
+                        end
+                    end
                     if (maxexp_result_fire) begin
                         case (maxexp_result_token)
                             2'd0: max_exp_q[7:0] <= maxexp_result_value;
@@ -344,23 +434,28 @@ module section_rmsnorm_frontend (
                         if (maxexp_result_subnormal)
                             max_subnormal_q <= 1'b1;
                     end
-                    if (loader_done)
+                    if (!run_resident_q && loader_done)
                         loader_done_q <= 1'b1;
                     if (maxexp_done)
                         maxexp_done_q <= 1'b1;
 
-                    if (loader_error) begin
+                    if (!run_resident_q && loader_error) begin
                         fail_frontend(STATUS_LOADER);
                     end else if (maxexp_error) begin
                         fail_frontend(STATUS_MAXEXP |
                                       (maxexp_status[3] ? STATUS_SCRATCH : 7'd0));
                     end else if (maxexp_result_bad) begin
                         fail_frontend(STATUS_INTERNAL);
-                    end else if ((loader_done_q || loader_done) &&
+                    end else if ((run_resident_q || loader_done_q ||
+                                  loader_done) &&
                                  (maxexp_done_q || maxexp_done)) begin
-                        if ((max_records_q != run_tokens_q) ||
-                            max_subnormal_q || maxexp_status[5]) begin
-                            fail_frontend((max_subnormal_q || maxexp_status[5]) ?
+                        if ((run_resident_q &&
+                             (!replay_complete_after ||
+                              replay_outstanding_after)) ||
+                            (max_records_after != {1'b0, run_tokens_q}) ||
+                            max_subnormal_after || maxexp_status[5]) begin
+                            fail_frontend((max_subnormal_after ||
+                                           maxexp_status[5]) ?
                                           STATUS_SUBNORMAL : STATUS_INTERNAL);
                         end else begin
                             state_q <= ST_SUM_START;
@@ -400,8 +495,10 @@ module section_rmsnorm_frontend (
                     end else if (sum_result_bad) begin
                         fail_frontend(STATUS_INTERNAL);
                     end else if (sum_done) begin
-                        if (!replay_complete_q || replay_outstanding_q ||
-                            (sum_records_q != run_tokens_q) || sum_status[6]) begin
+                        if (!replay_complete_after ||
+                            replay_outstanding_after ||
+                            (sum_records_after != {1'b0, run_tokens_q}) ||
+                            sum_status[6]) begin
                             fail_frontend(sum_status[6] ? STATUS_SUBNORMAL :
                                           STATUS_INTERNAL);
                         end else begin
@@ -437,11 +534,16 @@ module section_rmsnorm_frontend (
             assert(!(result_valid && error));
             assert(!(rd_req_valid && replay_outstanding_q));
             if (replay_outstanding_q)
-                assert(state_q == ST_SUM || state_q == ST_DRAIN);
+                assert((run_resident_q && state_q == ST_LOAD) ||
+                       state_q == ST_SUM || state_q == ST_DRAIN);
             if (result_valid) begin
                 assert(state_q == ST_SUM);
                 assert(result_token < run_tokens_q);
                 assert(result_rows == run_rows_q);
+            end
+            if (run_resident_q && state_q != ST_IDLE) begin
+                assert(!s_axis_tready);
+                assert(!r_wr_valid);
             end
         end
         if (f_past_valid && rst_n && !pipeline_abort &&

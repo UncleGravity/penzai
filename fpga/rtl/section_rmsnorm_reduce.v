@@ -17,6 +17,7 @@ module section_rmsnorm_reduce (
     input  wire [13:0]   cfg_rows,
     input  wire [2:0]    cfg_tokens,
     input  wire [31:0]   cfg_eps,
+    input  wire          cfg_resident,
 
     input  wire          abort_run,
     output wire          busy,
@@ -156,6 +157,7 @@ module section_rmsnorm_reduce (
         .clk(clk), .rst_n(rst_n),
         .cfg_valid(child_cfg_valid), .cfg_ready(front_cfg_ready),
         .cfg_rows(cfg_rows), .cfg_tokens(cfg_tokens),
+        .cfg_resident(cfg_resident),
         .abort_run(child_abort), .busy(front_busy), .done(front_done),
         .error(front_error), .status(front_status),
         .s_axis_tdata(s_axis_tdata), .s_axis_tkeep(s_axis_tkeep),

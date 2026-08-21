@@ -38,6 +38,7 @@ const source_scratch = sourceStatus(section.RmsNormQ8SourceStatus.weighted(
     section.RmsNormWeightedSourceStatus.scratch,
 ));
 const source_q8_scale = sourceStatus(section.RmsNormQ8SourceStatus.q8(1 << 1));
+const source_internal = sourceStatus(section.RmsNormQ8SourceStatus.internal);
 
 const Scratch = struct {
     banks: [4][2048]u64 = .{.{0} ** 2048} ** 4,
@@ -93,6 +94,7 @@ const ExpectedRecord = struct {
 };
 
 const RunOptions = struct {
+    resident: bool = false,
     stalls: bool = true,
     fixed_response_delay: ?usize = null,
     hold_first_record_beats: bool = false,
@@ -145,6 +147,7 @@ const Dut = struct {
         c.dut_set_gamma_config(self.handle, 0, 0);
         c.dut_set_gamma_stream(self.handle, 0, 0, 0, 0);
         c.dut_set_run_config(self.handle, 0, 0, 0, 0);
+        c.dut_set_run_resident(self.handle, 0);
         c.dut_set_residual_stream(self.handle, 0, 0, 0, 0);
         c.dut_set_r_write_sink(self.handle, 0, 0);
         c.dut_set_read_request_ready(self.handle, 0);
@@ -342,6 +345,23 @@ fn configureRun(
     dut.eval();
 }
 
+fn populateResident(
+    scratch: *Scratch,
+    values: []const u32,
+    rows: usize,
+) !void {
+    for (0..values.len / 2) |word| {
+        const token_word_count = rows / 2;
+        const token = word / token_word_count;
+        const token_word = word % token_word_count;
+        try scratch.write(
+            @intCast(token_word % 4),
+            @intCast(token * 512 + token_word / 4),
+            residualWord(values, word),
+        );
+    }
+}
+
 fn expectRejectedStart(
     dut: *Dut,
     rows: usize,
@@ -536,12 +556,17 @@ fn runPipeline(
         try computeInverses(values, rows, tokens, eps)
     else
         [_]u32{0} ** 4;
+    if (options.resident)
+        try populateResident(scratch, values, rows);
+    c.dut_set_run_resident(dut.handle, @intFromBool(options.resident));
     try configureRun(dut, rows, tokens, eps);
 
     var prng = std.Random.DefaultPrng.init(seed);
     const random = prng.random();
     const total_words = values.len / 2;
     const reduce_requests = rows / 8 * tokens;
+    const reduction_phase_requests = reduce_requests *
+        @as(usize, if (options.resident) 2 else 1);
     var word: usize = 0;
     var presenting = false;
     var held_word: u64 = 0;
@@ -591,7 +616,7 @@ fn runPipeline(
             return error.PipelineTimeout;
         }
 
-        if (!presenting and word < total_words and
+        if (!options.resident and !presenting and word < total_words and
             (!options.stalls or random.uintLessThan(u8, 4) != 0))
         {
             presenting = true;
@@ -688,6 +713,10 @@ fn runPipeline(
         }
 
         try std.testing.expectEqual(stream_fire, write_fire);
+        if (options.resident) {
+            try std.testing.expect(c.dut_residual_stream_ready(dut.handle) == 0);
+            try std.testing.expect(c.dut_r_write_valid(dut.handle) == 0);
+        }
         if (c.dut_r_write_valid(dut.handle) != 0) {
             const current = ScratchWrite{
                 .bank = @truncate(c.dut_r_write_bank(dut.handle)),
@@ -745,10 +774,10 @@ fn runPipeline(
 
         if (request_fire) {
             const request = readRequest(dut);
-            const local = if (request_count < reduce_requests)
-                request_count
+            const local = if (request_count < reduction_phase_requests)
+                request_count % reduce_requests
             else
-                request_count - reduce_requests;
+                request_count - reduction_phase_requests;
             const groups_per_token = rows / 8;
             try std.testing.expectEqual(@as(u2, 0), request.role);
             try std.testing.expectEqual(
@@ -813,9 +842,14 @@ fn runPipeline(
     try std.testing.expect(c.dut_output_valid(dut.handle) == 0);
     try std.testing.expectEqual(options.expected_status != null, c.dut_error(dut.handle) != 0);
     try std.testing.expectEqual(options.expected_status orelse 0, pipelineStatus(dut));
-    try std.testing.expectEqual(options.expected_writes orelse total_words, write_count);
     try std.testing.expectEqual(
-        options.expected_requests orelse reduce_requests * 2,
+        options.expected_writes orelse
+            (if (options.resident) 0 else total_words),
+        write_count,
+    );
+    try std.testing.expectEqual(
+        options.expected_requests orelse reduce_requests *
+            @as(usize, if (options.resident) 3 else 2),
         request_count,
     );
     try std.testing.expectEqual(request_count, response_count);
@@ -1009,6 +1043,85 @@ fn verifyRunFaults(
         eps_1e_6,
         .{},
         0x2115,
+    );
+}
+
+fn verifyLegacySourceInternalStatus(
+    dut: *Dut,
+    scratch: *Scratch,
+    gamma: []const u32,
+    values: []const u32,
+) !void {
+    try populateResident(scratch, values, 128);
+    c.dut_set_run_resident(dut.handle, 1);
+    try configureRun(dut, 128, 1, eps_1e_6);
+    c.dut_set_residual_stream(dut.handle, 1, residualWord(values, 0), 0xff, 0);
+    c.dut_set_r_write_sink(dut.handle, 1, 0);
+    c.dut_set_read_request_ready(dut.handle, 0);
+    c.dut_set_output_ready(dut.handle, 1);
+    dut.eval();
+
+    var startup: usize = 0;
+    while (c.dut_debug_state(dut.handle) != 1) : (startup += 1) {
+        if (startup > 16) return error.SourceInternalStartupTimeout;
+        dut.step();
+    }
+    try std.testing.expect(c.dut_busy(dut.handle) != 0);
+    try std.testing.expect(c.dut_debug_source_busy(dut.handle) != 0);
+    try std.testing.expect(c.dut_residual_stream_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_r_write_valid(dut.handle) == 0);
+
+    // Exercise the legacy defensive condition directly: a final Q8 completion
+    // observed before the scalar producer is clean must be source-internal bit
+    // 15, which occupies bit 28 in the unchanged 30-bit wrapper contract.
+    c.dut_force_source_done(dut.handle, 1);
+    dut.eval();
+    try std.testing.expect(c.dut_debug_source_error(dut.handle) != 0);
+    try std.testing.expect(c.dut_debug_child_fault(dut.handle) != 0);
+    try std.testing.expectEqual(
+        section.RmsNormQ8SourceStatus.internal,
+        @as(u16, @intCast(c.dut_debug_source_status(dut.handle))),
+    );
+    dut.step();
+    c.dut_force_source_done(dut.handle, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_error(dut.handle) != 0);
+    try std.testing.expectEqual(source_internal, pipelineStatus(dut));
+    try std.testing.expectEqual(
+        section.RmsNormQ8SourceStatus.internal,
+        @as(u16, @intCast(c.dut_debug_source_status(dut.handle))),
+    );
+    try std.testing.expectEqual(@as(u1, 0), @as(u1, @truncate(
+        pipelineStatus(dut) >> 29,
+    )));
+
+    var cleanup: usize = 0;
+    while (c.dut_done(dut.handle) == 0) : (cleanup += 1) {
+        if (cleanup > 128) return error.SourceInternalCleanupTimeout;
+        try std.testing.expect(c.dut_output_valid(dut.handle) == 0);
+        dut.step();
+    }
+    try std.testing.expect(c.dut_busy(dut.handle) == 0);
+    try std.testing.expect(c.dut_error(dut.handle) != 0);
+    try std.testing.expectEqual(source_internal, pipelineStatus(dut));
+    try std.testing.expectEqual(
+        section.RmsNormQ8SourceStatus.internal,
+        @as(u16, @intCast(c.dut_debug_source_status(dut.handle))),
+    );
+    dut.clearInputs();
+    dut.step();
+
+    try reloadGamma(dut, gamma, 0x2116);
+    _ = try runPipeline(
+        dut,
+        scratch,
+        values,
+        gamma,
+        128,
+        1,
+        eps_1e_6,
+        .{ .resident = true },
+        0x2117,
     );
 }
 
@@ -1264,6 +1377,12 @@ pub fn main() !void {
     try verifyRejectedStarts(&dut, gamma128, residualWord(values128, 0));
     try verifyGammaFaults(&dut, gamma128);
     try verifyRunFaults(&dut, &scratch, gamma128);
+    try verifyLegacySourceInternalStatus(
+        &dut,
+        &scratch,
+        gamma128,
+        values128,
+    );
     try verifyAborts(&dut, &scratch, gamma128, values128);
 
     var legal_shapes: usize = 0;
@@ -1272,6 +1391,7 @@ pub fn main() !void {
     var total_requests: usize = 0;
     var total_records: usize = 0;
     var four_token_final_fires: usize = 0;
+    var resident_shapes: usize = 0;
     for (rows_set, 0..) |rows, row_index| {
         const gamma = try makeGamma(allocator, rows);
         defer allocator.free(gamma);
@@ -1297,18 +1417,37 @@ pub fn main() !void {
             total_records += stats.records;
             if (tokens == 4)
                 four_token_final_fires += stats.final_output_fires;
+
+            const resident_stats = try runPipeline(
+                &dut,
+                &scratch,
+                values,
+                gamma,
+                rows,
+                tokens,
+                eps_1e_6,
+                .{ .resident = true },
+                0x6000 + row_index * 8 + tokens,
+            );
+            resident_shapes += 1;
+            total_cycles += resident_stats.cycles;
+            total_requests += resident_stats.requests;
+            total_records += resident_stats.records;
         }
     }
     try std.testing.expectEqual(rows_set.len, four_token_final_fires);
 
     std.debug.print(
         "section_rmsnorm_q8_pipeline cosim:\n" ++
-            "  legal shapes={d}, cycles={d}, R writes={d}, shared reads={d}\n" ++
+            "  external shapes={d}, resident shapes={d}, cycles={d}, " ++
+            "R writes={d}, shared reads={d}\n" ++
             "  exact native records={d}, four-token final hooks={d}, " ++
             "gamma/residual framing, reduction/source " ++
-            "faults, prefix quarantine, abort phases=8, no-reset restart: passed\n\n",
+            "faults, legacy status mapping, prefix quarantine, abort phases=8, " ++
+            "no-reset restart: passed\n\n",
         .{
             legal_shapes,
+            resident_shapes,
             total_cycles,
             total_writes,
             total_requests,

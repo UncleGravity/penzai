@@ -233,6 +233,25 @@ pub const RmsNormReduceStatus = struct {
     pub const fatal_mask: u13 = 0x1fff;
 };
 
+/// Aggregate diagnostics shared with `section_rmsnorm_scalar_pipeline.v`.
+/// Reduction and weighted-source child layouts remain verbatim; the top bit is
+/// reserved for scalar-pipeline ownership, framing, and lifecycle failures.
+pub const RmsNormScalarPipelineStatus = struct {
+    pub const reduce_shift: u5 = 0;
+    pub const weighted_shift: u5 = 13;
+    pub const internal: u23 = 1 << 22;
+
+    pub fn reduce(status: u13) u23 {
+        return @as(u23, status) << reduce_shift;
+    }
+
+    pub fn weighted(status: u9) u23 {
+        return @as(u23, status) << weighted_shift;
+    }
+
+    pub const fatal_mask: u23 = 0x7f_ffff;
+};
+
 /// Aggregate diagnostics shared with `section_rmsnorm_q8_pipeline.v`. Both
 /// child layouts remain verbatim; the top bit is reserved for wrapper ownership
 /// and lifecycle failures.
@@ -1534,6 +1553,27 @@ test "P3d RMSNorm Q8 source preserves both raw child status layouts" {
     );
 }
 
+test "P3d RMSNorm scalar pipeline preserves both raw child layouts" {
+    try std.testing.expectEqual(
+        @as(u23, 0x001fff),
+        RmsNormScalarPipelineStatus.reduce(0x1fff),
+    );
+    try std.testing.expectEqual(
+        @as(u23, 0x3f_e000),
+        RmsNormScalarPipelineStatus.weighted(0x1ff),
+    );
+    try std.testing.expectEqual(
+        @as(u23, 0x7f_ffff),
+        RmsNormScalarPipelineStatus.reduce(0x1fff) |
+            RmsNormScalarPipelineStatus.weighted(0x1ff) |
+            RmsNormScalarPipelineStatus.internal,
+    );
+    try std.testing.expectEqual(
+        @as(u23, 0x7f_ffff),
+        RmsNormScalarPipelineStatus.fatal_mask,
+    );
+}
+
 test "P3d RMSNorm Q8 pipeline preserves both composed child layouts" {
     try std.testing.expectEqual(
         @as(u30, 0x0000_1fff),
@@ -1542,6 +1582,14 @@ test "P3d RMSNorm Q8 pipeline preserves both composed child layouts" {
     try std.testing.expectEqual(
         @as(u30, 0x1fff_e000),
         RmsNormQ8PipelineStatus.source(0xffff),
+    );
+    try std.testing.expectEqual(
+        @as(u30, 0x1000_0000),
+        RmsNormQ8PipelineStatus.source(RmsNormQ8SourceStatus.internal),
+    );
+    try std.testing.expectEqual(
+        @as(u30, 0x2000_0000),
+        RmsNormQ8PipelineStatus.internal,
     );
     try std.testing.expectEqual(
         @as(u30, 0x3fff_ffff),

@@ -107,6 +107,7 @@ module section_rmsnorm_reduce_formal(input wire clk);
         .clk(clk), .rst_n(rst_n),
         .cfg_valid(cfg_valid), .cfg_ready(cfg_ready),
         .cfg_rows(cfg_rows), .cfg_tokens(cfg_tokens), .cfg_eps(cfg_eps),
+        .cfg_resident(1'b0),
         .abort_run(abort_run), .busy(busy), .done(done),
         .error(error), .status(status),
         .s_axis_tdata(64'd0), .s_axis_tkeep(8'hff),

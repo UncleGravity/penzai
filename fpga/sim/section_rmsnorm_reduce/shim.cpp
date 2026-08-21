@@ -15,6 +15,7 @@ Dut *dut_new(void) {
     Dut *d = new Dut();
     d->top = new Vsection_rmsnorm_reduce();
     d->top->cfg_valid = 0;
+    d->top->cfg_resident = 0;
     d->top->abort_run = 0;
     d->top->s_axis_tvalid = 0;
     d->top->r_wr_ready = 0;

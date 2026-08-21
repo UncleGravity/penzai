@@ -1,11 +1,11 @@
 `default_nettype none
 
-// Composition proof for the complete scratch-backed RMSNorm-to-Q8 boundary.
-// The real reducer, weighted-source, Q8 ingress, arbiter, and lifecycle wrapper
-// remain in the cone. Independently checked arithmetic leaves use their bounded
-// control stubs so faults, retained reads, abort cleanup, and restart stay
-// visible without reproving the numeric datapaths here.
-module section_rmsnorm_q8_pipeline_formal(input wire clk);
+// Composition proof for the production scratch-backed weighted RMSNorm scalar
+// boundary. The real reducer, weighted source, scratch arbiter, scalar framing,
+// and lifecycle wrapper remain in the cone. Independently checked arithmetic
+// leaves use bounded control stubs so faults, retained reads, cleanup, and
+// restart stay visible without reproving the numeric datapaths here.
+module section_rmsnorm_scalar_pipeline_formal(input wire clk);
     localparam [3:0] SC_STARTUP      = 4'd0;
     localparam [3:0] SC_CLEAN        = 4'd1;
     localparam [3:0] SC_REDUCE_FAULT = 4'd2;
@@ -36,14 +36,14 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     localparam [2:0] RUN_TOKENS = 3'd1;
     localparam [31:0] RUN_EPS = 32'h3586_37bd;
     localparam [31:0] GAMMA_SCALAR = 32'h3f00_0000;
-    localparam [29:0] STATUS_REDUCE_SCRATCH = 30'h0000_0020;
-    localparam [29:0] STATUS_SOURCE_SCRATCH = 30'h0001_0000;
-    localparam [29:0] STATUS_SOURCE_GAMMA = 30'h0000_4000;
-    localparam [29:0] STATUS_INTERNAL = 30'h2000_0000;
+    localparam [22:0] STATUS_REDUCE_SCRATCH = 23'h00_0020;
+    localparam [22:0] STATUS_SOURCE_SCRATCH = 23'h01_0000;
+    localparam [22:0] STATUS_SOURCE_GAMMA = 23'h00_4000;
+    localparam [22:0] STATUS_INTERNAL = 23'h40_0000;
     localparam [7:0] EXPECT_REDUCE_REQUESTS = 8'd1;
     localparam [7:0] EXPECT_SOURCE_REQUESTS = 8'd16;
     localparam [7:0] EXPECT_RESPONSES = 8'd17;
-    localparam [5:0] EXPECT_OUTPUT_BEATS = 6'd20;
+    localparam [7:0] EXPECT_OUTPUT_SCALARS = 8'd128;
     localparam [2:0] EXPECT_RECORDS = 3'd4;
 
 `ifdef FORMAL_SC_STARTUP
@@ -84,9 +84,9 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     reg [7:0] reduce_request_count_q = 8'd0;
     reg [7:0] source_request_count_q = 8'd0;
     reg [7:0] response_count_q = 8'd0;
-    reg [5:0] output_beat_count_q = 6'd0;
+    reg [7:0] output_scalar_count_q = 8'd0;
     reg [2:0] output_record_count_q = 3'd0;
-    reg [2:0] expected_output_beat_q = 3'd0;
+    reg [5:0] expected_output_scalar_q = 6'd0;
     reg [1:0] expected_output_token_q = 2'd0;
     reg [8:0] expected_output_block_q = 9'd0;
 
@@ -105,7 +105,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     reg saw_cfg_reject_q = 1'b0;
     reg saw_orphan_inject_q = 1'b0;
     reg saw_orphan_gamma_invalid_q = 1'b0;
-    reg [29:0] captured_status_q = 30'd0;
+    reg [22:0] captured_status_q = 23'd0;
 
     wire first_attempt = cfg_count_q == 3'd1;
     wire fault_scenario = (scenario == SC_REDUCE_FAULT) ||
@@ -158,7 +158,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire busy;
     wire done;
     wire error;
-    wire [29:0] status;
+    wire [22:0] status;
     wire r_wr_valid;
     wire [1:0] r_wr_bank;
     wire [13:0] r_wr_address;
@@ -191,14 +191,13 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire residual_tlast = 1'b1;
     wire residual_fire = residual_tvalid && residual_tready;
 
-    wire [63:0] m_axis_tdata;
-    wire m_axis_tvalid;
-    wire m_axis_tready = !((scenario == SC_ABORT_OUTPUT) && first_attempt &&
+    wire [31:0] scalar_data;
+    wire scalar_valid;
+    wire scalar_ready = !((scenario == SC_ABORT_OUTPUT) && first_attempt &&
                            !saw_abort_q && cycle_q[1:0] == 2'b01);
-    wire m_axis_tlast;
-    wire [1:0] m_axis_token;
-    wire [8:0] m_axis_block;
-    wire output_fire = m_axis_tvalid && m_axis_tready;
+    wire scalar_last;
+    wire [1:0] scalar_status;
+    wire output_fire = scalar_valid && scalar_ready;
 
     wire [1:0] formal_state;
     wire formal_cfg_fire;
@@ -209,7 +208,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire formal_source_busy;
     wire formal_source_done;
     wire formal_source_error;
-    wire [15:0] formal_source_status;
+    wire [8:0] formal_source_status;
     wire formal_reduce_result_fire;
     wire [1:0] formal_scratch_owner;
     wire formal_reduce_rd_req_fire;
@@ -223,12 +222,12 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire formal_cross_abort;
     wire formal_cleanup_abort_issued;
     wire formal_reduce_done_seen;
+    wire formal_source_done_seen;
+    wire formal_final_output_seen;
     wire formal_fault_latched;
-    wire [29:0] formal_latched_status;
+    wire [22:0] formal_latched_status;
     wire formal_output_fire;
     wire formal_final_output_fire;
-    wire formal_source_internal;
-    wire formal_source_completion_mismatch;
 
     wire abort_reduce_now = first_attempt && !saw_abort_q &&
                             scenario == SC_ABORT_REDUCE &&
@@ -244,7 +243,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire abort_run = rst_n &&
                      (abort_reduce_now || abort_source_now || abort_output_now);
 
-    section_rmsnorm_q8_pipeline #(
+    section_rmsnorm_scalar_pipeline #(
         .MIN_ROWS(RUN_ROWS),
         .MAX_ROWS(RUN_ROWS)
     ) dut (
@@ -273,10 +272,10 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
         .rd_rsp_ready(rd_rsp_ready),
         .rd_rsp_data(response_group(env_owner_token_q,
                                     env_owner_group_q)),
-        .rd_rsp_error(rd_rsp_error), .m_axis_tdata(m_axis_tdata),
-        .m_axis_tvalid(m_axis_tvalid), .m_axis_tready(m_axis_tready),
-        .m_axis_tlast(m_axis_tlast), .m_axis_token(m_axis_token),
-        .m_axis_block(m_axis_block), .formal_state(formal_state),
+        .rd_rsp_error(rd_rsp_error), .scalar_data(scalar_data),
+        .scalar_valid(scalar_valid), .scalar_ready(scalar_ready),
+        .scalar_last(scalar_last), .scalar_status(scalar_status),
+        .formal_state(formal_state),
         .formal_cfg_fire(formal_cfg_fire),
         .formal_reduce_busy(formal_reduce_busy),
         .formal_reduce_done(formal_reduce_done),
@@ -301,13 +300,12 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
         .formal_cross_abort(formal_cross_abort),
         .formal_cleanup_abort_issued(formal_cleanup_abort_issued),
         .formal_reduce_done_seen(formal_reduce_done_seen),
+        .formal_source_done_seen(formal_source_done_seen),
+        .formal_final_output_seen(formal_final_output_seen),
         .formal_fault_latched(formal_fault_latched),
         .formal_latched_status(formal_latched_status),
         .formal_output_fire(formal_output_fire),
-        .formal_final_output_fire(formal_final_output_fire),
-        .formal_source_internal(formal_source_internal),
-        .formal_source_completion_mismatch(
-            formal_source_completion_mismatch)
+        .formal_final_output_fire(formal_final_output_fire)
     );
 
     // Make the internal-fault quarantine nonvacuous: the orphan arrives in
@@ -337,9 +335,9 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             reduce_request_count_q <= 8'd0;
             source_request_count_q <= 8'd0;
             response_count_q <= 8'd0;
-            output_beat_count_q <= 6'd0;
+            output_scalar_count_q <= 8'd0;
             output_record_count_q <= 3'd0;
-            expected_output_beat_q <= 3'd0;
+            expected_output_scalar_q <= 6'd0;
             expected_output_token_q <= 2'd0;
             expected_output_block_q <= 9'd0;
             saw_atomic_start_q <= 1'b0;
@@ -357,7 +355,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             saw_cfg_reject_q <= 1'b0;
             saw_orphan_inject_q <= 1'b0;
             saw_orphan_gamma_invalid_q <= 1'b0;
-            captured_status_q <= 30'd0;
+            captured_status_q <= 23'd0;
         end else begin
             cycle_q <= cycle_q + 1'b1;
 
@@ -381,9 +379,9 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                 reduce_request_count_q <= 8'd0;
                 source_request_count_q <= 8'd0;
                 response_count_q <= 8'd0;
-                output_beat_count_q <= 6'd0;
+                output_scalar_count_q <= 8'd0;
                 output_record_count_q <= 3'd0;
-                expected_output_beat_q <= 3'd0;
+                expected_output_scalar_q <= 6'd0;
                 expected_output_token_q <= 2'd0;
                 expected_output_block_q <= 9'd0;
                 saw_reduce_result_q <= 1'b0;
@@ -428,19 +426,27 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             end
 
             if (output_fire) begin
-                output_beat_count_q <= output_beat_count_q + 1'b1;
-                if (m_axis_tlast) begin
+                output_scalar_count_q <= output_scalar_count_q + 1'b1;
+                if (scalar_last) begin
                     output_record_count_q <= output_record_count_q + 1'b1;
-                    expected_output_beat_q <= 3'd0;
-                    if (m_axis_block == 9'd3)
-                        saw_final_output_q <= 1'b1;
-                    else
+                    expected_output_scalar_q <= 6'd0;
+                    if (expected_output_block_q == 9'd3) begin
+                        if (expected_output_token_q == 2'd0)
+                            saw_final_output_q <= 1'b1;
+                        else begin
+                            expected_output_token_q <=
+                                expected_output_token_q + 1'b1;
+                            expected_output_block_q <= 9'd0;
+                        end
+                    end else begin
                         expected_output_block_q <=
                             expected_output_block_q + 1'b1;
-                end else
-                    expected_output_beat_q <= expected_output_beat_q + 1'b1;
+                    end
+                end else begin
+                    expected_output_scalar_q <= expected_output_scalar_q + 1'b1;
+                end
             end
-            if (m_axis_tvalid && !m_axis_tready)
+            if (scalar_valid && !scalar_ready)
                 saw_output_stall_q <= 1'b1;
 
             if (formal_fault_latched) begin
@@ -448,7 +454,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                 captured_status_q <= formal_latched_status;
             end
             if (formal_cross_abort && formal_fault_latched &&
-                formal_latched_status != 30'd0)
+                formal_latched_status != 23'd0)
                 saw_status_before_abort_q <= 1'b1;
 
             if (abort_run) begin
@@ -489,22 +495,11 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             assert(request_fire == (formal_reduce_rd_req_fire ||
                                     formal_source_rd_req_fire));
             assert(!(done && busy));
-            assert(formal_source_status[15] == formal_source_internal);
-            if (formal_state != PIPE_IDLE) begin
-                assert(!gamma_cfg_ready);
-                assert(!gamma_tready);
-            end
-            if (gamma_cfg_fire || gamma_fire)
-                assert(formal_state == PIPE_IDLE);
-            if (formal_source_completion_mismatch) begin
-                assert(formal_source_internal);
-                assert(formal_source_error);
-            end
-            assert(!(m_axis_tvalid && error));
+            assert(!(scalar_valid && error));
             assert(reduce_request_count_q <= EXPECT_REDUCE_REQUESTS);
             assert(source_request_count_q <= EXPECT_SOURCE_REQUESTS);
             assert(response_count_q <= EXPECT_RESPONSES);
-            assert(output_beat_count_q <= EXPECT_OUTPUT_BEATS);
+            assert(output_scalar_count_q <= EXPECT_OUTPUT_SCALARS);
             assert(output_record_count_q <= EXPECT_RECORDS);
 
             if (env_owner_q != OWNER_NONE) begin
@@ -552,7 +547,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                        !residual_fire);
                 assert(!r_wr_valid);
                 assert(!formal_reduce_result_fire);
-                assert(!m_axis_tvalid && !formal_output_fire);
+                assert(!scalar_valid && !formal_output_fire);
             end
             if (f_past_valid &&
                 $past(rst_n && orphan_inject_now)) begin
@@ -598,7 +593,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                 assert(!rd_req_valid);
                 assert(!r_wr_valid);
                 assert(!formal_reduce_result_fire);
-                assert(!m_axis_tvalid);
+                assert(!scalar_valid);
             end
 
             if (formal_reduce_result_fire) begin
@@ -612,28 +607,27 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                 assert(!formal_reduce_error);
             end
 
-            if (m_axis_tvalid) begin
+            if (scalar_valid) begin
                 assert(formal_state == PIPE_RUN);
                 assert(!abort_run);
                 assert(!formal_cross_abort);
                 assert(!formal_fault_latched);
                 assert(!formal_reduce_error);
                 assert(!formal_source_error);
-                assert(m_axis_token == expected_output_token_q);
-                assert(m_axis_block == expected_output_block_q);
-                assert(m_axis_tlast == (expected_output_beat_q == 3'd4));
+                assert(scalar_last == (expected_output_scalar_q == 6'd31));
             end
             if (formal_state == PIPE_CLEANUP || formal_cross_abort ||
                 formal_fault_latched || abort_run ||
                 formal_reduce_error || formal_source_error) begin
-                assert(!m_axis_tvalid);
+                assert(!scalar_valid);
             end
             assert(formal_final_output_fire ==
-                   (output_fire && m_axis_tlast &&
-                    m_axis_token == 2'd0 && m_axis_block == 9'd3));
+                   (output_fire && scalar_last &&
+                    expected_output_token_q == 2'd0 &&
+                    expected_output_block_q == 9'd3));
 
             if (formal_fault_latched) begin
-                assert(formal_latched_status != 30'd0);
+                assert(formal_latched_status != 23'd0);
                 assert(error);
                 assert(status == formal_latched_status);
                 assert(formal_state == PIPE_CLEANUP || (done && !busy));
@@ -647,20 +641,17 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             if (cfg_reject_scenario && first_attempt &&
                 formal_cross_abort && formal_fault_latched) begin
                 assert(formal_latched_status == STATUS_SOURCE_GAMMA);
-                assert(formal_source_status == 16'h0002);
+                assert(formal_source_status == 9'h002);
                 assert(formal_reduce_busy);
             end
             if (orphan_fault_scenario && first_attempt &&
                 formal_fault_latched) begin
                 assert(formal_latched_status == STATUS_INTERNAL);
                 assert(status == STATUS_INTERNAL);
-                assert(!formal_source_status[15]);
             end
-            if (formal_fault_latched && formal_latched_status[28])
-                assert(formal_source_status[15]);
             if (formal_cleanup_abort_issued && formal_fault_latched) begin
                 assert(!formal_cross_abort);
-                assert(formal_latched_status != 30'd0);
+                assert(formal_latched_status != 23'd0);
             end
             if (f_past_valid && formal_cleanup_abort_issued &&
                 !$past(formal_cleanup_abort_issued)) begin
@@ -668,33 +659,33 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
             end
 
             if (abort_run) begin
-                assert(!m_axis_tvalid);
+                assert(!scalar_valid);
                 assert(!done);
             end
             if (f_past_valid && $past(rst_n && abort_run)) begin
                 assert(formal_state == PIPE_CLEANUP);
                 assert(!formal_fault_latched);
-                assert(formal_latched_status == 30'd0);
+                assert(formal_latched_status == 23'd0);
                 assert(formal_cleanup_abort_issued);
                 assert(!formal_cross_abort);
-                assert(!done && !error && status == 30'd0);
+                assert(!done && !error && status == 23'd0);
             end
             if (saw_abort_q && cfg_count_q == 3'd1) begin
                 assert(!done);
                 assert(!error);
-                assert(status == 30'd0);
-                assert(!m_axis_tvalid);
+                assert(status == 23'd0);
+                assert(!scalar_valid);
             end
             if (cfg_reject_scenario && first_attempt &&
                 !saw_cfg_reject_q) begin
                 assert(reduce_request_count_q == 8'd0);
                 assert(source_request_count_q == 8'd0);
                 assert(response_count_q == 8'd0);
-                assert(output_beat_count_q == 6'd0);
+                assert(output_scalar_count_q == 8'd0);
                 assert(!rd_req_valid);
                 assert(!r_wr_valid);
                 assert(!formal_reduce_result_fire);
-                assert(!m_axis_tvalid);
+                assert(!scalar_valid);
             end
 
             if (done && error) begin
@@ -709,7 +700,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                     assert(reduce_request_count_q == 8'd0);
                     assert(source_request_count_q == 8'd0);
                     assert(response_count_q == 8'd0);
-                    assert(output_beat_count_q == 6'd0);
+                    assert(output_scalar_count_q == 8'd0);
                 end
                 else if (scenario == SC_ORPHAN_FAULT) begin
                     assert(status == STATUS_INTERNAL);
@@ -718,36 +709,35 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                     assert(reduce_request_count_q == 8'd0);
                     assert(source_request_count_q == 8'd0);
                     assert(response_count_q == 8'd1);
-                    assert(output_beat_count_q == 6'd0);
+                    assert(output_scalar_count_q == 8'd0);
                 end
                 else
                     assert(1'b0);
             end
             if (done && !error) begin
-                assert(!busy && status == 30'd0);
+                assert(!busy && status == 23'd0);
                 assert(saw_reduce_result_q);
                 assert(saw_reduce_done_q);
                 assert(saw_final_output_q);
                 assert(reduce_request_count_q == EXPECT_REDUCE_REQUESTS);
                 assert(source_request_count_q == EXPECT_SOURCE_REQUESTS);
                 assert(response_count_q == EXPECT_RESPONSES);
-                assert(output_beat_count_q == EXPECT_OUTPUT_BEATS);
+                assert(output_scalar_count_q == EXPECT_OUTPUT_SCALARS);
                 assert(output_record_count_q == EXPECT_RECORDS);
             end
             if (f_past_valid && $past(rst_n && done))
                 assert(!done);
 
             if (f_past_valid && !abort_run &&
-                $past(rst_n && !abort_run && m_axis_tvalid &&
-                      !m_axis_tready && !formal_reduce_error &&
+                $past(rst_n && !abort_run && scalar_valid &&
+                      !scalar_ready && !formal_reduce_error &&
                       !formal_source_error)) begin
                 if (!formal_reduce_error && !formal_source_error &&
                     !formal_cross_abort) begin
-                    assert(m_axis_tvalid);
-                    assert(m_axis_tdata == $past(m_axis_tdata));
-                    assert(m_axis_tlast == $past(m_axis_tlast));
-                    assert(m_axis_token == $past(m_axis_token));
-                    assert(m_axis_block == $past(m_axis_block));
+                    assert(scalar_valid);
+                    assert(scalar_data == $past(scalar_data));
+                    assert(scalar_last == $past(scalar_last));
+                    assert(scalar_status == $past(scalar_status));
                 end
             end
 

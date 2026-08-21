@@ -157,6 +157,7 @@ module section_rmsnorm_frontend_formal(input wire clk);
         .clk(clk), .rst_n(rst_n),
         .cfg_valid(cfg_valid), .cfg_ready(cfg_ready),
         .cfg_rows(cfg_rows), .cfg_tokens(cfg_tokens),
+        .cfg_resident(1'b0),
         .abort_run(abort_run), .busy(busy), .done(done),
         .error(error), .status(status),
         .s_axis_tdata(input_data), .s_axis_tkeep(8'hff),

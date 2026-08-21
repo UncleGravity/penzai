@@ -2,6 +2,16 @@
 bmc
 faults
 cover
+resident_clean_bmc
+resident_clean_cover
+resident_max_fault_bmc
+resident_max_fault_cover
+resident_sum_fault_bmc
+resident_sum_fault_cover
+resident_abort_max_bmc
+resident_abort_max_cover
+resident_abort_sum_bmc
+resident_abort_sum_cover
 
 [options]
 bmc: mode bmc
@@ -10,17 +20,69 @@ faults: mode bmc
 faults: depth 80
 cover: mode cover
 cover: depth 140
+resident_clean_bmc: mode bmc
+resident_clean_bmc: depth 64
+resident_clean_cover: mode cover
+resident_clean_cover: depth 100
+resident_max_fault_bmc: mode bmc
+resident_max_fault_bmc: depth 80
+resident_max_fault_cover: mode cover
+resident_max_fault_cover: depth 160
+resident_sum_fault_bmc: mode bmc
+resident_sum_fault_bmc: depth 96
+resident_sum_fault_cover: mode cover
+resident_sum_fault_cover: depth 160
+resident_abort_max_bmc: mode bmc
+resident_abort_max_bmc: depth 80
+resident_abort_max_cover: mode cover
+resident_abort_max_cover: depth 160
+resident_abort_sum_bmc: mode bmc
+resident_abort_sum_bmc: depth 96
+resident_abort_sum_cover: mode cover
+resident_abort_sum_cover: depth 160
 
 [engines]
 bmc: abc bmc3
 faults: abc bmc3
 cover: smtbmc boolector
+resident_clean_bmc: abc bmc3
+resident_clean_cover: smtbmc boolector
+resident_max_fault_bmc: abc bmc3
+resident_max_fault_cover: smtbmc boolector
+resident_sum_fault_bmc: abc bmc3
+resident_sum_fault_cover: smtbmc boolector
+resident_abort_max_bmc: abc bmc3
+resident_abort_max_cover: smtbmc boolector
+resident_abort_sum_bmc: abc bmc3
+resident_abort_sum_cover: smtbmc boolector
 
 [script]
 bmc: read -formal -D FORMAL -D FORMAL_BMC section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
 faults: read -formal -D FORMAL -D FORMAL_FAULTS section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
 cover: read -formal -D FORMAL -D FORMAL_COVER section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_formal.sv
-prep -top section_rmsnorm_frontend_formal -flatten
+bmc: prep -top section_rmsnorm_frontend_formal -flatten
+faults: prep -top section_rmsnorm_frontend_formal -flatten
+cover: prep -top section_rmsnorm_frontend_formal -flatten
+resident_clean_bmc: read -formal -D FORMAL -D FORMAL_RESIDENT_CLEAN section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_clean_cover: read -formal -D FORMAL -D FORMAL_RESIDENT_CLEAN section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_max_fault_bmc: read -formal -D FORMAL -D FORMAL_RESIDENT_MAX_FAULT section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_max_fault_cover: read -formal -D FORMAL -D FORMAL_RESIDENT_MAX_FAULT section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_sum_fault_bmc: read -formal -D FORMAL -D FORMAL_RESIDENT_SUM_FAULT section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_sum_fault_cover: read -formal -D FORMAL -D FORMAL_RESIDENT_SUM_FAULT section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_abort_max_bmc: read -formal -D FORMAL -D FORMAL_RESIDENT_ABORT_MAX section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_abort_max_cover: read -formal -D FORMAL -D FORMAL_RESIDENT_ABORT_MAX section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_abort_sum_bmc: read -formal -D FORMAL -D FORMAL_RESIDENT_ABORT_SUM section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_abort_sum_cover: read -formal -D FORMAL -D FORMAL_RESIDENT_ABORT_SUM section_rmsnorm_loader.v section_rmsnorm_maxexp.v section_rmsnorm_sumsq.v section_rmsnorm_frontend.v section_rmsnorm_frontend_resident_formal.sv
+resident_clean_bmc: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_clean_cover: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_max_fault_bmc: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_max_fault_cover: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_sum_fault_bmc: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_sum_fault_cover: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_abort_max_bmc: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_abort_max_cover: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_abort_sum_bmc: prep -top section_rmsnorm_frontend_resident_formal -flatten
+resident_abort_sum_cover: prep -top section_rmsnorm_frontend_resident_formal -flatten
 
 [files]
 fpga/rtl/section_rmsnorm_loader.v
@@ -28,3 +90,4 @@ fpga/rtl/section_rmsnorm_maxexp.v
 fpga/rtl/section_rmsnorm_sumsq.v
 fpga/rtl/section_rmsnorm_frontend.v
 fpga/formal/section_rmsnorm_frontend_formal.sv
+fpga/formal/section_rmsnorm_frontend_resident_formal.sv

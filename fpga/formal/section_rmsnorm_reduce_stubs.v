@@ -12,6 +12,7 @@ module section_rmsnorm_frontend (
     output wire          cfg_ready,
     input  wire [13:0]   cfg_rows,
     input  wire [2:0]    cfg_tokens,
+    input  wire          cfg_resident,
     input  wire          abort_run,
     output wire          busy,
     output reg           done,
@@ -185,7 +186,8 @@ module section_rmsnorm_frontend (
     end
 `endif
 
-    wire _unused = &{1'b0, s_axis_tdata, s_axis_tkeep, s_axis_tvalid,
+    wire _unused = &{1'b0, cfg_resident, s_axis_tdata, s_axis_tkeep,
+                     s_axis_tvalid,
                      s_axis_tlast, r_wr_ready, r_wr_error, rd_rsp_data};
 endmodule
 
