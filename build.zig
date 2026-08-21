@@ -382,6 +382,20 @@ fn addFormalSteps(b: *std.Build) void {
         &section_rmsnorm_q8_pipeline_run.step,
     );
 
+    const section_residual_add_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--sequential",
+        "--prefix",
+        ".zig-cache/sby/section_residual_add",
+        "fpga/formal/section_residual_add.sby",
+    });
+    const section_residual_add_step = b.step(
+        "formal-section-residual-add",
+        "Prove residual-add scratch ownership, faults, abort, quarantine, and restart",
+    );
+    section_residual_add_step.dependOn(&section_residual_add_run.step);
+
     const section_ffn_pairer_run = b.addSystemCommand(&.{
         "sby",
         "-f",
@@ -454,6 +468,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_rmsnorm_weighted_source_step);
     formal.dependOn(section_rmsnorm_q8_source_step);
     formal.dependOn(section_rmsnorm_q8_pipeline_step);
+    formal.dependOn(section_residual_add_step);
     formal.dependOn(section_ffn_pairer_step);
     formal.dependOn(section_gate_packer_step);
     formal.dependOn(q8_internal_ingress_step);
@@ -628,6 +643,15 @@ const section_rmsnorm_mul_rne_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_mul_rne.v",
 };
 
+const section_residual_add_rne_rtl = [_][]const u8{
+    "fpga/rtl/section_residual_add_rne.v",
+};
+
+const section_residual_add_rtl = [_][]const u8{
+    "fpga/rtl/section_residual_add.v",
+    "fpga/rtl/section_residual_add_rne.v",
+};
+
 const section_rmsnorm_reduce_rtl = [_][]const u8{
     "fpga/rtl/section_rmsnorm_reduce.v",
     "fpga/rtl/section_rmsnorm_frontend.v",
@@ -752,6 +776,16 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
         "-Wno-UNUSEDSIGNAL",                  "-Wno-UNUSEDPARAM", "--top-module", "section_rmsnorm_mul_rne",
         "fpga/rtl/section_rmsnorm_mul_rne.v",
     });
+    const section_residual_add_rne_lint = b.addSystemCommand(&.{
+        "verilator",                           "--lint-only",      "-Wall",        "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",                   "-Wno-UNUSEDPARAM", "--top-module", "section_residual_add_rne",
+        "fpga/rtl/section_residual_add_rne.v",
+    });
+    const section_residual_add_lint = b.addSystemCommand(&.{
+        "verilator",                       "--lint-only",                         "-Wall",        "-Wno-DECLFILENAME",
+        "-Wno-UNUSEDSIGNAL",               "-Wno-UNUSEDPARAM",                    "--top-module", "section_residual_add",
+        "fpga/rtl/section_residual_add.v", "fpga/rtl/section_residual_add_rne.v",
+    });
     const section_rmsnorm_reduce_lint = b.addSystemCommand(&.{
         "verilator",                         "--lint-only",                       "-Wall",                               "-Wno-DECLFILENAME",
         "-Wno-UNUSEDSIGNAL",                 "-Wno-UNUSEDPARAM",                  "+incdir+fpga/rtl/numeric",            "--top-module",
@@ -789,6 +823,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     lint_step.dependOn(&section_rmsnorm_frontend_lint.step);
     lint_step.dependOn(&section_rmsnorm_inv_lint.step);
     lint_step.dependOn(&section_rmsnorm_mul_rne_lint.step);
+    lint_step.dependOn(&section_residual_add_rne_lint.step);
+    lint_step.dependOn(&section_residual_add_lint.step);
     lint_step.dependOn(&section_rmsnorm_reduce_lint.step);
     lint_step.dependOn(&section_rmsnorm_weighted_source_lint.step);
     lint_step.dependOn(&section_rmsnorm_q8_source_lint.step);
@@ -814,6 +850,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     const section_rmsnorm_frontend_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-frontend", "Verilator cosim: residual load, max-exponent scan, R replay, and fixed sumsq", "section_rmsnorm_frontend", "fpga/sim/section_rmsnorm_frontend", &section_rmsnorm_frontend_rtl, .section);
     const section_rmsnorm_inv_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-inv", "Verilator cosim: deterministic fixed-mean and two-step inverse RMS", "section_rmsnorm_inv", "fpga/sim/section_rmsnorm_inv", &section_rmsnorm_inv_rtl, .section);
     const section_rmsnorm_mul_rne_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-mul-rne", "Verilator cosim: exact finite binary32 RNE RMSNorm multiplier", "section_rmsnorm_mul_rne", "fpga/sim/section_rmsnorm_mul_rne", &section_rmsnorm_mul_rne_rtl, .section);
+    const section_residual_add_rne_cosim = addCosim(b, target, optimize, "test-rtl-section-residual-add-rne", "Verilator cosim: exact finite binary32 RNE residual adder", "section_residual_add_rne", "fpga/sim/section_residual_add_rne", &section_residual_add_rne_rtl, .section);
+    const section_residual_add_cosim = addCosim(b, target, optimize, "test-rtl-section-residual-add", "Verilator cosim: scratch-backed exact-RNE residual add and resident R writeback", "section_residual_add", "fpga/sim/section_residual_add", &section_residual_add_rtl, .section);
     const section_rmsnorm_reduce_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-reduce", "Verilator cosim: scratch-backed RMSNorm reduction through buffered inverse scalars", "section_rmsnorm_reduce", "fpga/sim/section_rmsnorm_reduce", &section_rmsnorm_reduce_rtl, .section);
     const section_rmsnorm_weighted_source_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-weighted-source", "Verilator cosim: sealed gamma, scratch replay, and exact PS-order weighted RMSNorm scalars", "section_rmsnorm_weighted_source", "fpga/sim/section_rmsnorm_weighted_source", &section_rmsnorm_weighted_source_rtl, .section);
     const section_rmsnorm_q8_source_cosim = addCosim(b, target, optimize, "test-rtl-section-rmsnorm-q8-source", "Verilator cosim: exact weighted RMSNorm scalars through native Q8_0 publication", "section_rmsnorm_q8_source", "fpga/sim/section_rmsnorm_q8_source", &section_rmsnorm_q8_source_rtl, .section);
@@ -841,6 +879,8 @@ fn addRtlSteps(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     rtl_cosim.dependOn(section_rmsnorm_frontend_cosim);
     rtl_cosim.dependOn(section_rmsnorm_inv_cosim);
     rtl_cosim.dependOn(section_rmsnorm_mul_rne_cosim);
+    rtl_cosim.dependOn(section_residual_add_rne_cosim);
+    rtl_cosim.dependOn(section_residual_add_cosim);
     rtl_cosim.dependOn(section_rmsnorm_reduce_cosim);
     rtl_cosim.dependOn(section_rmsnorm_weighted_source_cosim);
     rtl_cosim.dependOn(section_rmsnorm_q8_source_cosim);

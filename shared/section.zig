@@ -130,6 +130,34 @@ pub const RmsNormMulResult = struct {
     status: u2,
 };
 
+/// Per-result diagnostics shared with `section_residual_add_rne.v`.
+pub const ResidualAddArithmeticStatus = struct {
+    pub const nonfinite_input: u2 = 1 << 0;
+    pub const overflow: u2 = 1 << 1;
+    pub const fatal_mask: u2 = nonfinite_input | overflow;
+};
+
+pub const ResidualAddResult = struct {
+    bits: u32,
+    status: u2,
+};
+
+/// Run diagnostics shared with `section_residual_add.v`.
+pub const ResidualAddStatus = struct {
+    pub const bad_cfg: u7 = 1 << 0;
+    pub const frame: u7 = 1 << 1;
+    pub const scratch_read: u7 = 1 << 2;
+    pub const scratch_write: u7 = 1 << 3;
+    pub const arithmetic_shift: u3 = 4;
+    pub const internal: u7 = 1 << 6;
+
+    pub fn arithmetic(status: u2) u7 {
+        return @as(u7, status) << arithmetic_shift;
+    }
+
+    pub const fatal_mask: u7 = 0x7f;
+};
+
 /// Diagnostics shared with `section_rmsnorm_weighted_source.v`.
 pub const RmsNormGammaStatus = struct {
     pub const bad_cfg: u4 = 1 << 0;
@@ -306,6 +334,89 @@ pub fn rmsNormMulRneBits(a_bits: u32, b_bits: u32) RmsNormMulResult {
     if (fraction >= (@as(u64, 1) << 23))
         return .{ .bits = sign | 0x0080_0000, .status = 0 };
     return .{ .bits = sign | @as(u32, @truncate(fraction)), .status = 0 };
+}
+
+/// Integer-only oracle for the exact finite binary32 residual addition leaf.
+/// Finite operands are converted to an exact integer in minimum-subnormal
+/// units, added without reassociation, then rounded once to binary32 RNE.
+pub fn residualAddRneBits(a_bits: u32, b_bits: u32) ResidualAddResult {
+    const exponent_a: u8 = @truncate(a_bits >> 23);
+    const exponent_b: u8 = @truncate(b_bits >> 23);
+    const fraction_a: u23 = @truncate(a_bits);
+    const fraction_b: u23 = @truncate(b_bits);
+    if (exponent_a == 0xff or exponent_b == 0xff)
+        return .{
+            .bits = 0,
+            .status = ResidualAddArithmeticStatus.nonfinite_input,
+        };
+
+    const a_zero = exponent_a == 0 and fraction_a == 0;
+    const b_zero = exponent_b == 0 and fraction_b == 0;
+    if (a_zero and b_zero)
+        return .{ .bits = (a_bits & b_bits) & 0x8000_0000, .status = 0 };
+    if (a_zero) return .{ .bits = b_bits, .status = 0 };
+    if (b_zero) return .{ .bits = a_bits, .status = 0 };
+
+    const significand_a: u24 =
+        (@as(u24, @intFromBool(exponent_a != 0)) << 23) | fraction_a;
+    const significand_b: u24 =
+        (@as(u24, @intFromBool(exponent_b != 0)) << 23) | fraction_b;
+    const effective_a: u8 = if (exponent_a == 0) 1 else exponent_a;
+    const effective_b: u8 = if (exponent_b == 0) 1 else exponent_b;
+    const magnitude_a = @as(u278, significand_a) << @intCast(effective_a - 1);
+    const magnitude_b = @as(u278, significand_b) << @intCast(effective_b - 1);
+    const sign_a = a_bits >> 31 != 0;
+    const sign_b = b_bits >> 31 != 0;
+
+    var sign = sign_a;
+    var magnitude: u278 = undefined;
+    if (sign_a == sign_b) {
+        magnitude = magnitude_a + magnitude_b;
+    } else if (magnitude_a > magnitude_b) {
+        magnitude = magnitude_a - magnitude_b;
+    } else if (magnitude_b > magnitude_a) {
+        magnitude = magnitude_b - magnitude_a;
+        sign = sign_b;
+    } else {
+        // Exact cancellation is +0 in round-to-nearest mode.
+        return .{ .bits = 0, .status = 0 };
+    }
+
+    const sign_bits: u32 = @as(u32, @intFromBool(sign)) << 31;
+    const lead: u9 = @intCast(277 - @clz(magnitude));
+    if (lead <= 22)
+        return .{
+            .bits = sign_bits | @as(u32, @truncate(magnitude)),
+            .status = 0,
+        };
+
+    const shift: u9 = lead - 23;
+    var retained = magnitude >> shift;
+    if (shift != 0) {
+        const remainder_mask = (@as(u278, 1) << shift) - 1;
+        const remainder = magnitude & remainder_mask;
+        const halfway = @as(u278, 1) << (shift - 1);
+        if (remainder > halfway or
+            (remainder == halfway and (retained & 1) != 0))
+            retained += 1;
+    }
+
+    var biased: u9 = lead - 22;
+    if (retained >= (@as(u278, 1) << 24)) {
+        retained >>= 1;
+        biased += 1;
+    }
+    if (biased >= 255)
+        return .{
+            .bits = sign_bits | 0x7f80_0000,
+            .status = ResidualAddArithmeticStatus.overflow,
+        };
+    return .{
+        .bits = sign_bits |
+            (@as(u32, biased) << 23) |
+            (@as(u32, @truncate(retained)) & 0x007f_ffff),
+        .status = 0,
+    };
 }
 
 /// Exact PS-order weighted RMSNorm scalar oracle. The second multiply is not
@@ -1278,6 +1389,50 @@ test "P3d exact finite multiplier covers IEEE rounding boundaries" {
         const swapped = rmsNormMulRneBits(case.b, case.a);
         try std.testing.expectEqual(got.bits, swapped.bits);
         try std.testing.expectEqual(got.status, swapped.status);
+    }
+}
+
+test "P3d exact residual addition covers RNE and status boundaries" {
+    try std.testing.expectEqual(
+        @as(u2, 0x3),
+        ResidualAddArithmeticStatus.fatal_mask,
+    );
+    try std.testing.expectEqual(@as(u7, 0x7f), ResidualAddStatus.fatal_mask);
+    try std.testing.expectEqual(
+        @as(u7, 0x20),
+        ResidualAddStatus.arithmetic(ResidualAddArithmeticStatus.overflow),
+    );
+    const cases = [_]struct {
+        a: u32,
+        b: u32,
+        bits: u32,
+        status: u2 = 0,
+    }{
+        .{ .a = 0x3f80_0000, .b = 0x3f80_0000, .bits = 0x4000_0000 },
+        .{ .a = 0x3f80_0000, .b = 0x3380_0000, .bits = 0x3f80_0000 },
+        .{ .a = 0x3f80_0001, .b = 0x3380_0000, .bits = 0x3f80_0002 },
+        .{ .a = 0x3f80_0000, .b = 0xbf80_0000, .bits = 0 },
+        .{ .a = 0x8000_0000, .b = 0x8000_0000, .bits = 0x8000_0000 },
+        .{ .a = 0x0080_0000, .b = 0x807f_ffff, .bits = 1 },
+        .{ .a = 0x007f_ffff, .b = 1, .bits = 0x0080_0000 },
+        .{
+            .a = 0x7f7f_ffff,
+            .b = 0x7f7f_ffff,
+            .bits = 0x7f80_0000,
+            .status = ResidualAddArithmeticStatus.overflow,
+        },
+        .{
+            .a = 0x7f80_0000,
+            .b = 0x3f80_0000,
+            .bits = 0,
+            .status = ResidualAddArithmeticStatus.nonfinite_input,
+        },
+    };
+    for (cases) |case| {
+        const got = residualAddRneBits(case.a, case.b);
+        try std.testing.expectEqual(case.bits, got.bits);
+        try std.testing.expectEqual(case.status, got.status);
+        try std.testing.expectEqual(got, residualAddRneBits(case.b, case.a));
     }
 }
 
