@@ -35,10 +35,11 @@ void dut_free(Dut *d) {
 void dut_eval(Dut *d) { d->top->eval(); }
 void dut_set_clk(Dut *d, int value) { d->top->clk = value; }
 void dut_set_rst_n(Dut *d, int value) { d->top->rst_n = value; }
-void dut_set_config(Dut *d, int valid, uint16_t rows, uint8_t tokens) {
+void dut_set_config(Dut *d, int valid, uint16_t rows, uint8_t tokens, int resident) {
     d->top->cfg_valid = valid;
     d->top->cfg_rows = rows;
     d->top->cfg_tokens = tokens;
+    d->top->cfg_resident = resident;
 }
 void dut_set_abort(Dut *d, int value) { d->top->abort_run = value; }
 void dut_set_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int last) {

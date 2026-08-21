@@ -71,7 +71,7 @@ const Dut = struct {
     fn reset(self: *Dut) void {
         c.dut_set_clk(self.handle, 0);
         c.dut_set_rst_n(self.handle, 0);
-        c.dut_set_config(self.handle, 0, 0, 0);
+        c.dut_set_config(self.handle, 0, 0, 0, 0);
         c.dut_set_abort(self.handle, 0);
         c.dut_set_stream(self.handle, 0, 0, 0, 0);
         c.dut_set_r_write_sink(self.handle, 0, 0);
@@ -86,6 +86,7 @@ const Dut = struct {
 };
 
 const RunOptions = struct {
+    resident: bool = false,
     stalls: bool = true,
     early_last_word: ?usize = null,
     write_error_word: ?usize = null,
@@ -105,6 +106,24 @@ fn wordAt(values: []const u32, word: usize) u64 {
         (@as(u64, values[word * 2 + 1]) << 32);
 }
 
+fn seedScratch(
+    scratch: *Scratch,
+    values: []const u32,
+    rows: u32,
+    tokens: u3,
+) !void {
+    const words_per_token = rows / 2;
+    for (0..@as(usize, tokens) * words_per_token) |word| {
+        const token = word / words_per_token;
+        const token_word = word % words_per_token;
+        try scratch.write(
+            @intCast(token_word % 4),
+            @intCast(token * 512 + token_word / 4),
+            wordAt(values, word),
+        );
+    }
+}
+
 fn readResult(dut: *Dut) Result {
     return .{
         .token = @truncate(c.dut_result_token(dut.handle)),
@@ -115,13 +134,19 @@ fn readResult(dut: *Dut) Result {
     };
 }
 
-fn configure(dut: *Dut, rows: u32, tokens: u3) !void {
+fn configure(dut: *Dut, rows: u32, tokens: u3, resident: bool) !void {
     try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
-    c.dut_set_config(dut.handle, 1, @intCast(rows), tokens);
+    c.dut_set_config(
+        dut.handle,
+        1,
+        @intCast(rows),
+        tokens,
+        @intFromBool(resident),
+    );
     dut.eval();
     try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
     dut.step();
-    c.dut_set_config(dut.handle, 0, 0, 0);
+    c.dut_set_config(dut.handle, 0, 0, 0, 0);
     dut.eval();
 }
 
@@ -153,7 +178,10 @@ fn run(
         }
     }
 
-    try configure(dut, rows, tokens);
+    if (options.resident)
+        try seedScratch(scratch, values, rows, tokens);
+
+    try configure(dut, rows, tokens, options.resident);
     try std.testing.expect(c.dut_busy(dut.handle) != 0);
 
     var prng = std.Random.DefaultPrng.init(seed);
@@ -174,7 +202,7 @@ fn run(
     while (true) : (cycle += 1) {
         if (cycle > values.len * 20 + 4096) return error.StreamTimeout;
 
-        if (!presenting and word_index < total_words)
+        if (!options.resident and !presenting and word_index < total_words)
             presenting = !options.stalls or rnd.uintLessThan(u8, 4) != 0;
         const stream_data = if (presenting) wordAt(values, word_index) else 0;
         const natural_last = presenting and word_index + 1 == total_words;
@@ -223,6 +251,10 @@ fn run(
         const write_valid = c.dut_r_write_valid(dut.handle) != 0;
         const write_fire = write_valid and write_ready;
         try std.testing.expectEqual(stream_fire, write_fire);
+        if (options.resident) {
+            try std.testing.expect(c.dut_stream_ready(dut.handle) == 0);
+            try std.testing.expect(!write_valid);
+        }
         if (write_valid) {
             const expected_bank: u8 = @intCast(word_index % 4);
             const token = word_index / (rows / 2);
@@ -258,8 +290,16 @@ fn run(
         if (request_fire) {
             const token = c.dut_read_request_token(dut.handle);
             const group = c.dut_read_request_group(dut.handle);
-            try std.testing.expectEqual(@as(u8, @intCast(request_count / (rows / 8))), token);
-            try std.testing.expectEqual(@as(u16, @intCast(request_count % (rows / 8))), group);
+            const groups_per_pass = values.len / 8;
+            const request_in_pass = request_count % groups_per_pass;
+            try std.testing.expectEqual(
+                @as(u8, @intCast(request_in_pass / (rows / 8))),
+                token,
+            );
+            try std.testing.expectEqual(
+                @as(u16, @intCast(request_in_pass % (rows / 8))),
+                group,
+            );
             pending = .{
                 .token = token,
                 .group = group,
@@ -292,7 +332,10 @@ fn run(
         if (c.dut_done(dut.handle) != 0 and c.dut_busy(dut.handle) == 0) {
             if (options.expected_status) |expected_status| {
                 try std.testing.expect(c.dut_error(dut.handle) != 0);
-                try std.testing.expect(c.dut_status(dut.handle) & expected_status != 0);
+                try std.testing.expectEqual(
+                    expected_status,
+                    c.dut_status(dut.handle),
+                );
             } else {
                 if (c.dut_error(dut.handle) != 0 or
                     c.dut_status(dut.handle) != 0)
@@ -309,8 +352,15 @@ fn run(
                 }
                 try std.testing.expect(c.dut_error(dut.handle) == 0);
                 try std.testing.expectEqual(@as(u8, 0), c.dut_status(dut.handle));
-                try std.testing.expectEqual(total_words, write_count);
-                try std.testing.expectEqual(values.len / 8, request_count);
+                try std.testing.expectEqual(
+                    if (options.resident) @as(usize, 0) else total_words,
+                    write_count,
+                );
+                try std.testing.expectEqual(
+                    (values.len / 8) *
+                        (if (options.resident) @as(usize, 2) else 1),
+                    request_count,
+                );
                 try std.testing.expectEqual(token_count, result_count);
             }
             break;
@@ -346,7 +396,7 @@ fn makeValues(allocator: std.mem.Allocator, rows: usize, tokens: usize) ![]u32 {
 }
 
 fn testBadConfig(dut: *Dut) !void {
-    try configure(dut, 7, 1);
+    try configure(dut, 7, 1, false);
     try std.testing.expect(c.dut_done(dut.handle) != 0);
     try std.testing.expect(c.dut_error(dut.handle) != 0);
     try std.testing.expect(c.dut_status(dut.handle) & section.RmsNormFrontendStatus.bad_cfg != 0);
@@ -358,7 +408,7 @@ fn testAbortOutstanding(
     scratch: *Scratch,
     values: []const u32,
 ) !void {
-    try configure(dut, 8, 1);
+    try configure(dut, 8, 1, false);
     var word: usize = 0;
     var pending: ?PendingRead = null;
     var cycle: usize = 0;
@@ -439,6 +489,9 @@ pub fn main() !void {
     const compact = try makeValues(allocator, 128, 4);
     defer allocator.free(compact);
     const compact_stats = try run(&dut, &scratch, compact, 128, 4, .{}, 0x6171_8e22);
+    const resident_stats = try run(&dut, &scratch, compact, 128, 4, .{
+        .resident = true,
+    }, 0x6171_8e23);
 
     const full = try makeValues(allocator, 4096, 4);
     defer allocator.free(full);
@@ -468,17 +521,25 @@ pub fn main() !void {
         .read_error_request = 0,
         .expected_status = section.RmsNormFrontendStatus.scratch,
     }, 0x1005);
+    _ = try run(&dut, &scratch, fault_values, 8, 2, .{
+        .resident = true,
+        .read_error_request = 0,
+        .expected_status = section.RmsNormFrontendStatus.max_exp |
+            section.RmsNormFrontendStatus.scratch,
+    }, 0x1006);
 
     const abort_values = fault_values[0..8];
     try testAbortOutstanding(&dut, &scratch, abort_values);
-    const restart_stats = try run(&dut, &scratch, abort_values, 8, 1, .{}, 0x1006);
+    const restart_stats = try run(&dut, &scratch, abort_values, 8, 1, .{}, 0x1007);
 
     std.debug.print(
-        "\n  section RMSNorm frontend: 128x4={d} cycles, 4096x4={d} cycles\n" ++
+        "\n  section RMSNorm frontend: 128x4={d} cycles, " ++
+            "resident 128x4={d} cycles, 4096x4={d} cycles\n" ++
             "  writes/reads/results full={d}/{d}/{d}; restart={d} cycles\n" ++
             "  exact scan+sumsq, stalls, loader/scan/scratch faults, abort/drain/restart: passed\n\n",
         .{
             compact_stats.cycles,
+            resident_stats.cycles,
             full_stats.cycles,
             full_stats.writes,
             full_stats.reads,

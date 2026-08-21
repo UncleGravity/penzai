@@ -14,7 +14,7 @@ void dut_free(Dut *d);
 void dut_eval(Dut *d);
 void dut_set_clk(Dut *d, int value);
 void dut_set_rst_n(Dut *d, int value);
-void dut_set_config(Dut *d, int valid, uint16_t rows, uint8_t tokens);
+void dut_set_config(Dut *d, int valid, uint16_t rows, uint8_t tokens, int resident);
 void dut_set_abort(Dut *d, int value);
 void dut_set_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int last);
 void dut_set_r_write_sink(Dut *d, int ready, int error);

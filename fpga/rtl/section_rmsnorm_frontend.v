@@ -104,6 +104,11 @@ module section_rmsnorm_frontend (
     reg [2:0] sum_records_q;
     reg abort_pulse_q;
     reg drain_report_error_q;
+    reg scan_valid_q;
+    reg [255:0] scan_data_q;
+    reg scan_error_q;
+    reg scan_last_q;
+    reg scan_fault_pending_q;
 
     wire cfg_shape_ok = (cfg_rows >= 14'd8) &&
                         (cfg_rows <= 14'd4096) &&
@@ -188,16 +193,54 @@ module section_rmsnorm_frontend (
                                 maxexp_result_subnormal);
 
     wire maxexp_group_ready;
-    wire maxexp_group_valid = run_resident_q ?
-        (rst_n && !pipeline_abort && (state_q == ST_LOAD) &&
-         replay_outstanding_q && rd_rsp_valid) : loader_group_valid;
-    wire [255:0] maxexp_group_data = run_resident_q ? rd_rsp_data :
-                                      loader_group_data;
-    wire maxexp_group_error = run_resident_q && rd_rsp_error;
-    wire maxexp_group_last = run_resident_q ?
+    wire resident_group_last =
         (({1'b0, replay_token_q} + 3'd1 == run_tokens_q) &&
-         (replay_group_q + 1'b1 == run_groups_q)) : loader_group_last;
-    assign loader_group_ready = !run_resident_q && maxexp_group_ready;
+         (replay_group_q + 1'b1 == run_groups_q));
+    wire scan_source_valid = rst_n && !pipeline_abort &&
+        (state_q == ST_LOAD) &&
+        (run_resident_q ? (replay_outstanding_q && rd_rsp_valid) :
+                          loader_group_valid);
+    wire [255:0] scan_source_data = run_resident_q ? rd_rsp_data :
+                                     loader_group_data;
+    wire scan_source_error = run_resident_q && rd_rsp_error;
+    wire scan_source_last = run_resident_q ? resident_group_last :
+                                            loader_group_last;
+    wire scan_source_ready = rst_n && !pipeline_abort &&
+        (state_q == ST_LOAD) && (!scan_valid_q || maxexp_group_ready);
+    wire scan_source_fire = scan_source_valid && scan_source_ready;
+    wire maxexp_group_valid = rst_n && !pipeline_abort &&
+                              (state_q == ST_LOAD) && scan_valid_q;
+    wire [255:0] maxexp_group_data = scan_data_q;
+    wire maxexp_group_error = scan_error_q;
+    wire maxexp_group_last = scan_last_q;
+    assign loader_group_ready = !run_resident_q && scan_source_ready;
+
+    // Cut source selection and resident replay state out of the max-exponent
+    // reduction cone while retaining one-group-per-cycle elastic throughput.
+    always @(posedge clk) begin
+        if (!rst_n || pipeline_abort || (state_q != ST_LOAD)) begin
+            scan_valid_q <= 1'b0;
+            scan_data_q <= 256'd0;
+            scan_error_q <= 1'b0;
+            scan_last_q <= 1'b0;
+            scan_fault_pending_q <= 1'b0;
+        end else begin
+            if (scan_source_fire && scan_source_error)
+                scan_fault_pending_q <= 1'b1;
+            if (!scan_valid_q || maxexp_group_ready) begin
+                scan_valid_q <= scan_source_valid;
+                if (scan_source_valid) begin
+                    scan_data_q <= scan_source_data;
+                    scan_error_q <= scan_source_error;
+                    scan_last_q <= scan_source_last;
+                end else begin
+                    scan_data_q <= 256'd0;
+                    scan_error_q <= 1'b0;
+                    scan_last_q <= 1'b0;
+                end
+            end
+        end
+    end
 
     section_rmsnorm_maxexp u_maxexp (
         .clk(clk), .rst_n(rst_n),
@@ -250,11 +293,12 @@ module section_rmsnorm_frontend (
 
     wire replay_load = run_resident_q && (state_q == ST_LOAD);
     wire replay_sum = state_q == ST_SUM;
-    wire replay_consumer_ready = replay_load ? maxexp_group_ready :
+    wire replay_consumer_ready = replay_load ? scan_source_ready :
                                  sum_group_ready;
     assign rd_req_valid = rst_n && !pipeline_abort &&
                           (replay_load || replay_sum) &&
                           !replay_outstanding_q && !replay_complete_q &&
+                          !(replay_load && scan_fault_pending_q) &&
                           replay_consumer_ready;
     assign rd_req_token = {1'b0, replay_token_q};
     assign rd_req_group = {1'b0, replay_group_q};
@@ -266,11 +310,11 @@ module section_rmsnorm_frontend (
                           (replay_group_q + 1'b1 == run_groups_q);
     assign rd_rsp_ready = rst_n && replay_outstanding_q &&
                           (abort_run || (state_q == ST_DRAIN) ||
-                           (replay_load && maxexp_group_ready) ||
+                           (replay_load && scan_source_ready) ||
                            (replay_sum && sum_group_ready));
     wire rd_rsp_fire = rd_rsp_valid && rd_rsp_ready;
     wire replay_terminal_fire = rd_rsp_fire &&
-        ((replay_load && maxexp_group_last) ||
+        ((replay_load && resident_group_last) ||
          (replay_sum && sum_group_last));
     wire replay_complete_after = replay_complete_q ||
                                  replay_terminal_fire;
@@ -414,7 +458,7 @@ module section_rmsnorm_frontend (
                         replay_outstanding_q <= 1'b1;
                     if (run_resident_q && rd_rsp_fire) begin
                         replay_outstanding_q <= 1'b0;
-                        if (maxexp_group_last) begin
+                        if (resident_group_last) begin
                             replay_complete_q <= 1'b1;
                         end else if (replay_group_q + 1'b1 == run_groups_q) begin
                             replay_group_q <= 10'd0;
@@ -558,6 +602,31 @@ module section_rmsnorm_frontend (
         if (f_past_valid && rst_n &&
             $past(rst_n && (state_q == ST_DRAIN) && !rd_rsp_valid))
             assert(state_q == ST_DRAIN);
+        if (rst_n && !pipeline_abort) begin
+            if (scan_valid_q)
+                assert(state_q == ST_LOAD);
+            if (run_resident_q && (state_q == ST_LOAD))
+                assert(rd_rsp_fire == scan_source_fire);
+        end
+        if (f_past_valid && rst_n && !pipeline_abort &&
+            (state_q == ST_LOAD) &&
+            $past(rst_n && !pipeline_abort && (state_q == ST_LOAD) &&
+                  scan_source_fire)) begin
+            assert(scan_valid_q);
+            assert(scan_data_q == $past(scan_source_data));
+            assert(scan_error_q == $past(scan_source_error));
+            assert(scan_last_q == $past(scan_source_last));
+            if ($past(scan_source_error))
+                assert(scan_fault_pending_q);
+        end
+        if (f_past_valid && rst_n && !pipeline_abort &&
+            $past(rst_n && !pipeline_abort && maxexp_group_valid &&
+                  !maxexp_group_ready)) begin
+            assert(maxexp_group_valid);
+            assert(maxexp_group_data == $past(maxexp_group_data));
+            assert(maxexp_group_error == $past(maxexp_group_error));
+            assert(maxexp_group_last == $past(maxexp_group_last));
+        end
     end
 `endif
 
