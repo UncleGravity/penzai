@@ -50,7 +50,7 @@ const result_bytes_per_rb = gather.result_bytes_per_rb; // single source in gath
 // Errors this op can raise: the DMA substrate's, this kernel's, plus heap failures.
 // SeqDispatch = the seq.v arm refused or failed a run (details already printed); never
 // silently retried over MMIO — a failed replay means the stream or executor needs looking at.
-const KernelError = regwin.Error || error{ KernelTimeout, ScratchTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock, ActivationState, ActivationQuantization, ScratchState };
+const KernelError = regwin.Error || error{ KernelTimeout, ScratchTimeout, BadId, BadVersion, BadRows, BadWeightPorts, BadClock, ActivationState, ActivationQuantization, ScratchState, NormState, ResidualState };
 pub const Error = dma_mod.Error || KernelError || error{ HeapFailure, OutOfMemory, SeqDispatch, ScratchMismatch };
 
 // ---- The matmul kernel AXI-Lite driver (a tenant on the PL substrate) -------
@@ -65,6 +65,7 @@ const ACT_STATE_ERROR: u32 = 1 << 1;
 const SCRATCH_CTRL_DRAIN_START: u32 = 1 << 0;
 const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
 const SCRATCH_CTRL_SECTION_BEGIN: u32 = 1 << 2;
+const SCRATCH_CTRL_RESIDENT_R: u32 = 1 << 3;
 const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
 const SCRATCH_WRITER_DONE: u32 = 1 << 1;
 const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
@@ -81,6 +82,7 @@ const SCRATCH_FFN_PRODUCER_DONE: u32 = SCRATCH_CONSUMER_DONE;
 const SCRATCH_FFN_GATE_READY: u32 = 1 << 13;
 const SCRATCH_STREAMING_RESTART_BUSY: u32 = SCRATCH_WRITER_BUSY | SCRATCH_DRAIN_BUSY |
     SCRATCH_FFN_PRODUCER_BUSY | SCRATCH_SECTION_ACTIVE;
+const NORM_CTRL_LOAD_GAMMA: u32 = 1 << 0;
 
 const ActivationMode = enum(u32) {
     packed_load = 0,
@@ -113,6 +115,7 @@ pub const version_with_activation_reuse: u32 = 13;
 pub const version_with_scratch: u32 = 14;
 pub const version_with_ffn_section: u32 = 15;
 pub const version_with_streaming_ffn: u32 = 16;
+pub const version_with_p3d: u32 = section.p3d_kernel_version;
 
 const FfnSectionSchedule = enum { legacy_scratch, streaming_q8 };
 const StreamingFfnWaitState = enum { pending, kernel_done, scratch_error };
@@ -126,6 +129,83 @@ fn ffnSectionSchedule(version: u32) FfnSectionSchedule {
 
 fn streamingFfnRestartSafe(scratch_status: u32) bool {
     return scratch_status & SCRATCH_STREAMING_RESTART_BUSY == 0;
+}
+
+fn p3dFfnEligible(version: u32, model_rows: u32, eps_bits: u32) bool {
+    return version >= version_with_p3d and
+        section.p3dModelRowsValid(model_rows) and
+        section.p3dNormEpsValid(eps_bits);
+}
+
+const FfnHostPlan = struct {
+    p3d: bool,
+    sync_residual: bool,
+    sync_norm_weight: bool,
+    gamma_loads_per_command: u2,
+    residual_dmas_per_tile: u2,
+    ps_norm: bool,
+    external_up_activation: bool,
+    ps_residual_add: bool,
+};
+
+fn ffnHostPlan(version: u32, model_rows: u32, eps_bits: u32) ?FfnHostPlan {
+    if (version < version_with_ffn_section) return null;
+    if (version >= version_with_p3d) {
+        if (!p3dFfnEligible(version, model_rows, eps_bits)) return null;
+        return .{
+            .p3d = true,
+            .sync_residual = true,
+            .sync_norm_weight = true,
+            .gamma_loads_per_command = 1,
+            .residual_dmas_per_tile = 1,
+            .ps_norm = false,
+            .external_up_activation = false,
+            .ps_residual_add = false,
+        };
+    }
+    return .{
+        .p3d = false,
+        .sync_residual = false,
+        .sync_norm_weight = false,
+        .gamma_loads_per_command = 0,
+        .residual_dmas_per_tile = 0,
+        .ps_norm = true,
+        .external_up_activation = true,
+        .ps_residual_add = true,
+    };
+}
+
+fn p3dRestartSafe(scratch_status: u32, norm_status: u32) bool {
+    return streamingFfnRestartSafe(scratch_status) and
+        norm_status & section.NormStatus.idle != 0;
+}
+
+const P3dFaultClass = enum { quantization, norm, residual, scratch };
+
+fn classifyP3dFault(
+    norm_status: u32,
+    norm_error: u32,
+    residual_error: u32,
+    quant_status: u32,
+) P3dFaultClass {
+    if (quant_status != 0) return .quantization;
+    if (norm_status & (section.NormStatus.gamma_error | section.NormStatus.norm_error) != 0 or
+        norm_error != 0) return .norm;
+    if (norm_status & section.NormStatus.residual_error != 0 or residual_error != 0)
+        return .residual;
+    return .scratch;
+}
+
+fn publishFfnResult(
+    p3d: bool,
+    down_result: []const u8,
+    residual: []const u8,
+    dst: []u8,
+) ps_elemwise.ElemwiseError!void {
+    if (!p3d) return ps_elemwise.addBytes(down_result, residual, dst);
+    if (down_result.len != dst.len or residual.len != dst.len)
+        return error.InvalidLength;
+    @memcpy(dst, down_result);
 }
 
 fn classifyStreamingFfnWait(
@@ -191,6 +271,10 @@ pub const Kernel = struct {
 
     pub fn hasStreamingFfn(self: Kernel) bool {
         return ffnSectionSchedule(self.version) == .streaming_q8;
+    }
+
+    pub fn hasP3d(self: Kernel) bool {
+        return self.version >= version_with_p3d;
     }
 
     /// Fabric clock in MHz, self-described by the bitstream (CLK_HZ register).
@@ -288,6 +372,21 @@ pub const Kernel = struct {
         return error.KernelTimeout;
     }
 
+    pub fn waitP3dKernelDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const norm_status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            const scratch_status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            if (norm_status & section.NormStatus.error_mask != 0 or
+                scratch_status & SCRATCH_ANY_ERROR != 0)
+                return self.p3dStateError(norm_status);
+            if (self.win.rd(regmap.offsetOf("STATUS")) & STATUS_DONE != 0)
+                return self.checkDoneState();
+        }
+        return error.KernelTimeout;
+    }
+
     fn checkDoneState(self: *Kernel) KernelError!void {
         if (self.hasActivationReuse() and
             self.win.rd(regmap.offsetOf("ACT_STATE")) & ACT_STATE_ERROR != 0)
@@ -308,6 +407,68 @@ pub const Kernel = struct {
     pub fn quantStatus(self: Kernel) u32 {
         if (!self.hasActivationReuse()) return 0;
         return self.win.rd(regmap.offsetOf("QUANT_STATUS"));
+    }
+
+    fn p3dStateError(self: Kernel, norm_status: u32) KernelError {
+        const norm_error = self.win.rd(regmap.offsetOf("NORM_ERROR"));
+        const residual_error = self.win.rd(regmap.offsetOf("RESIDUAL_ERROR"));
+        const quant_status = self.quantStatus();
+        std.debug.print(
+            "pl: P3d section failed norm_status=0x{x} norm_error=0x{x} residual_error=0x{x} quant_status=0x{x} scratch_status=0x{x} scratch_error=0x{x}\n",
+            .{
+                norm_status,
+                norm_error,
+                residual_error,
+                quant_status,
+                self.win.rd(regmap.offsetOf("SCRATCH_STATUS")),
+                self.win.rd(regmap.offsetOf("SCRATCH_ERROR")),
+            },
+        );
+        return switch (classifyP3dFault(
+            norm_status,
+            norm_error,
+            residual_error,
+            quant_status,
+        )) {
+            .quantization => error.ActivationQuantization,
+            .norm => error.NormState,
+            .residual => error.ResidualState,
+            .scratch => error.ScratchState,
+        };
+    }
+
+    pub fn beginNormGammaLoad(self: *Kernel, model_rows: u32) void {
+        std.debug.assert(self.hasP3d());
+        std.debug.assert(section.p3dModelRowsValid(model_rows));
+        self.win.wr(regmap.offsetOf("MODEL_ROWS"), model_rows);
+        self.win.wr(regmap.offsetOf("NORM_CTRL"), NORM_CTRL_LOAD_GAMMA);
+    }
+
+    pub fn waitNormGammaDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            if (status & section.NormStatus.gamma_done == 0) continue;
+            if (status & section.NormStatus.gamma_error != 0 or
+                status & section.NormStatus.gamma_valid == 0)
+                return self.p3dStateError(status);
+            return;
+        }
+        return error.KernelTimeout;
+    }
+
+    pub fn waitP3dNormDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            if (status & section.NormStatus.norm_done == 0) continue;
+            if (status & section.NormStatus.norm_error != 0)
+                return self.p3dStateError(status);
+            return;
+        }
+        return error.KernelTimeout;
     }
 
     pub fn selectPackedActivation(self: *Kernel) void {
@@ -338,12 +499,52 @@ pub const Kernel = struct {
         self.win.wr(regmap.offsetOf("SCRATCH_CTRL"), SCRATCH_CTRL_SECTION_BEGIN);
     }
 
+    pub fn beginP3dFfnSection(
+        self: *Kernel,
+        model_rows: u32,
+        ffn_rows: u32,
+        tokens: u32,
+        eps_bits: u32,
+        resident_r: bool,
+    ) void {
+        std.debug.assert(self.hasP3d());
+        std.debug.assert(section.p3dModelRowsValid(model_rows));
+        std.debug.assert(ffn_rows >= layout.q1_block and
+            ffn_rows <= section.ffn_dim_max and ffn_rows % layout.q1_block == 0);
+        std.debug.assert(tokens >= 1 and tokens <= section.query_tile_max);
+        std.debug.assert(section.p3dNormEpsValid(eps_bits));
+        self.selectDdrResult();
+        self.win.wr(regmap.offsetOf("MODEL_ROWS"), model_rows);
+        self.win.wr(regmap.offsetOf("NORM_EPS"), eps_bits);
+        self.win.wr(regmap.offsetOf("SCRATCH_ROWS"), ffn_rows);
+        self.win.wr(regmap.offsetOf("SCRATCH_TOKENS"), tokens);
+        self.win.wr(
+            regmap.offsetOf("SCRATCH_CTRL"),
+            SCRATCH_CTRL_SECTION_BEGIN |
+                (if (resident_r) SCRATCH_CTRL_RESIDENT_R else 0),
+        );
+    }
+
     pub fn waitFfnSectionActive(self: *Kernel) KernelError!void {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
             const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
             if (status & SCRATCH_ANY_ERROR != 0) return error.ScratchState;
             if (status & SCRATCH_SECTION_ACTIVE != 0) return;
+        }
+        return error.ScratchTimeout;
+    }
+
+    pub fn waitP3dSectionActive(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const scratch_status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            const norm_status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            if (scratch_status & SCRATCH_ANY_ERROR != 0 or
+                norm_status & section.NormStatus.error_mask != 0)
+                return self.p3dStateError(norm_status);
+            if (scratch_status & SCRATCH_SECTION_ACTIVE != 0) return;
         }
         return error.ScratchTimeout;
     }
@@ -405,6 +606,61 @@ pub const Kernel = struct {
             return error.ScratchState;
     }
 
+    pub fn waitP3dSectionDone(self: *Kernel) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        const required_norm = section.NormStatus.norm_done |
+            section.NormStatus.residual_done | section.NormStatus.gamma_valid;
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const scratch_status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            const norm_status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            if (scratch_status & SCRATCH_ANY_ERROR != 0 or
+                norm_status & section.NormStatus.error_mask != 0)
+                return self.p3dStateError(norm_status);
+            if (scratch_status & SCRATCH_SECTION_DONE == 0) continue;
+            if (scratch_status & (SCRATCH_SECTION_ACTIVE | SCRATCH_CONSUMER_BUSY) != 0 or
+                scratch_status & section.ScratchStatus.r_valid == 0 or
+                norm_status & required_norm != required_norm)
+                return self.p3dStateError(norm_status);
+            return;
+        }
+        return error.ScratchTimeout;
+    }
+
+    fn waitP3dScratchDone(
+        self: *Kernel,
+        done_mask: u32,
+        required_valid_mask: u32,
+    ) KernelError!void {
+        std.debug.assert(self.hasP3d());
+        var i: usize = 0;
+        while (i < regwin.wait_limit) : (i += 1) {
+            const scratch_status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
+            const norm_status = self.win.rd(regmap.offsetOf("NORM_STATUS"));
+            if (scratch_status & SCRATCH_ANY_ERROR != 0 or
+                norm_status & section.NormStatus.error_mask != 0)
+                return self.p3dStateError(norm_status);
+            if (scratch_status & done_mask == 0) continue;
+            if (required_valid_mask != 0 and
+                scratch_status & required_valid_mask != required_valid_mask)
+                return self.p3dStateError(norm_status);
+            return;
+        }
+        return error.ScratchTimeout;
+    }
+
+    pub fn waitP3dWriterDone(self: *Kernel, role: section.F32Role) KernelError!void {
+        try self.waitP3dScratchDone(SCRATCH_WRITER_DONE, scratchRoleValidMask(role));
+    }
+
+    pub fn waitP3dGateReady(self: *Kernel) KernelError!void {
+        try self.waitP3dScratchDone(SCRATCH_FFN_GATE_READY, 0);
+    }
+
+    pub fn waitP3dProducerDone(self: *Kernel) KernelError!void {
+        try self.waitP3dScratchDone(SCRATCH_FFN_PRODUCER_DONE, 0);
+    }
+
     fn waitScratchDone(self: *Kernel, done_mask: u32, required_valid_mask: u32) KernelError!void {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
@@ -445,7 +701,12 @@ pub const Kernel = struct {
         var i: usize = 0;
         while (i < regwin.wait_limit) : (i += 1) {
             const status = self.win.rd(regmap.offsetOf("SCRATCH_STATUS"));
-            if (streamingFfnRestartSafe(status)) return;
+            if (self.hasP3d()) {
+                if (p3dRestartSafe(
+                    status,
+                    self.win.rd(regmap.offsetOf("NORM_STATUS")),
+                )) return;
+            } else if (streamingFfnRestartSafe(status)) return;
         }
         std.debug.print("pl: streaming FFN abort cleanup timed out status=0x{x} error=0x{x}\n", .{
             self.win.rd(regmap.offsetOf("SCRATCH_STATUS")),
@@ -1043,9 +1304,9 @@ pub fn Backend(comptime Heap: type) type {
             return result;
         }
 
-        /// Execute one semantic FFN command as three GEMM runs. RMSNorm and the
-        /// final residual add stay on the PS for v15; gate/up intermediates and
-        /// SwiGLU never leave section-private PL storage.
+        /// Execute one semantic FFN command as three GEMM runs. V17 also keeps
+        /// weighted RMSNorm and the exact residual add inside the section; older
+        /// kernels retain the PS boundary around the same private UP/GATE/DOWN flow.
         pub fn tryFfnSection(
             self: *Self,
             heap: *Heap,
@@ -1066,6 +1327,13 @@ pub fn Backend(comptime Heap: type) type {
             const model_dim: usize = op.model_dim;
             const ffn_dim: usize = op.ffn_dim;
             const tokens: usize = op.token_count;
+            const eps_bits: u32 = @bitCast(op.eps);
+            const host_plan = ffnHostPlan(
+                self.kernel.version,
+                op.model_dim,
+                eps_bits,
+            ) orelse return null;
+            const p3d = host_plan.p3d;
             const model_bytes = std.math.mul(usize, model_dim * @sizeOf(f32), tokens) catch return null;
             const ffn_weight_bytes = switch (op.weight_fmt) {
                 .w1a8 => layout.packedWeightBytes(ffn_dim, model_dim) catch return null,
@@ -1100,6 +1368,8 @@ pub fn Backend(comptime Heap: type) type {
             _ = heap.bytes(down_max_dma) catch return error.HeapFailure;
             const normalized_phys = heap.deviceAddress(normalized_max_dma) catch return error.HeapFailure;
             const down_phys = heap.deviceAddress(down_max_dma) catch return error.HeapFailure;
+            const residual_phys = heap.deviceAddress(op.residual) catch return error.HeapFailure;
+            const norm_weight_phys = heap.deviceAddress(op.norm_weight) catch return error.HeapFailure;
             const up_weights_phys = heap.deviceAddress(op.up_weights) catch return error.HeapFailure;
             const gate_weights_phys = heap.deviceAddress(op.gate_weights) catch return error.HeapFailure;
             const down_weights_phys = heap.deviceAddress(op.down_weights) catch return error.HeapFailure;
@@ -1157,6 +1427,30 @@ pub fn Backend(comptime Heap: type) type {
                 if (dmas_armed and scratch_cleanup_safe) self.abortProjectionDmas();
             }
 
+            if (host_plan.sync_residual)
+                heap.syncToDevice(op.residual) catch return error.HeapFailure;
+            if (host_plan.sync_norm_weight)
+                heap.syncToDevice(op.norm_weight) catch return error.HeapFailure;
+            if (host_plan.sync_residual or host_plan.sync_norm_weight)
+                result.norm_ns +|= profile.lap(ctx, &last);
+
+            if (host_plan.gamma_loads_per_command == 1) {
+                // Gamma is shared across every token tile in this semantic FFN
+                // command. Once this DMA starts, any failure is terminal for the
+                // PL attempt; the error cleanup above globally aborts the v17
+                // lifecycle and waits for restart-safe idle.
+                try self.dma_a.resetMm2s();
+                self.kernel.beginNormGammaLoad(op.model_dim);
+                section_started = true;
+                dmas_armed = true;
+                try self.dma_a.startReadFromDdr(norm_weight_phys, norm_weight.len);
+                try self.dma_a.waitReadDone();
+                dmas_armed = false;
+                try self.kernel.waitNormGammaDone();
+                section_started = false;
+                result.norm_ns +|= profile.lap(ctx, &last);
+            }
+
             var col0: usize = 0;
             while (col0 < tokens) {
                 const tile_tokens = @min(@as(usize, section.query_tile_max), tokens - col0);
@@ -1170,36 +1464,64 @@ pub fn Backend(comptime Heap: type) type {
                 const down_buf = heap.bytes(down_dma) catch return error.HeapFailure;
                 const epoch = self.takeActivationEpoch();
 
-                ps_rmsnorm.runWeightedBytes(
-                    residual_tile,
-                    norm_weight,
-                    normalized,
-                    op.model_dim,
-                    @intCast(tile_tokens),
-                    op.eps,
-                ) catch return error.HeapFailure;
-                result.norm_ns +|= profile.lap(ctx, &last);
-                heap.syncToDevice(normalized_dma) catch return error.HeapFailure;
-                result.gate_up.sync_to_ns +|= profile.lap(ctx, &last);
+                if (!host_plan.ps_norm) {
+                    std.debug.assert(host_plan.residual_dmas_per_tile == 1);
+                    try self.dma_a.resetMm2s();
+                    self.kernel.beginP3dFfnSection(
+                        op.model_dim,
+                        op.ffn_dim,
+                        @intCast(tile_tokens),
+                        eps_bits,
+                        false,
+                    );
+                    section_started = true;
+                    try self.kernel.waitP3dSectionActive();
+                    dmas_armed = true;
+                    try self.dma_a.startReadFromDdr(
+                        residual_phys + @as(u64, @intCast(residual_offset)),
+                        tile_model_bytes,
+                    );
+                    try self.dma_a.waitReadDone();
+                    dmas_armed = false;
+                    result.norm_ns +|= profile.lap(ctx, &last);
+                } else {
+                    ps_rmsnorm.runWeightedBytes(
+                        residual_tile,
+                        norm_weight,
+                        normalized,
+                        op.model_dim,
+                        @intCast(tile_tokens),
+                        op.eps,
+                    ) catch return error.HeapFailure;
+                    result.norm_ns +|= profile.lap(ctx, &last);
+                    heap.syncToDevice(normalized_dma) catch return error.HeapFailure;
+                    result.gate_up.sync_to_ns +|= profile.lap(ctx, &last);
 
-                if (streaming_ffn)
-                    self.kernel.beginStreamingFfnSection(op.ffn_dim, @intCast(tile_tokens))
-                else
-                    self.kernel.beginFfnSection();
-                section_started = true;
-                try self.kernel.waitFfnSectionActive();
+                    if (streaming_ffn)
+                        self.kernel.beginStreamingFfnSection(op.ffn_dim, @intCast(tile_tokens))
+                    else
+                        self.kernel.beginFfnSection();
+                    section_started = true;
+                    try self.kernel.waitFfnSectionActive();
+                }
 
                 for (projections, 0..) |projection, projection_index| {
+                    const external_activation = projection.mode == .raw_f32_load and
+                        host_plan.external_up_activation;
                     if (projection.mode == .reuse and
                         !self.kernel.residentMatches(epoch, @intCast(upstream_q1_blocks), @intCast(tile_tokens)))
                         return error.ActivationState;
                     // V16 clears the tagged Q8 bank while UP runs. Do not launch
                     // GATE until X1 is committed and that bank is capture-ready.
-                    if (projection_index == 1 and streaming_ffn)
-                        try self.kernel.waitFfnGateReady();
+                    if (projection_index == 1 and streaming_ffn) {
+                        if (p3d)
+                            try self.kernel.waitP3dGateReady()
+                        else
+                            try self.kernel.waitFfnGateReady();
+                    }
                     try self.dma_w[0].resetMm2s();
                     for (self.dma_w[1..]) |*dma| try dma.resetMm2s();
-                    if (projection.mode == .raw_f32_load) try self.dma_a.resetMm2s();
+                    if (external_activation) try self.dma_a.resetMm2s();
                     dmas_armed = true;
                     for (&self.dma_w, 0..) |*dma, port| {
                         try dma.startReadFromDdr(
@@ -1207,7 +1529,7 @@ pub fn Backend(comptime Heap: type) type {
                             upstream_port_bytes,
                         );
                     }
-                    if (projection.mode == .raw_f32_load)
+                    if (external_activation)
                         try self.dma_a.startReadFromDdr(normalized_phys, tile_model_bytes);
                     self.kernel.configureScratchOnly(projection.role, op.ffn_dim, @intCast(tile_tokens));
                     self.kernel.runWithActivation(
@@ -1220,17 +1542,27 @@ pub fn Backend(comptime Heap: type) type {
                         epoch,
                     );
                     result.gate_up.setup_ns +|= profile.lap(ctx, &last);
-                    if (streaming_ffn)
+                    if (p3d)
+                        try self.kernel.waitP3dKernelDone()
+                    else if (streaming_ffn)
                         try self.kernel.waitFfnKernelDone()
                     else
                         try self.kernel.waitDone();
-                    if (projection_index == 1 and streaming_ffn)
-                        try self.kernel.waitFfnProducerDone()
-                    else
+                    if (projection_index == 1 and streaming_ffn) {
+                        if (p3d)
+                            try self.kernel.waitP3dProducerDone()
+                        else
+                            try self.kernel.waitFfnProducerDone();
+                    } else if (p3d) {
+                        try self.kernel.waitP3dWriterDone(projection.role);
+                    } else {
                         try self.kernel.waitScratchWriterDone(projection.role);
+                    }
                     for (&self.dma_w) |*dma| try dma.waitReadDone();
-                    if (projection.mode == .raw_f32_load) try self.dma_a.waitReadDone();
+                    if (external_activation) try self.dma_a.waitReadDone();
                     dmas_armed = false;
+                    if (p3d and projection_index == 0)
+                        try self.kernel.waitP3dNormDone();
                     result.gate_up.wait_ns +|= profile.lap(ctx, &last);
                     result.gate_up.kernel_runs +|= 1;
                     if (ctx != null) accumulateCounters(&gate_up_counters, self.readCounters());
@@ -1257,13 +1589,18 @@ pub fn Backend(comptime Heap: type) type {
                     self.takeActivationEpoch(),
                 );
                 result.down.setup_ns +|= profile.lap(ctx, &last);
-                if (streaming_ffn)
+                if (p3d)
+                    try self.kernel.waitP3dKernelDone()
+                else if (streaming_ffn)
                     try self.kernel.waitFfnKernelDone()
                 else
                     try self.kernel.waitDone();
                 if (!streaming_ffn)
                     try self.kernel.waitFfnConsumerDone();
-                try self.kernel.waitFfnSectionDone();
+                if (p3d)
+                    try self.kernel.waitP3dSectionDone()
+                else
+                    try self.kernel.waitFfnSectionDone();
                 for (&self.dma_w) |*dma| try dma.waitReadDone();
                 try self.dma_w[0].waitWriteDone();
                 dmas_armed = false;
@@ -1283,6 +1620,24 @@ pub fn Backend(comptime Heap: type) type {
                 }
                 col0 += tile_tokens;
             }
+            const down_result = if (private_down) |buffer|
+                @as([]const u8, buffer)
+            else
+                direct_down orelse unreachable;
+            // Publication starts only after every PL tile succeeds. P3d's DOWN
+            // stream already contains the exact residual sum; older kernels still
+            // perform that final operation on the PS.
+            publishFfnResult(p3d, down_result, residual, dst) catch
+                return error.HeapFailure;
+            if (!host_plan.ps_residual_add) {
+                heap.syncToDevice(op.dst) catch return error.HeapFailure;
+                result.down.result_layout_ns +|= profile.lap(ctx, &last);
+                result.residual_add_ns = 0;
+            } else {
+                heap.syncToDevice(op.dst) catch return error.HeapFailure;
+                result.residual_add_ns = profile.lap(ctx, &last);
+            }
+
             result.gate_up_command_ns = result.gate_up.setup_ns +| result.gate_up.wait_ns +|
                 result.gate_up.sync_to_ns;
             result.down_command_ns = result.down.setup_ns +| result.down.wait_ns +|
@@ -1292,17 +1647,6 @@ pub fn Backend(comptime Heap: type) type {
             // PL SwiGLU is fused into the down kernel wait and cannot be timed
             // independently without perturbing the section pipeline.
             result.swiglu_ns = 0;
-            const down_result = if (private_down) |buffer|
-                @as([]const u8, buffer)
-            else
-                direct_down orelse unreachable;
-            // Publication starts only after every PL tile succeeds. addBytes
-            // validates all lengths before writing, so this removes the redundant
-            // private-buffer copy without weakening fail-before-publication.
-            ps_elemwise.addBytes(down_result, residual, dst) catch return error.HeapFailure;
-            heap.syncToDevice(op.dst) catch return error.HeapFailure;
-            result.residual_add_ns = profile.lap(ctx, &last);
-
             applyCounters(&result.gate_up, gate_up_counters);
             applyCounters(&result.down, down_counters);
             return result;
@@ -1643,7 +1987,109 @@ test "FFN section schedule switches only at kernel v16" {
     );
     try std.testing.expectEqual(
         FfnSectionSchedule.streaming_q8,
-        ffnSectionSchedule(version_with_streaming_ffn + 1),
+        ffnSectionSchedule(version_with_p3d),
+    );
+}
+
+test "P3d FFN eligibility is exact to v17 shape and epsilon" {
+    const eps_bits: u32 = @bitCast(@as(f32, 1.0e-5));
+    try std.testing.expect(!p3dFfnEligible(version_with_streaming_ffn, 128, eps_bits));
+    try std.testing.expect(p3dFfnEligible(version_with_p3d, 128, eps_bits));
+    try std.testing.expect(p3dFfnEligible(version_with_p3d, 4096, eps_bits));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 64, eps_bits));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 192, eps_bits));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 8192, eps_bits));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 128, 0));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 128, 1));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 128, 0x7f80_0000));
+    try std.testing.expect(!p3dFfnEligible(version_with_p3d, 128, 0xbf80_0000));
+}
+
+test "P3d host masks match the shared v17 register contract" {
+    try std.testing.expectEqual(section.ScratchControl.resident_r, SCRATCH_CTRL_RESIDENT_R);
+    try std.testing.expectEqual(section.NormControl.load_gamma, NORM_CTRL_LOAD_GAMMA);
+    try std.testing.expectEqual(@as(u32, 17), version_with_p3d);
+}
+
+test "FFN host plan preserves v16 boundaries and selects the complete P3d schedule" {
+    const eps_bits: u32 = @bitCast(@as(f32, 1.0e-5));
+    const v16 = ffnHostPlan(version_with_streaming_ffn, 4096, eps_bits).?;
+    try std.testing.expect(!v16.p3d);
+    try std.testing.expect(!v16.sync_residual);
+    try std.testing.expect(!v16.sync_norm_weight);
+    try std.testing.expectEqual(@as(u2, 0), v16.gamma_loads_per_command);
+    try std.testing.expectEqual(@as(u2, 0), v16.residual_dmas_per_tile);
+    try std.testing.expect(v16.ps_norm);
+    try std.testing.expect(v16.external_up_activation);
+    try std.testing.expect(v16.ps_residual_add);
+
+    const p3d = ffnHostPlan(version_with_p3d, 4096, eps_bits).?;
+    try std.testing.expect(p3d.p3d);
+    try std.testing.expect(p3d.sync_residual);
+    try std.testing.expect(p3d.sync_norm_weight);
+    try std.testing.expectEqual(@as(u2, 1), p3d.gamma_loads_per_command);
+    try std.testing.expectEqual(@as(u2, 1), p3d.residual_dmas_per_tile);
+    try std.testing.expect(!p3d.ps_norm);
+    try std.testing.expect(!p3d.external_up_activation);
+    try std.testing.expect(!p3d.ps_residual_add);
+
+    try std.testing.expect(ffnHostPlan(version_with_ffn_section - 1, 4096, eps_bits) == null);
+    try std.testing.expect(ffnHostPlan(version_with_p3d, 192, eps_bits) == null);
+    try std.testing.expect(ffnHostPlan(version_with_p3d, 4096, 0) == null);
+}
+
+test "P3d fault classification preserves arithmetic detail and precedence" {
+    try std.testing.expectEqual(
+        P3dFaultClass.quantization,
+        classifyP3dFault(section.NormStatus.norm_error, 1, 1, 1),
+    );
+    try std.testing.expectEqual(
+        P3dFaultClass.norm,
+        classifyP3dFault(section.NormStatus.gamma_error, 0, 0, 0),
+    );
+    try std.testing.expectEqual(
+        P3dFaultClass.norm,
+        classifyP3dFault(0, section.NormError.controller, 0, 0),
+    );
+    try std.testing.expectEqual(
+        P3dFaultClass.residual,
+        classifyP3dFault(section.NormStatus.residual_error, 0, 1, 0),
+    );
+    try std.testing.expectEqual(
+        P3dFaultClass.scratch,
+        classifyP3dFault(0, 0, 0, 0),
+    );
+}
+
+test "P3d cleanup requires both scratch release and global norm idle" {
+    try std.testing.expect(p3dRestartSafe(0, section.NormStatus.idle));
+    try std.testing.expect(!p3dRestartSafe(SCRATCH_SECTION_ACTIVE, section.NormStatus.idle));
+    try std.testing.expect(!p3dRestartSafe(0, section.NormStatus.norm_busy));
+    try std.testing.expect(!p3dRestartSafe(SCRATCH_WRITER_BUSY, section.NormStatus.norm_busy));
+}
+
+test "FFN publication keeps v16 residual add and treats P3d output as final" {
+    const down = [_]f32{ 1.5, -2.0, 8.0, 0.25 };
+    const residual = [_]f32{ 0.5, 3.0, -1.0, 0.75 };
+    var v16: [down.len]f32 = undefined;
+    var p3d: [down.len]f32 = undefined;
+    try publishFfnResult(
+        false,
+        std.mem.asBytes(&down),
+        std.mem.asBytes(&residual),
+        std.mem.asBytes(&v16),
+    );
+    try publishFfnResult(
+        true,
+        std.mem.asBytes(&down),
+        std.mem.asBytes(&residual),
+        std.mem.asBytes(&p3d),
+    );
+    try std.testing.expectEqualSlices(f32, &.{ 2.0, 1.0, 7.0, 1.0 }, &v16);
+    try std.testing.expectEqualSlices(f32, &down, &p3d);
+    try std.testing.expectError(
+        error.InvalidLength,
+        publishFfnResult(true, std.mem.asBytes(&down)[0..8], std.mem.asBytes(&residual), std.mem.asBytes(&p3d)),
     );
 }
 
