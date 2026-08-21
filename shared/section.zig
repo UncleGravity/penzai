@@ -9,6 +9,10 @@ pub const layout = @import("layout.zig");
 
 pub const version: u16 = 1;
 pub const ffn_kernel_version: u32 = 15;
+/// First matmul contract that executes weighted RMSNorm and exact residual add
+/// inside the named FFN section. `ffn_kernel_version` remains the minimum for
+/// the older named-section wire command; callers must gate P3d behavior on this.
+pub const p3d_kernel_version: u32 = 17;
 
 // V1 is the first routed point. A command may contain a longer prompt; the
 // controller walks it in tiles no larger than this value.
@@ -24,6 +28,132 @@ pub const f32_banks_per_role: u32 = 4;
 pub const f32_values_per_word: u32 = 2;
 pub const f32_word_bytes: u32 = f32_values_per_word * @sizeOf(f32);
 pub const f32_rows_per_group: u32 = f32_banks_per_role * f32_values_per_word;
+
+/// Host/RTL bit contract for `SCRATCH_CTRL`. These are write-only strobes. Abort
+/// has priority when several bits are written together. `resident_r` qualifies
+/// `section_begin` in the same write and has no effect by itself.
+pub const ScratchControl = struct {
+    pub const drain_start: u32 = 1 << 0;
+    pub const abort: u32 = 1 << 1;
+    pub const section_begin: u32 = 1 << 2;
+    pub const resident_r: u32 = 1 << 3;
+};
+
+/// Stable `SCRATCH_STATUS` layout through v17. A clean v17 `section_done`
+/// coincides with `r_valid` only after the final exact residual word is committed
+/// and accepted externally. Abort/fault of an active section clears tentative R
+/// validity before restart-safe idle; an idle sealed R is not a command target.
+pub const ScratchStatus = struct {
+    pub const writer_busy: u32 = 1 << 0;
+    pub const writer_done: u32 = 1 << 1;
+    pub const drain_busy: u32 = 1 << 2;
+    pub const drain_done: u32 = 1 << 3;
+    pub const any_error: u32 = 1 << 4;
+    pub const r_valid: u32 = 1 << 5;
+    pub const x0_valid: u32 = 1 << 6;
+    pub const x1_valid: u32 = 1 << 7;
+    pub const x2_valid: u32 = 1 << 8;
+    pub const producer_busy: u32 = 1 << 9;
+    pub const producer_done: u32 = 1 << 10;
+    pub const section_active: u32 = 1 << 11;
+    pub const section_done: u32 = 1 << 12;
+    pub const gate_ready: u32 = 1 << 13;
+    pub const defined_mask: u32 = 0x3fff;
+};
+
+/// Coarse `SCRATCH_ERROR` categories. Bits 0..6 retain their v14/v16 meanings;
+/// detailed v17 arithmetic status lives in `NORM_ERROR`/`RESIDUAL_ERROR`.
+pub const ScratchError = struct {
+    pub const config: u32 = 1 << 0;
+    pub const writer: u32 = 1 << 1;
+    pub const abort: u32 = 1 << 2;
+    pub const drain: u32 = 1 << 3;
+    pub const stale: u32 = 1 << 4;
+    pub const section: u32 = 1 << 5;
+    pub const swiglu_q8: u32 = 1 << 6;
+    pub const rmsnorm: u32 = 1 << 7;
+    pub const residual: u32 = 1 << 8;
+    pub const fatal_mask: u32 = 0x1ff;
+    pub const defined_mask: u32 = fatal_mask;
+};
+
+/// `NORM_CTRL` write-only commands. Gamma loading snapshots `MODEL_ROWS` only
+/// when accepted from global shared-resource idle: legacy/raw activation ingress,
+/// GEMM/Q8 ingress, scratch read/write/drain owners, retained responses, every v17
+/// leaf, and the section controller must all be quiescent. Global cancellation
+/// uses `ScratchControl.abort` so one abort source owns every section leaf.
+pub const NormControl = struct {
+    pub const load_gamma: u32 = 1 << 0;
+};
+
+/// `NORM_STATUS` lifecycle bits. Done/error bits are sticky per operation class:
+/// gamma flags clear on an accepted gamma load, while norm/residual flags clear
+/// atomically on an accepted section begin; global abort clears all three classes.
+/// `idle` means global shared-resource quiescence: legacy/raw activation ingress,
+/// GEMM/Q8 ingress, all scratch read/write/drain owners and retained responses,
+/// every v17 leaf, and the section/abort-cleanup controller are quiescent. Both
+/// gamma load and section begin require it. It may coexist with sealed gamma/R.
+/// Any accepted section that terminates with an error clears `gamma_valid` and
+/// requires a clean gamma reload, even if the fault occurs after norm completion.
+pub const NormStatus = struct {
+    pub const gamma_busy: u32 = 1 << 0;
+    pub const gamma_done: u32 = 1 << 1;
+    pub const gamma_error: u32 = 1 << 2;
+    pub const gamma_valid: u32 = 1 << 3;
+    pub const norm_busy: u32 = 1 << 4;
+    pub const norm_done: u32 = 1 << 5;
+    pub const norm_error: u32 = 1 << 6;
+    pub const residual_busy: u32 = 1 << 7;
+    pub const residual_done: u32 = 1 << 8;
+    pub const residual_error: u32 = 1 << 9;
+    pub const idle: u32 = 1 << 10;
+    pub const busy_mask: u32 = gamma_busy | norm_busy | residual_busy;
+    pub const done_mask: u32 = gamma_done | norm_done | residual_done;
+    pub const error_mask: u32 = gamma_error | norm_error | residual_error;
+    pub const defined_mask: u32 = 0x7ff;
+};
+
+/// `NORM_ERROR` preserves the raw standalone status layouts. Q8 quantizer detail
+/// remains in `QUANT_STATUS`; `controller` covers arbitration/framing ownership
+/// failures that no RMSNorm leaf can diagnose.
+pub const NormError = struct {
+    pub const scalar_shift: u5 = 0;
+    pub const gamma_shift: u5 = 23;
+    pub const controller: u32 = 1 << 27;
+
+    pub fn scalar(status: u23) u32 {
+        return @as(u32, status) << scalar_shift;
+    }
+
+    pub fn gamma(status: u4) u32 {
+        return @as(u32, status) << gamma_shift;
+    }
+
+    pub const fatal_mask: u32 = 0x0fff_ffff;
+    pub const defined_mask: u32 = fatal_mask;
+};
+
+/// `RESIDUAL_ERROR` is the raw seven-bit `ResidualAddStatus` value. Every bit
+/// outside `defined_mask` reads zero, as do unlisted high bits in the other RO
+/// status/error registers above.
+pub const ResidualError = struct {
+    pub const raw_mask: u32 = 0x7f;
+    pub const defined_mask: u32 = raw_mask;
+};
+
+/// Pre-start legality shared by the v17 controller and its software fallback
+/// gate. RMSNorm's fixed mean conversion requires a power-of-two row count.
+pub fn p3dModelRowsValid(rows: u32) bool {
+    return rows >= 128 and rows <= model_dim_max and (rows & (rows - 1)) == 0;
+}
+
+/// The inverse-RMS leaf accepts positive, finite, normal binary32 epsilon.
+/// Subnormal epsilon is deliberately rejected rather than silently flushed.
+pub fn p3dNormEpsValid(eps_bits: u32) bool {
+    const sign = eps_bits >> 31;
+    const exponent: u8 = @truncate(eps_bits >> 23);
+    return sign == 0 and exponent != 0 and exponent != 0xff;
+}
 
 /// Diagnostic status bits shared with `section_rmsnorm_loader.v`.
 pub const RmsNormLoaderStatus = struct {
@@ -1154,6 +1284,58 @@ test "P3 FFN pair native ingress reorders into canonical token blocks" {
         error.InvalidSubblock,
         ffnPairNativeTag(4, q8_buffer_block_capacity * 4 * ffn_pair_groups_per_block),
     );
+}
+
+test "P3d v17 register lifecycle masks are exact and non-overlapping" {
+    try std.testing.expectEqual(@as(u32, 15), ffn_kernel_version);
+    try std.testing.expectEqual(@as(u32, 17), p3d_kernel_version);
+
+    try std.testing.expectEqual(@as(u32, 0x1), ScratchControl.drain_start);
+    try std.testing.expectEqual(@as(u32, 0x2), ScratchControl.abort);
+    try std.testing.expectEqual(@as(u32, 0x4), ScratchControl.section_begin);
+    try std.testing.expectEqual(@as(u32, 0x8), ScratchControl.resident_r);
+    try std.testing.expectEqual(
+        @as(u32, 0),
+        ScratchControl.resident_r & ScratchControl.section_begin,
+    );
+
+    try std.testing.expectEqual(@as(u32, 0x20), ScratchStatus.r_valid);
+    try std.testing.expectEqual(@as(u32, 0x800), ScratchStatus.section_active);
+    try std.testing.expectEqual(@as(u32, 0x1000), ScratchStatus.section_done);
+    try std.testing.expectEqual(@as(u32, 0x3fff), ScratchStatus.defined_mask);
+    try std.testing.expectEqual(@as(u32, 0x1ff), ScratchError.fatal_mask);
+    try std.testing.expectEqual(ScratchError.fatal_mask, ScratchError.defined_mask);
+
+    try std.testing.expectEqual(@as(u32, 1), NormControl.load_gamma);
+    try std.testing.expectEqual(@as(u32, 0x91), NormStatus.busy_mask);
+    try std.testing.expectEqual(@as(u32, 0x122), NormStatus.done_mask);
+    try std.testing.expectEqual(@as(u32, 0x244), NormStatus.error_mask);
+    try std.testing.expectEqual(@as(u32, 0x400), NormStatus.idle);
+    try std.testing.expectEqual(@as(u32, 0x7ff), NormStatus.defined_mask);
+
+    try std.testing.expectEqual(@as(u32, 0x007f_ffff), NormError.scalar(0x7f_ffff));
+    try std.testing.expectEqual(@as(u32, 0x0780_0000), NormError.gamma(0xf));
+    try std.testing.expectEqual(@as(u32, 0x0800_0000), NormError.controller);
+    try std.testing.expectEqual(@as(u32, 0x0fff_ffff), NormError.fatal_mask);
+    try std.testing.expectEqual(NormError.fatal_mask, NormError.defined_mask);
+    try std.testing.expectEqual(
+        @as(u32, ResidualAddStatus.fatal_mask),
+        ResidualError.raw_mask,
+    );
+    try std.testing.expectEqual(ResidualError.raw_mask, ResidualError.defined_mask);
+
+    try std.testing.expect(!p3dModelRowsValid(127));
+    try std.testing.expect(p3dModelRowsValid(128));
+    try std.testing.expect(!p3dModelRowsValid(384));
+    try std.testing.expect(p3dModelRowsValid(4096));
+    try std.testing.expect(!p3dModelRowsValid(8192));
+    try std.testing.expect(!p3dNormEpsValid(0x0000_0000));
+    try std.testing.expect(!p3dNormEpsValid(0x0000_0001));
+    try std.testing.expect(p3dNormEpsValid(0x0080_0000));
+    try std.testing.expect(p3dNormEpsValid(0x7f7f_ffff));
+    try std.testing.expect(!p3dNormEpsValid(0x7f80_0000));
+    try std.testing.expect(!p3dNormEpsValid(0x7fc0_0000));
+    try std.testing.expect(!p3dNormEpsValid(0x8080_0000));
 }
 
 test "P3d RMSNorm sumsq status and fixed integer oracle are explicit" {

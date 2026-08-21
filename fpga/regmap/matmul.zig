@@ -170,11 +170,20 @@ test "regmap parses known offsets and resets" {
     try std.testing.expectEqual(@as(u32, 0x20), offsetOf("W_STALL"));
     try std.testing.expectEqual(@as(u32, 0x34), offsetOf("R_BEATS"));
     try std.testing.expectEqual(@as(u32, 0x48), offsetOf("NUM_ROWS"));
-    try std.testing.expectEqual(@as(u32, 16), resetOf("VERSION"));
+    try std.testing.expectEqual(@as(u32, 17), resetOf("VERSION"));
     try std.testing.expectEqual(@as(u32, 0x4C), offsetOf("ACT_MODE"));
+    try std.testing.expectEqual(@as(u32, 0x50), offsetOf("ACT_EPOCH"));
     try std.testing.expectEqual(@as(u32, 0x60), offsetOf("LOADED_COLS"));
     try std.testing.expectEqual(@as(u32, 0x68), offsetOf("SCRATCH_MODE"));
+    try std.testing.expectEqual(@as(u32, 0x78), offsetOf("SCRATCH_CTRL"));
     try std.testing.expectEqual(@as(u32, 0x80), offsetOf("SCRATCH_ERROR"));
+    try std.testing.expectEqual(@as(u32, 0x84), offsetOf("MODEL_ROWS"));
+    try std.testing.expectEqual(@as(u32, 0x88), offsetOf("NORM_EPS"));
+    try std.testing.expectEqual(@as(u32, 0x8C), offsetOf("NORM_CTRL"));
+    try std.testing.expectEqual(@as(u32, 0x90), offsetOf("NORM_STATUS"));
+    try std.testing.expectEqual(@as(u32, 0x400), resetOf("NORM_STATUS"));
+    try std.testing.expectEqual(@as(u32, 0x94), offsetOf("NORM_ERROR"));
+    try std.testing.expectEqual(@as(u32, 0x98), offsetOf("RESIDUAL_ERROR"));
     try std.testing.expectEqual(Access.rw, table[4].access);
 }
 
@@ -185,13 +194,48 @@ test "emitVerilog contains offsets and ro reset values" {
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_ID = 32'hB05A2000;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NUM_ROWS = 12'h048;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_ACT_MODE = 12'h04C;") != null);
-    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_VERSION = 32'h00000010;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_VERSION = 32'h00000011;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_SCRATCH_MODE = 12'h068;") != null);
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_SCRATCH_ERROR = 12'h080;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_MODEL_ROWS = 12'h084;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NORM_EPS = 12'h088;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NORM_CTRL = 12'h08C;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NORM_STATUS = 12'h090;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_NORM_STATUS = 32'h00000400;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_NORM_ERROR = 12'h094;") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_OFF_RESIDUAL_ERROR = 12'h098;") != null);
     // wo/rw registers must not get a reset localparam.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_RST_CTRL") == null);
     // COLS_MAX flows to the RTL so decode_top can drive the kernel from it.
     try std.testing.expect(std.mem.indexOf(u8, out, "MATMUL_COLS_MAX = 8;") != null);
+}
+
+test "v17 schema freezes shared-idle, tee, and seal semantics" {
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        raw,
+        "v16 tee requires NUM_ROWS equality and 16-row alignment",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        raw,
+        "v16 tee requires NUM_COLS equality",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        raw,
+        "global shared-resource quiescence",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        raw,
+        "Any accepted section that terminates with an error",
+    ) != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        raw,
+        "Every unlisted bit of a read-only register",
+    ) != null);
 }
 
 test "address map and caps are internally consistent" {
