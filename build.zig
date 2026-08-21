@@ -464,6 +464,19 @@ fn addFormalSteps(b: *std.Build) void {
     );
     decode_ffn_step.dependOn(&decode_ffn_run.step);
 
+    const decode_p3d_run = b.addSystemCommand(&.{
+        "sby",
+        "-f",
+        "--prefix",
+        ".zig-cache/sby/decode_p3d",
+        "fpga/formal/decode_p3d.sby",
+    });
+    const decode_p3d_step = b.step(
+        "formal-decode-p3d",
+        "Model-check v17 P3d ownership, write barriers, Q8 routing, output isolation, and cleanup",
+    );
+    decode_p3d_step.dependOn(&decode_p3d_run.step);
+
     const formal = b.step("formal", "Run formal verification pilots");
     formal.dependOn(seq_reg_master_step);
     formal.dependOn(seq_core_step);
@@ -490,6 +503,7 @@ fn addFormalSteps(b: *std.Build) void {
     formal.dependOn(section_gate_packer_step);
     formal.dependOn(q8_internal_ingress_step);
     formal.dependOn(decode_ffn_step);
+    formal.dependOn(decode_p3d_step);
 }
 
 // Flash-attention numeric leaves. The cosim-only harness wraps interpolation, exp,
@@ -585,6 +599,17 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/section_gate_packer.v",
     "fpga/rtl/section_ffn_pairer.v",
     "fpga/rtl/section_q8_buffer.v",
+    "fpga/rtl/section_rmsnorm_scalar_pipeline.v",
+    "fpga/rtl/section_rmsnorm_reduce.v",
+    "fpga/rtl/section_rmsnorm_frontend.v",
+    "fpga/rtl/section_rmsnorm_loader.v",
+    "fpga/rtl/section_rmsnorm_maxexp.v",
+    "fpga/rtl/section_rmsnorm_sumsq.v",
+    "fpga/rtl/section_rmsnorm_inv.v",
+    "fpga/rtl/section_rmsnorm_weighted_source.v",
+    "fpga/rtl/section_rmsnorm_mul_rne.v",
+    "fpga/rtl/section_residual_add.v",
+    "fpga/rtl/section_residual_add_rne.v",
     "fpga/rtl/gemm_kernel.v",
     "fpga/rtl/gemm_ternary_select.v",
     "fpga/rtl/gemm.v",
@@ -593,7 +618,7 @@ const decode_top_rtl = [_][]const u8{
     "fpga/rtl/numeric/fma.v",
 };
 
-const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_swiglu.v fpga/rtl/section_f32_scratch.v fpga/rtl/section_gate_packer.v fpga/rtl/section_ffn_pairer.v fpga/rtl/section_q8_buffer.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fmul.v fpga/rtl/numeric/fadd.v fpga/rtl/numeric/fma.v";
+const decode_top_rtl_args = "fpga/rtl/decode_top.v fpga/rtl/q8_ingress.v fpga/rtl/q8_quantizer.v fpga/rtl/section_swiglu.v fpga/rtl/section_f32_scratch.v fpga/rtl/section_gate_packer.v fpga/rtl/section_ffn_pairer.v fpga/rtl/section_q8_buffer.v fpga/rtl/section_rmsnorm_scalar_pipeline.v fpga/rtl/section_rmsnorm_reduce.v fpga/rtl/section_rmsnorm_frontend.v fpga/rtl/section_rmsnorm_loader.v fpga/rtl/section_rmsnorm_maxexp.v fpga/rtl/section_rmsnorm_sumsq.v fpga/rtl/section_rmsnorm_inv.v fpga/rtl/section_rmsnorm_weighted_source.v fpga/rtl/section_rmsnorm_mul_rne.v fpga/rtl/section_residual_add.v fpga/rtl/section_residual_add_rne.v fpga/rtl/gemm_kernel.v fpga/rtl/gemm_ternary_select.v fpga/rtl/gemm.v fpga/rtl/numeric/fmul.v fpga/rtl/numeric/fadd.v fpga/rtl/numeric/fma.v";
 
 // Exact canonical FP32 -> Q8_0 activation quantizer. Kept standalone until its
 // numerical and routed-cost gates justify attaching it to the GEMM activation RAM.

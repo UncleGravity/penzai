@@ -44,6 +44,12 @@ const REG_SCRATCH_TOKENS: u8 = 0x74;
 const REG_SCRATCH_CTRL: u8 = 0x78;
 const REG_SCRATCH_STATUS: u8 = 0x7C;
 const REG_SCRATCH_ERROR: u8 = 0x80;
+const REG_MODEL_ROWS: u8 = 0x84;
+const REG_NORM_EPS: u8 = 0x88;
+const REG_NORM_CTRL: u8 = 0x8C;
+const REG_NORM_STATUS: u8 = 0x90;
+const REG_NORM_ERROR: u8 = 0x94;
+const REG_RESIDUAL_ERROR: u8 = 0x98;
 
 const ACT_PACKED_LOAD: u32 = 0;
 const ACT_REUSE: u32 = 1;
@@ -56,16 +62,19 @@ const SCRATCH_MODE_DDR: u32 = 0;
 const SCRATCH_MODE_TEE: u32 = 1;
 const SCRATCH_MODE_DRAIN: u32 = 2;
 const SCRATCH_MODE_ONLY: u32 = 3;
+const SCRATCH_ROLE_R: u32 = 0;
 const SCRATCH_ROLE_X0: u32 = 1;
 const SCRATCH_ROLE_X1: u32 = 2;
 const SCRATCH_CTRL_DRAIN_START: u32 = 1;
 const SCRATCH_CTRL_ABORT: u32 = 1 << 1;
 const SCRATCH_CTRL_SECTION_BEGIN: u32 = 1 << 2;
+const SCRATCH_CTRL_RESIDENT_R: u32 = 1 << 3;
 const SCRATCH_WRITER_BUSY: u32 = 1 << 0;
 const SCRATCH_WRITER_DONE: u32 = 1 << 1;
 const SCRATCH_DRAIN_BUSY: u32 = 1 << 2;
 const SCRATCH_DRAIN_DONE: u32 = 1 << 3;
 const SCRATCH_ANY_ERROR: u32 = 1 << 4;
+const SCRATCH_R_VALID: u32 = 1 << 5;
 const SCRATCH_X0_VALID: u32 = 1 << 6;
 const SCRATCH_X1_VALID: u32 = 1 << 7;
 const SCRATCH_CONSUMER_BUSY: u32 = 1 << 9;
@@ -79,6 +88,35 @@ const SCRATCH_ERROR_ABORT: u32 = 1 << 2;
 const SCRATCH_ERROR_STALE: u32 = 1 << 4;
 const SCRATCH_ERROR_SECTION: u32 = 1 << 5;
 const SCRATCH_ERROR_SWIGLU_Q8: u32 = 1 << 6;
+const SCRATCH_ERROR_RMS: u32 = 1 << 7;
+const SCRATCH_ERROR_RESIDUAL: u32 = 1 << 8;
+
+const NORM_GAMMA_BUSY: u32 = 1 << 0;
+const NORM_GAMMA_DONE: u32 = 1 << 1;
+const NORM_GAMMA_ERROR: u32 = 1 << 2;
+const NORM_GAMMA_VALID: u32 = 1 << 3;
+const NORM_BUSY: u32 = 1 << 4;
+const NORM_DONE: u32 = 1 << 5;
+const NORM_ERROR: u32 = 1 << 6;
+const RESIDUAL_BUSY: u32 = 1 << 7;
+const RESIDUAL_DONE: u32 = 1 << 8;
+const RESIDUAL_ERROR: u32 = 1 << 9;
+const NORM_GLOBAL_IDLE: u32 = 1 << 10;
+
+const DBG_P3D_ACTIVE: u32 = 1 << 0;
+const DBG_P3D_CLEANUP: u32 = 1 << 1;
+const DBG_P3D_KILL: u32 = 1 << 2;
+const DBG_P3D_R_COMPLETE: u32 = 1 << 3;
+const DBG_P3D_NORM_SEALED: u32 = 1 << 4;
+const DBG_P3D_RESIDUAL_STARTED: u32 = 1 << 5;
+const DBG_P3D_Q8_OWNER_MASK: u32 = 3 << 6;
+const DBG_P3D_Q8_OWNER_RMS: u32 = 1 << 6;
+const DBG_P3D_OUTER_OWNER_MASK: u32 = 3 << 8;
+const DBG_P3D_OUTER_OWNER: u32 = 3 << 8;
+const DBG_P3D_SUBOWNER_MASK: u32 = 3 << 10;
+const DBG_P3D_SUBOWNER_RMS: u32 = 1 << 10;
+const DBG_P3D_SUBOWNER_RESIDUAL: u32 = 2 << 10;
+const DBG_P3D_RSP_VALID: u32 = 1 << 12;
 
 const DBG_FFN_ACTIVE: u32 = 1 << 0;
 const DBG_FFN_PRODUCER_BUSY: u32 = 1 << 1;
@@ -93,6 +131,12 @@ const DBG_FFN_PACKER_BUSY: u32 = 1 << 9;
 const DBG_FFN_SECTION_DONE: u32 = 1 << 10;
 const DBG_FFN_ANY_ERROR: u32 = 1 << 11;
 const DBG_FFN_PAIRER_STAGING_REQ: u32 = 1 << 12;
+
+const DBG_SHARED_COMPUTE_VALID: u32 = 1 << 0;
+const DBG_SHARED_Q8_START: u32 = 1 << 1;
+const DBG_SHARED_KERNEL_START: u32 = 1 << 2;
+const DBG_SHARED_GAMMA_BUSY: u32 = 1 << 3;
+const DBG_SHARED_GAMMA_READY: u32 = 1 << 6;
 
 const WEIGHT_FMT_BINARY: u32 = 1;
 const WEIGHT_FMT_TERNARY: u32 = 2;
@@ -745,6 +789,360 @@ fn packRawF32(values: []const f32, beats: []u64) void {
     }
 }
 
+fn loadP3dGamma(dut: *Dut, rows: usize, gamma_beats: []const u64) !void {
+    if (gamma_beats.len != rows / 2) return error.P3dGammaShapeMismatch;
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
+    axiWrite(dut, REG_NORM_CTRL, 1);
+
+    for (gamma_beats, 0..) |beat, index| {
+        if (index % 5 == 2) {
+            c.dut_set_a(dut.h, 0, 0, 0);
+            dut.step();
+        }
+        var accepted = false;
+        for (0..256) |_| {
+            c.dut_set_a(
+                dut.h,
+                beat,
+                1,
+                @intFromBool(index + 1 == gamma_beats.len),
+            );
+            c.dut_eval(dut.h);
+            const fire = c.dut_a_ready(dut.h) != 0;
+            dut.step();
+            if (fire) {
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) return error.P3dGammaReadyTimeout;
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+
+    for (0..256) |_| {
+        const status = try axiRead(dut, REG_NORM_STATUS);
+        if (status & NORM_GAMMA_DONE != 0) {
+            if (status & (NORM_GAMMA_BUSY | NORM_GAMMA_ERROR) != 0 or
+                status & NORM_GAMMA_VALID == 0 or
+                try axiRead(dut, REG_QUANT_STATUS) != 0)
+                return error.P3dGammaStatusMismatch;
+            return;
+        }
+        dut.step();
+    }
+    return error.P3dGammaDoneTimeout;
+}
+
+fn verifyGammaOverlapRejection(
+    dut: *Dut,
+    rows: usize,
+    gamma_beats: []const u64,
+) !void {
+    if (gamma_beats.len != rows / 2) return error.P3dGammaShapeMismatch;
+    if (try axiRead(dut, REG_SCRATCH_STATUS) & SCRATCH_R_VALID == 0)
+        return error.P3dGammaOverlapRequiresResidentR;
+
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
+    axiWrite(dut, REG_NORM_CTRL, 1);
+    if (try axiRead(dut, REG_NORM_STATUS) & NORM_GAMMA_BUSY == 0)
+        return error.P3dGammaOverlapDidNotStart;
+
+    // R has valid metadata, so this drain would be legal except that gamma owns
+    // the shared activation interface. It must retire rejected without reading R.
+    configureScratch(dut, SCRATCH_MODE_DRAIN, SCRATCH_ROLE_R, rows, 1);
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_DRAIN_START);
+    var scratch_status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (scratch_status & (SCRATCH_DRAIN_DONE | SCRATCH_R_VALID) !=
+        (SCRATCH_DRAIN_DONE | SCRATCH_R_VALID) or
+        scratch_status & SCRATCH_DRAIN_BUSY != 0 or
+        try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_CONFIG == 0)
+        return error.P3dGammaOverlapDrainWasNotRejected;
+
+    // MODEL_ROWS=0 selects valid legacy CTRL.START/SECTION_BEGIN shapes. Both
+    // must fail closed while the gamma frame is still open.
+    axiWrite(dut, REG_MODEL_ROWS, 0);
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_R, rows, 1);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        rows / layout.Q1_BLOCK,
+        1,
+        WEIGHT_FMT_BINARY,
+        ACT_RAW_LOAD,
+        0xF15F_6A00,
+    );
+    if (try axiRead(dut, REG_STATUS) & 3 != 2 or
+        c.dut_dbg_ffn_lifecycle(dut.h) &
+            (DBG_FFN_ACTIVE | DBG_FFN_KERNEL_BUSY) != 0 or
+        c.dut_dbg_ffn_phase(dut.h) != 0)
+        return error.P3dGammaOverlapKernelStartWasNotRejected;
+
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    scratch_status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (scratch_status & SCRATCH_SECTION_ACTIVE != 0 or
+        scratch_status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+            (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+        c.dut_dbg_ffn_phase(dut.h) != 0)
+        return error.P3dGammaOverlapSectionBeginWasNotRejected;
+
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 1);
+    for (gamma_beats, 0..) |beat, index| {
+        var accepted = false;
+        for (0..256) |_| {
+            c.dut_set_a(
+                dut.h,
+                beat,
+                1,
+                @intFromBool(index + 1 == gamma_beats.len),
+            );
+            c.dut_eval(dut.h);
+            const owners = c.dut_dbg_shared_activation(dut.h);
+            if (owners & DBG_SHARED_GAMMA_BUSY == 0 or
+                owners & (DBG_SHARED_COMPUTE_VALID | DBG_SHARED_Q8_START |
+                    DBG_SHARED_KERNEL_START) != 0)
+                return error.P3dGammaOverlapSharedConsumerOpened;
+            if ((c.dut_a_ready(dut.h) != 0) !=
+                (owners & DBG_SHARED_GAMMA_READY != 0))
+                return error.P3dGammaOverlapReadyOwnerMismatch;
+            for (0..PORTS) |port| {
+                if (c.dut_w_ready(dut.h, @intCast(port)) != 0)
+                    return error.P3dGammaOverlapConsumedWeight;
+            }
+            if (c.dut_m_valid(dut.h) != 0 or
+                c.dut_dbg_ffn_lifecycle(dut.h) & DBG_FFN_KERNEL_BUSY != 0)
+                return error.P3dGammaOverlapOpenedKernelStream;
+            const fire = c.dut_a_ready(dut.h) != 0;
+            dut.step();
+            if (fire) {
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) return error.P3dGammaOverlapReadyTimeout;
+    }
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+
+    for (0..256) |_| {
+        const status = try axiRead(dut, REG_NORM_STATUS);
+        if (status & NORM_GAMMA_DONE != 0) {
+            if (status & (NORM_GAMMA_BUSY | NORM_GAMMA_ERROR) != 0 or
+                status & NORM_GAMMA_VALID == 0 or
+                try axiRead(dut, REG_W_BEATS) != 0 or
+                try axiRead(dut, REG_A_BEATS) != 0 or
+                try axiRead(dut, REG_R_BEATS) != 0)
+                return error.P3dGammaOverlapTerminalMismatch;
+            return;
+        }
+        dut.step();
+    }
+    return error.P3dGammaOverlapDoneTimeout;
+}
+
+fn rejectEarlyP3dGammaFrame(dut: *Dut, rows: usize, first_beat: u64) !void {
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
+    axiWrite(dut, REG_NORM_CTRL, 1);
+    var accepted = false;
+    for (0..256) |_| {
+        c.dut_set_a(dut.h, first_beat, 1, 1);
+        c.dut_eval(dut.h);
+        const fire = c.dut_a_ready(dut.h) != 0;
+        dut.step();
+        if (fire) {
+            accepted = true;
+            break;
+        }
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+    if (!accepted) return error.P3dGammaFaultReadyTimeout;
+
+    for (0..256) |_| {
+        const status = try axiRead(dut, REG_NORM_STATUS);
+        if (status & NORM_GAMMA_DONE != 0) {
+            if (status & NORM_GAMMA_ERROR == 0 or
+                status & (NORM_GAMMA_BUSY | NORM_GAMMA_VALID) != 0 or
+                try axiRead(dut, REG_NORM_ERROR) == 0)
+                return error.P3dGammaFaultStatusMismatch;
+            return;
+        }
+        dut.step();
+    }
+    return error.P3dGammaFaultDoneTimeout;
+}
+
+fn beginP3dSection(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    resident: bool,
+) !void {
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(model_rows));
+    axiWrite(dut, REG_NORM_EPS, 0x3586_37bd);
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    axiWrite(
+        dut,
+        REG_SCRATCH_CTRL,
+        SCRATCH_CTRL_SECTION_BEGIN |
+            (if (resident) SCRATCH_CTRL_RESIDENT_R else 0),
+    );
+    const scratch_status = try axiRead(dut, REG_SCRATCH_STATUS);
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (scratch_status & SCRATCH_SECTION_ACTIVE == 0 or
+        scratch_status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) != 0 or
+        norm_status & (NORM_BUSY | NORM_GAMMA_VALID) !=
+            (NORM_BUSY | NORM_GAMMA_VALID) or
+        norm_status & (NORM_DONE | NORM_ERROR | RESIDUAL_DONE |
+            RESIDUAL_ERROR) != 0)
+        return error.P3dSectionBeginRejected;
+    if (c.dut_dbg_ffn_phase(dut.h) != 1)
+        return error.P3dSectionBeginPhaseMismatch;
+    if (resident and c.dut_a_ready(dut.h) != 0)
+        return error.P3dResidentOpenedResidualIngress;
+}
+
+fn sendP3dResidual(dut: *Dut, residual_beats: []const u64) !void {
+    for (residual_beats, 0..) |beat, index| {
+        if (index % 7 == 3) {
+            c.dut_set_a(dut.h, 0, 0, 0);
+            dut.step();
+            dut.step();
+        }
+        var accepted = false;
+        for (0..256) |_| {
+            c.dut_set_a(
+                dut.h,
+                beat,
+                1,
+                @intFromBool(index + 1 == residual_beats.len),
+            );
+            c.dut_eval(dut.h);
+            if (c.dut_m_valid(dut.h) != 0)
+                return error.P3dResidualLoadExposedOutput;
+            const fire = c.dut_a_ready(dut.h) != 0;
+            dut.step();
+            if (fire) {
+                accepted = true;
+                break;
+            }
+        }
+        if (!accepted) return error.P3dResidualReadyTimeout;
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+}
+
+fn waitP3dTerminal(
+    dut: *Dut,
+    section_done: bool,
+    expected_error_mask: u32,
+) !void {
+    var terminal = false;
+    for (0..16384) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0)
+            return error.P3dFaultEscapedQuarantine;
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        if (lifecycle & (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP |
+            DBG_P3D_KILL | DBG_P3D_OUTER_OWNER_MASK |
+            DBG_P3D_SUBOWNER_MASK | DBG_P3D_RSP_VALID) == 0)
+        {
+            terminal = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!terminal) {
+        std.debug.print(
+            "P3d cleanup timeout: lifecycle=0x{x} phase={d} scratch=0x{x}/0x{x} norm=0x{x}/0x{x}\n",
+            .{
+                c.dut_dbg_p3d_lifecycle(dut.h),
+                c.dut_dbg_ffn_phase(dut.h),
+                try axiRead(dut, REG_SCRATCH_STATUS),
+                try axiRead(dut, REG_SCRATCH_ERROR),
+                try axiRead(dut, REG_NORM_STATUS),
+                try axiRead(dut, REG_NORM_ERROR),
+            },
+        );
+        return error.P3dFaultCleanupTimeout;
+    }
+
+    const scratch_status = try axiRead(dut, REG_SCRATCH_STATUS);
+    const scratch_error = try axiRead(dut, REG_SCRATCH_ERROR);
+    if ((scratch_status & SCRATCH_SECTION_DONE != 0) != section_done or
+        scratch_status & SCRATCH_SECTION_ACTIVE != 0 or
+        scratch_status & SCRATCH_R_VALID != 0 or
+        scratch_status & SCRATCH_ANY_ERROR == 0 or
+        scratch_error & expected_error_mask != expected_error_mask)
+        return error.P3dFaultTerminalStatusMismatch;
+}
+
+fn rejectEarlyP3dResidualFrame(dut: *Dut, first_beat: u64) !void {
+    var accepted = false;
+    for (0..256) |_| {
+        c.dut_set_a(dut.h, first_beat, 1, 1);
+        c.dut_eval(dut.h);
+        const fire = c.dut_a_ready(dut.h) != 0;
+        dut.step();
+        if (fire) {
+            accepted = true;
+            break;
+        }
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+    if (!accepted) return error.P3dResidualFrameReadyTimeout;
+    try waitP3dTerminal(
+        dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_RMS,
+    );
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (norm_status & (NORM_DONE | NORM_ERROR) !=
+        (NORM_DONE | NORM_ERROR) or
+        norm_status & (NORM_GAMMA_VALID | RESIDUAL_DONE |
+            RESIDUAL_ERROR) != 0 or
+        try axiRead(dut, REG_NORM_ERROR) == 0)
+        return error.P3dResidualFrameStatusMismatch;
+}
+
+fn abortP3dWithRetainedRmsResponse(dut: *Dut) !void {
+    var retained = false;
+    for (0..4096) |_| {
+        c.dut_eval(dut.h);
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        if (lifecycle & (DBG_P3D_OUTER_OWNER_MASK |
+            DBG_P3D_SUBOWNER_MASK | DBG_P3D_RSP_VALID) ==
+            (DBG_P3D_OUTER_OWNER | DBG_P3D_SUBOWNER_RMS |
+                DBG_P3D_RSP_VALID))
+        {
+            retained = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!retained) return error.P3dRetainedResponseTimeout;
+
+    axiWrite(dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT);
+    c.dut_eval(dut.h);
+    const aborted = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (aborted & (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL |
+        DBG_P3D_OUTER_OWNER_MASK | DBG_P3D_SUBOWNER_MASK |
+        DBG_P3D_RSP_VALID) !=
+        (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL |
+            DBG_P3D_OUTER_OWNER | DBG_P3D_SUBOWNER_RMS |
+            DBG_P3D_RSP_VALID))
+        return error.P3dAbortDidNotRetainResponse;
+
+    c.dut_set_p3d_read_response_hold(dut.h, 0);
+    try waitP3dTerminal(dut, false, SCRATCH_ERROR_ABORT);
+    if (try axiRead(dut, REG_NORM_STATUS) != NORM_GLOBAL_IDLE or
+        try axiRead(dut, REG_NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) != 0)
+        return error.P3dAbortStatusMismatch;
+}
+
 fn runScratchOnlyProjection(
     dut: *Dut,
     rows: usize,
@@ -964,6 +1362,97 @@ fn runStreamingGateProjection(
         .capture_fires = capture_fires,
         .phases_seen = phases_seen,
     };
+}
+
+fn faultP3dGateQ8(
+    dut: *Dut,
+    rows: usize,
+    tokens: usize,
+    epoch: u32,
+) !void {
+    try waitGateReady(dut);
+    configureScratch(dut, SCRATCH_MODE_ONLY, SCRATCH_ROLE_X0, rows, tokens);
+    c.dut_set_gate_q8_numeric_error(dut.h, 1);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_REUSE,
+        epoch,
+    );
+
+    var entered_cleanup = false;
+    for (0..128) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+            return error.P3dGateFaultExposedStream;
+        if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
+            entered_cleanup = true;
+            break;
+        }
+        dut.step();
+    }
+    c.dut_set_gate_q8_numeric_error(dut.h, 0);
+    if (!entered_cleanup) return error.P3dGateFaultDidNotTrigger;
+    try waitP3dTerminal(
+        dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_SWIGLU_Q8,
+    );
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (norm_status & (NORM_DONE | NORM_ERROR) !=
+        (NORM_DONE | NORM_ERROR) or
+        norm_status & (NORM_GAMMA_VALID | RESIDUAL_DONE |
+            RESIDUAL_ERROR) != 0 or
+        try axiRead(dut, REG_NORM_ERROR) & (1 << 27) == 0)
+        return error.P3dGateFaultStatusMismatch;
+    try expectPreservedP3dQuantStatus(dut);
+}
+
+fn expectPreservedP3dQuantStatus(dut: *Dut) !void {
+    const terminal = try axiRead(dut, REG_QUANT_STATUS);
+    if (terminal == 0) return error.P3dQuantFaultStatusMissing;
+    for (0..8) |_| dut.step();
+    if (try axiRead(dut, REG_QUANT_STATUS) != terminal)
+        return error.P3dQuantFaultStatusNotPreserved;
+}
+
+fn faultP3dRmsQ8(dut: *Dut, residual_beats: []const u64) !void {
+    try sendP3dResidual(dut, residual_beats);
+    if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_Q8_OWNER_MASK !=
+        DBG_P3D_Q8_OWNER_RMS)
+        return error.P3dRmsQ8OwnerMissing;
+
+    c.dut_set_gate_q8_numeric_error(dut.h, 1);
+    var entered_cleanup = false;
+    for (0..128) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0)
+            return error.P3dRmsQ8FaultExposedStream;
+        if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
+            entered_cleanup = true;
+            break;
+        }
+        dut.step();
+    }
+    c.dut_set_gate_q8_numeric_error(dut.h, 0);
+    if (!entered_cleanup) return error.P3dRmsQ8FaultDidNotTrigger;
+    try waitP3dTerminal(
+        dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_RMS,
+    );
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (norm_status & (NORM_DONE | NORM_ERROR) !=
+        (NORM_DONE | NORM_ERROR) or
+        norm_status & (NORM_GAMMA_VALID | RESIDUAL_DONE |
+            RESIDUAL_ERROR) != 0 or
+        try axiRead(dut, REG_NORM_ERROR) == 0)
+        return error.P3dRmsQ8FaultStatusMismatch;
+    try expectPreservedP3dQuantStatus(dut);
 }
 
 fn rejectDuplicateGateAtWaitDown(
@@ -1290,6 +1779,271 @@ fn runInternalDown(
     };
 }
 
+fn runP3dDown(
+    a: std.mem.Allocator,
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+) !InternalRun {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_D003,
+    );
+
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    const stream = try a.alloc(u8, model_rows * tokens * @sizeOf(f32));
+    errdefer a.free(stream);
+    var wi = [_]usize{0} ** PORTS;
+    var out_offset: usize = 0;
+    var saw_last = false;
+    var replay_fires: usize = 0;
+    var cycles: usize = 0;
+    const blocks = ffn_rows / shared_layout.q8_block;
+    const expected_records = blocks * tokens;
+
+    // M_AXIS is the private S2MM quarantine allocation for this section. Beats
+    // are tentative until the clean terminal status below; software discards
+    // the allocation after any section error.
+    for (0..CYCLE_LIMIT) |cycle| {
+        cycles = cycle + 1;
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(
+                dut.h,
+                @intCast(port),
+                &words,
+                @intFromBool(valid),
+            );
+        }
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        const ready = cycle % 17 < 9;
+        c.dut_set_m_ready(dut.h, @intFromBool(ready));
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0)
+            return error.P3dDownAcceptedExternalActivation;
+        if (c.dut_dbg_replay_fire(dut.h) != 0) replay_fires += 1;
+
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        if (c.dut_m_valid(dut.h) != 0 and ready) {
+            if (c.dut_m_keep(dut.h) != 0xff or
+                out_offset + 8 > stream.len)
+                return error.P3dDownFraming;
+            std.mem.writeInt(
+                u64,
+                stream[out_offset..][0..8],
+                c.dut_m_data(dut.h),
+                .little,
+            );
+            out_offset += 8;
+            if (c.dut_m_last(dut.h) != 0) {
+                if (saw_last or out_offset != stream.len)
+                    return error.P3dDownFraming;
+                saw_last = true;
+            }
+        }
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+        if (saw_last) break;
+    } else return error.P3dDownTimeout;
+
+    c.dut_set_a(dut.h, 0, 0, 0);
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    c.dut_set_m_ready(dut.h, 1);
+
+    var terminal = false;
+    for (0..512) |_| {
+        const status = try axiRead(dut, REG_SCRATCH_STATUS);
+        if (status & SCRATCH_SECTION_DONE != 0) {
+            terminal = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!terminal) return error.P3dCleanTerminalTimeout;
+    if (wi[0] != w_beats or replay_fires != expected_records * 5 or
+        !saw_last or out_offset != stream.len)
+        return error.P3dDownTraversalMismatch;
+
+    const scratch_status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (scratch_status & (SCRATCH_SECTION_DONE | SCRATCH_R_VALID) !=
+        (SCRATCH_SECTION_DONE | SCRATCH_R_VALID) or
+        scratch_status & (SCRATCH_SECTION_ACTIVE | SCRATCH_ANY_ERROR |
+            SCRATCH_X0_VALID | SCRATCH_X1_VALID | SCRATCH_CONSUMER_BUSY) != 0 or
+        try axiRead(dut, REG_SCRATCH_ERROR) != 0)
+    {
+        std.debug.print("P3d clean scratch status=0x{x} error=0x{x}\n", .{
+            scratch_status,
+            try axiRead(dut, REG_SCRATCH_ERROR),
+        });
+        return error.P3dCleanScratchStatusMismatch;
+    }
+
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    const expected_norm = NORM_GAMMA_DONE | NORM_GAMMA_VALID |
+        NORM_DONE | RESIDUAL_DONE | NORM_GLOBAL_IDLE;
+    if (norm_status != expected_norm or
+        try axiRead(dut, REG_NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) != 0)
+        return error.P3dCleanNormStatusMismatch;
+    return .{
+        .stream = stream,
+        .replay_fires = replay_fires,
+        .cycles = cycles,
+    };
+}
+
+fn faultP3dResidual(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    c.dut_set_residual_numeric_error(dut.h, 1);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_FA17,
+    );
+
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    var wi = [_]usize{0} ** PORTS;
+    var entered_cleanup = false;
+    for (0..CYCLE_LIMIT) |_| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(
+                dut.h,
+                @intCast(port),
+                &words,
+                @intFromBool(valid),
+            );
+        }
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        c.dut_set_m_ready(dut.h, 1);
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+            return error.P3dResidualFaultExposedStream;
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
+            entered_cleanup = true;
+            break;
+        }
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+    }
+
+    c.dut_set_residual_numeric_error(dut.h, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    if (!entered_cleanup) return error.P3dResidualFaultDidNotTrigger;
+    try waitP3dTerminal(
+        dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_RESIDUAL,
+    );
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (norm_status & (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) !=
+        (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) or
+        norm_status & (NORM_GAMMA_VALID | NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) == 0)
+        return error.P3dResidualFaultStatusMismatch;
+}
+
+fn faultP3dDownActivation(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_FA18,
+    );
+    c.dut_set_down_activation_error(dut.h, 1);
+
+    var entered_cleanup = false;
+    var saw_residual_start = false;
+    for (0..128) |_| {
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        c.dut_set_m_ready(dut.h, 1);
+        c.dut_eval(dut.h);
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        saw_residual_start = saw_residual_start or
+            lifecycle & DBG_P3D_RESIDUAL_STARTED != 0;
+        if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
+            return error.P3dDownActivationFaultExposedStream;
+        if (lifecycle & DBG_P3D_CLEANUP != 0) {
+            entered_cleanup = true;
+            break;
+        }
+        dut.step();
+    }
+
+    c.dut_set_down_activation_error(dut.h, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    if (!saw_residual_start) return error.P3dDownActivationDidNotStartResidual;
+    if (!entered_cleanup) return error.P3dDownActivationFaultDidNotTrigger;
+    try waitP3dTerminal(
+        dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_RESIDUAL,
+    );
+    const norm_status = try axiRead(dut, REG_NORM_STATUS);
+    if (norm_status & (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) !=
+        (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) or
+        norm_status & (NORM_GAMMA_VALID | NORM_ERROR) != 0 or
+        try axiRead(dut, REG_NORM_ERROR) != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) == 0)
+        return error.P3dDownActivationFaultStatusMismatch;
+}
+
 fn expectFfnResult(stream: []const u8, expected: []const f32, rows: usize, tokens: usize) !void {
     if (stream.len != rows * tokens * @sizeOf(f32) or expected.len != rows * tokens)
         return error.FfnSectionResultShapeMismatch;
@@ -1304,6 +2058,37 @@ fn expectFfnResult(stream: []const u8, expected: []const f32, rows: usize, token
             }
         }
     }
+}
+
+fn expectFfnChangedFromValues(
+    stream: []const u8,
+    baseline: []const f32,
+    rows: usize,
+    tokens: usize,
+) !void {
+    if (stream.len != rows * tokens * @sizeOf(f32) or
+        baseline.len != rows * tokens)
+        return error.FfnSectionResultShapeMismatch;
+    var changed = false;
+    var offset: usize = 0;
+    for (0..rows / ROWS) |rb| {
+        for (0..tokens) |token| {
+            for (0..ROWS) |lane| {
+                const got = std.mem.readInt(u32, stream[offset..][0..4], .little);
+                offset += 4;
+                const original: u32 =
+                    @bitCast(baseline[token * rows + rb * ROWS + lane]);
+                changed = changed or got != original;
+            }
+        }
+    }
+    if (!changed) return error.P3dNonzeroWeightsWerePassthrough;
+}
+
+fn expectFfnChangedFromStream(stream: []const u8, baseline: []const u8) !void {
+    if (stream.len != baseline.len) return error.FfnSectionResultShapeMismatch;
+    if (std.mem.eql(u8, stream, baseline))
+        return error.P3dNonzeroWeightsWerePassthrough;
 }
 
 fn runFfnSectionCase(a: std.mem.Allocator) !void {
@@ -1477,6 +2262,345 @@ fn runFfnSectionCase(a: std.mem.Allocator) !void {
         return error.FfnRestartTraversalMismatch;
     std.debug.print(
         "decode_top v16 GATE Q8 fault: error bits5/6 set, outstanding owner/orphan drained; no-reset restart completed bit-exact\n",
+        .{},
+    );
+}
+
+fn runP3dSectionCase(a: std.mem.Allocator) !void {
+    const model_rows: usize = 128;
+    const ffn_rows: usize = 128;
+    const tokens: usize = 1;
+    const q1_blocks: usize = 1;
+
+    var weight_bits: [3][model_rows]u128 = undefined;
+    var weight_scales: [3][model_rows]f16 = undefined;
+    const nonzero_scale: f16 = @floatCast(@as(f32, 1.0 / 128.0));
+    for (&weight_bits) |*projection| {
+        for (projection) |*bits| bits.* = ~@as(u128, 0);
+    }
+    for (&weight_scales) |*projection| {
+        for (projection) |*scale| scale.* = nonzero_scale;
+    }
+    var port_storage: [3][PORTS][]u8 = undefined;
+    var port_views: [3][PORTS][]const u8 = undefined;
+    for (0..3) |projection| {
+        for (0..PORTS) |port| {
+            port_storage[projection][port] = try a.alloc(
+                u8,
+                weightPortBytes(model_rows / ROWS, q1_blocks, WEIGHT_FMT_BINARY),
+            );
+            port_views[projection][port] = port_storage[projection][port];
+        }
+        packWeightPorts(
+            model_rows,
+            q1_blocks,
+            &weight_bits[projection],
+            &weight_scales[projection],
+            port_storage[projection],
+        );
+    }
+    defer {
+        for (&port_storage) |*projection| {
+            for (projection) |storage| a.free(storage);
+        }
+    }
+
+    var gamma = [_]f32{1.0} ** model_rows;
+    var gamma_beats: [model_rows / 2]u64 = undefined;
+    packRawF32(&gamma, &gamma_beats);
+    var residual: [tokens * model_rows]f32 = undefined;
+    for (&residual, 0..) |*value, index| {
+        const centered: i32 = @as(i32, @intCast(index % 31)) - 15;
+        value.* = @as(f32, @floatFromInt(centered)) * 0.03125;
+    }
+    var residual_beats: [residual.len / 2]u64 = undefined;
+    packRawF32(&residual, &residual_beats);
+
+    var dut = Dut.init();
+    defer dut.deinit();
+    reset(&dut);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_D001,
+        port_views[0],
+        &.{},
+    );
+    const gate = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_D001,
+        port_views[1],
+    );
+    const external = try runP3dDown(
+        a,
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    defer a.free(external.stream);
+    try expectFfnChangedFromValues(
+        external.stream,
+        &residual,
+        model_rows,
+        tokens,
+    );
+
+    // The clean section reseals the updated residual, so the next begin can
+    // validate and consume R without opening S_AXIS_ACTS.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, true);
+    c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+    for (0..32) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0)
+            return error.P3dResidentAcceptedResidual;
+        dut.step();
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_D002,
+        port_views[0],
+        &.{},
+    );
+    const resident_gate = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_D002,
+        port_views[1],
+    );
+    const resident = try runP3dDown(
+        a,
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    defer a.free(resident.stream);
+    try expectFfnChangedFromStream(resident.stream, external.stream);
+
+    const expected_records = tokens * ffn_rows / shared_layout.q8_block;
+    if (gate.record_fires != expected_records or
+        resident_gate.record_fires != expected_records or
+        external.replay_fires != expected_records * 5 or
+        resident.replay_fires != expected_records * 5)
+        return error.P3dTraversalMismatch;
+
+    try verifyGammaOverlapRejection(&dut, model_rows, &gamma_beats);
+
+    // Keep the later fault/restart checks numerically simple. The two clean
+    // sections above already proved all three nonzero projections contribute.
+    for (&weight_bits) |*projection| {
+        for (projection) |*bits| bits.* = 0;
+    }
+    for (&weight_scales) |*projection| {
+        for (projection) |*scale| scale.* = 0;
+    }
+    for (0..3) |projection| {
+        packWeightPorts(
+            model_rows,
+            q1_blocks,
+            &weight_bits[projection],
+            &weight_scales[projection],
+            port_storage[projection],
+        );
+    }
+
+    // Gamma framing is fail-closed, and an invalid table cannot begin a P3d
+    // section or open any stream.
+    try rejectEarlyP3dGammaFrame(&dut, model_rows, gamma_beats[0]);
+    axiWrite(&dut, REG_NORM_EPS, 0x3586_37bd);
+    configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    axiWrite(&dut, REG_SCRATCH_CTRL, SCRATCH_CTRL_SECTION_BEGIN);
+    var scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+    if (scratch_status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+        (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+        scratch_status & SCRATCH_SECTION_ACTIVE != 0 or
+        try axiRead(&dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_CONFIG == 0 or
+        try axiRead(&dut, REG_NORM_STATUS) & (NORM_DONE | NORM_ERROR) !=
+            (NORM_DONE | NORM_ERROR) or
+        c.dut_a_ready(dut.h) != 0)
+        return error.P3dInvalidGammaBeginDidNotFailClosed;
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // The section's external R frame is exact: an early TLAST faults RMS,
+    // invalidates both the tentative R seal and gamma, and drains to idle.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try rejectEarlyP3dResidualFrame(&dut, residual_beats[0]);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Both destinations of the sole Q8 ingress retain the terminal diagnostic
+    // across automatic P3d kill/cleanup, then clear it on the next gamma load.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try faultP3dRmsQ8(&dut, &residual_beats);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Inject a real child response error at the shared scratch boundary.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    c.dut_set_p3d_scratch_error(dut.h, 1);
+    try sendP3dResidual(&dut, &residual_beats);
+    var rms_fault = false;
+    for (0..16384) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0)
+            return error.P3dRmsScratchFaultExposedOutput;
+        if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
+            rms_fault = true;
+            break;
+        }
+        dut.step();
+    }
+    c.dut_set_p3d_scratch_error(dut.h, 0);
+    if (!rms_fault) return error.P3dRmsScratchFaultDidNotTrigger;
+    try waitP3dTerminal(
+        &dut,
+        true,
+        SCRATCH_ERROR_SECTION | SCRATCH_ERROR_RMS,
+    );
+    if (try axiRead(&dut, REG_NORM_STATUS) & (NORM_DONE | NORM_ERROR) !=
+        (NORM_DONE | NORM_ERROR) or
+        try axiRead(&dut, REG_NORM_ERROR) == 0)
+        return error.P3dRmsScratchFaultStatusMismatch;
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Fault the reused quantizer after a complete RMS+UP milestone.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_FA01,
+        port_views[0],
+        &.{},
+    );
+    try faultP3dGateQ8(&dut, ffn_rows, tokens, 0xF15F_FA01);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Reach DOWN cleanly, then make the first residual input non-finite. The
+    // raw DOWN beat and the leaf fault cycle are both suppressed from M_AXIS.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_FA02,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_FA02,
+        port_views[1],
+    );
+    try faultP3dResidual(
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Fault DOWN activation before the residual leaf can diagnose arithmetic.
+    // The controller must still publish a terminal residual error, and raw DOWN
+    // data must remain quarantined from M_AXIS.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_FA04,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_FA04,
+        port_views[1],
+    );
+    try faultP3dDownActivation(&dut, model_rows, ffn_rows, tokens);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Hold a real RMS response at the untagged scratch boundary while ABORT is
+    // accepted. Outer and P3d subownership must survive until response drain.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    c.dut_set_p3d_read_response_hold(dut.h, 1);
+    try sendP3dResidual(&dut, &residual_beats);
+    try abortP3dWithRetainedRmsResponse(&dut);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // No reset after any fault or the retained-response abort. A final exact
+    // external run proves all leaves, owners, seals, and Q8 state restart cleanly.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        0xF15F_FA03,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        0xF15F_FA03,
+        port_views[1],
+    );
+    const restarted = try runP3dDown(
+        a,
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    defer a.free(restarted.stream);
+    try expectFfnResult(restarted.stream, &residual, model_rows, tokens);
+    scratch_status = try axiRead(&dut, REG_SCRATCH_STATUS);
+    if (scratch_status & (SCRATCH_SECTION_DONE | SCRATCH_R_VALID) !=
+        (SCRATCH_SECTION_DONE | SCRATCH_R_VALID))
+        return error.P3dNoResetRestartDidNotResealR;
+    std.debug.print(
+        "decode_top v17 P3d 128x128x1: nonzero external/resident; gamma exclusion; RMS/GATE Q8 and section faults; no-reset restart exact\n",
         .{},
     );
 }
@@ -1666,7 +2790,7 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
 
     if (blocks == 2 and cols == 3) {
         reset(&dut);
-        if (try axiRead(&dut, 0x04) != 16) return error.ScratchVersionMismatch;
+        if (try axiRead(&dut, 0x04) != 17) return error.ScratchVersionMismatch;
 
         configureScratch(&dut, SCRATCH_MODE_TEE, SCRATCH_ROLE_X1, rows, cols);
         const tee_up = try runProjection(a, &dut, rows, rows, blocks, cols, weight_fmt, ACT_RAW_LOAD, epoch, ports_load, raw_beats, raw_beats.len, .none, true, false);
@@ -1786,5 +2910,6 @@ pub fn main() !void {
     try runRawResidentCase(a, false, 2, 3);
     try runRawResidentCase(a, true, 2, 3);
     try runFfnSectionCase(a);
+    try runP3dSectionCase(a);
     std.debug.print("all decode_top cosim cases passed (decode_top === windowedFixedOutput, bit-exact)\n", .{});
 }

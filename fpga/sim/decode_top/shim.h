@@ -41,7 +41,13 @@ uint32_t dut_dbg_capture_tag(Dut *);
 uint32_t dut_dbg_replay_tag(Dut *);
 uint32_t dut_dbg_ffn_lifecycle(Dut *);
 uint32_t dut_dbg_scratch_error(Dut *);
+uint32_t dut_dbg_p3d_lifecycle(Dut *);
+uint32_t dut_dbg_shared_activation(Dut *);
 void dut_set_gate_q8_numeric_error(Dut *, int);
+void dut_set_p3d_scratch_error(Dut *, int);
+void dut_set_residual_numeric_error(Dut *, int);
+void dut_set_down_activation_error(Dut *, int);
+void dut_set_p3d_read_response_hold(Dut *, int);
 
 #ifdef __cplusplus
 }

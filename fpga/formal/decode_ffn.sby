@@ -5,13 +5,13 @@ abort_cover
 
 [options]
 bmc: mode bmc
-bmc: depth 420
+bmc: depth 520
 clean_cover: mode cover
-clean_cover: depth 318
-clean_cover: skip 312
+clean_cover: depth 400
+clean_cover: skip 390
 abort_cover: mode cover
-abort_cover: depth 420
-abort_cover: skip 414
+abort_cover: depth 520
+abort_cover: skip 508
 
 [engines]
 bmc: abc bmc3
