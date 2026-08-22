@@ -156,6 +156,7 @@ module section_residual_add_formal(input wire clk);
         .busy(busy), .done(done), .error(error), .status(status),
         .s_axis_tdata(input_data), .s_axis_tkeep(8'hff),
         .s_axis_tvalid(input_valid), .s_axis_tready(input_ready),
+        .s_axis_tready_core(),
         .s_axis_tlast(input_last),
         .rd_req_valid(rd_req_valid), .rd_req_ready(request_ready),
         .rd_req_role(rd_req_role), .rd_req_token(rd_req_token),

@@ -33,6 +33,7 @@ module section_gate_packer (
     input  wire [7:0]    s_axis_tkeep,
     input  wire          s_axis_tvalid,
     output wire          s_axis_tready,
+    output wire          s_axis_tready_core,
     input  wire          s_axis_tlast,
 
     output wire [255:0]  m_axis_tdata,
@@ -83,8 +84,9 @@ module section_gate_packer (
 
     // Do not accept beyond the physical end of the run. Holding ingress while
     // a completed group is stalled also guarantees fail-closed output stability.
-    assign s_axis_tready = rst_n && busy_q && !abort_run &&
-                           !input_complete_q && output_slot_open;
+    assign s_axis_tready_core = rst_n && busy_q && !input_complete_q &&
+                                output_slot_open;
+    assign s_axis_tready = s_axis_tready_core && !abort_run;
     wire input_accept = s_axis_tvalid && s_axis_tready;
     wire expected_input_last =
         (rowblock_q + 1'b1 == run_rowblocks_q) &&
@@ -204,6 +206,8 @@ module section_gate_packer (
         f_past_valid <= 1'b1;
 
         if (rst_n) begin
+            assert(s_axis_tready ==
+                   (s_axis_tready_core && !abort_run));
             assert(rowblock_q < (run_rowblocks_q == 0 ? 10'd1 : run_rowblocks_q));
             assert(token_q < (run_tokens_q == 0 ? 3'd1 : run_tokens_q));
             assert(pair_q <= 3'd7);
@@ -216,6 +220,8 @@ module section_gate_packer (
                 assert(!m_axis_tvalid);
                 assert(!s_axis_tready);
             end
+            if (abort_run)
+                assert(!s_axis_tready && !m_axis_tvalid);
         end
 
         if (f_past_valid && rst_n && !abort_run &&

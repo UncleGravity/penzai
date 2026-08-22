@@ -39,6 +39,7 @@ module section_residual_add #(
     input  wire [7:0]    s_axis_tkeep,
     input  wire          s_axis_tvalid,
     output wire          s_axis_tready,
+    output wire          s_axis_tready_core,
     input  wire          s_axis_tlast,
 
     // Untagged shared-scratch group read. The requested role is always R.
@@ -144,7 +145,9 @@ module section_residual_add #(
     wire unexpected_rsp = orphan_rsp_present && !wrapper_idle;
     wire traffic_enable = rst_n && !abort_run && !unexpected_rsp;
 
-    assign s_axis_tready = traffic_enable && (state_q == ST_INPUT);
+    assign s_axis_tready_core = rst_n && !unexpected_rsp &&
+                                (state_q == ST_INPUT);
+    assign s_axis_tready = s_axis_tready_core && !abort_run;
     wire input_fire = s_axis_tvalid && s_axis_tready;
 
     wire [10:0] current_group =
@@ -399,6 +402,14 @@ module section_residual_add #(
 
     // Retain the latched shape through completion for formal/lint visibility.
     wire _unused_run_rows = &{1'b0, run_rows_q};
+
+`ifdef FORMAL
+    always @* begin
+        assert(s_axis_tready == (s_axis_tready_core && !abort_run));
+        if (abort_run)
+            assert(!s_axis_tready && !input_fire);
+    end
+`endif
 endmodule
 
 `default_nettype wire

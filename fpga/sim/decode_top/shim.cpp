@@ -224,6 +224,32 @@ uint32_t dut_dbg_p3d_q8_accounting(Dut *d) {
            (r->decode_top__DOT__p3d_q8_record_count_q << 8) |
            (r->decode_top__DOT__p3d_q8_record_expected_q << 18);
 }
+uint32_t dut_dbg_control_boundaries(Dut *d) {
+    auto *r = d->t->rootp;
+    return (r->decode_top__DOT__gamma_load_accept ? 1u : 0u) |
+           (r->decode_top__DOT__gamma_cfg_start_q ? 2u : 0u) |
+           (r->decode_top__DOT__gamma_cfg_fire ? 4u : 0u) |
+           (r->decode_top__DOT__rms_gamma_cfg_ready ? 8u : 0u) |
+           (r->decode_top__DOT__rms_gamma_busy ? 0x10u : 0u) |
+           (r->decode_top__DOT__gamma_load_busy ? 0x20u : 0u) |
+           (r->decode_top__DOT__rms_gamma_valid ? 0x40u : 0u) |
+           (r->decode_top__DOT__gamma_valid_live ? 0x80u : 0u) |
+           (r->decode_top__DOT__kernel_activation_abort_now ? 0x100u : 0u) |
+           (r->decode_top__DOT__kernel_activation_abort_q ? 0x200u : 0u) |
+           (r->decode_top__DOT__u_kernel__DOT__busy_q ? 0x400u : 0u) |
+           (d->t->s_axis_w0_tready ? 0x800u : 0u) |
+           (d->t->s_axis_acts_tready ? 0x1000u : 0u) |
+           (d->t->m_axis_tvalid ? 0x2000u : 0u) |
+           (r->decode_top__DOT__scratch_r_wr_valid ? 0x4000u : 0u) |
+           (r->decode_top__DOT__scratch_rd_req_accept ? 0x8000u : 0u) |
+           (r->decode_top__DOT__kernel_dbg_state << 16) |
+           (r->decode_top__DOT__activation_valid ? 0x100000u : 0u) |
+           (r->decode_top__DOT__activation_error ? 0x200000u : 0u) |
+           (r->decode_top__DOT__kernel_m_axis_tready_core ? 0x400000u : 0u) |
+           (r->decode_top__DOT__kernel_sink_accept ? 0x800000u : 0u) |
+           (r->decode_top__DOT__kernel_m_axis_tvalid_raw ? 0x1000000u : 0u) |
+           (r->decode_top__DOT__kernel_m_axis_tlast ? 0x2000000u : 0u);
+}
 void dut_set_gate_q8_numeric_error(Dut *d, int v) {
     d->t->sim_inject_q8_numeric_error = v;
 }

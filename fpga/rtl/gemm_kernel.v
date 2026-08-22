@@ -587,6 +587,12 @@ module gemm_kernel #(
                     end
                 endcase
                 end
+            end else if (activation_abort) begin
+                // A registered abort can arrive after ST_FINISH retired busy_q.
+                // The wrapper qualifies this pulse with prior-cycle busy, so it
+                // cannot manufacture an error for a genuinely idle abort.
+                activation_error <= 1'b1;
+                activation_valid <= 1'b0;
             end
         end
     end

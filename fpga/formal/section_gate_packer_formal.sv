@@ -115,6 +115,7 @@ module section_gate_packer_formal(input wire clk);
         .abort_run(abort_run), .busy(busy), .done(done), .error(error),
         .s_axis_tdata(s_axis_tdata), .s_axis_tkeep(s_axis_tkeep),
         .s_axis_tvalid(s_axis_tvalid), .s_axis_tready(s_axis_tready),
+        .s_axis_tready_core(),
         .s_axis_tlast(s_axis_tlast),
         .m_axis_tdata(m_axis_tdata), .m_axis_tvalid(m_axis_tvalid),
         .m_axis_tready(output_ready), .m_axis_tlast(m_axis_tlast),

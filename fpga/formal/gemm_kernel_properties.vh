@@ -135,6 +135,16 @@
                 assert(m_axis_tkeep == $past(m_axis_tkeep));
                 assert(m_axis_tlast == $past(m_axis_tlast));
             end
+            if (f_gemm_past_valid && $past(rst_n) &&
+                $past(activation_abort && !start_pulse)) begin
+                assert(!activation_valid);
+                assert(activation_error);
+            end
+            if (f_gemm_past_valid && $past(rst_n && busy_q &&
+                                           state == ST_ERROR)) begin
+                assert(kernel_done);
+                assert(!busy_q);
+            end
         end
 
 `ifndef GEMM_FORMAL_DISABLE_GENERIC_COVERS

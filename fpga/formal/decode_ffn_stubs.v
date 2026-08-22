@@ -144,6 +144,7 @@ module section_f32_scratch (
     output wire wr_busy, output reg wr_done, output reg wr_error,
     input wire [63:0] s_axis_tdata, input wire [7:0] s_axis_tkeep,
     input wire s_axis_tvalid, output wire s_axis_tready,
+    output wire s_axis_tready_core,
     input wire s_axis_tlast, output wire wr_commit_valid,
     output wire [1:0] wr_commit_bank, output wire [13:0] wr_commit_address,
     input wire r_wr_valid, output wire r_wr_ready,
@@ -163,7 +164,8 @@ module section_f32_scratch (
     reg [2:0] rd_delay_q;
     assign wr_cfg_ready = rst_n && !wr_busy_q && !wr_abort;
     assign wr_busy = wr_busy_q;
-    assign s_axis_tready = wr_busy_q && !wr_abort;
+    assign s_axis_tready_core = rst_n && wr_busy_q;
+    assign s_axis_tready = s_axis_tready_core && !wr_abort;
     assign wr_commit_valid = 1'b0;
     assign wr_commit_bank = 2'd0;
     assign wr_commit_address = 14'd0;
@@ -435,6 +437,7 @@ module section_residual_add (
     output reg [6:0] status,
     input wire [63:0] s_axis_tdata, input wire [7:0] s_axis_tkeep,
     input wire s_axis_tvalid, output wire s_axis_tready,
+    output wire s_axis_tready_core,
     input wire s_axis_tlast,
     output wire rd_req_valid, input wire rd_req_ready,
     output wire [1:0] rd_req_role, output wire [2:0] rd_req_token,
@@ -471,7 +474,8 @@ module section_residual_add (
     assign rd_req_group = beat_q[13:3];
     assign rd_rsp_ready = rst_n &&
                           (read_owned_q || (rd_rsp_valid && !busy));
-    assign s_axis_tready = (state_q == ST_INPUT) && !abort_run;
+    assign s_axis_tready_core = rst_n && (state_q == ST_INPUT);
+    assign s_axis_tready = s_axis_tready_core && !abort_run;
     assign r_wr_valid = (state_q == ST_WRITE) && !abort_run;
     assign r_wr_bank = beat_q[1:0];
     assign r_wr_address = beat_q[13:0];
@@ -658,6 +662,11 @@ module gemm_kernel #(
                         end
                     end
                 end
+            end else if (activation_abort) begin
+                // Match the real kernel when a registered abort follows a
+                // final output beat that retired busy_q in the prior cycle.
+                activation_error <= 1'b1;
+                activation_valid <= 1'b0;
             end
         end
     end

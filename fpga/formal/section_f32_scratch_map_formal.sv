@@ -80,6 +80,8 @@ module section_f32_scratch_map_formal(input wire clk);
     reg ref_rd_pending = 1'b0;
     reg [13:0] ref_rd_address = 14'd0;
     reg ref_rd_pending_error = 1'b0;
+    reg ref_prev_mem_write = 1'b0;
+    reg [13:0] ref_prev_mem_write_address = 14'd0;
     reg ref_rd_result_pending = 1'b0;
     reg ref_rd_result_error = 1'b0;
     reg ref_rsp_expected = 1'b0;
@@ -133,6 +135,7 @@ module section_f32_scratch_map_formal(input wire clk);
         .wr_busy(wr_busy), .wr_done(wr_done), .wr_error(wr_error),
         .s_axis_tdata(64'd0), .s_axis_tkeep(8'hff),
         .s_axis_tvalid(stream_valid), .s_axis_tready(s_axis_tready),
+        .s_axis_tready_core(),
 `ifdef MAP_PROVE
         .s_axis_tlast(1'b0),
 `else
@@ -184,7 +187,11 @@ module section_f32_scratch_map_formal(input wire clk);
             ref_rd_pending <= 1'b0;
             ref_rd_result_pending <= 1'b0;
             ref_rsp_expected <= 1'b0;
+            ref_prev_mem_write <= 1'b0;
         end else begin
+            ref_prev_mem_write <= wr_commit_valid;
+            if (wr_commit_valid)
+                ref_prev_mem_write_address <= wr_commit_address;
             ref_rsp_expected <= ref_rd_result_pending;
             if (ref_rd_result_pending)
                 ref_rsp_error <= ref_rd_result_error;
@@ -192,6 +199,9 @@ module section_f32_scratch_map_formal(input wire clk);
             ref_rd_result_pending <= ref_rd_pending;
             if (ref_rd_pending) begin
                 ref_rd_result_error <= ref_rd_pending_error ||
+                                       (ref_prev_mem_write &&
+                                        (ref_rd_address ==
+                                         ref_prev_mem_write_address)) ||
                                        (wr_commit_valid &&
                                         (ref_rd_address == wr_commit_address));
             end
@@ -199,10 +209,7 @@ module section_f32_scratch_map_formal(input wire clk);
             ref_rd_pending <= rd_issue_valid;
             if (rd_issue_valid) begin
                 ref_rd_address <= rd_issue_address;
-                ref_rd_pending_error <= rd_request_bad_ref ||
-                                        (wr_commit_valid &&
-                                         (rd_issue_address ==
-                                          wr_commit_address));
+                ref_rd_pending_error <= rd_request_bad_ref;
             end
 
             if (cfg_accept) begin
@@ -319,6 +326,8 @@ module section_f32_scratch_map_formal(input wire clk);
         cover(rst_n && rd_rsp_valid && !rd_rsp_ready);
         cover(rst_n && rd_issue_valid && wr_commit_valid &&
               rd_issue_address == wr_commit_address);
+        cover(rst_n && ref_rd_pending && wr_commit_valid &&
+              ref_rd_address == wr_commit_address);
     end
 endmodule
 

@@ -79,6 +79,7 @@ module section_f32_scratch_storage_formal(input wire clk);
         .wr_busy(wr_busy), .wr_done(wr_done), .wr_error(wr_error),
         .s_axis_tdata(stream_data), .s_axis_tkeep(8'hff),
         .s_axis_tvalid(stream_valid), .s_axis_tready(stream_ready),
+        .s_axis_tready_core(),
         .s_axis_tlast(stream_last),
         .wr_commit_valid(wr_commit_valid), .wr_commit_bank(wr_commit_bank),
         .wr_commit_address(wr_commit_address),

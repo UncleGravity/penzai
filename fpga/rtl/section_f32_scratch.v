@@ -37,6 +37,7 @@ module section_f32_scratch (
     input  wire [7:0]    s_axis_tkeep,
     input  wire          s_axis_tvalid,
     output wire          s_axis_tready,
+    output wire          s_axis_tready_core,
     input  wire          s_axis_tlast,
 
     // Accepted memory writes, exposed for section-control accounting/formal.
@@ -134,9 +135,10 @@ module section_f32_scratch (
 
     assign wr_cfg_ready = rst_n && !wr_busy_q && !wr_abort && !r_wr_valid;
     assign wr_busy      = wr_busy_q;
-    // Abort wins combinationally so a beat presented in the abort cycle is not
-    // accidentally committed before the controller observes completion.
-    assign s_axis_tready = rst_n && wr_busy_q && !wr_abort;
+    // The producer-facing core view excludes only abort quarantine. The actual
+    // leaf handshake remains fail-closed in the abort cycle.
+    assign s_axis_tready_core = rst_n && wr_busy_q;
+    assign s_axis_tready = s_axis_tready_core && !wr_abort;
 
     wire wr_accept = s_axis_tvalid && s_axis_tready;
     wire wr_final_rowblock = (wr_rowblock == run_rowblocks - 1'b1);
@@ -225,6 +227,8 @@ module section_f32_scratch (
     reg         rd_pending_q;
     reg [13:0]  rd_address_q;
     reg         rd_pending_error_q;
+    reg         rd_prev_mem_write_q;
+    reg [13:0]  rd_prev_mem_write_address_q;
     reg         rd_result_pending_q;
     reg         rd_result_error_q;
     reg         rd_rsp_valid_q;
@@ -246,8 +250,8 @@ module section_f32_scratch (
     assign rd_quiescent = rst_n && !rd_pending_q && !rd_result_pending_q &&
                           !rd_rsp_valid_q;
     wire rd_accept = rd_req_valid && rd_req_ready;
-    wire rd_accept_collision = rd_accept && !rd_request_bad && mem_write &&
-                               (rd_address == mem_write_address);
+    wire rd_accept_collision_deferred = rd_prev_mem_write_q &&
+        (rd_address_q == rd_prev_mem_write_address_q);
     wire rd_issue_collision = rd_pending_q &&
                               mem_write && (rd_address_q == mem_write_address);
 
@@ -303,8 +307,12 @@ module section_f32_scratch (
             rd_result_pending_q <= 1'b0;
             rd_rsp_valid_q  <= 1'b0;
             rd_rsp_error    <= 1'b0;
+            rd_prev_mem_write_q <= 1'b0;
         end else begin
             wr_done <= 1'b0;
+            rd_prev_mem_write_q <= mem_write;
+            if (mem_write)
+                rd_prev_mem_write_address_q <= mem_write_address;
 
             if (cfg_accept) begin
                 wr_error      <= !cfg_shape_ok;
@@ -366,14 +374,16 @@ module section_f32_scratch (
             if (rd_accept) begin
                 rd_pending_q       <= 1'b1;
                 rd_address_q       <= rd_address;
-                rd_pending_error_q <= rd_request_bad || rd_accept_collision;
+                rd_pending_error_q <= rd_request_bad;
             end else if (rd_pending_q) begin
                 rd_pending_q <= 1'b0;
             end
 
             if (rd_pending_q) begin
                 rd_result_pending_q <= 1'b1;
-                rd_result_error_q   <= rd_pending_error_q || rd_issue_collision;
+                rd_result_error_q   <= rd_pending_error_q ||
+                                       rd_accept_collision_deferred ||
+                                       rd_issue_collision;
             end else if (rd_result_pending_q) begin
                 rd_result_pending_q <= 1'b0;
             end
@@ -387,5 +397,13 @@ module section_f32_scratch (
             end
         end
     end
+
+`ifdef FORMAL
+    always @* begin
+        assert(s_axis_tready == (s_axis_tready_core && !wr_abort));
+        if (wr_abort)
+            assert(!s_axis_tready && !wr_commit_valid);
+    end
+`endif
 
 endmodule

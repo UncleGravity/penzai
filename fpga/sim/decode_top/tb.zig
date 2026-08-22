@@ -145,6 +145,37 @@ const DBG_SHARED_KERNEL_START: u32 = 1 << 2;
 const DBG_SHARED_GAMMA_BUSY: u32 = 1 << 3;
 const DBG_SHARED_GAMMA_READY: u32 = 1 << 6;
 
+const DBG_CTRL_GAMMA_ADMIT: u32 = 1 << 0;
+const DBG_CTRL_GAMMA_PENDING: u32 = 1 << 1;
+const DBG_CTRL_GAMMA_FIRE: u32 = 1 << 2;
+const DBG_CTRL_GAMMA_READY: u32 = 1 << 3;
+const DBG_CTRL_GAMMA_RAW_BUSY: u32 = 1 << 4;
+const DBG_CTRL_GAMMA_BUSY: u32 = 1 << 5;
+const DBG_CTRL_GAMMA_RAW_VALID: u32 = 1 << 6;
+const DBG_CTRL_GAMMA_VALID: u32 = 1 << 7;
+const DBG_CTRL_KERNEL_ABORT_NOW: u32 = 1 << 8;
+const DBG_CTRL_KERNEL_ABORT_Q: u32 = 1 << 9;
+const DBG_CTRL_KERNEL_BUSY: u32 = 1 << 10;
+const DBG_CTRL_WEIGHT_READY: u32 = 1 << 11;
+const DBG_CTRL_ACTS_READY: u32 = 1 << 12;
+const DBG_CTRL_OUTPUT_VALID: u32 = 1 << 13;
+const DBG_CTRL_SCRATCH_R_WRITE: u32 = 1 << 14;
+const DBG_CTRL_SCRATCH_READ_ACCEPT: u32 = 1 << 15;
+const DBG_CTRL_KERNEL_STATE_SHIFT: u5 = 16;
+const DBG_CTRL_KERNEL_STATE_MASK: u32 = 0xF << DBG_CTRL_KERNEL_STATE_SHIFT;
+const DBG_CTRL_ACTIVATION_VALID: u32 = 1 << 20;
+const DBG_CTRL_ACTIVATION_ERROR: u32 = 1 << 21;
+const DBG_CTRL_KERNEL_READY_CORE: u32 = 1 << 22;
+const DBG_CTRL_KERNEL_SINK_ACCEPT: u32 = 1 << 23;
+const DBG_CTRL_KERNEL_RAW_OUTPUT_VALID: u32 = 1 << 24;
+const DBG_CTRL_KERNEL_RAW_OUTPUT_LAST: u32 = 1 << 25;
+
+const KERNEL_ST_IDLE: u32 = 0;
+const KERNEL_ST_LOAD_ACTS: u32 = 1;
+const KERNEL_ST_WISSUE: u32 = 4;
+const KERNEL_ST_EMIT: u32 = 7;
+const KERNEL_ST_FINISH: u32 = 8;
+
 const DBG_LEGACY_BEGIN_OK: u32 = 1 << 0;
 const DBG_LEGACY_CFG_PENDING: u32 = 1 << 1;
 const DBG_LEGACY_CFG_FIRE: u32 = 1 << 2;
@@ -854,6 +885,258 @@ fn runTop(a: std.mem.Allocator, physical_rows: usize, logical_rows: usize, progr
     return result;
 }
 
+fn dbgKernelState(control: u32) u32 {
+    return (control & DBG_CTRL_KERNEL_STATE_MASK) >>
+        DBG_CTRL_KERNEL_STATE_SHIFT;
+}
+
+fn driveKernelBoundaryInputs(dut: *Dut, output_ready: bool) void {
+    var words = [_]u32{0x8000_0000} ** ROWS_PER_PORT;
+    for (0..PORTS) |port|
+        c.dut_set_w(dut.h, @intCast(port), &words, 1);
+    c.dut_set_a(dut.h, 0, 1, 0);
+    c.dut_set_m_ready(dut.h, @intFromBool(output_ready));
+}
+
+fn clearKernelBoundaryInputs(dut: *Dut) void {
+    var words = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port|
+        c.dut_set_w(dut.h, @intCast(port), &words, 0);
+    c.dut_set_a(dut.h, 0, 0, 0);
+    c.dut_set_m_ready(dut.h, 1);
+}
+
+fn abortPlainKernelAtState(
+    dut: *Dut,
+    target_state: u32,
+    epoch: u32,
+    live_final_emit: bool,
+) !void {
+    configureProjection(
+        dut,
+        ROWS,
+        ROWS,
+        1,
+        1,
+        WEIGHT_FMT_BINARY,
+        ACT_PACKED_LOAD,
+        epoch,
+    );
+    const output_ready = target_state != KERNEL_ST_EMIT or live_final_emit;
+    var reached = false;
+    for (0..4096) |_| {
+        driveKernelBoundaryInputs(dut, output_ready);
+        c.dut_eval(dut.h);
+        const control = c.dut_dbg_control_boundaries(dut.h);
+        if (dbgKernelState(control) == target_state) {
+            if (target_state == KERNEL_ST_EMIT and live_final_emit and
+                control & DBG_CTRL_KERNEL_RAW_OUTPUT_LAST == 0)
+            {
+                dut.step();
+                continue;
+            }
+            if (control & DBG_CTRL_KERNEL_BUSY == 0)
+                return error.KernelAbortTargetWasNotBusy;
+            if ((control & DBG_CTRL_KERNEL_READY_CORE != 0) != output_ready)
+                return error.KernelAbortReadyCoreMismatch;
+            if (target_state == KERNEL_ST_LOAD_ACTS and
+                control & DBG_CTRL_ACTS_READY == 0)
+                return error.KernelLoadActsBoundaryWasNotOpen;
+            if (target_state == KERNEL_ST_WISSUE and
+                control & DBG_CTRL_WEIGHT_READY == 0)
+                return error.KernelWeightIssueBoundaryWasNotOpen;
+            if (target_state == KERNEL_ST_EMIT and
+                control & (DBG_CTRL_OUTPUT_VALID |
+                    DBG_CTRL_KERNEL_RAW_OUTPUT_VALID) !=
+                    (DBG_CTRL_OUTPUT_VALID |
+                        DBG_CTRL_KERNEL_RAW_OUTPUT_VALID))
+                return error.KernelEmitBoundaryWasNotValid;
+            if (target_state == KERNEL_ST_EMIT and live_final_emit and
+                control & (DBG_CTRL_KERNEL_READY_CORE |
+                    DBG_CTRL_KERNEL_SINK_ACCEPT |
+                    DBG_CTRL_KERNEL_RAW_OUTPUT_LAST) !=
+                    (DBG_CTRL_KERNEL_READY_CORE |
+                        DBG_CTRL_KERNEL_SINK_ACCEPT |
+                        DBG_CTRL_KERNEL_RAW_OUTPUT_LAST))
+                return error.KernelFinalEmitBoundaryWasNotLive;
+            if (target_state == KERNEL_ST_FINISH and
+                control & DBG_CTRL_ACTIVATION_VALID == 0)
+                return error.KernelFinishBoundaryWasNotResident;
+            reached = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!reached) return error.KernelAbortTargetTimeout;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    var control = c.dut_dbg_control_boundaries(dut.h);
+    if (control & DBG_CTRL_KERNEL_ABORT_NOW == 0 or
+        control & DBG_CTRL_KERNEL_ABORT_Q != 0 or
+        control & (DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
+            DBG_CTRL_OUTPUT_VALID | DBG_CTRL_SCRATCH_R_WRITE |
+            DBG_CTRL_SCRATCH_READ_ACCEPT |
+            DBG_CTRL_KERNEL_SINK_ACCEPT) != 0)
+        return error.KernelAbortSameCycleQuarantineMismatch;
+    if (target_state == KERNEL_ST_EMIT and live_final_emit and
+        control & (DBG_CTRL_KERNEL_READY_CORE |
+            DBG_CTRL_KERNEL_RAW_OUTPUT_VALID |
+            DBG_CTRL_KERNEL_RAW_OUTPUT_LAST) !=
+            (DBG_CTRL_KERNEL_READY_CORE |
+                DBG_CTRL_KERNEL_RAW_OUTPUT_VALID |
+                DBG_CTRL_KERNEL_RAW_OUTPUT_LAST))
+        return error.KernelFinalEmitAbortDidNotPreserveCoreBoundary;
+
+    // Hold raw abort long enough to cross registered ingress, enter ST_ERROR,
+    // and retire it. A sticky section fault must not deadlock cleanup there.
+    var retired = false;
+    var checked_finish_abort_status = false;
+    for (0..8) |abort_cycle| {
+        dut.step();
+        control = c.dut_dbg_control_boundaries(dut.h);
+        if (abort_cycle == 0 and
+            control & DBG_CTRL_KERNEL_ABORT_Q == 0)
+            return error.KernelAbortWasNotRegistered;
+        if (abort_cycle == 0 and target_state == KERNEL_ST_EMIT and
+            live_final_emit and dbgKernelState(control) != KERNEL_ST_FINISH)
+            return error.KernelFinalEmitDidNotReachFinishUnderAbort;
+        if (target_state == KERNEL_ST_FINISH and
+            control & DBG_CTRL_KERNEL_ABORT_Q != 0 and
+            !checked_finish_abort_status)
+        {
+            if (try axiRead(dut, REG_ACT_STATE) != 2)
+                return error.KernelFinishAbortTransientStatusWasStale;
+            checked_finish_abort_status = true;
+            c.dut_eval(dut.h);
+            control = c.dut_dbg_control_boundaries(dut.h);
+        }
+        if (control & (DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
+            DBG_CTRL_OUTPUT_VALID | DBG_CTRL_SCRATCH_R_WRITE |
+            DBG_CTRL_SCRATCH_READ_ACCEPT |
+            DBG_CTRL_KERNEL_SINK_ACCEPT) != 0)
+            return error.KernelAbortHeldQuarantineMismatch;
+        if (control & DBG_CTRL_KERNEL_BUSY == 0 and
+            dbgKernelState(control) == KERNEL_ST_IDLE and
+            control & DBG_CTRL_KERNEL_ABORT_Q == 0)
+        {
+            retired = true;
+            break;
+        }
+    }
+    if (!retired) return error.KernelAbortHeldCleanupTimeout;
+    if (target_state == KERNEL_ST_FINISH and !checked_finish_abort_status)
+        return error.KernelFinishAbortTransientStatusWasNotChecked;
+    if (control & DBG_CTRL_ACTIVATION_VALID != 0 or
+        control & DBG_CTRL_ACTIVATION_ERROR == 0)
+        return error.KernelAbortActivationStateMismatch;
+    if (target_state == KERNEL_ST_EMIT and live_final_emit and
+        try axiRead(dut, REG_ACT_STATE) != 2)
+        return error.KernelFinalEmitAbortStatusWasNotPersistent;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    clearKernelBoundaryInputs(dut);
+    dut.step();
+}
+
+fn verifyKernelAbortBoundaries() !void {
+    var dut = Dut.init();
+    defer dut.deinit();
+    reset(&dut);
+
+    // A truly idle raw abort was ignored by the old direct kernel port and must
+    // neither create a delayed pulse nor poison an already-resident activation.
+    configureProjection(
+        &dut,
+        ROWS,
+        ROWS,
+        1,
+        1,
+        WEIGHT_FMT_BINARY,
+        ACT_PACKED_LOAD,
+        0xA807_0000,
+    );
+    var saw_resident = false;
+    var saw_busy = false;
+    for (0..4096) |_| {
+        driveKernelBoundaryInputs(&dut, true);
+        c.dut_eval(dut.h);
+        const control = c.dut_dbg_control_boundaries(dut.h);
+        saw_busy = saw_busy or control & DBG_CTRL_KERNEL_BUSY != 0;
+        if (saw_busy and control & DBG_CTRL_KERNEL_BUSY == 0 and
+            control & DBG_CTRL_ACTIVATION_VALID != 0 and
+            control & DBG_CTRL_ACTIVATION_ERROR == 0)
+        {
+            saw_resident = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!saw_resident) return error.IdleKernelAbortResidentSetupTimeout;
+    clearKernelBoundaryInputs(&dut);
+    dut.step();
+    const status_before_idle_abort = try axiRead(&dut, REG_STATUS);
+    const act_state_before_idle_abort = try axiRead(&dut, REG_ACT_STATE);
+    if (act_state_before_idle_abort != 1)
+        return error.IdleKernelAbortResidentSetupMismatch;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    for (0..3) |_| {
+        c.dut_eval(dut.h);
+        const control = c.dut_dbg_control_boundaries(dut.h);
+        if (control & DBG_CTRL_KERNEL_ABORT_NOW == 0 or
+            control & DBG_CTRL_ACTIVATION_VALID == 0 or
+            control & (DBG_CTRL_KERNEL_ABORT_Q | DBG_CTRL_KERNEL_BUSY |
+                DBG_CTRL_ACTIVATION_ERROR |
+                DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
+                DBG_CTRL_OUTPUT_VALID | DBG_CTRL_KERNEL_SINK_ACCEPT) != 0)
+            return error.IdleKernelAbortChangedState;
+        dut.step();
+    }
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    dut.step();
+    if (try axiRead(&dut, REG_STATUS) != status_before_idle_abort or
+        try axiRead(&dut, REG_ACT_STATE) != act_state_before_idle_abort)
+        return error.IdleKernelAbortChangedPublicStatus;
+
+    try abortPlainKernelAtState(&dut, KERNEL_ST_LOAD_ACTS, 0xA807_0001, false);
+    try abortPlainKernelAtState(&dut, KERNEL_ST_WISSUE, 0xA807_0002, false);
+    try abortPlainKernelAtState(&dut, KERNEL_ST_EMIT, 0xA807_0003, false);
+    try abortPlainKernelAtState(&dut, KERNEL_ST_EMIT, 0xA807_0004, true);
+    try abortPlainKernelAtState(&dut, KERNEL_ST_FINISH, 0xA807_0005, false);
+
+    if (try axiRead(&dut, REG_ACT_STATE) != 2)
+        return error.KernelFinishAbortStatusWasNotPublished;
+    configureProjection(
+        &dut,
+        ROWS,
+        ROWS,
+        1,
+        1,
+        WEIGHT_FMT_BINARY,
+        ACT_REUSE,
+        0xA807_0005,
+    );
+    clearKernelBoundaryInputs(&dut);
+    dut.step();
+    const reuse = c.dut_dbg_control_boundaries(dut.h);
+    if (reuse & (DBG_CTRL_ACTIVATION_VALID | DBG_CTRL_WEIGHT_READY |
+        DBG_CTRL_ACTS_READY | DBG_CTRL_OUTPUT_VALID) != 0 or
+        reuse & (DBG_CTRL_ACTIVATION_ERROR | DBG_CTRL_KERNEL_BUSY) !=
+            (DBG_CTRL_ACTIVATION_ERROR | DBG_CTRL_KERNEL_BUSY))
+        return error.KernelFinishAbortWasReusable;
+    dut.step();
+    if (c.dut_dbg_control_boundaries(dut.h) & DBG_CTRL_KERNEL_BUSY != 0)
+        return error.KernelBadReuseDidNotRetire;
+
+    std.debug.print(
+        "decode_top r7 kernel abort: idle unchanged; LOAD_ACTS/WISSUE/" ++
+            "stalled/live-final EMIT quarantined; held ERROR retired; " ++
+            "FINISH reuse rejected\n",
+        .{},
+    );
+}
+
 fn runCase(a: std.mem.Allocator, num_rb: usize, logical_rows_raw: ?usize, program_rows_raw: ?usize, blocks: usize, num_cols: usize, ternary: bool, seed: u64, note: []const u8) !void {
     const physical_rows = num_rb * ROWS;
     const logical_rows = logical_rows_raw orelse physical_rows;
@@ -979,10 +1262,54 @@ fn packRawF32(values: []const f32, beats: []u64) void {
     }
 }
 
+fn beginGammaLoadChecked(dut: *Dut) !void {
+    c.dut_eval(dut.h);
+    const before = c.dut_dbg_control_boundaries(dut.h);
+    if (before & (DBG_CTRL_GAMMA_BUSY | DBG_CTRL_GAMMA_RAW_BUSY |
+        DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE) != 0)
+        return error.P3dGammaBoundaryWasNotIdle;
+
+    c.dut_set_axi_write(dut.h, REG_NORM_CTRL, 1, 1);
+    dut.step();
+    dut.step();
+    const admitted = c.dut_dbg_control_boundaries(dut.h);
+    if (admitted & (DBG_CTRL_GAMMA_ADMIT | DBG_CTRL_GAMMA_READY) !=
+        (DBG_CTRL_GAMMA_ADMIT | DBG_CTRL_GAMMA_READY) or
+        admitted & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+            DBG_CTRL_GAMMA_RAW_BUSY | DBG_CTRL_GAMMA_BUSY) != 0 or
+        admitted & (DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID) !=
+            before & (DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID))
+        return error.P3dGammaAdmissionBoundaryMismatch;
+
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    const pending = c.dut_dbg_control_boundaries(dut.h);
+    if (pending & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+        DBG_CTRL_GAMMA_READY | DBG_CTRL_GAMMA_BUSY) !=
+        (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+            DBG_CTRL_GAMMA_READY | DBG_CTRL_GAMMA_BUSY) or
+        pending & (DBG_CTRL_GAMMA_RAW_BUSY | DBG_CTRL_GAMMA_VALID |
+            DBG_CTRL_ACTS_READY) != 0 or
+        pending & DBG_CTRL_GAMMA_RAW_VALID !=
+            before & DBG_CTRL_GAMMA_RAW_VALID)
+        return error.P3dGammaPendingBoundaryMismatch;
+
+    dut.step();
+    const started = c.dut_dbg_control_boundaries(dut.h);
+    if (started & (DBG_CTRL_GAMMA_RAW_BUSY | DBG_CTRL_GAMMA_BUSY |
+        DBG_CTRL_ACTS_READY) !=
+        (DBG_CTRL_GAMMA_RAW_BUSY | DBG_CTRL_GAMMA_BUSY |
+            DBG_CTRL_ACTS_READY) or
+        started & (DBG_CTRL_GAMMA_ADMIT | DBG_CTRL_GAMMA_PENDING |
+            DBG_CTRL_GAMMA_FIRE | DBG_CTRL_GAMMA_RAW_VALID |
+            DBG_CTRL_GAMMA_VALID) != 0)
+        return error.P3dGammaLeafBoundaryMismatch;
+}
+
 fn loadP3dGamma(dut: *Dut, rows: usize, gamma_beats: []const u64) !void {
     if (gamma_beats.len != rows / 2) return error.P3dGammaShapeMismatch;
     axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
-    axiWrite(dut, REG_NORM_CTRL, 1);
+    try beginGammaLoadChecked(dut);
 
     for (gamma_beats, 0..) |beat, index| {
         if (index % 5 == 2) {
@@ -1021,6 +1348,69 @@ fn loadP3dGamma(dut: *Dut, rows: usize, gamma_beats: []const u64) !void {
         dut.step();
     }
     return error.P3dGammaDoneTimeout;
+}
+
+fn abortGammaReplacementAtPending(dut: *Dut, rows: usize) !void {
+    axiWrite(dut, REG_MODEL_ROWS, @intCast(rows));
+    c.dut_eval(dut.h);
+    const before = c.dut_dbg_control_boundaries(dut.h);
+    if (before & (DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID) !=
+        (DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID) or
+        before & DBG_CTRL_GAMMA_BUSY != 0)
+        return error.P3dGammaReplacementRequiresValidTable;
+
+    c.dut_set_axi_write(dut.h, REG_NORM_CTRL, 1, 1);
+    dut.step();
+    dut.step();
+    const admitted = c.dut_dbg_control_boundaries(dut.h);
+    if (admitted & (DBG_CTRL_GAMMA_ADMIT | DBG_CTRL_GAMMA_READY |
+        DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID) !=
+        (DBG_CTRL_GAMMA_ADMIT | DBG_CTRL_GAMMA_READY |
+            DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID) or
+        admitted & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+            DBG_CTRL_GAMMA_BUSY) != 0)
+        return error.P3dGammaReplacementAdmissionMismatch;
+
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    const pending = c.dut_dbg_control_boundaries(dut.h);
+    if (pending & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+        DBG_CTRL_GAMMA_READY | DBG_CTRL_GAMMA_BUSY |
+        DBG_CTRL_GAMMA_RAW_VALID) !=
+        (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+            DBG_CTRL_GAMMA_READY | DBG_CTRL_GAMMA_BUSY |
+            DBG_CTRL_GAMMA_RAW_VALID) or
+        pending & (DBG_CTRL_GAMMA_VALID | DBG_CTRL_GAMMA_RAW_BUSY |
+            DBG_CTRL_ACTS_READY) != 0)
+        return error.P3dGammaReplacementPendingMismatch;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    const suppressed = c.dut_dbg_control_boundaries(dut.h);
+    if (suppressed & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_BUSY |
+        DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_KERNEL_ABORT_NOW) !=
+        (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_BUSY |
+            DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_KERNEL_ABORT_NOW) or
+        suppressed & (DBG_CTRL_GAMMA_FIRE | DBG_CTRL_GAMMA_VALID |
+            DBG_CTRL_KERNEL_ABORT_Q | DBG_CTRL_WEIGHT_READY |
+            DBG_CTRL_ACTS_READY | DBG_CTRL_OUTPUT_VALID |
+            DBG_CTRL_SCRATCH_R_WRITE | DBG_CTRL_SCRATCH_READ_ACCEPT) != 0)
+        return error.P3dGammaReplacementAbortDidNotQuarantine;
+
+    dut.step();
+    const cleared = c.dut_dbg_control_boundaries(dut.h);
+    if (cleared & (DBG_CTRL_GAMMA_PENDING | DBG_CTRL_GAMMA_FIRE |
+        DBG_CTRL_GAMMA_RAW_BUSY | DBG_CTRL_GAMMA_BUSY |
+        DBG_CTRL_GAMMA_RAW_VALID | DBG_CTRL_GAMMA_VALID |
+        DBG_CTRL_KERNEL_ABORT_Q | DBG_CTRL_SCRATCH_R_WRITE |
+        DBG_CTRL_SCRATCH_READ_ACCEPT) != 0)
+        return error.P3dGammaReplacementAbortWasNotCleared;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    c.dut_set_axi_idle(dut.h);
+    dut.step();
+    if (try axiRead(dut, REG_NORM_STATUS) != NORM_GLOBAL_IDLE)
+        return error.P3dGammaReplacementAbortStatusMismatch;
 }
 
 fn verifyGammaOverlapRejection(
@@ -2185,6 +2575,122 @@ fn runInternalDown(
     };
 }
 
+fn abortInternalDownAtKernelState(
+    dut: *Dut,
+    rows: usize,
+    ffn_dim: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+    target_state: u32,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+    configureProjection(
+        dut,
+        rows,
+        rows,
+        ffn_dim / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_A900 | target_state,
+    );
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    const expected_replays = ffn_dim / shared_layout.q8_block * tokens * 5;
+    var wi = [_]usize{0} ** PORTS;
+    var replay_fires: usize = 0;
+    const output_ready = target_state != KERNEL_ST_EMIT;
+    var reached = false;
+
+    for (0..CYCLE_LIMIT) |_| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(dut.h, @intCast(port), &words, @intFromBool(valid));
+        }
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        c.dut_set_m_ready(dut.h, @intFromBool(output_ready));
+        c.dut_eval(dut.h);
+        if (c.dut_a_ready(dut.h) != 0)
+            return error.InternalDownAbortAcceptedExternalActivation;
+        if (c.dut_dbg_replay_fire(dut.h) != 0)
+            replay_fires += 1;
+
+        const control = c.dut_dbg_control_boundaries(dut.h);
+        if (dbgKernelState(control) == target_state) {
+            if (control & DBG_CTRL_KERNEL_BUSY == 0 or
+                (target_state == KERNEL_ST_EMIT and
+                    control & DBG_CTRL_OUTPUT_VALID == 0) or
+                (target_state == KERNEL_ST_FINISH and
+                    (wi[0] != w_beats or replay_fires != expected_replays)))
+                return error.InternalDownAbortTargetMismatch;
+            reached = true;
+            break;
+        }
+
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+    }
+    if (!reached) return error.InternalDownAbortTargetTimeout;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 1);
+    c.dut_eval(dut.h);
+    var control = c.dut_dbg_control_boundaries(dut.h);
+    if (control & DBG_CTRL_KERNEL_ABORT_NOW == 0 or
+        control & DBG_CTRL_KERNEL_ABORT_Q != 0 or
+        control & (DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
+            DBG_CTRL_OUTPUT_VALID | DBG_CTRL_SCRATCH_R_WRITE |
+            DBG_CTRL_SCRATCH_READ_ACCEPT |
+            DBG_CTRL_KERNEL_SINK_ACCEPT) != 0)
+        return error.InternalDownAbortSameCycleQuarantineMismatch;
+    dut.step();
+
+    control = c.dut_dbg_control_boundaries(dut.h);
+    const lifecycle = c.dut_dbg_ffn_lifecycle(dut.h);
+    if (control & DBG_CTRL_KERNEL_ABORT_Q == 0 or
+        control & (DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
+            DBG_CTRL_OUTPUT_VALID | DBG_CTRL_KERNEL_SINK_ACCEPT) != 0 or
+        lifecycle & (DBG_FFN_ACTIVE | DBG_FFN_ABORT_CLEANUP) !=
+            (DBG_FFN_ACTIVE | DBG_FFN_ABORT_CLEANUP))
+        return error.InternalDownAbortRegisteredBoundaryMismatch;
+
+    c.dut_force_scratch_abort_strobe(dut.h, 0);
+    clearKernelBoundaryInputs(dut);
+    var retired = false;
+    for (0..256) |_| {
+        c.dut_eval(dut.h);
+        if (c.dut_m_valid(dut.h) != 0 or c.dut_a_ready(dut.h) != 0)
+            return error.InternalDownAbortCleanupExposedStream;
+        const state = c.dut_dbg_ffn_lifecycle(dut.h);
+        if (state & DBG_FFN_ACTIVE == 0) {
+            if (state & DBG_FFN_ABORT_CLEANUP != 0)
+                return error.InternalDownAbortCleanupOwnerMismatch;
+            retired = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!retired) return error.InternalDownAbortCleanupTimeout;
+
+    const status = try axiRead(dut, REG_SCRATCH_STATUS);
+    if (status & (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) !=
+        (SCRATCH_SECTION_DONE | SCRATCH_ANY_ERROR) or
+        status & SCRATCH_SECTION_ACTIVE != 0 or
+        try axiRead(dut, REG_SCRATCH_ERROR) & SCRATCH_ERROR_ABORT == 0 or
+        try axiRead(dut, REG_ACT_STATE) != 2)
+        return error.InternalDownAbortStatusMismatch;
+}
+
 fn runP3dDown(
     a: std.mem.Allocator,
     dut: *Dut,
@@ -2787,6 +3293,44 @@ fn runFfnSectionCase(a: std.mem.Allocator) !void {
         "decode_top v16 GATE Q8 fault: error bits5/6 set, outstanding owner/orphan drained; no-reset restart completed bit-exact\n",
         .{},
     );
+
+    // FINISH is exercised first so the following complete UP/GATE setup is a
+    // no-reset restart from the exact natural-done/registered-abort boundary.
+    for ([_]u32{ KERNEL_ST_FINISH, KERNEL_ST_EMIT }, 0..) |target, index| {
+        configureScratch(&dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_dim, tokens);
+        try beginLegacySectionChecked(&dut);
+        try runScratchOnlyProjection(
+            &dut,
+            ffn_dim,
+            q1_blocks,
+            tokens,
+            SCRATCH_ROLE_X1,
+            ACT_RAW_LOAD,
+            0xF15F_A900 + @as(u32, @intCast(index)),
+            port_views[0],
+            &raw_beats,
+        );
+        _ = try runStreamingGateProjection(
+            &dut,
+            ffn_dim,
+            tokens,
+            0xF15F_A900 + @as(u32, @intCast(index)),
+            port_views[1],
+        );
+        try abortInternalDownAtKernelState(
+            &dut,
+            model_dim,
+            ffn_dim,
+            tokens,
+            port_views[2],
+            target,
+        );
+    }
+    std.debug.print(
+        "decode_top r7 legacy DOWN: ST_FINISH clean publication blocked; " ++
+            "no-reset restart and stalled EMIT abort quarantined\n",
+        .{},
+    );
 }
 
 fn runP3dSectionCase(a: std.mem.Allocator) !void {
@@ -2842,6 +3386,10 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
     var dut = Dut.init();
     defer dut.deinit();
     reset(&dut);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+    try abortGammaReplacementAtPending(&dut, model_rows);
+    // No reset: the cancelled replacement must leave no stale pending pulse or
+    // public VALID, and a complete reload must own S_AXIS normally.
     try loadP3dGamma(&dut, model_rows, &gamma_beats);
 
     // Acceptance snapshots the section, but an abort in the following launch
@@ -3529,6 +4077,7 @@ pub fn main() !void {
 
     try verifyAbortDominatesCoencodedStarts();
     try verifyInternalModeRequiresSection();
+    try verifyKernelAbortBoundaries();
     try runCase(a, 1, null, null, 2, 1, false, 0x4101, "decode, 1 rb");
     try runCase(a, 2, null, null, 3, 3, false, 0x4102, "multi-rb prefill C=3");
     try runCase(a, 1, null, null, 4, 8, false, 0x4103, "prefill C=8 full bank");

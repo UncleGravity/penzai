@@ -182,12 +182,20 @@ module decode_top #(
     , output wire        formal_p3d_clean_complete
     , output wire        formal_gamma_busy
     , output wire        formal_gamma_valid
+    , output wire        formal_gamma_cfg_admit
+    , output wire        formal_gamma_cfg_pending
+    , output wire        formal_gamma_cfg_fire
+    , output wire        formal_gamma_cfg_ready
+    , output wire        formal_kernel_abort_now
+    , output wire        formal_kernel_abort_pending
+    , output wire        formal_kernel_busy
     , output wire        formal_rms_rd_req
     , output wire        formal_residual_rd_req
     , output wire        formal_rms_r_wr_valid
     , output wire        formal_residual_r_wr_valid
     , output wire        formal_scratch_r_wr_valid
     , output wire        formal_kernel_output_valid
+    , output wire        formal_kernel_sink_accept
     , output wire        formal_residual_output_valid
     , output wire        formal_r_valid
     , output wire        formal_norm_error
@@ -332,6 +340,7 @@ module decode_top #(
     reg [13:0] model_rows_q;
     reg [31:0] norm_eps_q;
     reg        norm_load_gamma_strobe;
+    reg        gamma_cfg_start_q /* verilator public_flat_rd */;
     reg [13:0] p3d_model_rows_q;
     reg [2:0]  p3d_tokens_q;
     reg [31:0] p3d_eps_q;
@@ -341,6 +350,7 @@ module decode_top #(
     reg        p3d_cleanup_q;
     reg        p3d_cleanup_is_abort_q;
     reg        p3d_kill_q;
+    reg        kernel_activation_abort_q /* verilator public_flat_rd */;
     reg        p3d_r_load_complete_q;
     reg [13:0] p3d_r_write_count_q;
     reg [13:0] p3d_r_write_expected_q;
@@ -392,17 +402,24 @@ module decode_top #(
     reg [31:0] cycle_count_q;
 
     wire kernel_busy;
+    wire [3:0] kernel_dbg_state /* verilator public_flat_rd */;
     wire kernel_done;
-    wire activation_error;
-    wire activation_valid;
+    wire kernel_done_healthy;
+    wire activation_error /* verilator public_flat_rd */;
+    wire activation_valid /* verilator public_flat_rd */;
+    wire activation_error_status;
+    wire activation_valid_status;
     wire [31:0] loaded_act_epoch;
     wire [15:0] loaded_act_q1_blocks;
     wire [15:0] loaded_act_cols;
     wire [5:0] quantizer_status;
     wire q8_activation_abort;
     wire q8_ingress_abort;
+    wire kernel_activation_abort_now /* verilator public_flat_rd */;
+    wire kernel_abort_window /* verilator public_flat_rd */;
     wire kernel_start /* verilator public_flat_rd */;
     wire weight_tready;
+    wire kernel_weight_tready_raw;
     wire weight_tvalid = s_axis_w0_tvalid && s_axis_w1_tvalid &&
                          s_axis_w2_tvalid && s_axis_w3_tvalid;
     wire [ROWS*32-1:0] weight_tdata = {
@@ -427,7 +444,8 @@ module decode_top #(
     wire native_acts_tvalid;
     wire native_acts_tready;
     wire raw_acts_tready;
-    wire kernel_acts_tready;
+    wire kernel_acts_tready /* verilator public_flat_rd */;
+    wire kernel_acts_tready_raw;
     wire swiglu_in_valid;
     wire swiglu_in_ready;
     wire [31:0] swiglu_in_gate;
@@ -440,13 +458,13 @@ module decode_top #(
     wire swiglu_out_last;
     wire [1:0] swiglu_out_status;
 
-    wire rms_gamma_cfg_ready;
+    wire rms_gamma_cfg_ready /* verilator public_flat_rd */;
     wire rms_gamma_tready /* verilator public_flat_rd */;
     wire rms_gamma_busy /* verilator public_flat_rd */;
     wire rms_gamma_done;
     wire rms_gamma_error;
     wire [3:0] rms_gamma_status;
-    wire rms_gamma_valid;
+    wire rms_gamma_valid /* verilator public_flat_rd */;
     wire rms_cfg_ready;
     wire rms_busy /* verilator public_flat_rd */;
     wire rms_done;
@@ -477,6 +495,7 @@ module decode_top #(
     wire residual_error;
     wire [6:0] residual_status;
     wire residual_s_axis_tready;
+    wire residual_s_axis_tready_core;
     wire residual_rd_req_valid;
     wire residual_rd_req_ready;
     wire [1:0] residual_rd_req_role;
@@ -496,13 +515,20 @@ module decode_top #(
     wire residual_m_axis_tlast;
 
     wire norm_global_idle;
-    wire gamma_load_accept;
+    wire gamma_load_accept /* verilator public_flat_rd */;
+    wire gamma_cfg_fire /* verilator public_flat_rd */;
     wire p3d_section_begin_ok /* verilator public_flat_rd */;
     wire p3d_fault_event;
-    // Gamma loading exclusively owns S_AXIS_ACTS.  Every compute launch and
-    // direct activation ingress uses this one predicate, so a busy loader can
-    // neither share a beat nor admit work which will consume a later beat.
-    wire shared_activation_idle = !rms_gamma_busy;
+    wire kernel_downstream_quarantine = kernel_abort_window ||
+                                        p3d_fault_event;
+    // Gamma admission immediately reserves S_AXIS_ACTS. The accepted command
+    // is held at a registered boundary until the RMS leaf accepts it.
+    wire gamma_load_busy /* verilator public_flat_rd */ =
+        gamma_cfg_start_q || rms_gamma_busy;
+    wire gamma_valid_live /* verilator public_flat_rd */ =
+        rms_gamma_valid && !gamma_cfg_start_q;
+    wire shared_activation_idle = !gamma_load_busy &&
+                                  !kernel_activation_abort_q;
     wire compute_s_axis_acts_tvalid /* verilator public_flat_rd */ =
         s_axis_acts_tvalid && shared_activation_idle;
 
@@ -520,6 +546,7 @@ module decode_top #(
                           !p3d_cleanup_q && !p3d_abort_now;
     wire qualified_kernel_start = kernel_start_q && !section_abort_now &&
                                   !ffn_fault_q && !p3d_kill_q &&
+                                  !kernel_activation_abort_q &&
                                   shared_activation_idle;
     wire q8_ingress_start /* verilator public_flat_rd */ =
                             shared_activation_idle &&
@@ -620,18 +647,20 @@ module decode_top #(
                                           !p3d_r_load_complete_q &&
                                           !p3d_cleanup_q &&
                                           shared_activation_idle;
-    assign s_axis_acts_tready = rms_gamma_busy ? rms_gamma_tready :
-                                (p3d_external_residual_ingress ?
-                                 rms_s_axis_tready :
-                                 (p3d_active_q ? 1'b0 :
-                                  (internal_activation_mode ? 1'b0 :
-                                   (raw_activation_mode ? raw_acts_tready :
-                                    kernel_acts_tready))));
+    assign s_axis_acts_tready = gamma_cfg_start_q ? 1'b0 :
+                                (rms_gamma_busy ? rms_gamma_tready :
+                                 (p3d_external_residual_ingress ?
+                                  rms_s_axis_tready :
+                                  (p3d_active_q ? 1'b0 :
+                                   (internal_activation_mode ? 1'b0 :
+                                    (raw_activation_mode ? raw_acts_tready :
+                                     kernel_acts_tready)))));
 
     wire [63:0] kernel_m_axis_tdata;
     wire        kernel_m_axis_tvalid;
-    wire        kernel_m_axis_tready;
-    wire        kernel_m_axis_tlast;
+    wire        kernel_m_axis_tvalid_raw /* verilator public_flat_rd */;
+    wire        kernel_m_axis_tready_core /* verilator public_flat_rd */;
+    wire        kernel_m_axis_tlast /* verilator public_flat_rd */;
     wire [7:0]  kernel_m_axis_tkeep;
 
     localparam [1:0] SCRATCH_MODE_DDR   = 2'd0;
@@ -657,6 +686,7 @@ module decode_top #(
     wire scratch_wr_done;
     wire scratch_wr_error;
     wire scratch_wr_tready;
+    wire scratch_wr_tready_core;
     wire scratch_wr_commit_valid;
     wire [1:0] scratch_wr_commit_bank;
     wire [13:0] scratch_wr_commit_address;
@@ -677,10 +707,13 @@ module decode_top #(
     wire gate_packer_busy;
     wire gate_packer_done;
     wire gate_packer_error;
+    wire gate_packer_s_axis_tready;
+    wire gate_packer_s_axis_tready_core;
     wire ffn_pairer_start_ready;
     wire ffn_pairer_busy;
     wire ffn_pairer_done;
     wire ffn_pairer_error;
+    wire ffn_pairer_s_axis_tready_core;
     wire q8_buffer_cfg_ready /* verilator public_flat_rd */;
     wire q8_buffer_seal_ready;
     wire q8_buffer_seal_done;
@@ -715,6 +748,8 @@ module decode_top #(
     assign gamma_load_accept = norm_load_gamma_strobe &&
                                !section_abort_now && norm_global_idle &&
                                rms_gamma_cfg_ready;
+    assign gamma_cfg_fire = gamma_cfg_start_q && !section_abort_now &&
+                            rms_gamma_cfg_ready;
     wire scratch_consumer_metadata_ok = scratch_valid_q[1] && scratch_valid_q[2] &&
                                         (scratch_valid_rows_q[1] == scratch_rows_q) &&
                                         (scratch_valid_rows_q[2] == scratch_rows_q) &&
@@ -860,7 +895,7 @@ module decode_top #(
                                   (scratch_mode_q == SCRATCH_MODE_DDR) &&
                                   scratch_section_shape_ok &&
                                   p3d_model_rows_ok && p3d_eps_ok &&
-                                  rms_gamma_valid &&
+                                  gamma_valid_live &&
                                   (gamma_sealed_rows_q == model_rows_q) &&
                                   rms_cfg_ready && q8_buffer_cfg_ready &&
                                   norm_global_idle &&
@@ -894,6 +929,7 @@ module decode_top #(
             ffn_down_start_q         <= 1'b0;
             p3d_leaf_start_q         <= 1'b0;
             legacy_q8_cfg_start_q    <= 1'b0;
+            gamma_cfg_start_q        <= 1'b0;
         end else begin
             kernel_start_q <= start_strobe && scratch_launch_ok &&
                               !section_abort_now && !ffn_fault_q;
@@ -912,31 +948,39 @@ module decode_top #(
                                 !section_abort_now && !ffn_fault_q;
             p3d_leaf_start_q <= p3d_section_begin_ok;
             legacy_q8_cfg_start_q <= legacy_section_begin_ok;
+            if (section_abort_now || gamma_cfg_fire)
+                gamma_cfg_start_q <= 1'b0;
+            else if (gamma_load_accept)
+                gamma_cfg_start_q <= 1'b1;
         end
     end
 
-    // Atomic fork: neither downstream observes TVALID unless the other is
-    // ready, and the kernel advances only when both accept on the same edge.
+    // In a live cycle this is an atomic fork: neither sink observes TVALID
+    // unless the other is ready, and the kernel advances with both accepts.
+    // Abort quarantine suppresses visible sinks. Core-ready may discard one or
+    // more tentative beats during diagnosis and raw-kill cycles until the
+    // registered kernel abort arrives.
     wire scratch_tee_active = scratch_tee_run_q;
     wire scratch_only_active = scratch_only_run_q;
     wire scratch_writer_active = scratch_tee_active || scratch_only_active;
-    wire scratch_sink_valid = scratch_writer_active && kernel_m_axis_tvalid &&
+    wire scratch_sink_valid = !kernel_downstream_quarantine &&
+                              scratch_writer_active && kernel_m_axis_tvalid &&
                               (scratch_only_active || m_axis_tready);
     wire ddr_kernel_valid = kernel_m_axis_tvalid && !scratch_only_active &&
                             !ffn_gate_run_q &&
                             !(p3d_active_q && p3d_residual_started_q) &&
                             (!scratch_tee_active || scratch_wr_tready);
-    wire gate_packer_s_axis_tready;
-    assign kernel_m_axis_tready = (p3d_active_q &&
-                                  p3d_residual_started_q) ?
-                                  (residual_s_axis_tready && !p3d_kill_q &&
-                                   !p3d_fault_event) :
-                                  (ffn_gate_run_q ? gate_packer_s_axis_tready :
-                                  (scratch_only_active ? scratch_wr_tready :
-                                  (scratch_tee_active ?
-                                   (m_axis_tready && scratch_wr_tready) :
-                                   (scratch_drain_busy_q ? 1'b0 :
-                                    m_axis_tready))));
+    wire gate_packer_s_axis_tvalid = !kernel_downstream_quarantine &&
+                                     ffn_gate_run_q &&
+                                     kernel_m_axis_tvalid;
+    assign kernel_m_axis_tready_core =
+        (p3d_active_q && p3d_residual_started_q) ?
+            residual_s_axis_tready_core :
+        (ffn_gate_run_q ? gate_packer_s_axis_tready_core :
+        (scratch_only_active ? scratch_wr_tready_core :
+        (scratch_tee_active ?
+            (m_axis_tready && scratch_wr_tready_core) :
+        (scratch_drain_busy_q ? 1'b0 : m_axis_tready))));
 
     wire scratch_writer_abort = section_abort_now || p3d_kill_q ||
                                 (scratch_writer_active &&
@@ -965,12 +1009,13 @@ module decode_top #(
         .error(gate_packer_error),
         .s_axis_tdata(kernel_m_axis_tdata),
         .s_axis_tkeep(kernel_m_axis_tkeep),
-        .s_axis_tvalid(ffn_gate_run_q && kernel_m_axis_tvalid),
+        .s_axis_tvalid(gate_packer_s_axis_tvalid),
         .s_axis_tready(gate_packer_s_axis_tready),
+        .s_axis_tready_core(gate_packer_s_axis_tready_core),
         .s_axis_tlast(kernel_m_axis_tlast),
         .m_axis_tdata(gate_packer_m_axis_tdata),
         .m_axis_tvalid(gate_packer_m_axis_tvalid),
-        .m_axis_tready(gate_packer_m_axis_tready),
+        .m_axis_tready(ffn_pairer_s_axis_tready_core),
         .m_axis_tlast(gate_packer_m_axis_tlast),
         .m_axis_token(gate_packer_m_axis_token),
         .m_axis_block(gate_packer_m_axis_block),
@@ -1004,6 +1049,7 @@ module decode_top #(
         .s_axis_tdata(gate_packer_m_axis_tdata),
         .s_axis_tvalid(gate_packer_m_axis_tvalid),
         .s_axis_tready(gate_packer_m_axis_tready),
+        .s_axis_tready_core(ffn_pairer_s_axis_tready_core),
         .s_axis_tlast(gate_packer_m_axis_tlast),
         .s_axis_token(gate_packer_m_axis_token),
         .s_axis_block(gate_packer_m_axis_block),
@@ -1029,8 +1075,11 @@ module decode_top #(
     wire residual_write_phase = p3d_active_q && p3d_residual_started_q &&
                                 !p3d_cleanup_q;
     wire p3d_write_conflict = rms_r_wr_valid && residual_r_wr_valid;
-    wire scratch_r_wr_valid = (rms_write_phase && rms_r_wr_valid) ||
-                              (residual_write_phase && residual_r_wr_valid);
+    wire r_write_quarantine = p3d_kill_q || kernel_activation_abort_q;
+    wire scratch_r_wr_valid /* verilator public_flat_rd */ =
+                              !r_write_quarantine &&
+                              ((rms_write_phase && rms_r_wr_valid) ||
+                               (residual_write_phase && residual_r_wr_valid));
     wire scratch_r_wr_ready;
     wire scratch_r_wr_error;
     wire [1:0] scratch_r_wr_bank = rms_write_phase ? rms_r_wr_bank :
@@ -1040,18 +1089,19 @@ module decode_top #(
                                         residual_r_wr_address;
     wire [63:0] scratch_r_wr_data = rms_write_phase ? rms_r_wr_data :
                                       residual_r_wr_data;
-    assign rms_r_wr_ready = rms_write_phase && !residual_r_wr_valid &&
-                            scratch_r_wr_ready;
-    assign residual_r_wr_ready = residual_write_phase && !rms_r_wr_valid &&
+    assign rms_r_wr_ready = !r_write_quarantine && rms_write_phase &&
+                            !residual_r_wr_valid && scratch_r_wr_ready;
+    assign residual_r_wr_ready = !r_write_quarantine &&
+                                 residual_write_phase && !rms_r_wr_valid &&
                                  scratch_r_wr_ready;
 
     section_rmsnorm_scalar_pipeline u_section_rmsnorm_scalar_pipeline (
         .clk(clk),
         .rst_n(rst_n),
         .abort_run(p3d_abort_now),
-        .gamma_cfg_valid(gamma_load_accept),
+        .gamma_cfg_valid(gamma_cfg_fire),
         .gamma_cfg_ready(rms_gamma_cfg_ready),
-        .gamma_cfg_rows(model_rows_q),
+        .gamma_cfg_rows(gamma_load_rows_q),
         .gamma_tdata(s_axis_acts_tdata),
         .gamma_tkeep(s_axis_acts_tkeep),
         .gamma_tvalid(s_axis_acts_tvalid && rms_gamma_busy),
@@ -1105,6 +1155,10 @@ module decode_top #(
     );
 
     wire residual_cfg_valid = p3d_active_q && ffn_down_start_q;
+    wire residual_s_axis_tvalid = p3d_active_q &&
+                                  p3d_residual_started_q &&
+                                  !kernel_downstream_quarantine &&
+                                  kernel_m_axis_tvalid;
     section_residual_add u_section_residual_add (
         .clk(clk),
         .rst_n(rst_n),
@@ -1124,10 +1178,9 @@ module decode_top #(
 `endif
             kernel_m_axis_tdata),
         .s_axis_tkeep(kernel_m_axis_tkeep),
-        .s_axis_tvalid(p3d_active_q && p3d_residual_started_q &&
-                       !p3d_kill_q && !p3d_fault_event &&
-                       kernel_m_axis_tvalid),
+        .s_axis_tvalid(residual_s_axis_tvalid),
         .s_axis_tready(residual_s_axis_tready),
+        .s_axis_tready_core(residual_s_axis_tready_core),
         .s_axis_tlast(kernel_m_axis_tlast),
         .rd_req_valid(residual_rd_req_valid),
         .rd_req_ready(residual_rd_req_ready),
@@ -1171,6 +1224,7 @@ module decode_top #(
         .s_axis_tkeep(kernel_m_axis_tkeep),
         .s_axis_tvalid(scratch_sink_valid),
         .s_axis_tready(scratch_wr_tready),
+        .s_axis_tready_core(scratch_wr_tready_core),
         .s_axis_tlast(kernel_m_axis_tlast),
         .wr_commit_valid(scratch_wr_commit_valid),
         .wr_commit_bank(scratch_wr_commit_bank),
@@ -1194,6 +1248,13 @@ module decode_top #(
         .rd_rsp_data(scratch_rd_rsp_data),
         .rd_rsp_error(scratch_rd_rsp_error)
     );
+
+    wire kernel_sink_accept /* verilator public_flat_rd */ =
+        (scratch_sink_valid && scratch_wr_tready) ||
+        (gate_packer_s_axis_tvalid && gate_packer_s_axis_tready) ||
+        (residual_s_axis_tvalid && residual_s_axis_tready) ||
+        (residual_m_axis_tvalid && residual_m_axis_tready) ||
+        (m_axis_tvalid && m_axis_tready);
 
     // Canonical drain walks [token][group][bank0..3].  One 256-bit memory read
     // is copied into a no-reset group register, then a local 64-bit register
@@ -1315,7 +1376,8 @@ module decode_top #(
                 residual_rd_rsp_ready : scratch_rd_rsp_valid) :
         scratch_rd_rsp_valid;
 
-    wire scratch_rd_req_accept = scratch_rd_req_valid && scratch_rd_req_ready;
+    wire scratch_rd_req_accept /* verilator public_flat_rd */ =
+                               scratch_rd_req_valid && scratch_rd_req_ready;
     wire scratch_rd_rsp_accept = scratch_rd_rsp_valid && scratch_rd_rsp_ready;
     always @(posedge clk) begin
         if (!rst_n) begin
@@ -1448,17 +1510,17 @@ module decode_top #(
     wire p3d_residual_output_selected = p3d_active_q &&
                                         p3d_residual_started_q;
     assign residual_m_axis_tready = p3d_residual_output_selected &&
-                                    !p3d_kill_q && !p3d_fault_event &&
+                                    !kernel_downstream_quarantine &&
                                     m_axis_tready;
     assign m_axis_tdata  = p3d_residual_output_selected ?
                            residual_m_axis_tdata :
                            (scratch_drain_busy_q ? scratch_drain_emit_data_q :
                             kernel_m_axis_tdata);
-    assign m_axis_tvalid = p3d_residual_output_selected ?
-                           (residual_m_axis_tvalid && !p3d_kill_q &&
-                            !p3d_fault_event) :
-                           (scratch_drain_busy_q ? scratch_drain_tvalid :
-                            ddr_kernel_valid);
+    assign m_axis_tvalid = !kernel_downstream_quarantine &&
+                           (p3d_residual_output_selected ?
+                            residual_m_axis_tvalid :
+                            (scratch_drain_busy_q ? scratch_drain_tvalid :
+                             ddr_kernel_valid));
     assign m_axis_tlast  = p3d_residual_output_selected ?
                            residual_m_axis_tlast :
                            (scratch_drain_busy_q ? scratch_drain_tlast :
@@ -1564,6 +1626,31 @@ module decode_top #(
         1'b0;
 `endif
 
+    assign kernel_activation_abort_now =
+        kernel_section_abort || q8_activation_abort || q8_ingress_abort ||
+        sim_down_activation_abort ||
+        (scratch_writer_active && section_abort_now) ||
+        (scratch_consumer_busy_q && section_abort_now);
+    assign kernel_abort_window = kernel_activation_abort_now ||
+                                 kernel_activation_abort_q;
+    assign activation_error_status = activation_error ||
+                                     kernel_activation_abort_q;
+    assign activation_valid_status = activation_valid &&
+                                     !kernel_activation_abort_q;
+    assign weight_tready = kernel_weight_tready_raw && !kernel_abort_window;
+    assign kernel_acts_tready = kernel_acts_tready_raw &&
+                                !kernel_abort_window;
+    assign kernel_m_axis_tvalid = kernel_m_axis_tvalid_raw &&
+                                  !kernel_abort_window;
+    assign kernel_done_healthy = kernel_done && !kernel_abort_window;
+    always @(posedge clk) begin
+        if (!rst_n)
+            kernel_activation_abort_q <= 1'b0;
+        else
+            kernel_activation_abort_q <= kernel_activation_abort_now &&
+                                         kernel_busy;
+    end
+
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(512)) u_kernel (
         .clk(clk),
         .rst_n(rst_n),
@@ -1575,11 +1662,7 @@ module decode_top #(
         .weight_fmt(weight_fmt_q),
         .act_mode(ffn_down_start_q ? 2'd0 : act_mode_q),
         .act_epoch(act_epoch_q),
-        .activation_abort(kernel_section_abort || q8_activation_abort ||
-                          q8_ingress_abort ||
-                          sim_down_activation_abort ||
-                          (scratch_writer_active && section_abort_now) ||
-                          (scratch_consumer_busy_q && section_abort_now)),
+        .activation_abort(kernel_activation_abort_q),
         .emin(EMIN_FLOOR),
         .kernel_done(kernel_done),
         .activation_error(activation_error),
@@ -1589,17 +1672,19 @@ module decode_top #(
         .loaded_act_cols(loaded_act_cols),
         .busy(kernel_busy),
         .s_axis_tdata(weight_tdata),
-        .s_axis_tvalid(weight_tvalid),
-        .s_axis_tready(weight_tready),
+        .s_axis_tvalid(weight_tvalid && !kernel_activation_abort_q),
+        .s_axis_tready(kernel_weight_tready_raw),
         .s_axis_acts_tdata(kernel_acts_tdata),
-        .s_axis_acts_tvalid(kernel_acts_tvalid),
-        .s_axis_acts_tready(kernel_acts_tready),
+        .s_axis_acts_tvalid(kernel_acts_tvalid &&
+                            !kernel_activation_abort_q),
+        .s_axis_acts_tready(kernel_acts_tready_raw),
         .m_axis_tdata(kernel_m_axis_tdata),
-        .m_axis_tvalid(kernel_m_axis_tvalid),
-        .m_axis_tready(kernel_m_axis_tready),
+        .m_axis_tvalid(kernel_m_axis_tvalid_raw),
+        .m_axis_tready(kernel_m_axis_tready_core &&
+                       !kernel_activation_abort_q),
         .m_axis_tlast(kernel_m_axis_tlast),
         .m_axis_tkeep(kernel_m_axis_tkeep),
-        .dbg_state()
+        .dbg_state(kernel_dbg_state)
     );
 
     wire p3d_cleanup_resources_idle = !rms_busy && !residual_busy &&
@@ -1619,9 +1704,11 @@ module decode_top #(
     wire p3d_clean_complete = (ffn_phase_q == FFN_DOWN_RUN) &&
                                p3d_active_q && residual_done &&
                                !residual_error &&
-                               (ffn_down_kernel_done_q || kernel_done) &&
+                               (ffn_down_kernel_done_q ||
+                                kernel_done_healthy) &&
                                ffn_replay_complete_q && !activation_error &&
-                               !ffn_fault_q && !p3d_fault_event;
+                               !ffn_fault_q && !p3d_fault_event &&
+                               !kernel_abort_window;
 
     // Scratch lifecycle and ownership.  Configuration registers remain writable,
     // but every accepted operation runs exclusively from these snapshots.
@@ -1753,7 +1840,7 @@ module decode_top #(
                     scratch_error_q[1] <= 1'b1;
                 end
             end
-            if (kernel_done) begin
+            if (kernel_done_healthy) begin
                 scratch_tee_run_q <= 1'b0;
                 scratch_only_run_q <= 1'b0;
             end
@@ -1774,7 +1861,7 @@ module decode_top #(
                 ffn_seal_pending_q       <= 1'b0;
             end
 
-            if ((ffn_phase_q == FFN_UP_RUN) && kernel_done) begin
+            if ((ffn_phase_q == FFN_UP_RUN) && kernel_done_healthy) begin
                 if (activation_error ||
                     !(scratch_valid_q[2] ||
                       (scratch_wr_done && scratch_writer_active &&
@@ -1789,11 +1876,12 @@ module decode_top #(
             end
 
             if (p3d_active_q && (ffn_phase_q == FFN_UP_RUN) &&
-                p3d_up_kernel_done_q && p3d_norm_seal_event)
+                p3d_up_kernel_done_q && p3d_norm_seal_event &&
+                !kernel_abort_window)
                 ffn_phase_q <= FFN_WAIT_GATE;
 
             if (ffn_phase_q == FFN_GATE_RUN) begin
-                if (kernel_done) begin
+                if (kernel_done_healthy) begin
                     ffn_gate_kernel_done_q <= 1'b1;
                     ffn_gate_run_q <= 1'b0;
                 end
@@ -1828,11 +1916,11 @@ module decode_top #(
                     end
                 end
 
-                if ((ffn_gate_kernel_done_q || kernel_done) &&
+                if ((ffn_gate_kernel_done_q || kernel_done_healthy) &&
                     (ffn_gate_packer_done_q || gate_packer_done) &&
                     (ffn_gate_pairer_done_q || ffn_pairer_done) &&
                     ffn_capture_complete_q && !section_fault_event &&
-                    !ffn_fault_q) begin
+                    !ffn_fault_q && !kernel_abort_window) begin
                     ffn_phase_q <= FFN_SEAL;
                     ffn_seal_pending_q <= 1'b1;
                     ffn_gate_run_q <= 1'b0;
@@ -1865,7 +1953,7 @@ module decode_top #(
                 ffn_down_kernel_done_q  <= 1'b0;
             end
 
-            if ((ffn_phase_q == FFN_DOWN_RUN) && kernel_done)
+            if ((ffn_phase_q == FFN_DOWN_RUN) && kernel_done_healthy)
                 ffn_down_kernel_done_q <= 1'b1;
 
             if ((ffn_phase_q == FFN_DOWN_RUN) && q8_buffer_rd_req_valid &&
@@ -1894,9 +1982,9 @@ module decode_top #(
             end
 
             if ((ffn_phase_q == FFN_DOWN_RUN) && !p3d_active_q &&
-                (ffn_down_kernel_done_q || kernel_done) &&
+                (ffn_down_kernel_done_q || kernel_done_healthy) &&
                 ffn_replay_complete_q && !activation_error &&
-                !ffn_fault_q) begin
+                !ffn_fault_q && !kernel_abort_window) begin
                 ffn_phase_q <= FFN_IDLE;
                 scratch_section_active_q <= 1'b0;
                 scratch_section_done_q <= 1'b1;
@@ -2334,7 +2422,7 @@ module decode_top #(
                     norm_scalar_error_q <= 23'd0;
                     q8_owner_q <= Q8_OWNER_NONE;
                 end
-                if ((ffn_phase_q == FFN_UP_RUN) && kernel_done)
+                if ((ffn_phase_q == FFN_UP_RUN) && kernel_done_healthy)
                     p3d_up_kernel_done_q <= 1'b1;
                 if (ffn_gate_start_q)
                     q8_owner_q <= Q8_OWNER_GATE;
@@ -2625,10 +2713,10 @@ module decode_top #(
         norm_error_q,
         norm_done_q,
         norm_busy_live,
-        rms_gamma_valid,
+        gamma_valid_live,
         gamma_error_q,
         gamma_done_q,
-        rms_gamma_busy
+        gamma_load_busy
     };
     wire [31:0] norm_error_value = {
         4'd0,
@@ -2657,7 +2745,9 @@ module decode_top #(
                     MATMUL_OFF_WEIGHT_FMT[7:0]:    rdata_q <= {30'd0, weight_fmt_q};
                     MATMUL_OFF_ACT_MODE[7:0]:      rdata_q <= {30'd0, act_mode_q};
                     MATMUL_OFF_ACT_EPOCH[7:0]:     rdata_q <= act_epoch_q;
-                    MATMUL_OFF_ACT_STATE[7:0]:     rdata_q <= {30'd0, activation_error, activation_valid};
+                    MATMUL_OFF_ACT_STATE[7:0]:     rdata_q <= {
+                        30'd0, activation_error_status, activation_valid_status
+                    };
                     MATMUL_OFF_LOADED_EPOCH[7:0]:  rdata_q <= loaded_act_epoch;
                     MATMUL_OFF_LOADED_Q1_BLOCKS[7:0]: rdata_q <= {16'd0, loaded_act_q1_blocks};
                     MATMUL_OFF_LOADED_COLS[7:0]:   rdata_q <= {16'd0, loaded_act_cols};
@@ -2735,16 +2825,18 @@ module decode_top #(
                              (ffn_phase_q == FFN_WAIT_UP);
     assign formal_gate_start = ffn_gate_start_q;
     assign formal_gate_drain_ready =
-        (ffn_gate_kernel_done_q || kernel_done) &&
+        (ffn_gate_kernel_done_q || kernel_done_healthy) &&
         (ffn_gate_packer_done_q || gate_packer_done) &&
         (ffn_gate_pairer_done_q || ffn_pairer_done) &&
-        ffn_capture_complete_q && !section_fault_event && !ffn_fault_q;
+        ffn_capture_complete_q && !section_fault_event && !ffn_fault_q &&
+        !kernel_abort_window;
     assign formal_seal_done = q8_buffer_seal_done &&
                               !q8_buffer_seal_error;
     assign formal_down_start = ffn_down_start_q;
     assign formal_down_complete_ready =
-        (ffn_down_kernel_done_q || kernel_done) &&
-        ffn_replay_complete_q && !activation_error && !ffn_fault_q;
+        (ffn_down_kernel_done_q || kernel_done_healthy) &&
+        ffn_replay_complete_q && !activation_error && !ffn_fault_q &&
+        !kernel_abort_window;
     assign formal_producer_done = ffn_producer_done_q;
     assign formal_capture_token = ffn_capture_token_q;
     assign formal_capture_block = ffn_capture_block_q;
@@ -2763,14 +2855,22 @@ module decode_top #(
     assign formal_p3d_begin_ok = p3d_section_begin_ok;
     assign formal_p3d_fault = p3d_fault_event;
     assign formal_p3d_clean_complete = p3d_clean_complete;
-    assign formal_gamma_busy = rms_gamma_busy;
-    assign formal_gamma_valid = rms_gamma_valid;
+    assign formal_gamma_busy = gamma_load_busy;
+    assign formal_gamma_valid = gamma_valid_live;
+    assign formal_gamma_cfg_admit = gamma_load_accept;
+    assign formal_gamma_cfg_pending = gamma_cfg_start_q;
+    assign formal_gamma_cfg_fire = gamma_cfg_fire;
+    assign formal_gamma_cfg_ready = rms_gamma_cfg_ready;
+    assign formal_kernel_abort_now = kernel_activation_abort_now;
+    assign formal_kernel_abort_pending = kernel_activation_abort_q;
+    assign formal_kernel_busy = kernel_busy;
     assign formal_rms_rd_req = rms_rd_req_valid;
     assign formal_residual_rd_req = residual_rd_req_valid;
     assign formal_rms_r_wr_valid = rms_r_wr_valid;
     assign formal_residual_r_wr_valid = residual_r_wr_valid;
     assign formal_scratch_r_wr_valid = scratch_r_wr_valid;
     assign formal_kernel_output_valid = kernel_m_axis_tvalid;
+    assign formal_kernel_sink_accept = kernel_sink_accept;
     assign formal_residual_output_valid = residual_m_axis_tvalid;
     assign formal_r_valid = scratch_valid_q[0];
     assign formal_norm_error = norm_error_q;
@@ -2811,7 +2911,7 @@ module decode_top #(
             assert({1'b0, ffn_replay_token_q} <
                    (ffn_tokens_q == 0 ? 3'd1 : ffn_tokens_q));
 
-            if (rms_gamma_busy) begin
+            if (gamma_load_busy) begin
                 assert(!shared_activation_idle);
                 assert(!scratch_launch_ok);
                 assert(!scratch_section_begin_ok);
@@ -2825,7 +2925,114 @@ module decode_top #(
                 assert(!q8_ingress_start);
                 assert(!compute_s_axis_acts_tvalid);
                 assert(!p3d_external_residual_ingress);
-                assert(s_axis_acts_tready == rms_gamma_tready);
+                if (gamma_cfg_start_q) begin
+                    assert(!s_axis_acts_tready);
+                    assert(!gamma_valid_live);
+                end else begin
+                    assert(s_axis_acts_tready == rms_gamma_tready);
+                end
+            end
+
+            if (gamma_load_accept) begin
+                assert(!gamma_cfg_start_q);
+                assert(!gamma_cfg_fire);
+            end
+            if (gamma_cfg_start_q) begin
+                assert(gamma_load_busy);
+                if (section_abort_now)
+                    assert(!gamma_cfg_fire);
+                else if (rms_gamma_cfg_ready)
+                    assert(gamma_cfg_fire);
+            end
+            if (gamma_cfg_fire) begin
+                assert(gamma_cfg_start_q && rms_gamma_cfg_ready);
+                assert(!section_abort_now);
+            end
+
+            if (kernel_abort_window) begin
+                assert(!weight_tready);
+                assert(!kernel_acts_tready);
+                assert(!kernel_m_axis_tvalid);
+                assert(!kernel_start);
+                assert(!kernel_done_healthy);
+                assert(!p3d_clean_complete);
+                assert(!formal_gate_drain_ready);
+                assert(!formal_down_complete_ready);
+            end
+            if (kernel_downstream_quarantine) begin
+                assert(!kernel_sink_accept);
+                assert(!m_axis_tvalid);
+                assert(!residual_m_axis_tready);
+            end
+            if (r_write_quarantine || section_abort_now)
+                assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
+            assert(scratch_wr_tready ==
+                   (scratch_wr_tready_core && !scratch_writer_abort));
+            assert(gate_packer_s_axis_tready ==
+                   (gate_packer_s_axis_tready_core &&
+                    !ffn_pipeline_abort));
+            assert(gate_packer_m_axis_tready ==
+                   (ffn_pairer_s_axis_tready_core &&
+                    !ffn_pipeline_abort));
+            assert(residual_s_axis_tready ==
+                   (residual_s_axis_tready_core && !p3d_abort_now));
+            if (scratch_writer_abort)
+                assert(!(scratch_sink_valid && scratch_wr_tready));
+            if (ffn_pipeline_abort) begin
+                assert(!(gate_packer_s_axis_tvalid &&
+                         gate_packer_s_axis_tready));
+                assert(!(gate_packer_m_axis_tvalid &&
+                         gate_packer_m_axis_tready));
+            end
+            if (p3d_abort_now)
+                assert(!(residual_s_axis_tvalid &&
+                         residual_s_axis_tready));
+            if (kernel_activation_abort_q) begin
+                assert(activation_error_status);
+                assert(!activation_valid_status);
+            end
+
+            if (f_decode_past_valid && $past(rst_n)) begin
+                assert(kernel_activation_abort_q ==
+                       $past(kernel_activation_abort_now && kernel_busy));
+                if ($past(kernel_activation_abort_q)) begin
+                    assert(activation_error);
+                    assert(!activation_valid);
+                end
+                if ($past(kernel_activation_abort_now && kernel_busy &&
+                          kernel_m_axis_tvalid_raw && kernel_m_axis_tlast &&
+                          kernel_m_axis_tready_core &&
+                          !kernel_activation_abort_q)) begin
+                    assert(kernel_activation_abort_q);
+                    assert(!kernel_sink_accept);
+                    assert(!m_axis_tvalid);
+                    assert(!kernel_done_healthy);
+                    assert(!formal_gate_drain_ready);
+                    assert(!formal_down_complete_ready);
+                    assert(!p3d_clean_complete);
+                    if ($past(ffn_phase_q) == FFN_UP_RUN)
+                        assert(ffn_phase_q != FFN_WAIT_GATE);
+                    if ($past(ffn_phase_q) == FFN_GATE_RUN)
+                        assert(ffn_phase_q != FFN_SEAL);
+                end
+                if ($past(read_accept && kernel_activation_abort_q &&
+                          (s_axi_araddr[7:0] == MATMUL_OFF_ACT_STATE[7:0])))
+                    assert(rdata_q[1:0] == 2'b10);
+                if ($past(gamma_load_accept)) begin
+                    assert(gamma_cfg_start_q);
+                    assert(gamma_load_rows_q == $past(model_rows_q));
+                end
+                if ($past(gamma_cfg_start_q && !gamma_cfg_fire &&
+                          !section_abort_now)) begin
+                    assert(gamma_cfg_start_q);
+                    assert(gamma_load_rows_q == $past(gamma_load_rows_q));
+                end
+                if ($past(gamma_cfg_fire || section_abort_now))
+                    assert(!gamma_cfg_start_q);
+                if ($past(p3d_fault_event)) begin
+                    assert(p3d_kill_q);
+                    assert(p3d_cleanup_q);
+                end
             end
 
             if (scratch_rd_owner_q == SCRATCH_RD_PAIRER)
@@ -3021,8 +3228,14 @@ module decode_top #(
 
             if (p3d_abort_now && p3d_residual_output_selected) begin
                 assert(!m_axis_tvalid);
-                assert(!kernel_m_axis_tready);
+                assert(!(residual_s_axis_tvalid &&
+                         residual_s_axis_tready));
                 assert(!scratch_r_wr_valid);
+            end
+            if (p3d_kill_q) begin
+                assert(!scratch_rd_req_accept);
+                assert(!scratch_wr_commit_valid);
+                assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
             end
 
             // P3d scratch reads are untagged at both arbitration levels.  Each
@@ -3122,8 +3335,8 @@ module decode_top #(
             if (p3d_residual_output_selected) begin
                 assert(!ddr_kernel_valid);
                 assert(m_axis_tvalid ==
-                       (residual_m_axis_tvalid && !p3d_kill_q &&
-                        !p3d_fault_event));
+                       (residual_m_axis_tvalid &&
+                        !kernel_downstream_quarantine));
                 if (m_axis_tvalid) begin
                     assert(m_axis_tdata == residual_m_axis_tdata);
                     assert(m_axis_tkeep == residual_m_axis_tkeep);
@@ -3133,7 +3346,7 @@ module decode_top #(
             if (p3d_fault_event && p3d_residual_output_selected) begin
                 assert(!m_axis_tvalid);
                 assert(!residual_m_axis_tready);
-                assert(!kernel_m_axis_tready);
+                assert(!kernel_sink_accept);
             end
             if (p3d_clean_complete) begin
                 assert(!p3d_fault_event);

@@ -132,10 +132,15 @@ module decode_p3d_formal(input wire clk);
     wire formal_p3d_residual_started, formal_p3d_begin_ok;
     wire formal_p3d_fault, formal_p3d_clean_complete;
     wire formal_gamma_busy, formal_gamma_valid;
+    wire formal_gamma_cfg_admit, formal_gamma_cfg_pending;
+    wire formal_gamma_cfg_fire, formal_gamma_cfg_ready;
+    wire formal_kernel_abort_now, formal_kernel_abort_pending;
+    wire formal_kernel_busy;
     wire formal_rms_rd_req, formal_residual_rd_req;
     wire formal_rms_r_wr_valid, formal_residual_r_wr_valid;
     wire formal_scratch_r_wr_valid;
-    wire formal_kernel_output_valid, formal_residual_output_valid;
+    wire formal_kernel_output_valid, formal_kernel_sink_accept;
+    wire formal_residual_output_valid;
     wire formal_r_valid;
     wire formal_norm_error, formal_norm_controller_error;
     wire formal_residual_error;
@@ -229,12 +234,20 @@ module decode_p3d_formal(input wire clk);
         .formal_p3d_clean_complete(formal_p3d_clean_complete),
         .formal_gamma_busy(formal_gamma_busy),
         .formal_gamma_valid(formal_gamma_valid),
+        .formal_gamma_cfg_admit(formal_gamma_cfg_admit),
+        .formal_gamma_cfg_pending(formal_gamma_cfg_pending),
+        .formal_gamma_cfg_fire(formal_gamma_cfg_fire),
+        .formal_gamma_cfg_ready(formal_gamma_cfg_ready),
+        .formal_kernel_abort_now(formal_kernel_abort_now),
+        .formal_kernel_abort_pending(formal_kernel_abort_pending),
+        .formal_kernel_busy(formal_kernel_busy),
         .formal_rms_rd_req(formal_rms_rd_req),
         .formal_residual_rd_req(formal_residual_rd_req),
         .formal_rms_r_wr_valid(formal_rms_r_wr_valid),
         .formal_residual_r_wr_valid(formal_residual_r_wr_valid),
         .formal_scratch_r_wr_valid(formal_scratch_r_wr_valid),
         .formal_kernel_output_valid(formal_kernel_output_valid),
+        .formal_kernel_sink_accept(formal_kernel_sink_accept),
         .formal_residual_output_valid(formal_residual_output_valid),
         .formal_r_valid(formal_r_valid),
         .formal_norm_error(formal_norm_error),
@@ -349,6 +362,8 @@ module decode_p3d_formal(input wire clk);
     reg saw_rms_q8_accept_q;
     reg saw_rms_q8_fire_q;
     reg saw_rms_q8_final_q;
+    reg saw_gamma_cfg_pending_q;
+    reg saw_gamma_cfg_fire_q;
     always @(posedge clk) begin
         f_past_valid <= 1'b1;
         if (!rst_n) begin
@@ -364,6 +379,8 @@ module decode_p3d_formal(input wire clk);
             saw_rms_q8_accept_q <= 1'b0;
             saw_rms_q8_fire_q <= 1'b0;
             saw_rms_q8_final_q <= 1'b0;
+            saw_gamma_cfg_pending_q <= 1'b0;
+            saw_gamma_cfg_fire_q <= 1'b0;
         end else begin
             if (formal_p3d_begin_ok)
                 saw_begin_q <= 1'b1;
@@ -396,6 +413,10 @@ module decode_p3d_formal(input wire clk);
                 saw_rms_q8_fire_q <= 1'b1;
             if (formal_rms_q8_final_record_fire)
                 saw_rms_q8_final_q <= 1'b1;
+            if (formal_gamma_cfg_pending)
+                saw_gamma_cfg_pending_q <= 1'b1;
+            if (formal_gamma_cfg_fire)
+                saw_gamma_cfg_fire_q <= 1'b1;
 
             assert(!(formal_rms_rd_req && formal_residual_rd_req));
             assert(!(formal_rms_r_wr_valid && formal_residual_r_wr_valid));
@@ -404,6 +425,53 @@ module decode_p3d_formal(input wire clk);
                 assert(!formal_compute_acts_tvalid);
                 assert(!formal_q8_ingress_start);
                 assert(!formal_kernel_start);
+            end
+            if (formal_gamma_cfg_admit) begin
+                assert(!formal_gamma_cfg_pending);
+                assert(!formal_gamma_cfg_fire);
+            end
+            if (formal_gamma_cfg_pending) begin
+                assert(formal_gamma_busy);
+                assert(!formal_gamma_valid);
+                assert(!acts_ready);
+                if (formal_abort_strobe)
+                    assert(!formal_gamma_cfg_fire);
+                else if (formal_gamma_cfg_ready)
+                    assert(formal_gamma_cfg_fire);
+            end
+            if (formal_gamma_cfg_fire)
+                assert(formal_gamma_cfg_pending && formal_gamma_cfg_ready);
+
+            if (formal_kernel_abort_now || formal_kernel_abort_pending) begin
+                assert(!w0_ready && !w1_ready && !w2_ready && !w3_ready);
+                assert(!formal_kernel_output_valid);
+                assert(!formal_kernel_sink_accept);
+                assert(!formal_kernel_start);
+                assert(!formal_p3d_clean_complete);
+            end
+            if (formal_kernel_start)
+                assert(!formal_kernel_abort_now &&
+                       !formal_kernel_abort_pending);
+            if (f_past_valid && $past(rst_n)) begin
+                assert(formal_kernel_abort_pending ==
+                       $past(formal_kernel_abort_now && formal_kernel_busy));
+                if ($past(formal_gamma_cfg_admit))
+                    assert(formal_gamma_cfg_pending);
+                if ($past(formal_gamma_cfg_fire)) begin
+                    assert(!formal_gamma_cfg_pending);
+                    assert(formal_gamma_busy);
+                end
+                if ($past(formal_kernel_abort_now && formal_kernel_busy)) begin
+                    assert(formal_kernel_abort_pending);
+                    assert(formal_p3d_cleanup || formal_abort_cleanup);
+                end
+                if ($past(formal_kernel_abort_now ||
+                          formal_kernel_abort_pending)) begin
+                    if ($past(formal_ffn_phase) == 3'd2)
+                        assert(formal_ffn_phase != 3'd3);
+                    if ($past(formal_ffn_phase) == 3'd4)
+                        assert(formal_ffn_phase != 3'd5);
+                end
             end
             if (formal_up_start && formal_p3d_active)
                 assert(formal_p3d_r_load_complete);
@@ -499,6 +567,7 @@ module decode_p3d_formal(input wire clk);
 `ifdef FORMAL_P3D_ABORT
         cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
               saw_abort_cleanup_owner_q && saw_gamma_exclusion_q &&
+              saw_gamma_cfg_pending_q && saw_gamma_cfg_fire_q &&
               !formal_p3d_active &&
               !formal_p3d_cleanup &&
               (formal_scratch_rd_owner == 2'd0));
@@ -507,7 +576,8 @@ module decode_p3d_formal(input wire clk);
               saw_rms_q8_accept_q && saw_rms_q8_fire_q &&
               saw_rms_q8_final_q && saw_norm_seal_q && saw_gate_q8_q &&
               saw_residual_start_q &&
-              saw_gamma_exclusion_q &&
+              saw_gamma_exclusion_q && saw_gamma_cfg_pending_q &&
+              saw_gamma_cfg_fire_q &&
               saw_residual_output_q && formal_section_done &&
               !formal_section_active && formal_r_valid);
 `endif
@@ -518,7 +588,8 @@ module decode_p3d_formal(input wire clk);
                      result_data, result_keep, result_last, formal_p3d_kill,
                      formal_abort_cleanup, formal_p3d_clean_complete,
                      formal_scratch_r_wr_valid,
-                     formal_kernel_output_valid, formal_quant_status,
+                     formal_kernel_output_valid, formal_kernel_sink_accept,
+                     formal_quant_status,
                      formal_abort_strobe, formal_rms_q8_record_accept,
                      formal_rms_q8_record_pending,
                      formal_rms_q8_record_fire,
@@ -527,6 +598,10 @@ module decode_p3d_formal(input wire clk);
                      formal_p3d_q8_record_expected,
                      formal_p3d_norm_q8_done,
                      formal_p3d_norm_seal_event,
+                     formal_gamma_cfg_admit, formal_gamma_cfg_pending,
+                     formal_gamma_cfg_fire, formal_gamma_cfg_ready,
+                     formal_kernel_abort_now,
+                     formal_kernel_abort_pending, formal_kernel_busy,
                      command_q, slot_phase_q};
 endmodule
 

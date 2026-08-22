@@ -106,6 +106,7 @@ module section_f32_scratch_ooc (
         .wr_busy(wr_busy), .wr_done(wr_done), .wr_error(wr_error),
         .s_axis_tdata(s_axis_tdata_i), .s_axis_tkeep(s_axis_tkeep_i),
         .s_axis_tvalid(s_axis_tvalid_i), .s_axis_tready(s_axis_tready),
+        .s_axis_tready_core(),
         .s_axis_tlast(s_axis_tlast_i),
         .wr_commit_valid(wr_commit_valid), .wr_commit_bank(wr_commit_bank),
         .wr_commit_address(wr_commit_address),

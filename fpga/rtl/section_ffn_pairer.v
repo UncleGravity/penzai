@@ -34,6 +34,7 @@ module section_ffn_pairer (
     input  wire [255:0]  s_axis_tdata,
     input  wire          s_axis_tvalid,
     output wire          s_axis_tready,
+    output wire          s_axis_tready_core,
     input  wire          s_axis_tlast,
     input  wire [1:0]    s_axis_token,
     input  wire [8:0]    s_axis_block,
@@ -107,8 +108,9 @@ module section_ffn_pairer (
     reg [1:0] reorder_rd_group_q;
 
     wire [1:0] expected_group = {expect_upper_q, expect_group_odd_q};
-    assign s_axis_tready = rst_n && busy_q && !abort_run && !input_complete_q &&
-                           !replay_active_q;
+    assign s_axis_tready_core = rst_n && busy_q && !input_complete_q &&
+                                !replay_active_q;
+    assign s_axis_tready = s_axis_tready_core && !abort_run;
     wire input_accept = s_axis_tvalid && s_axis_tready;
     wire input_tag_ok = (s_axis_token == expect_token_q) &&
                         (s_axis_block == expect_block_q) &&
@@ -398,6 +400,11 @@ module section_ffn_pairer (
     assign formal_orphan = orphan_q;
     assign formal_emit_active = emit_active_q;
     assign formal_emit_lane = emit_lane_q;
+    always @* begin
+        assert(s_axis_tready == (s_axis_tready_core && !abort_run));
+        if (abort_run)
+            assert(!s_axis_tready);
+    end
 `endif
 
 endmodule

@@ -103,6 +103,9 @@ module decode_ffn_formal(input wire clk);
     wire [2:0] formal_capture_beat, formal_replay_beat;
     wire formal_legacy_q8_cfg_pending, formal_legacy_q8_cfg_fire;
     wire formal_legacy_q8_cfg_ready;
+    wire formal_kernel_abort_now, formal_kernel_abort_pending;
+    wire formal_kernel_busy;
+    wire formal_kernel_sink_accept;
 `ifdef FORMAL_COVER_CLEAN
     wire formal_inject_abort = 1'b0;
 `elsif FORMAL_COVER_ABORT
@@ -187,7 +190,11 @@ module decode_ffn_formal(input wire clk);
         .formal_replay_beat(formal_replay_beat),
         .formal_legacy_q8_cfg_pending(formal_legacy_q8_cfg_pending),
         .formal_legacy_q8_cfg_fire(formal_legacy_q8_cfg_fire),
-        .formal_legacy_q8_cfg_ready(formal_legacy_q8_cfg_ready)
+        .formal_legacy_q8_cfg_ready(formal_legacy_q8_cfg_ready),
+        .formal_kernel_abort_now(formal_kernel_abort_now),
+        .formal_kernel_abort_pending(formal_kernel_abort_pending),
+        .formal_kernel_busy(formal_kernel_busy),
+        .formal_kernel_sink_accept(formal_kernel_sink_accept)
     );
 
     // Drive one clean section. If abort_case is selected, interrupt the first
@@ -279,6 +286,7 @@ module decode_ffn_formal(input wire clk);
     reg prev_down_complete_ready_q;
     reg prev_legacy_q8_cfg_pending_q;
     reg saw_legacy_q8_cfg_q;
+    reg saw_kernel_abort_q;
 
     wire capture_fire = formal_capture_fire;
     wire replay_fire = formal_replay_fire;
@@ -321,6 +329,7 @@ module decode_ffn_formal(input wire clk);
             saw_abort_drained_q <= 1'b0;
             saw_restart_begin_q <= 1'b0;
             saw_legacy_q8_cfg_q <= 1'b0;
+            saw_kernel_abort_q <= 1'b0;
         end else begin
             if (formal_section_begin_ok) begin
                 clean_milestone_q <= 3'd1;
@@ -333,6 +342,8 @@ module decode_ffn_formal(input wire clk);
             end
             if (formal_legacy_q8_cfg_fire)
                 saw_legacy_q8_cfg_q <= 1'b1;
+            if (formal_kernel_abort_pending)
+                saw_kernel_abort_q <= 1'b1;
             if (formal_legacy_q8_cfg_fire)
                 assert(formal_legacy_q8_cfg_ready);
             if (formal_inject_abort) begin
@@ -360,6 +371,33 @@ module decode_ffn_formal(input wire clk);
                 prev_legacy_q8_cfg_pending_q &&
                 !prev_section_begin_ok_q)
                 assert(!formal_legacy_q8_cfg_pending);
+
+            if (formal_kernel_abort_now || formal_kernel_abort_pending) begin
+                assert(!w0_ready && !w1_ready && !w2_ready && !w3_ready);
+                assert(!acts_ready);
+                assert(!result_valid);
+                assert(!formal_kernel_sink_accept);
+                assert(!formal_gate_drain_ready);
+                assert(!formal_down_complete_ready);
+            end
+            if (f_past_valid && prev_rst_n_q) begin
+                assert(formal_kernel_abort_pending ==
+                       $past(formal_kernel_abort_now && formal_kernel_busy));
+                if ($past(formal_kernel_abort_now && formal_kernel_busy)) begin
+                    assert(formal_kernel_abort_pending);
+                    assert(formal_abort_cleanup);
+                end
+                if ($past(formal_kernel_abort_now ||
+                          formal_kernel_abort_pending)) begin
+                    if ($past(formal_ffn_phase) == 3'd2)
+                        assert(formal_ffn_phase != 3'd3);
+                    if ($past(formal_ffn_phase) == 3'd4)
+                        assert(formal_ffn_phase != 3'd5);
+                    if (($past(formal_ffn_phase) == 3'd7) &&
+                        (formal_ffn_phase == 3'd0))
+                        assert(|formal_scratch_error);
+                end
+            end
 
             if ((clean_milestone_q == 3'd1) && formal_ffn_gate_ready)
                 clean_milestone_q <= 3'd2;
@@ -505,7 +543,7 @@ module decode_ffn_formal(input wire clk);
 `elsif FORMAL_COVER_ABORT
         cover(rst_n && abort_case && saw_abort_owner_q && saw_abort_hold_q &&
               saw_abort_drained_q && saw_restart_begin_q &&
-              saw_legacy_q8_cfg_q &&
+              saw_legacy_q8_cfg_q && saw_kernel_abort_q &&
               (clean_milestone_q == 3'd7));
 `endif
     end
@@ -513,7 +551,10 @@ module decode_ffn_formal(input wire clk);
     wire _unused = &{1'b0, bresp, bvalid, awready, wready, rdata, rresp,
                      arready, rvalid, w0_ready, w1_ready, w2_ready, w3_ready,
                      acts_ready, result_data, result_keep, result_valid,
-                     result_last, command_q, slot_phase_q};
+                     result_last, formal_kernel_abort_now,
+                     formal_kernel_abort_pending, formal_kernel_busy,
+                     formal_kernel_sink_accept,
+                     command_q, slot_phase_q};
 endmodule
 
 `default_nettype wire
