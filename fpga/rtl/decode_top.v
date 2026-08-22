@@ -132,9 +132,16 @@ module decode_top #(
     , input wire         sim_inject_down_activation_error
     , input wire         sim_hold_p3d_rd_rsp
     , input wire         sim_force_scratch_abort_strobe
+    , input wire         sim_inject_inactive_norm_owner
+    , input wire         sim_inject_inactive_residual_owner
 `endif
 `ifdef FORMAL_DECODE_INTEGRATION
     , input wire         formal_inject_abort
+    , input wire         formal_inject_inactive_norm_owner
+    , input wire         formal_inject_inactive_residual_owner
+    , input wire         formal_inject_ownerless_rsp
+    , input wire         formal_inject_ownerless_rsp_error
+    , input wire         formal_inject_q8_cfg_fault
 `endif
 `ifdef FORMAL
     , output wire [2:0]  formal_ffn_phase
@@ -217,6 +224,11 @@ module decode_top #(
     , output wire [9:0]  formal_p3d_q8_record_expected
     , output wire        formal_p3d_norm_q8_done
     , output wire        formal_p3d_norm_seal_event
+    , output wire        formal_scratch_rd_req_accept
+    , output wire        formal_scratch_select_p3d
+    , output wire        formal_p3d_select_rms
+    , output wire        formal_scratch_leaf_rsp_valid
+    , output wire        formal_residual_cfg_fire
 `endif
 );
     localparam integer ROWS = 16;
@@ -350,6 +362,13 @@ module decode_top #(
     reg        p3d_cleanup_q;
     reg        p3d_cleanup_is_abort_q;
     reg        p3d_kill_q;
+    reg        rms_p3d_kill_q /* verilator public_flat_rd */;
+    reg        q8_p3d_abort_q /* verilator public_flat_rd */;
+    reg        q8_fault_q /* verilator public_flat_rd */;
+    reg        q8_fault_source_held_q;
+    reg [5:0]  q8_fault_status_q;
+    reg [1:0]  q8_fault_owner_q;
+    reg        r_abort_mode_q /* verilator public_flat_rd */;
     reg        kernel_activation_abort_q /* verilator public_flat_rd */;
     reg        p3d_r_load_complete_q;
     reg [13:0] p3d_r_write_count_q;
@@ -362,6 +381,7 @@ module decode_top #(
     reg        p3d_norm_sealed_q;
     reg        p3d_up_kernel_done_q;
     reg        p3d_residual_started_q;
+    reg        p3d_down_committed_q /* verilator public_flat_rd */;
     reg [1:0]  p3d_scratch_error_q;
     reg [5:0]  p3d_quant_status_q;
 
@@ -393,6 +413,10 @@ module decode_top #(
     localparam [1:0] Q8_OWNER_RMS  = 2'd1;
     localparam [1:0] Q8_OWNER_GATE = 2'd2;
     reg [1:0] q8_owner_q;
+    reg       rms_q8_slot_valid_q /* verilator public_flat_rd */;
+    reg [31:0] rms_q8_slot_data_q;
+    reg       rms_q8_slot_last_q;
+    reg [1:0] rms_q8_slot_status_q;
 
     // Fixed-point window floor: a constant of the f16 format (min contribution exponent
     // e_ws+e_as = -24 + -24), NOT a runtime register. Wired straight to the kernel; the
@@ -414,6 +438,7 @@ module decode_top #(
     wire [15:0] loaded_act_cols;
     wire [5:0] quantizer_status;
     wire q8_activation_abort;
+    wire q8_fault_raw;
     wire q8_ingress_abort;
     wire kernel_activation_abort_now /* verilator public_flat_rd */;
     wire kernel_abort_window /* verilator public_flat_rd */;
@@ -482,14 +507,16 @@ module decode_top #(
     wire [2:0] rms_rd_req_token;
     wire [10:0] rms_rd_req_group;
     wire rms_rd_rsp_valid;
-    wire rms_rd_rsp_ready;
+    wire rms_rd_rsp_ready /* verilator public_flat_rd */;
     wire [31:0] rms_scalar_data;
     wire rms_scalar_valid;
     wire rms_scalar_ready;
     wire rms_scalar_last;
     wire [1:0] rms_scalar_status;
+    wire rms_q8_record_pending;
 
     wire residual_cfg_ready;
+    wire residual_cfg_boundary_ok;
     wire residual_busy;
     wire residual_done;
     wire residual_error;
@@ -519,8 +546,8 @@ module decode_top #(
     wire gamma_cfg_fire /* verilator public_flat_rd */;
     wire p3d_section_begin_ok /* verilator public_flat_rd */;
     wire p3d_fault_event;
-    wire kernel_downstream_quarantine = kernel_abort_window ||
-                                        p3d_fault_event;
+    wire legacy_fault_raw;
+    wire kernel_downstream_quarantine = kernel_abort_window;
     // Gamma admission immediately reserves S_AXIS_ACTS. The accepted command
     // is held at a registered boundary until the RMS leaf accepts it.
     wire gamma_load_busy /* verilator public_flat_rd */ =
@@ -541,13 +568,27 @@ module decode_top #(
 `endif
                              ;
     wire p3d_abort_now = section_abort_now || p3d_kill_q;
+    // Raw software abort remains immediate. Cross-leaf fault kill reaches the
+    // RMS child through one local register, after all architectural outputs and
+    // direct writes have already been quarantined.
+    wire rms_child_abort /* verilator public_flat_rd */ =
+        section_abort_now || rms_p3d_kill_q;
     wire p3d_leaf_start /* verilator public_flat_rd */ =
                           p3d_leaf_start_q && p3d_active_q &&
-                          !p3d_cleanup_q && !p3d_abort_now;
-    wire qualified_kernel_start = kernel_start_q && !section_abort_now &&
-                                  !ffn_fault_q && !p3d_kill_q &&
+                          !p3d_cleanup_q && !section_abort_now;
+    wire kernel_start_candidate =
+        (kernel_start_q && (!p3d_active_q || !ffn_down_start_q)) ||
+        p3d_down_launch;
+    wire qualified_kernel_start = kernel_start_candidate &&
+                                  !section_abort_now &&
+                                  !ffn_fault_q &&
                                   !kernel_activation_abort_q &&
-                                  shared_activation_idle;
+                                  !p3d_cleanup_q && !p3d_kill_q &&
+                                  !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                                  !q8_fault_q && !r_abort_mode_q &&
+                                  shared_activation_idle &&
+                                  (!p3d_down_committed_q ||
+                                   p3d_down_launch);
     wire q8_ingress_start /* verilator public_flat_rd */ =
                             shared_activation_idle &&
                             (p3d_leaf_start || ffn_gate_start_q ||
@@ -564,13 +605,14 @@ module decode_top #(
                                    (ffn_gate_start_q ?
                                     {13'd0, ffn_tokens_q} : num_cols_q);
     wire [31:0] q8_internal_data = (q8_owner_q == Q8_OWNER_RMS) ?
-                                    rms_scalar_data : swiglu_out_data;
+                                    rms_q8_slot_data_q : swiglu_out_data;
     wire q8_internal_last = (q8_owner_q == Q8_OWNER_RMS) ?
-                            rms_scalar_last : swiglu_out_last;
+                            rms_q8_slot_last_q : swiglu_out_last;
     wire [1:0] q8_internal_status = (q8_owner_q == Q8_OWNER_RMS) ?
-                                     rms_scalar_status : swiglu_out_status;
+                                     rms_q8_slot_status_q :
+                                     swiglu_out_status;
     wire q8_internal_valid = (q8_owner_q == Q8_OWNER_RMS) ?
-                             rms_scalar_valid :
+                             rms_q8_slot_valid_q :
                              ((q8_owner_q == Q8_OWNER_GATE) ?
                               swiglu_out_valid : 1'b0);
     wire q8_internal_ready;
@@ -692,16 +734,29 @@ module decode_top #(
     wire [13:0] scratch_wr_commit_address;
     wire scratch_rd_req_valid;
     wire scratch_rd_req_ready;
+    wire scratch_rd_admission_idle;
     wire scratch_rd_quiescent;
     wire [1:0] scratch_rd_req_role;
     wire [2:0] scratch_rd_req_token;
     wire [10:0] scratch_rd_req_group;
     wire scratch_rd_issue_valid;
     wire [13:0] scratch_rd_issue_address;
-    wire scratch_rd_rsp_valid;
+    wire scratch_leaf_rd_rsp_valid;
     wire scratch_rd_rsp_ready;
-    wire [255:0] scratch_rd_rsp_data;
-    wire scratch_rd_rsp_error;
+    wire [255:0] scratch_leaf_rd_rsp_data;
+    wire scratch_leaf_rd_rsp_error;
+    wire scratch_rd_rsp_valid = scratch_leaf_rd_rsp_valid
+`ifdef FORMAL_DECODE_INTEGRATION
+                                || formal_inject_ownerless_rsp
+`endif
+                                ;
+    wire [255:0] scratch_rd_rsp_data = scratch_leaf_rd_rsp_data;
+    wire scratch_rd_rsp_error = scratch_leaf_rd_rsp_error
+`ifdef FORMAL_DECODE_INTEGRATION
+                                || (formal_inject_ownerless_rsp &&
+                                    formal_inject_ownerless_rsp_error)
+`endif
+                                ;
 
     wire gate_packer_start_ready;
     wire gate_packer_busy;
@@ -727,13 +782,17 @@ module decode_top #(
     wire q8_buffer_cap_record_error;
     wire [10:0] q8_buffer_bank0_record_count;
 
-    wire scratch_idle = !kernel_busy && !kernel_start_q &&
-                        !scratch_tee_run_q && !scratch_only_run_q &&
-                        !scratch_wr_busy && !scratch_drain_busy_q &&
-                        !scratch_consumer_busy_q && !ffn_gate_run_q &&
-                        !ffn_producer_busy_q && !ffn_replay_active_q &&
-                        !ffn_replay_inflight_q && !scratch_rd_rsp_valid &&
-                        (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+    wire scratch_nonread_idle = !kernel_busy && !kernel_start_q &&
+                                !scratch_tee_run_q && !scratch_only_run_q &&
+                                !scratch_wr_busy && !scratch_drain_busy_q &&
+                                !scratch_consumer_busy_q && !ffn_gate_run_q &&
+                                !ffn_producer_busy_q &&
+                                !ffn_replay_active_q &&
+                                !ffn_replay_inflight_q;
+    wire scratch_admission_idle = scratch_nonread_idle &&
+                                  (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+                                  scratch_rd_admission_idle;
+    wire scratch_idle = scratch_admission_idle && !scratch_rd_rsp_valid &&
                         scratch_rd_quiescent;
     assign norm_global_idle = scratch_idle &&
                               (ffn_phase_q == FFN_IDLE) &&
@@ -743,10 +802,28 @@ module decode_top #(
                               shared_activation_idle && !rms_busy &&
                               !residual_busy && !p3d_active_q &&
                               !p3d_cleanup_q && !p3d_kill_q &&
+                              !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                              !q8_fault_q && !q8_fault_source_held_q &&
+                              !r_abort_mode_q &&
+                              !rms_q8_slot_valid_q &&
                               !(|q8_buffer_bank_clearing) &&
                               (q8_owner_q == Q8_OWNER_NONE);
+    wire norm_admission_idle = scratch_admission_idle &&
+                               (ffn_phase_q == FFN_IDLE) &&
+                               !scratch_section_active_q &&
+                               !ffn_abort_cleanup_q &&
+                               !gate_packer_busy && !ffn_pairer_busy &&
+                               shared_activation_idle && !rms_busy &&
+                               !residual_busy && !p3d_active_q &&
+                               !p3d_cleanup_q && !p3d_kill_q &&
+                               !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                               !q8_fault_q && !q8_fault_source_held_q &&
+                               !r_abort_mode_q &&
+                               !rms_q8_slot_valid_q &&
+                               !(|q8_buffer_bank_clearing) &&
+                               (q8_owner_q == Q8_OWNER_NONE);
     assign gamma_load_accept = norm_load_gamma_strobe &&
-                               !section_abort_now && norm_global_idle &&
+                               !section_abort_now && norm_admission_idle &&
                                rms_gamma_cfg_ready;
     assign gamma_cfg_fire = gamma_cfg_start_q && !section_abort_now &&
                             rms_gamma_cfg_ready;
@@ -795,10 +872,10 @@ module decode_top #(
                                !ffn_replay_active_q && !ffn_replay_inflight_q &&
                                !gate_packer_busy && !ffn_pairer_busy &&
                                !residual_busy && !p3d_cleanup_q &&
-                               !p3d_kill_q && p3d_r_load_complete_q;
+                               p3d_r_load_complete_q;
     wire ffn_up_preflight_ok = ffn_up_shape_ok && scratch_wr_cfg_ready &&
                                (p3d_active_q ? p3d_up_resources_ok :
-                                scratch_idle);
+                                scratch_admission_idle);
 
     wire ffn_gate_candidate = (ffn_phase_q == FFN_WAIT_GATE) &&
                               scratch_section_active_q &&
@@ -811,7 +888,8 @@ module decode_top #(
                              (num_rows_q == {18'd0, ffn_rows_q}) &&
                              (num_cols_q == {13'd0, ffn_tokens_q}) &&
                              (num_rowblocks_q == {6'd0, ffn_rows_q[13:4]});
-    wire ffn_gate_preflight_ok = ffn_gate_shape_ok && scratch_idle &&
+    wire ffn_gate_preflight_ok = ffn_gate_shape_ok &&
+                                 scratch_admission_idle &&
                                  gate_packer_start_ready &&
                                  ffn_pairer_start_ready &&
                                  (!p3d_active_q ||
@@ -833,24 +911,49 @@ module decode_top #(
                               ((num_rows_q == {18'd0, p3d_model_rows_q}) &&
                                (num_rowblocks_q ==
                                 {6'd0, p3d_model_rows_q[13:4]})));
-    wire ffn_down_preflight_ok = ffn_down_shape_ok && scratch_idle &&
-                                 (!p3d_active_q || residual_cfg_ready);
+    wire ffn_down_preflight_ok = ffn_down_shape_ok &&
+                                 scratch_admission_idle &&
+                                 (!p3d_active_q ||
+                                  (residual_cfg_ready &&
+                                   residual_cfg_boundary_ok));
 
     wire scratch_ddr_preflight_ok = (scratch_mode_q == SCRATCH_MODE_DDR) &&
-                                    scratch_idle &&
+                                    scratch_admission_idle &&
                                     (ffn_down_candidate ?
                                      (ffn_down_shape_ok &&
-                                      (!p3d_active_q || residual_cfg_ready)) :
+                                      (!p3d_active_q ||
+                                       (residual_cfg_ready &&
+                                        residual_cfg_boundary_ok))) :
                                      (!scratch_section_active_q &&
                                       !internal_activation_mode));
     wire scratch_tee_preflight_ok = scratch_tee_shape_ok && scratch_wr_cfg_ready &&
-                                    scratch_idle && !scratch_section_active_q;
-    wire scratch_launch_ok = shared_activation_idle &&
+                                    scratch_admission_idle &&
+                                    !scratch_section_active_q;
+    wire lifecycle_admission_clear = !p3d_cleanup_q && !p3d_kill_q &&
+                                     !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                                     !r_abort_mode_q && !q8_fault_q &&
+                                     !q8_fault_source_held_q &&
+                                     !ffn_fault_q && !ffn_abort_cleanup_q;
+    wire scratch_launch_ok = lifecycle_admission_clear &&
+                             shared_activation_idle &&
                              (scratch_ddr_preflight_ok ||
                               scratch_tee_preflight_ok ||
                               ffn_up_preflight_ok ||
                               ffn_gate_preflight_ok ||
                               ffn_down_preflight_ok);
+    wire ffn_down_command_accept = start_strobe &&
+                                   ffn_down_preflight_ok &&
+                                   lifecycle_admission_clear &&
+                                   shared_activation_idle &&
+                                   !section_abort_now && !ffn_fault_q;
+    // Reserve the P3d phase boundary on the command edge and through the
+    // registered launch pulse. Retained responses still drain through their
+    // captured owners, but no new RMS request or direct R write can race the
+    // residual configuration handshake.
+    wire p3d_down_reservation = p3d_active_q &&
+                                 (ffn_down_command_accept ||
+                                  ffn_down_start_q ||
+                                  p3d_down_committed_q);
     wire scratch_tee_start = scratch_tee_start_q;
     wire scratch_only_start = scratch_only_start_q;
     wire scratch_consumer_start = scratch_consumer_start_q;
@@ -897,8 +1000,8 @@ module decode_top #(
                                   p3d_model_rows_ok && p3d_eps_ok &&
                                   gamma_valid_live &&
                                   (gamma_sealed_rows_q == model_rows_q) &&
-                                  rms_cfg_ready && q8_buffer_cfg_ready &&
-                                  norm_global_idle &&
+                                  q8_buffer_cfg_ready &&
+                                  norm_admission_idle &&
                                   (!scratch_section_resident_strobe ||
                                    p3d_resident_metadata_ok);
     wire legacy_section_begin_ok /* verilator public_flat_rd */ =
@@ -908,7 +1011,9 @@ module decode_top #(
                                    shared_activation_idle &&
                                    (scratch_mode_q == SCRATCH_MODE_DDR) &&
                                    scratch_section_shape_ok &&
-                                   q8_buffer_cfg_ready && scratch_idle &&
+                                   q8_buffer_cfg_ready &&
+                                   scratch_admission_idle &&
+                                   lifecycle_admission_clear &&
                                    !scratch_section_active_q;
     wire scratch_section_begin_ok = p3d_section_begin_ok ||
                                     legacy_section_begin_ok;
@@ -927,6 +1032,7 @@ module decode_top #(
             scratch_consumer_start_q <= 1'b0;
             ffn_gate_start_q         <= 1'b0;
             ffn_down_start_q         <= 1'b0;
+            p3d_down_committed_q     <= 1'b0;
             p3d_leaf_start_q         <= 1'b0;
             legacy_q8_cfg_start_q    <= 1'b0;
             gamma_cfg_start_q        <= 1'b0;
@@ -943,15 +1049,26 @@ module decode_top #(
             ffn_gate_start_q <= start_strobe && ffn_gate_preflight_ok &&
                                 shared_activation_idle &&
                                 !section_abort_now && !ffn_fault_q;
-            ffn_down_start_q <= start_strobe && ffn_down_preflight_ok &&
-                                shared_activation_idle &&
-                                !section_abort_now && !ffn_fault_q;
+            ffn_down_start_q <= ffn_down_command_accept;
+            p3d_down_committed_q <= residual_phase_commit;
             p3d_leaf_start_q <= p3d_section_begin_ok;
             legacy_q8_cfg_start_q <= legacy_section_begin_ok;
             if (section_abort_now || gamma_cfg_fire)
                 gamma_cfg_start_q <= 1'b0;
             else if (gamma_load_accept)
                 gamma_cfg_start_q <= 1'b1;
+        end
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            rms_p3d_kill_q <= 1'b0;
+            q8_p3d_abort_q <= 1'b0;
+            r_abort_mode_q <= 1'b0;
+        end else begin
+            rms_p3d_kill_q <= p3d_kill_q;
+            q8_p3d_abort_q <= p3d_kill_q;
+            r_abort_mode_q <= p3d_kill_q || kernel_activation_abort_q;
         end
     end
 
@@ -982,10 +1099,13 @@ module decode_top #(
             (m_axis_tready && scratch_wr_tready_core) :
         (scratch_drain_busy_q ? 1'b0 : m_axis_tready))));
 
-    wire scratch_writer_abort = section_abort_now || p3d_kill_q ||
-                                (scratch_writer_active &&
-                                 (q8_activation_abort || activation_error ||
-                                  (kernel_done && scratch_wr_busy)));
+    wire scratch_writer_abort /* verilator public_flat_rd */ =
+        section_abort_now || q8_p3d_abort_q ||
+        (scratch_writer_active &&
+         (q8_fault_q || activation_error ||
+          (kernel_done && scratch_wr_busy)));
+    wire scratch_r_wr_abort /* verilator public_flat_rd */ =
+        section_abort_now || r_abort_mode_q;
 
     wire [255:0] gate_packer_m_axis_tdata;
     wire gate_packer_m_axis_tvalid;
@@ -994,7 +1114,8 @@ module decode_top #(
     wire [1:0] gate_packer_m_axis_token;
     wire [8:0] gate_packer_m_axis_block;
     wire [1:0] gate_packer_m_axis_group;
-    wire ffn_pipeline_abort = section_abort_now || p3d_kill_q;
+    wire ffn_pipeline_abort = section_abort_now || q8_p3d_abort_q ||
+                              q8_fault_q;
 
     section_gate_packer u_section_gate_packer (
         .clk(clk),
@@ -1070,35 +1191,58 @@ module decode_top #(
         .out_last(ffn_pairer_out_last)
     );
 
-    wire rms_write_phase = p3d_active_q && !p3d_resident_q &&
-                           !p3d_r_load_complete_q && !p3d_cleanup_q;
+    wire p3d_inactive_norm_owner_raw = p3d_active_q && !p3d_cleanup_q &&
+        !p3d_residual_started_q &&
+        (residual_rd_req_valid || residual_r_wr_valid
+`ifdef VERILATOR
+         || sim_inject_inactive_norm_owner
+`endif
+`ifdef FORMAL_DECODE_INTEGRATION
+         || formal_inject_inactive_norm_owner
+`endif
+        );
+    wire p3d_inactive_residual_owner_raw = p3d_active_q &&
+        !p3d_cleanup_q && p3d_residual_started_q &&
+        (rms_rd_req_valid || rms_r_wr_valid
+`ifdef VERILATOR
+         || sim_inject_inactive_residual_owner
+`endif
+`ifdef FORMAL_DECODE_INTEGRATION
+         || formal_inject_inactive_residual_owner
+`endif
+        );
+    wire p3d_inactive_owner_raw = p3d_inactive_norm_owner_raw ||
+                                   p3d_inactive_residual_owner_raw;
+    wire rms_write_phase = p3d_active_q && !p3d_residual_started_q &&
+                           !p3d_resident_q &&
+                           !p3d_r_load_complete_q && !p3d_cleanup_q &&
+                           !p3d_down_reservation;
     wire residual_write_phase = p3d_active_q && p3d_residual_started_q &&
-                                !p3d_cleanup_q;
-    wire p3d_write_conflict = rms_r_wr_valid && residual_r_wr_valid;
-    wire r_write_quarantine = p3d_kill_q || kernel_activation_abort_q;
+                                !p3d_cleanup_q && !p3d_down_reservation;
+    wire r_write_quarantine = section_abort_now || r_abort_mode_q;
     wire scratch_r_wr_valid /* verilator public_flat_rd */ =
                               !r_write_quarantine &&
                               ((rms_write_phase && rms_r_wr_valid) ||
                                (residual_write_phase && residual_r_wr_valid));
-    wire scratch_r_wr_ready;
+    wire scratch_r_wr_ready /* verilator public_flat_rd */;
     wire scratch_r_wr_error;
-    wire [1:0] scratch_r_wr_bank = rms_write_phase ? rms_r_wr_bank :
-                                    residual_r_wr_bank;
-    wire [13:0] scratch_r_wr_address = rms_write_phase ?
-                                        rms_r_wr_address :
-                                        residual_r_wr_address;
-    wire [63:0] scratch_r_wr_data = rms_write_phase ? rms_r_wr_data :
-                                      residual_r_wr_data;
+    wire [1:0] scratch_r_wr_bank = p3d_residual_started_q ?
+                                    residual_r_wr_bank : rms_r_wr_bank;
+    wire [13:0] scratch_r_wr_address = p3d_residual_started_q ?
+                                        residual_r_wr_address :
+                                        rms_r_wr_address;
+    wire [63:0] scratch_r_wr_data = p3d_residual_started_q ?
+                                     residual_r_wr_data : rms_r_wr_data;
     assign rms_r_wr_ready = !r_write_quarantine && rms_write_phase &&
-                            !residual_r_wr_valid && scratch_r_wr_ready;
+                            scratch_r_wr_ready;
     assign residual_r_wr_ready = !r_write_quarantine &&
-                                 residual_write_phase && !rms_r_wr_valid &&
+                                 residual_write_phase &&
                                  scratch_r_wr_ready;
 
     section_rmsnorm_scalar_pipeline u_section_rmsnorm_scalar_pipeline (
         .clk(clk),
         .rst_n(rst_n),
-        .abort_run(p3d_abort_now),
+        .abort_run(rms_child_abort),
         .gamma_cfg_valid(gamma_cfg_fire),
         .gamma_cfg_ready(rms_gamma_cfg_ready),
         .gamma_cfg_rows(gamma_load_rows_q),
@@ -1154,7 +1298,30 @@ module decode_top #(
         .scalar_status(rms_scalar_status)
     );
 
-    wire residual_cfg_valid = p3d_active_q && ffn_down_start_q;
+    assign residual_cfg_boundary_ok = !section_abort_now &&
+        !p3d_cleanup_q &&
+        !rms_p3d_kill_q && !q8_p3d_abort_q && !r_abort_mode_q &&
+        !q8_fault_q && !p3d_inactive_owner_raw &&
+        !rms_busy && !rms_q8_slot_valid_q && !rms_q8_record_pending &&
+        (q8_owner_q == Q8_OWNER_NONE) &&
+        (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+        (p3d_rd_owner_q == P3D_RD_NONE) && scratch_rd_admission_idle;
+    wire residual_cfg_valid = p3d_active_q && ffn_down_start_q &&
+                              residual_cfg_boundary_ok;
+    wire residual_cfg_fire = residual_cfg_valid && residual_cfg_ready;
+    // A raw Q8 diagnosis may collide with the leaf cfg handshake, but phase
+    // ownership is published only if the top-level diagnosis boundary is clean.
+    wire residual_phase_commit = residual_cfg_fire && !q8_fault_raw;
+    wire p3d_down_launch /* verilator public_flat_rd */ =
+                           p3d_down_committed_q && p3d_active_q &&
+                           p3d_residual_started_q && !section_abort_now &&
+                           !p3d_cleanup_q && !p3d_kill_q &&
+                           !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                           !q8_fault_q && !r_abort_mode_q &&
+                           !ffn_fault_q && !kernel_activation_abort_q;
+    wire ffn_down_launch = (ffn_down_start_q && !p3d_active_q) ||
+                           p3d_down_launch;
+    wire residual_child_abort = section_abort_now || r_abort_mode_q;
     wire residual_s_axis_tvalid = p3d_active_q &&
                                   p3d_residual_started_q &&
                                   !kernel_downstream_quarantine &&
@@ -1162,7 +1329,7 @@ module decode_top #(
     section_residual_add u_section_residual_add (
         .clk(clk),
         .rst_n(rst_n),
-        .abort_run(p3d_abort_now),
+        .abort_run(residual_child_abort),
         .cfg_valid(residual_cfg_valid),
         .cfg_ready(residual_cfg_ready),
         .cfg_rows(p3d_model_rows_q),
@@ -1229,6 +1396,7 @@ module decode_top #(
         .wr_commit_valid(scratch_wr_commit_valid),
         .wr_commit_bank(scratch_wr_commit_bank),
         .wr_commit_address(scratch_wr_commit_address),
+        .r_wr_abort(scratch_r_wr_abort),
         .r_wr_valid(scratch_r_wr_valid),
         .r_wr_ready(scratch_r_wr_ready),
         .r_wr_bank(scratch_r_wr_bank),
@@ -1237,16 +1405,17 @@ module decode_top #(
         .r_wr_error(scratch_r_wr_error),
         .rd_req_valid(scratch_rd_req_valid),
         .rd_req_ready(scratch_rd_req_ready),
+        .rd_admission_idle(scratch_rd_admission_idle),
         .rd_quiescent(scratch_rd_quiescent),
         .rd_req_role(scratch_rd_req_role),
         .rd_req_token(scratch_rd_req_token),
         .rd_req_group(scratch_rd_req_group),
         .rd_issue_valid(scratch_rd_issue_valid),
         .rd_issue_address(scratch_rd_issue_address),
-        .rd_rsp_valid(scratch_rd_rsp_valid),
+        .rd_rsp_valid(scratch_leaf_rd_rsp_valid),
         .rd_rsp_ready(scratch_rd_rsp_ready),
-        .rd_rsp_data(scratch_rd_rsp_data),
-        .rd_rsp_error(scratch_rd_rsp_error)
+        .rd_rsp_data(scratch_leaf_rd_rsp_data),
+        .rd_rsp_error(scratch_leaf_rd_rsp_error)
     );
 
     wire kernel_sink_accept /* verilator public_flat_rd */ =
@@ -1272,8 +1441,10 @@ module decode_top #(
                                     (scratch_valid_tokens_q[scratch_role_q] == scratch_tokens_q);
     wire scratch_drain_start_ok = scratch_drain_start_strobe &&
                                   !section_abort_now &&
+                                  lifecycle_admission_clear &&
                                   scratch_drain_shape_ok && scratch_role_metadata_ok &&
-                                  scratch_idle && !scratch_section_active_q &&
+                                  scratch_admission_idle &&
+                                  !scratch_section_active_q &&
                                   shared_activation_idle;
     wire scratch_drain_start_bad = scratch_drain_start_strobe &&
                                    !section_abort_now &&
@@ -1298,11 +1469,19 @@ module decode_top #(
     wire scratch_consumer_record_accounting_ok =
         (scratch_consumer_records_q < scratch_consumer_blocks_q) &&
         (scratch_consumer_records_q < scratch_consumer_total_blocks_q);
-    wire p3d_read_conflict = rms_rd_req_valid && residual_rd_req_valid;
-    wire p3d_select_rms = (p3d_rd_owner_q == P3D_RD_NONE) &&
-                          rms_rd_req_valid && !residual_rd_req_valid;
-    wire p3d_select_residual = (p3d_rd_owner_q == P3D_RD_NONE) &&
-                               residual_rd_req_valid && !rms_rd_req_valid;
+    // Kill and cleanup quarantine new untagged requests only.  The retained
+    // owner and response mux below stay live until the outstanding response
+    // drains.
+    wire p3d_read_admit = p3d_active_q && !section_abort_now &&
+                           !p3d_cleanup_q && !rms_p3d_kill_q &&
+                           !p3d_down_reservation;
+    wire p3d_select_rms = p3d_read_admit &&
+                          (p3d_rd_owner_q == P3D_RD_NONE) &&
+                          !p3d_residual_started_q && rms_rd_req_valid;
+    wire p3d_select_residual = p3d_read_admit &&
+                               (p3d_rd_owner_q == P3D_RD_NONE) &&
+                               p3d_residual_started_q &&
+                               residual_rd_req_valid;
     wire p3d_rd_req_valid = p3d_select_rms || p3d_select_residual;
     wire scratch_select_p3d = (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
                               p3d_rd_req_valid;
@@ -1402,15 +1581,44 @@ module decode_top #(
     assign swiglu_in_up = ffn_pairer_out_up;
     assign swiglu_in_last = ffn_pairer_out_last;
     assign ffn_pairer_out_ready = swiglu_in_ready;
-    assign rms_scalar_ready = (q8_owner_q == Q8_OWNER_RMS) ?
-                              q8_internal_ready : 1'b0;
+    wire rms_q8_slot_pop = rms_q8_slot_valid_q &&
+                           (q8_owner_q == Q8_OWNER_RMS) &&
+                           q8_internal_ready;
+    wire rms_q8_slot_legal = p3d_active_q && !p3d_residual_started_q &&
+                             !section_abort_now && !p3d_cleanup_q &&
+                             !p3d_down_reservation &&
+                             !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                             !q8_fault_q && !q8_ingress_start &&
+                             (q8_owner_q == Q8_OWNER_RMS);
+    assign rms_scalar_ready = rst_n && rms_q8_slot_legal &&
+                              !rms_q8_slot_valid_q;
+    wire rms_q8_slot_push = rms_scalar_valid && rms_scalar_ready;
+    wire rms_q8_slot_clear = section_abort_now || rms_p3d_kill_q ||
+                             q8_p3d_abort_q ||
+                             q8_fault_q || q8_ingress_start;
+    always @(posedge clk) begin
+        if (!rst_n || rms_q8_slot_clear) begin
+            rms_q8_slot_valid_q <= 1'b0;
+            rms_q8_slot_data_q <= 32'd0;
+            rms_q8_slot_last_q <= 1'b0;
+            rms_q8_slot_status_q <= 2'd0;
+        end else if (rms_q8_slot_push) begin
+            rms_q8_slot_valid_q <= 1'b1;
+            rms_q8_slot_data_q <= rms_scalar_data;
+            rms_q8_slot_last_q <= rms_scalar_last;
+            rms_q8_slot_status_q <= rms_scalar_status;
+        end else if (rms_q8_slot_pop) begin
+            rms_q8_slot_valid_q <= 1'b0;
+        end
+    end
     assign swiglu_out_ready = (q8_owner_q == Q8_OWNER_GATE) ?
                               q8_internal_ready : 1'b0;
 
     // Section abort is a lifecycle boundary for every stage that can retain
     // work. A traversal failure also kills any scalar, quantization, or native
     // record still owned by the section before software starts another run.
-    assign q8_ingress_abort = section_abort_now || p3d_kill_q;
+    assign q8_ingress_abort = section_abort_now || q8_p3d_abort_q ||
+                              q8_fault_q;
 
     section_swiglu u_section_swiglu (
         .clk(clk),
@@ -1442,7 +1650,8 @@ module decode_top #(
     wire [2:0] q8_buffer_cfg_tokens = ffn_tokens_q;
     wire [8:0] q8_buffer_cfg_blocks = ffn_blocks_q;
     wire q8_buffer_seal_valid = ffn_seal_pending_q;
-    wire q8_buffer_abort_valid = section_abort_now || p3d_kill_q;
+    wire q8_buffer_abort_valid = section_abort_now || q8_p3d_abort_q ||
+                                 q8_fault_q;
     wire q8_buffer_rd_req_valid = ffn_replay_active_q &&
                                   !ffn_replay_inflight_q;
     wire q8_buffer_rd_req_ready;
@@ -1516,7 +1725,15 @@ module decode_top #(
                            residual_m_axis_tdata :
                            (scratch_drain_busy_q ? scratch_drain_emit_data_q :
                             kernel_m_axis_tdata);
-    assign m_axis_tvalid = !kernel_downstream_quarantine &&
+    wire public_output_quarantine = section_abort_now ||
+                                    kernel_downstream_quarantine ||
+                                    legacy_fault_raw ||
+                                    p3d_fault_event || p3d_cleanup_q ||
+                                    p3d_kill_q ||
+                                    rms_p3d_kill_q || q8_p3d_abort_q ||
+                                    q8_fault_raw || q8_fault_q ||
+                                    p3d_inactive_owner_raw;
+    assign m_axis_tvalid = !public_output_quarantine &&
                            (p3d_residual_output_selected ?
                             residual_m_axis_tvalid :
                             (scratch_drain_busy_q ? scratch_drain_tvalid :
@@ -1546,7 +1763,7 @@ module decode_top #(
         else
             rms_q8_record_fire_q <= rms_q8_record_accept;
     end
-    wire rms_q8_record_pending = rms_q8_record_fire_q;
+    assign rms_q8_record_pending = rms_q8_record_fire_q;
     wire rms_q8_record_fire /* verilator public_flat_rd */ =
         rms_q8_record_pending && p3d_active_q && !p3d_abort_now &&
         !p3d_cleanup_q && !p3d_fault_event &&
@@ -1554,12 +1771,16 @@ module decode_top #(
     wire rms_q8_final_record_fire /* verilator public_flat_rd */ =
         rms_q8_record_fire &&
         (p3d_q8_record_count_q + 1'b1 == p3d_q8_record_expected_q);
+    wire rms_q8_owner_retire = rms_q8_record_pending &&
+        (q8_owner_q == Q8_OWNER_RMS) && !rms_q8_slot_valid_q &&
+        (p3d_q8_record_count_q + 1'b1 == p3d_q8_record_expected_q);
     wire rms_r_write_fire = rms_r_wr_valid && rms_r_wr_ready;
     wire rms_r_final_write_fire = rms_r_write_fire &&
         (p3d_r_write_count_q + 1'b1 == p3d_r_write_expected_q);
     wire p3d_norm_seal_event /* verilator public_flat_rd */ =
         p3d_active_q && !p3d_cleanup_q &&
         !p3d_abort_now && !p3d_fault_event &&
+        !p3d_inactive_owner_raw && !q8_fault_raw &&
         !p3d_norm_sealed_q &&
         (p3d_norm_leaf_done_q || (rms_done && !rms_error)) &&
         (p3d_norm_q8_done_q || rms_q8_final_record_fire) &&
@@ -1582,18 +1803,49 @@ module decode_top #(
                             (scratch_wr_done && scratch_writer_active &&
                              (scratch_write_role_q == 2'd2) &&
                              !scratch_wr_error))));
-    wire q8_fault_live = q8_activation_abort
+    assign q8_fault_raw = q8_activation_abort
 `ifdef VERILATOR
-                         || sim_inject_q8_numeric_error
+                         || (sim_inject_q8_numeric_error &&
+                             (q8_owner_q != Q8_OWNER_NONE))
+`endif
+`ifdef FORMAL_DECODE_INTEGRATION
+                         || formal_inject_q8_cfg_fault
 `endif
                         ;
-    wire [5:0] q8_fault_status_now = (quantizer_status != 6'd0) ?
-                                           quantizer_status :
-                                           (q8_fault_live ? 6'b00_1000 : 6'd0);
-    wire p3d_q8_fault_now = p3d_active_q &&
-                             (q8_owner_q != Q8_OWNER_NONE) &&
-                             q8_fault_live;
-    wire q8_numeric_fault = ffn_producer_busy_q && q8_fault_live;
+    wire q8_fault_capture = q8_fault_raw && !q8_fault_source_held_q;
+    wire q8_fault_live = q8_fault_q;
+    wire [5:0] q8_fault_status_now = q8_fault_status_q;
+    wire p3d_q8_fault_now = p3d_active_q && q8_fault_q;
+    wire q8_numeric_fault = (q8_fault_owner_q == Q8_OWNER_GATE) &&
+                            q8_fault_q;
+    always @(posedge clk) begin
+        if (!rst_n || section_abort_now || q8_ingress_start) begin
+            q8_fault_q <= 1'b0;
+            q8_fault_source_held_q <= 1'b0;
+            q8_fault_status_q <= 6'd0;
+            q8_fault_owner_q <= Q8_OWNER_NONE;
+        end else begin
+            q8_fault_q <= 1'b0;
+            // Terminal status is sticky through cleanup and clears only when a
+            // higher-level restart is actually accepted. A simultaneous fresh
+            // capture has later priority and replaces the retired diagnostic.
+            if (gamma_load_accept) begin
+                q8_fault_status_q <= 6'd0;
+                q8_fault_owner_q <= Q8_OWNER_NONE;
+                if (!q8_fault_raw)
+                    q8_fault_source_held_q <= 1'b0;
+            end
+            if (!q8_fault_raw)
+                q8_fault_source_held_q <= 1'b0;
+            if (q8_fault_capture) begin
+                q8_fault_q <= 1'b1;
+                q8_fault_source_held_q <= 1'b1;
+                q8_fault_status_q <= (quantizer_status != 6'd0) ?
+                                     quantizer_status : 6'b00_1000;
+                q8_fault_owner_q <= q8_owner_q;
+            end
+        end
+    end
     wire producer_leaf_fault = (ffn_phase_q == FFN_GATE_RUN) &&
                                (gate_packer_error || ffn_pairer_error ||
                                 q8_numeric_fault ||
@@ -1604,20 +1856,19 @@ module decode_top #(
                             activation_error) || q8_replay_fault ||
                            ((ffn_phase_q == FFN_SEAL) &&
                             q8_buffer_seal_error);
+    assign legacy_fault_raw = scratch_section_active_q && !p3d_active_q &&
+                              !ffn_abort_cleanup_q && ffn_fault_event;
     assign p3d_fault_event = p3d_active_q && !p3d_cleanup_q &&
                              (rms_error || residual_error ||
                               p3d_q8_fault_now ||
-                              p3d_read_conflict || p3d_write_conflict ||
                               p3d_accounting_fault ||
                               (scratch_r_wr_error && scratch_r_wr_valid) ||
                               ffn_fault_event);
-    wire section_fault_event = scratch_section_active_q &&
-                               !ffn_abort_cleanup_q &&
-                               (p3d_active_q ? p3d_fault_event :
-                                ffn_fault_event);
+    wire section_fault_event = (scratch_section_active_q &&
+                                !ffn_abort_cleanup_q && p3d_fault_event) ||
+                               legacy_fault_raw;
     wire kernel_section_abort = section_abort_now || ffn_fault_q ||
-                                (p3d_active_q ? p3d_kill_q :
-                                 section_fault_event);
+                                section_fault_event;
     wire sim_down_activation_abort =
 `ifdef VERILATOR
         sim_inject_down_activation_error && p3d_active_q &&
@@ -1627,11 +1878,18 @@ module decode_top #(
 `endif
 
     assign kernel_activation_abort_now =
-        kernel_section_abort || q8_activation_abort || q8_ingress_abort ||
+        kernel_section_abort || q8_fault_q ||
+        p3d_inactive_owner_raw || rms_p3d_kill_q ||
         sim_down_activation_abort ||
         (scratch_writer_active && section_abort_now) ||
         (scratch_consumer_busy_q && section_abort_now);
-    assign kernel_abort_window = kernel_activation_abort_now ||
+    // Raw leaf diagnosis terminates at kernel_activation_abort_q.D.  The
+    // internal ready/valid window consumes registered lifecycle state only;
+    // one diagnosis-edge beat is tentative and final publication is already
+    // quarantined above.
+    assign kernel_abort_window = section_abort_now || ffn_fault_q ||
+                                 rms_p3d_kill_q || q8_fault_q ||
+                                 sim_down_activation_abort ||
                                  kernel_activation_abort_q;
     assign activation_error_status = activation_error ||
                                      kernel_activation_abort_q;
@@ -1648,7 +1906,7 @@ module decode_top #(
             kernel_activation_abort_q <= 1'b0;
         else
             kernel_activation_abort_q <= kernel_activation_abort_now &&
-                                         kernel_busy;
+                                         (kernel_busy || qualified_kernel_start);
     end
 
     gemm_kernel #(.ROWS(ROWS), .COLS_MAX(MATMUL_COLS_MAX), .MAX_SUB_INDEX(512)) u_kernel (
@@ -1660,7 +1918,7 @@ module decode_top #(
         .num_rows(num_rows_q),
         .num_cols(num_cols_q),
         .weight_fmt(weight_fmt_q),
-        .act_mode(ffn_down_start_q ? 2'd0 : act_mode_q),
+        .act_mode(ffn_down_launch ? 2'd0 : act_mode_q),
         .act_epoch(act_epoch_q),
         .activation_abort(kernel_activation_abort_q),
         .emin(EMIN_FLOOR),
@@ -1687,7 +1945,14 @@ module decode_top #(
         .dbg_state(kernel_dbg_state)
     );
 
-    wire p3d_cleanup_resources_idle = !rms_busy && !residual_busy &&
+    wire p3d_cleanup_resources_idle = !p3d_kill_q &&
+                                       !rms_p3d_kill_q &&
+                                       !q8_p3d_abort_q &&
+                                       !r_abort_mode_q && !q8_fault_q &&
+                                       !q8_fault_source_held_q &&
+                                       !rms_q8_slot_valid_q &&
+                                       !rms_q8_record_pending &&
+                                       !rms_busy && !residual_busy &&
                                        !kernel_busy && !gate_packer_busy &&
                                        !ffn_pairer_busy && !scratch_wr_busy &&
                                        !scratch_tee_run_q &&
@@ -1698,12 +1963,14 @@ module decode_top #(
                                         SCRATCH_RD_NONE) &&
                                        (p3d_rd_owner_q == P3D_RD_NONE) &&
                                        !scratch_rd_rsp_valid &&
-                                       (q8_owner_q == Q8_OWNER_NONE);
+                                       (q8_owner_q == Q8_OWNER_NONE) &&
+                                       !(|q8_buffer_bank_clearing);
     wire p3d_cleanup_retire = p3d_cleanup_q &&
                               p3d_cleanup_resources_idle;
     wire p3d_clean_complete = (ffn_phase_q == FFN_DOWN_RUN) &&
                                p3d_active_q && residual_done &&
                                !residual_error &&
+                               !p3d_inactive_owner_raw && !q8_fault_raw &&
                                (ffn_down_kernel_done_q ||
                                 kernel_done_healthy) &&
                                ffn_replay_complete_q && !activation_error &&
@@ -1942,7 +2209,7 @@ module decode_top #(
                 end
             end
 
-            if (ffn_down_start_q) begin
+            if (ffn_down_launch) begin
                 ffn_phase_q             <= FFN_DOWN_RUN;
                 ffn_replay_active_q     <= 1'b1;
                 ffn_replay_inflight_q   <= 1'b0;
@@ -1984,7 +2251,8 @@ module decode_top #(
             if ((ffn_phase_q == FFN_DOWN_RUN) && !p3d_active_q &&
                 (ffn_down_kernel_done_q || kernel_done_healthy) &&
                 ffn_replay_complete_q && !activation_error &&
-                !ffn_fault_q && !kernel_abort_window) begin
+                !legacy_fault_raw && !ffn_fault_q &&
+                !kernel_abort_window) begin
                 ffn_phase_q <= FFN_IDLE;
                 scratch_section_active_q <= 1'b0;
                 scratch_section_done_q <= 1'b1;
@@ -2007,6 +2275,22 @@ module decode_top #(
                 if (q8_numeric_fault)
                     scratch_error_q[6] <= 1'b1;
                 ffn_seal_pending_q <= 1'b0;
+            end
+
+            if (q8_fault_q && !p3d_active_q) begin
+                ffn_abort_cleanup_q <= scratch_section_active_q;
+                ffn_fault_q <= scratch_section_active_q;
+                ffn_gate_run_q <= 1'b0;
+                ffn_seal_pending_q <= 1'b0;
+                ffn_replay_active_q <= 1'b0;
+                ffn_replay_inflight_q <= 1'b0;
+                scratch_tee_run_q <= 1'b0;
+                scratch_only_run_q <= 1'b0;
+                scratch_valid_q <= 4'd0;
+                if (scratch_section_active_q) begin
+                    scratch_section_done_q <= 1'b1;
+                    scratch_error_q[6] <= 1'b1;
+                end
             end
 
             if (p3d_kill_q) begin
@@ -2048,7 +2332,7 @@ module decode_top #(
                 scratch_error_q            <= 7'd0;
             end else if (scratch_drain_start_bad) begin
                 scratch_drain_done_q <= 1'b1;
-                if (!scratch_drain_shape_ok || !scratch_idle ||
+                if (!scratch_drain_shape_ok || !scratch_admission_idle ||
                     !shared_activation_idle)
                     scratch_error_q[0] <= 1'b1;
                 if (scratch_drain_shape_ok && !scratch_role_metadata_ok)
@@ -2071,7 +2355,7 @@ module decode_top #(
                 scratch_consumer_total_blocks_q <=
                     {7'd0, scratch_rows_q[13:5]} * {13'd0, scratch_tokens_q};
             end else if (scratch_consumer_busy_q && !section_abort_now &&
-                         !q8_activation_abort) begin
+                         !q8_fault_q) begin
                 // Input blocks may run ahead into the SwiGLU BRAM FIFO. Retire
                 // them only after all five canonical Q8 record beats are accepted.
                 if (q8_internal_record_done) begin
@@ -2167,7 +2451,7 @@ module decode_top #(
                 end
             end
 
-            if (internal_activation_mode && q8_activation_abort) begin
+            if (internal_activation_mode && q8_fault_q) begin
                 scratch_consumer_busy_q  <= 1'b0;
                 scratch_consumer_done_q  <= 1'b1;
                 scratch_consumer_state_q <= CONSUMER_IDLE;
@@ -2261,8 +2545,13 @@ module decode_top #(
                 !ffn_pairer_busy &&
                 (scratch_rd_owner_q == SCRATCH_RD_NONE) &&
                 !scratch_rd_rsp_valid && !p3d_active_q &&
-                !p3d_cleanup_q) begin
+                !p3d_cleanup_q && !q8_fault_q &&
+                !q8_fault_source_held_q && !q8_p3d_abort_q &&
+                !r_abort_mode_q && !rms_q8_slot_valid_q &&
+                !(|q8_buffer_bank_clearing) &&
+                (q8_owner_q == Q8_OWNER_NONE)) begin
                 ffn_abort_cleanup_q <= 1'b0;
+                ffn_fault_q <= 1'b0;
                 ffn_phase_q <= FFN_IDLE;
                 ffn_producer_busy_q <= 1'b0;
                 ffn_producer_done_q <= 1'b0;
@@ -2279,14 +2568,10 @@ module decode_top #(
                                !section_abort_now &&
                                !gamma_load_accept;
     wire p3d_norm_fault_now = rms_error ||
-        ((q8_owner_q == Q8_OWNER_RMS) && p3d_q8_fault_now) ||
+        ((q8_fault_owner_q == Q8_OWNER_RMS) && p3d_q8_fault_now) ||
         p3d_accounting_fault ||
-        (p3d_read_conflict && !p3d_residual_started_q) ||
-        (p3d_write_conflict && !p3d_residual_started_q) ||
         (scratch_r_wr_error && rms_write_phase);
     wire p3d_residual_fault_now = residual_error ||
-        (p3d_read_conflict && p3d_residual_started_q) ||
-        (p3d_write_conflict && p3d_residual_started_q) ||
         (scratch_r_wr_error && residual_write_phase);
 
     // P3d owns lifecycle/status and the registered cross-abort. Combinational
@@ -2337,9 +2622,6 @@ module decode_top #(
             if (gamma_load_accept || scratch_section_begin_ok ||
                 (start_strobe && scratch_launch_ok))
                 p3d_quant_status_q <= 6'd0;
-            if (p3d_active_q && (q8_owner_q != Q8_OWNER_NONE) &&
-                (quantizer_status != 6'd0))
-                p3d_quant_status_q <= quantizer_status;
             if (p3d_q8_fault_now)
                 p3d_quant_status_q <= q8_fault_status_now;
             if (gamma_load_accept) begin
@@ -2410,9 +2692,10 @@ module decode_top #(
                     p3d_q8_record_count_q <= p3d_q8_record_count_q + 1'b1;
                     if (rms_q8_final_record_fire) begin
                         p3d_norm_q8_done_q <= 1'b1;
-                        q8_owner_q <= Q8_OWNER_NONE;
                     end
                 end
+                if (rms_q8_owner_retire)
+                    q8_owner_q <= Q8_OWNER_NONE;
                 if (rms_done && !rms_error)
                     p3d_norm_leaf_done_q <= 1'b1;
                 if (p3d_norm_seal_event) begin
@@ -2420,7 +2703,6 @@ module decode_top #(
                     norm_done_q <= 1'b1;
                     norm_error_q <= 1'b0;
                     norm_scalar_error_q <= 23'd0;
-                    q8_owner_q <= Q8_OWNER_NONE;
                 end
                 if ((ffn_phase_q == FFN_UP_RUN) && kernel_done_healthy)
                     p3d_up_kernel_done_q <= 1'b1;
@@ -2428,7 +2710,7 @@ module decode_top #(
                     q8_owner_q <= Q8_OWNER_GATE;
                 if (gate_q8_final_record_fire)
                     q8_owner_q <= Q8_OWNER_NONE;
-                if (ffn_down_start_q)
+                if (residual_phase_commit)
                     p3d_residual_started_q <= 1'b1;
                 if (p3d_clean_complete) begin
                     p3d_active_q <= 1'b0;
@@ -2436,7 +2718,6 @@ module decode_top #(
                     residual_done_q <= 1'b1;
                     residual_error_q <= 1'b0;
                     residual_error_detail_q <= 7'd0;
-                    q8_owner_q <= Q8_OWNER_NONE;
                 end
             end else if (!p3d_active_q) begin
                 if (ffn_gate_start_q)
@@ -2475,12 +2756,34 @@ module decode_top #(
                             residual_status : 7'h40;
                     p3d_scratch_error_q[1] <= 1'b1;
                 end
-                if (p3d_read_conflict || p3d_write_conflict ||
-                    p3d_accounting_fault)
+                if (p3d_accounting_fault)
                     norm_controller_error_q <= 1'b1;
             end
 
-            if (p3d_kill_q)
+            // Wrong-owner activity is diagnosed at this clock boundary. It may
+            // collide with one tentative active-owner transaction, but it cannot
+            // retire the section or switch phase on that edge.
+            if (p3d_inactive_owner_raw) begin
+                p3d_active_q <= 1'b1;
+                p3d_cleanup_q <= 1'b1;
+                p3d_cleanup_is_abort_q <= 1'b0;
+                p3d_kill_q <= 1'b1;
+                p3d_residual_started_q <= p3d_residual_started_q;
+                gamma_sealed_rows_q <= 14'd0;
+                if (p3d_inactive_norm_owner_raw) begin
+                    norm_error_q <= 1'b1;
+                    norm_controller_error_q <= 1'b1;
+                    p3d_scratch_error_q[0] <= 1'b1;
+                end else begin
+                    residual_error_q <= 1'b1;
+                    residual_error_detail_q <= 7'h40;
+                    p3d_scratch_error_q[1] <= 1'b1;
+                end
+            end
+
+            if (q8_p3d_abort_q)
+                q8_owner_q <= Q8_OWNER_NONE;
+            if (q8_fault_q)
                 q8_owner_q <= Q8_OWNER_NONE;
 
             if (p3d_cleanup_retire) begin
@@ -2703,7 +3006,8 @@ module decode_top #(
     wire any_scratch_error = (|scratch_error_q) ||
                              (|p3d_scratch_error_q);
     wire [5:0] quant_status_value = (p3d_quant_status_q != 6'd0) ?
-                                     p3d_quant_status_q : quantizer_status;
+                                     p3d_quant_status_q :
+                                     q8_fault_status_q;
     wire [31:0] norm_status_value = {
         21'd0,
         norm_global_idle,
@@ -2832,7 +3136,7 @@ module decode_top #(
         !kernel_abort_window;
     assign formal_seal_done = q8_buffer_seal_done &&
                               !q8_buffer_seal_error;
-    assign formal_down_start = ffn_down_start_q;
+    assign formal_down_start = ffn_down_launch;
     assign formal_down_complete_ready =
         (ffn_down_kernel_done_q || kernel_done_healthy) &&
         ffn_replay_complete_q && !activation_error && !ffn_fault_q &&
@@ -2892,6 +3196,11 @@ module decode_top #(
     assign formal_p3d_q8_record_expected = p3d_q8_record_expected_q;
     assign formal_p3d_norm_q8_done = p3d_norm_q8_done_q;
     assign formal_p3d_norm_seal_event = p3d_norm_seal_event;
+    assign formal_scratch_rd_req_accept = scratch_rd_req_accept;
+    assign formal_scratch_select_p3d = scratch_select_p3d;
+    assign formal_p3d_select_rms = p3d_select_rms;
+    assign formal_scratch_leaf_rsp_valid = scratch_leaf_rd_rsp_valid;
+    assign formal_residual_cfg_fire = residual_cfg_fire;
 
     reg        f_decode_past_valid = 1'b0;
 
@@ -2964,6 +3273,15 @@ module decode_top #(
                 assert(!m_axis_tvalid);
                 assert(!residual_m_axis_tready);
             end
+            if (legacy_fault_raw)
+                assert(!m_axis_tvalid);
+            if (public_output_quarantine)
+                assert(!m_axis_tvalid);
+            if (!lifecycle_admission_clear) begin
+                assert(!scratch_launch_ok);
+                assert(!legacy_section_begin_ok);
+                assert(!scratch_drain_start_ok);
+            end
             if (r_write_quarantine || section_abort_now)
                 assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
             assert(scratch_wr_tready ==
@@ -2975,7 +3293,7 @@ module decode_top #(
                    (ffn_pairer_s_axis_tready_core &&
                     !ffn_pipeline_abort));
             assert(residual_s_axis_tready ==
-                   (residual_s_axis_tready_core && !p3d_abort_now));
+                   (residual_s_axis_tready_core && !residual_child_abort));
             if (scratch_writer_abort)
                 assert(!(scratch_sink_valid && scratch_wr_tready));
             if (ffn_pipeline_abort) begin
@@ -2984,7 +3302,7 @@ module decode_top #(
                 assert(!(gate_packer_m_axis_tvalid &&
                          gate_packer_m_axis_tready));
             end
-            if (p3d_abort_now)
+            if (residual_child_abort)
                 assert(!(residual_s_axis_tvalid &&
                          residual_s_axis_tready));
             if (kernel_activation_abort_q) begin
@@ -2994,7 +3312,8 @@ module decode_top #(
 
             if (f_decode_past_valid && $past(rst_n)) begin
                 assert(kernel_activation_abort_q ==
-                       $past(kernel_activation_abort_now && kernel_busy));
+                       $past(kernel_activation_abort_now &&
+                             (kernel_busy || qualified_kernel_start)));
                 if ($past(kernel_activation_abort_q)) begin
                     assert(activation_error);
                     assert(!activation_valid);
@@ -3044,17 +3363,50 @@ module decode_top #(
             if (scratch_drain_rsp_valid)
                 assert(scratch_rd_owner_q == SCRATCH_RD_DRAIN);
             if (scratch_rd_quiescent) begin
-                assert(!scratch_rd_rsp_valid);
+                assert(!scratch_leaf_rd_rsp_valid);
                 assert(scratch_rd_req_ready);
             end
             if (scratch_idle)
                 assert(scratch_rd_quiescent);
+            if ((scratch_rd_owner_q == SCRATCH_RD_NONE) &&
+                scratch_rd_rsp_valid) begin
+                assert(scratch_rd_rsp_ready);
+                assert(!scratch_idle);
+            end
+`ifdef FORMAL_DECODE_INTEGRATION
+            if (formal_inject_ownerless_rsp) begin
+                assert(scratch_rd_owner_q == SCRATCH_RD_NONE);
+                assert(!scratch_leaf_rd_rsp_valid);
+                assert(scratch_rd_req_accept);
+                assert(scratch_rd_rsp_accept);
+                assert(!ffn_pairer_rd_rsp_valid);
+                assert(!scratch_drain_rsp_valid);
+                assert(!rms_rd_rsp_valid);
+                assert(!residual_rd_rsp_valid);
+            end
+`endif
+            if (f_decode_past_valid && $past(rst_n &&
+                scratch_rd_req_accept && scratch_rd_rsp_accept &&
+                (scratch_rd_owner_q == SCRATCH_RD_NONE))) begin
+                if ($past(scratch_select_p3d)) begin
+                    assert(scratch_rd_owner_q == SCRATCH_RD_P3D);
+                    assert(p3d_rd_owner_q ==
+                           ($past(p3d_select_rms) ? P3D_RD_RMS :
+                            P3D_RD_RESIDUAL));
+                end else if ($past(scratch_select_pairer)) begin
+                    assert(scratch_rd_owner_q == SCRATCH_RD_PAIRER);
+                end else begin
+                    assert($past(scratch_select_drain));
+                    assert(scratch_rd_owner_q == SCRATCH_RD_DRAIN);
+                end
+            end
 
             if (scratch_only_run_q) begin
                 assert(scratch_section_active_q);
                 assert(!m_axis_tvalid);
             end
-            if (internal_activation_mode)
+            if (internal_activation_mode && !gamma_cfg_start_q &&
+                !rms_gamma_busy && !p3d_external_residual_ingress)
                 assert(!s_axis_acts_tready);
             if (scratch_section_active_q &&
                 (scratch_mode_q == SCRATCH_MODE_ONLY))
@@ -3071,6 +3423,25 @@ module decode_top #(
                 assert(!q8_activation_abort);
                 assert(quantizer_status == 6'd0);
             end
+            if (q8_fault_raw) begin
+                assert(!m_axis_tvalid);
+                assert(!p3d_norm_seal_event);
+                assert(!p3d_clean_complete);
+            end
+            if (q8_fault_q) begin
+                assert(q8_ingress_abort);
+                assert(kernel_activation_abort_now);
+                assert(!m_axis_tvalid);
+                assert(q8_fault_status_q != 6'd0);
+            end
+            if (rms_q8_slot_valid_q)
+                assert(!rms_scalar_ready);
+            if (rms_q8_slot_push) begin
+                assert(!rms_q8_slot_valid_q);
+                assert(rms_q8_slot_legal);
+            end
+            if (rms_q8_owner_retire)
+                assert(!rms_q8_slot_valid_q);
             if (p3d_cleanup_q && (p3d_quant_status_q != 6'd0))
                 assert(quant_status_value == p3d_quant_status_q);
             if (f_decode_past_valid &&
@@ -3082,6 +3453,36 @@ module decode_top #(
                       (p3d_quant_status_q != 6'd0) &&
                       !section_abort_now))
                 assert(p3d_quant_status_q == $past(p3d_quant_status_q));
+            if (f_decode_past_valid && $past(rst_n)) begin
+                if ($past(q8_fault_capture && !section_abort_now &&
+                          !q8_ingress_start)) begin
+                    assert(q8_fault_q);
+                    assert(q8_fault_status_q != 6'd0);
+                    assert(q8_fault_owner_q == $past(q8_owner_q));
+                end
+                if ($past(q8_fault_q)) begin
+                    assert(!q8_fault_q);
+                    assert(q8_owner_q == Q8_OWNER_NONE);
+                end
+                if ($past(rms_q8_slot_push && !rms_q8_slot_clear)) begin
+                    assert(rms_q8_slot_valid_q);
+                    assert(rms_q8_slot_data_q == $past(rms_scalar_data));
+                    assert(rms_q8_slot_last_q == $past(rms_scalar_last));
+                    assert(rms_q8_slot_status_q == $past(rms_scalar_status));
+                end
+                if ($past(rms_q8_slot_valid_q && !rms_q8_slot_pop &&
+                          !rms_q8_slot_clear)) begin
+                    assert(rms_q8_slot_valid_q);
+                    assert(rms_q8_slot_data_q == $past(rms_q8_slot_data_q));
+                    assert(rms_q8_slot_last_q == $past(rms_q8_slot_last_q));
+                    assert(rms_q8_slot_status_q ==
+                           $past(rms_q8_slot_status_q));
+                end
+                if ($past(rms_q8_slot_pop && !rms_q8_slot_clear))
+                    assert(!rms_q8_slot_valid_q);
+                if ($past(rms_q8_slot_clear))
+                    assert(!rms_q8_slot_valid_q);
+            end
 
             if (ffn_producer_busy_q) begin
                 assert(scratch_section_active_q);
@@ -3137,7 +3538,7 @@ module decode_top #(
                 assert(!kernel_acts_tvalid);
                 assert(!q8_buffer_m_axis_tready);
             end
-            if (ffn_producer_done_q) begin
+            if (ffn_producer_done_q && !p3d_cleanup_q) begin
                 assert(q8_buffer_bank_valid[0] || |scratch_error_q);
                 assert(!ffn_producer_busy_q);
             end
@@ -3155,6 +3556,10 @@ module decode_top #(
                 assert(p3d_leaf_start_q == $past(p3d_section_begin_ok));
                 assert(legacy_q8_cfg_start_q ==
                        $past(legacy_section_begin_ok));
+                assert(rms_p3d_kill_q == $past(p3d_kill_q));
+                assert(q8_p3d_abort_q == $past(p3d_kill_q));
+                assert(r_abort_mode_q ==
+                       $past(p3d_kill_q || kernel_activation_abort_q));
                 if ($past(p3d_section_begin_ok)) begin
                     assert(p3d_model_rows_q == $past(model_rows_q));
                     assert(p3d_tokens_q == $past(scratch_tokens_q));
@@ -3163,8 +3568,18 @@ module decode_top #(
                            $past(scratch_section_resident_strobe));
                     assert(ffn_tokens_q == $past(scratch_tokens_q));
                     assert(ffn_blocks_q == $past(scratch_rows_q[13:5]));
+                    if (section_abort_now) begin
+                        assert(!p3d_leaf_start);
+                    end else begin
+                        assert(p3d_leaf_start);
+                        assert(rms_cfg_ready && q8_buffer_cfg_ready);
+                        assert(q8_buffer_cfg_p3d && q8_buffer_cfg_valid);
+                    end
                 end
             end
+            if (norm_admission_idle && gamma_valid_live &&
+                !section_abort_now)
+                assert(rms_cfg_ready);
             if (p3d_section_begin_ok) begin
                 assert(!p3d_leaf_start);
                 assert(!q8_buffer_cfg_p3d);
@@ -3226,23 +3641,181 @@ module decode_top #(
                 assert(!q8_ingress_start);
             end
 
-            if (p3d_abort_now && p3d_residual_output_selected) begin
+            // P3d DOWN crosses two local boundaries: command to residual config,
+            // then committed config to the common kernel/replay launch. No config
+            // or child-ready cone reaches the high-fanout kernel start directly.
+            if (p3d_active_q && ffn_down_start_q)
+                assert(!ffn_down_launch && !kernel_start);
+            if (residual_cfg_fire) begin
+                assert(residual_cfg_boundary_ok);
+                assert(!ffn_down_launch && !kernel_start);
+                assert(!p3d_inactive_owner_raw);
+                assert(p3d_down_reservation);
+            end
+            if (q8_fault_raw && residual_cfg_fire) begin
+                assert(!residual_phase_commit);
+                assert(!p3d_down_launch && !kernel_start);
+                assert(!p3d_norm_seal_event);
+                assert(!p3d_clean_complete);
+                assert(!m_axis_tvalid);
+            end
+            if (p3d_down_launch) begin
+                assert(p3d_down_committed_q);
+                assert(p3d_residual_started_q);
+                assert(ffn_down_launch && kernel_start);
+                assert(p3d_down_reservation);
+            end
+            if (p3d_down_committed_q &&
+                (section_abort_now || p3d_cleanup_q || p3d_kill_q ||
+                 rms_p3d_kill_q || q8_p3d_abort_q || q8_fault_q ||
+                 r_abort_mode_q || ffn_fault_q ||
+                 kernel_activation_abort_q)) begin
+                assert(!p3d_down_launch);
+                assert(!kernel_start);
+            end
+            if (ffn_down_command_accept && p3d_active_q) begin
+                assert(p3d_down_reservation);
+                assert(!scratch_rd_req_accept);
+                assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
+            end
+            if (p3d_inactive_owner_raw) begin
+                assert(!p3d_norm_seal_event);
+                assert(!p3d_clean_complete);
+                assert(!residual_cfg_fire);
+                assert(!m_axis_tvalid);
+            end
+            assert(!(p3d_inactive_norm_owner_raw &&
+                     p3d_inactive_residual_owner_raw));
+            if (f_decode_past_valid && $past(rst_n)) begin
+                if ($past(ffn_down_command_accept && p3d_active_q)) begin
+                    assert(ffn_down_start_q);
+                    assert(p3d_down_reservation || p3d_cleanup_q);
+                    if (!section_abort_now && !q8_fault_q &&
+                        !p3d_inactive_owner_raw && !p3d_cleanup_q &&
+                        !p3d_kill_q) begin
+                        assert(residual_cfg_fire);
+                        assert(!ffn_down_launch);
+                        assert(!kernel_start);
+                    end
+                end
+                if ($past(residual_phase_commit)) begin
+                    assert(p3d_down_committed_q);
+                    if (!section_abort_now && !p3d_cleanup_q &&
+                        !p3d_kill_q && !rms_p3d_kill_q &&
+                        !q8_p3d_abort_q && !q8_fault_q &&
+                        !r_abort_mode_q && !ffn_fault_q &&
+                        !kernel_activation_abort_q) begin
+                        assert(p3d_down_launch);
+                        assert(kernel_start);
+                    end
+                end
+                if ($past(p3d_down_committed_q))
+                    assert(!p3d_down_committed_q);
+                if ($past(q8_fault_raw && residual_cfg_fire &&
+                          !section_abort_now)) begin
+                    assert(!p3d_down_committed_q);
+                    assert(!p3d_residual_started_q);
+                    assert(q8_fault_q);
+                end
+                if ($past(p3d_inactive_owner_raw &&
+                          !section_abort_now)) begin
+                    assert(p3d_active_q);
+                    assert(p3d_cleanup_q);
+                    assert(p3d_kill_q);
+                    assert(p3d_residual_started_q ==
+                           $past(p3d_residual_started_q));
+                    if ($past(p3d_inactive_norm_owner_raw)) begin
+                        assert(norm_error_q);
+                        assert(norm_controller_error_q);
+                    end else begin
+                        assert(residual_error_q);
+                    end
+                end
+                if ($past(p3d_down_launch && p3d_inactive_owner_raw &&
+                          !section_abort_now)) begin
+                    assert(kernel_activation_abort_q);
+                    assert(p3d_cleanup_q && p3d_kill_q);
+                    assert(residual_error_q);
+                    assert(!m_axis_tvalid);
+                    assert(!p3d_norm_seal_event);
+                    assert(!p3d_clean_complete);
+                end
+                if ($past(rms_p3d_kill_q && kernel_busy))
+                    assert(kernel_activation_abort_q);
+            end
+            if (p3d_down_launch && p3d_inactive_owner_raw) begin
+                assert(!m_axis_tvalid);
+                assert(!scratch_r_wr_valid);
+                assert(!p3d_norm_seal_event);
+                assert(!p3d_clean_complete);
+            end
+
+            if (residual_child_abort && p3d_residual_output_selected) begin
                 assert(!m_axis_tvalid);
                 assert(!(residual_s_axis_tvalid &&
                          residual_s_axis_tready));
-                assert(!scratch_r_wr_valid);
             end
             if (p3d_kill_q) begin
                 assert(!scratch_rd_req_accept);
                 assert(!scratch_wr_commit_valid);
+                assert(!m_axis_tvalid);
+            end
+            if (p3d_fault_event && !section_abort_now && !ffn_fault_q &&
+                !rms_p3d_kill_q && !q8_fault_q &&
+                !sim_down_activation_abort && !kernel_activation_abort_q)
+                assert(!kernel_abort_window);
+            if (p3d_kill_q || rms_p3d_kill_q || q8_p3d_abort_q ||
+                r_abort_mode_q) begin
+                assert(!p3d_cleanup_retire);
+                assert(!norm_global_idle);
+                assert(!gamma_load_accept);
+                assert(!p3d_section_begin_ok);
+                assert(!scratch_launch_ok);
+            end
+            if (!p3d_read_admit) begin
+                assert(!p3d_rd_req_valid);
+                assert(!rms_rd_req_ready && !residual_rd_req_ready);
+            end
+            if ((p3d_cleanup_q || p3d_kill_q || rms_p3d_kill_q) &&
+                (scratch_rd_owner_q == SCRATCH_RD_P3D)) begin
+                assert(p3d_rd_owner_q != P3D_RD_NONE);
+                if (scratch_rd_rsp_valid)
+                    assert(rms_rd_rsp_valid || residual_rd_rsp_valid);
+            end
+            assert(rms_child_abort ==
+                   (section_abort_now || rms_p3d_kill_q));
+            assert(scratch_r_wr_abort ==
+                   (section_abort_now || r_abort_mode_q));
+            if (section_abort_now) begin
+                assert(rms_child_abort);
+                assert(scratch_writer_abort && scratch_r_wr_abort);
+                assert(!scratch_r_wr_valid);
+                assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
+            end
+            if (r_abort_mode_q) begin
+                assert(scratch_r_wr_abort);
+                assert(!scratch_r_wr_valid);
                 assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
             end
 
             // P3d scratch reads are untagged at both arbitration levels.  Each
             // accepted child remains the sole subowner until the physical
             // response drains, including across fault/abort cleanup.
-            assert(!(rms_rd_req_valid && residual_rd_req_valid));
-            assert(!(rms_r_wr_valid && residual_r_wr_valid));
+            assert(!(p3d_select_rms && p3d_select_residual));
+            assert(!(rms_write_phase && residual_write_phase));
+            if (!p3d_residual_started_q) begin
+                assert(!p3d_select_residual);
+                assert(!residual_rd_req_ready);
+            end else begin
+                assert(!p3d_select_rms);
+                assert(!rms_rd_req_ready);
+            end
+            if (p3d_down_reservation) begin
+                assert(!p3d_rd_req_valid);
+                assert(!rms_rd_req_ready && !residual_rd_req_ready);
+                assert(!scratch_r_wr_valid);
+                assert(!(scratch_r_wr_valid && scratch_r_wr_ready));
+            end
             if (scratch_rd_owner_q == SCRATCH_RD_P3D)
                 assert(p3d_rd_owner_q != P3D_RD_NONE);
             if (p3d_rd_owner_q != P3D_RD_NONE)
@@ -3267,10 +3840,8 @@ module decode_top #(
                 assert(rms_write_phase ^ residual_write_phase);
                 if (rms_write_phase) begin
                     assert(rms_r_wr_valid);
-                    assert(!residual_r_wr_valid);
                 end else begin
                     assert(residual_r_wr_valid);
-                    assert(!rms_r_wr_valid);
                 end
             end
             if (p3d_active_q && scratch_only_start)
@@ -3336,7 +3907,7 @@ module decode_top #(
                 assert(!ddr_kernel_valid);
                 assert(m_axis_tvalid ==
                        (residual_m_axis_tvalid &&
-                        !kernel_downstream_quarantine));
+                        !public_output_quarantine));
                 if (m_axis_tvalid) begin
                     assert(m_axis_tdata == residual_m_axis_tdata);
                     assert(m_axis_tkeep == residual_m_axis_tkeep);
@@ -3345,12 +3916,16 @@ module decode_top #(
             end
             if (p3d_fault_event && p3d_residual_output_selected) begin
                 assert(!m_axis_tvalid);
-                assert(!residual_m_axis_tready);
-                assert(!kernel_sink_accept);
             end
             if (p3d_clean_complete) begin
                 assert(!p3d_fault_event);
                 assert(residual_done && !residual_error);
+            end
+            if (p3d_fault_event && scratch_r_wr_valid &&
+                scratch_r_wr_ready) begin
+                assert(!p3d_norm_seal_event);
+                assert(!p3d_clean_complete);
+                assert(!m_axis_tvalid);
             end
             if (f_decode_past_valid &&
                 $past(rst_n && p3d_clean_complete)) begin
@@ -3360,7 +3935,14 @@ module decode_top #(
                 assert(scratch_valid_tokens_q[0] == $past(p3d_tokens_q));
             end
             if (p3d_cleanup_retire)
-                assert(p3d_cleanup_resources_idle && !m_axis_tvalid);
+                assert(p3d_cleanup_resources_idle && !p3d_kill_q &&
+                       !rms_p3d_kill_q && !q8_p3d_abort_q &&
+                       !r_abort_mode_q && !q8_fault_q &&
+                       !(|q8_buffer_bank_clearing) &&
+                       !m_axis_tvalid);
+            if (f_decode_past_valid &&
+                $past(rst_n && p3d_cleanup_retire))
+                assert(!ffn_producer_done_q);
 
             // Every accepted failed section has a visible terminal attribution:
             // norm/controller before residual starts, residual thereafter.

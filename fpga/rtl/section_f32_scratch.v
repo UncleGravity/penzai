@@ -48,6 +48,7 @@ module section_f32_scratch (
     // Token-major direct writes into R. The section RMSNorm loader supplies
     // the already-mapped bank/address and owns framing/accounting. This port
     // is accepted only while the legacy GEMM-order writer is idle.
+    input  wire          r_wr_abort,
     input  wire          r_wr_valid,
     output wire          r_wr_ready,
     input  wire [1:0]    r_wr_bank,
@@ -58,6 +59,7 @@ module section_f32_scratch (
     // One role-local row group request.  group zero denotes rows 0..7.
     input  wire          rd_req_valid,
     output wire          rd_req_ready,
+    output wire          rd_admission_idle,
     output wire          rd_quiescent,
     input  wire [1:0]    rd_req_role,
     input  wire [2:0]    rd_req_token,
@@ -73,7 +75,7 @@ module section_f32_scratch (
     output wire          rd_rsp_valid,
     input  wire          rd_rsp_ready,
     output wire [255:0]  rd_rsp_data,
-    output reg           rd_rsp_error
+    output reg           rd_rsp_error /* verilator public_flat_rw */
 );
     localparam [1:0] ROLE_R  = 2'd0;
     localparam [1:0] ROLE_X0 = 2'd1;
@@ -169,7 +171,7 @@ module section_f32_scratch (
     // R occupies physical addresses 0..2047. Invalid direct writes handshake
     // and report an error without mutating storage, so the loader terminates
     // rather than hanging on a malformed command.
-    assign r_wr_ready = rst_n && !wr_busy_q && !wr_abort;
+    assign r_wr_ready = rst_n && !wr_busy_q && !r_wr_abort;
     wire r_wr_accept = r_wr_valid && r_wr_ready;
     wire r_wr_bad = r_wr_address >= 14'd2048;
     assign r_wr_error = r_wr_accept && r_wr_bad;
@@ -231,7 +233,7 @@ module section_f32_scratch (
     reg [13:0]  rd_prev_mem_write_address_q;
     reg         rd_result_pending_q;
     reg         rd_result_error_q;
-    reg         rd_rsp_valid_q;
+    reg         rd_rsp_valid_q /* verilator public_flat_rw */;
     reg [63:0]  rd_mem_bank0_q;
     reg [63:0]  rd_mem_bank1_q;
     reg [63:0]  rd_mem_bank2_q;
@@ -247,8 +249,10 @@ module section_f32_scratch (
     // request in flight preserves the single elastic response slot.
     assign rd_req_ready = rst_n && !rd_pending_q && !rd_result_pending_q &&
                           (!rd_rsp_valid_q || rd_rsp_ready);
+    assign rd_admission_idle = rst_n && !rd_pending_q &&
+                               !rd_result_pending_q;
     assign rd_quiescent = rst_n && !rd_pending_q && !rd_result_pending_q &&
-                          !rd_rsp_valid_q;
+                           !rd_rsp_valid_q;
     wire rd_accept = rd_req_valid && rd_req_ready;
     wire rd_accept_collision_deferred = rd_prev_mem_write_q &&
         (rd_address_q == rd_prev_mem_write_address_q);
@@ -403,6 +407,9 @@ module section_f32_scratch (
         assert(s_axis_tready == (s_axis_tready_core && !wr_abort));
         if (wr_abort)
             assert(!s_axis_tready && !wr_commit_valid);
+        assert(r_wr_ready == (rst_n && !wr_busy_q && !r_wr_abort));
+        if (r_wr_abort)
+            assert(!r_wr_ready && !r_wr_error && !r_wr_mem_write);
     end
 `endif
 

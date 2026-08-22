@@ -681,12 +681,14 @@ fn verifyOrphanCollisions(dut: *Dut) !void {
     dut.clearInputs();
     try expectFault(dut, section.ResidualAddStatus.internal);
 
-    // ST_WRITE: no tentative R mutation may escape with the orphan fault.
+    // ST_WRITE: the already-computed word may commit tentatively on the
+    // diagnosis edge, but the priority fault must prevent publication.
     try advanceToWrite(dut, zeros, 0);
     c.dut_set_write_sink(dut.handle, 1, 0);
     c.dut_set_read_response(dut.handle, 1, &zeros, 0);
     dut.eval();
-    try std.testing.expect(c.dut_write_valid(dut.handle) == 0);
+    try std.testing.expect(c.dut_write_valid(dut.handle) != 0);
+    try std.testing.expect(c.dut_output_valid(dut.handle) == 0);
     try std.testing.expect(c.dut_read_response_ready(dut.handle) != 0);
     dut.step();
     dut.clearInputs();

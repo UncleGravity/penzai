@@ -19,6 +19,7 @@ void dut_set_abort(Dut *d, int value);
 void dut_set_group(Dut *d, int valid, const uint32_t lanes[8], int error,
                    int last);
 void dut_set_result_ready(Dut *d, int value);
+void dut_force_summary_fatal(Dut *d, int value);
 
 int dut_config_ready(Dut *d);
 int dut_busy(Dut *d);

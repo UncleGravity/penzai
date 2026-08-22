@@ -293,10 +293,13 @@ module section_rmsnorm_scalar_pipeline #(
                                  (scratch_owner_q == RD_REDUCE);
     assign source_rd_rsp_valid = rd_rsp_valid &&
                                  (scratch_owner_q == RD_SOURCE);
-    assign rd_rsp_ready =
-        (scratch_owner_q == RD_REDUCE) ? reduce_rd_rsp_ready :
-        (scratch_owner_q == RD_SOURCE) ? source_rd_rsp_ready :
-        rd_rsp_valid;
+    // Abort owns the outer drain decision.  The response remains owner-routed
+    // into the child, but READY must not traverse the sibling child control
+    // cones while the wrapper is being killed.
+    assign rd_rsp_ready = child_abort ? 1'b1 :
+        ((scratch_owner_q == RD_REDUCE) ? reduce_rd_rsp_ready :
+         (scratch_owner_q == RD_SOURCE) ? source_rd_rsp_ready :
+         rd_rsp_valid);
     wire rd_rsp_fire = rd_rsp_valid && rd_rsp_ready;
 
     always @(posedge clk) begin
@@ -613,6 +616,33 @@ module section_rmsnorm_scalar_pipeline #(
                 assert(!source_rd_rsp_valid);
             if (scratch_owner_q == RD_SOURCE)
                 assert(!reduce_rd_rsp_valid);
+            if (child_abort && rd_rsp_valid &&
+                (scratch_owner_q == RD_REDUCE)) begin
+                assert(rd_rsp_ready && reduce_rd_rsp_valid &&
+                       reduce_rd_rsp_ready && rd_rsp_fire);
+            end
+            if (child_abort && rd_rsp_valid &&
+                (scratch_owner_q == RD_SOURCE)) begin
+                assert(rd_rsp_ready && source_rd_rsp_valid &&
+                       source_rd_rsp_ready && rd_rsp_fire);
+            end
+        end
+        if (f_past_valid && rst_n &&
+            $past(rst_n && child_abort && rd_rsp_valid &&
+                  (scratch_owner_q == RD_REDUCE))) begin
+            assert(scratch_owner_q == RD_NONE);
+            assert(!reduce_rd_rsp_ready);
+        end
+        if (f_past_valid && rst_n &&
+            $past(rst_n && child_abort && rd_rsp_valid &&
+                  (scratch_owner_q == RD_SOURCE))) begin
+            assert(scratch_owner_q == RD_NONE);
+            assert(!source_rd_rsp_ready);
+        end
+        if (f_past_valid && rst_n &&
+            $past(rst_n && child_abort && !rd_rsp_valid &&
+                  (scratch_owner_q != RD_NONE))) begin
+            assert(scratch_owner_q == $past(scratch_owner_q));
         end
         if (f_past_valid && rst_n && !abort_run && !child_fault_now &&
             !internal_fault_now && !output_frame_bad &&

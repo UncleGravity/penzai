@@ -86,7 +86,7 @@ module gemm_emit #(
     always @(posedge clk) begin
         if (!rst_n) begin v1<=1'b0; sign1<=1'b0; zero1<=1'b0; mag1<=0; emin1<=0; end
         else begin
-            v1 <= valid_in; sign1 <= sign0; zero1 <= (mag0 == {ACC_W{1'b0}});
+            v1 <= valid_in; sign1 <= sign0; zero1 <= (acc == {ACC_W{1'b0}});
             mag1 <= mag0; emin1 <= emin;
         end
     end
@@ -394,10 +394,12 @@ module gemm_rowblock #(
             // FF→add→FF — no read_col mux in series with it. Off the throughput path; costs +1
             // readout latency, which gemm_kernel realigns (pc_beat/pc_vld). The accumulate
             // recurrence (the CSA above) is untouched and stays single-cycle.
+            (* keep = "true" *) reg [CW-1:0] read_col_q;
             reg signed [ACC_W-1:0] rdS_q, rdC_q;
             always @(posedge clk) begin
-                rdS_q <= accS[read_col];
-                rdC_q <= accC[read_col];
+                read_col_q <= read_col;
+                rdS_q <= accS[read_col_q];
+                rdC_q <= accC[read_col_q];
             end
             assign acc_flat[r*ACC_W +: ACC_W] = rdS_q + rdC_q;
         end

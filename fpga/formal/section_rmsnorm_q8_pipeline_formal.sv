@@ -221,6 +221,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
     wire formal_reduce_rd_req_valid_raw;
     wire formal_source_rd_req_valid_raw;
     wire formal_cross_abort;
+    wire formal_scalar_cross_abort;
     wire formal_cleanup_abort_issued;
     wire formal_reduce_done_seen;
     wire formal_fault_latched;
@@ -299,6 +300,7 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
         .formal_source_rd_req_valid_raw(
             formal_source_rd_req_valid_raw),
         .formal_cross_abort(formal_cross_abort),
+        .formal_scalar_cross_abort(formal_scalar_cross_abort),
         .formal_cleanup_abort_issued(formal_cleanup_abort_issued),
         .formal_reduce_done_seen(formal_reduce_done_seen),
         .formal_fault_latched(formal_fault_latched),
@@ -309,6 +311,9 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
         .formal_source_completion_mismatch(
             formal_source_completion_mismatch)
     );
+
+    wire effective_scalar_abort = abort_run || formal_cross_abort ||
+                                  formal_scalar_cross_abort;
 
     // Make the internal-fault quarantine nonvacuous: the orphan arrives in
     // the exact RUN cycle where the reducer's first unowned request is pending.
@@ -512,8 +517,16 @@ module section_rmsnorm_q8_pipeline_formal(input wire clk);
                 if (formal_state == PIPE_CLEANUP)
                     assert(rd_rsp_ready);
             end
+            if (env_owner_q == OWNER_NONE)
+                assert(rd_rsp_ready ==
+                       (rd_rsp_valid || effective_scalar_abort));
             if (rd_rsp_ready)
-                assert(env_owner_q != OWNER_NONE || orphan_inject_now);
+                assert(env_owner_q != OWNER_NONE || orphan_inject_now ||
+                       effective_scalar_abort);
+            if (effective_scalar_abort)
+                assert(rd_rsp_ready);
+            if (effective_scalar_abort && rd_rsp_valid)
+                assert(response_fire && formal_rd_rsp_fire);
             if (formal_reduce_rd_req_fire)
                 assert(env_owner_q == OWNER_NONE && rd_req_role == 2'd0);
             if (formal_source_rd_req_fire)

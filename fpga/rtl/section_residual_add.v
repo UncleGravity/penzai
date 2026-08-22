@@ -139,8 +139,10 @@ module section_residual_add #(
                            (s_axis_tlast != expected_last);
 
     // Raw orphan presence is independent of any downstream ready signal. It
-    // fail-closes all tentative traffic in the detection cycle without a
-    // combinational ready/valid loop.
+    // fail-closes new reads, arithmetic and publication in the detection cycle
+    // without a combinational ready/valid loop. A word already in ST_WRITE may
+    // still commit tentatively; the priority fault branch below prevents it from
+    // ever reaching ST_OUTPUT.
     wire orphan_rsp_present = rd_rsp_valid && !read_owned_q;
     wire unexpected_rsp = orphan_rsp_present && !wrapper_idle;
     wire traffic_enable = rst_n && !abort_run && !unexpected_rsp;
@@ -211,7 +213,7 @@ module section_residual_add #(
         .result_status(add_result_status)
     );
 
-    assign r_wr_valid = traffic_enable && (state_q == ST_WRITE);
+    assign r_wr_valid = rst_n && !abort_run && (state_q == ST_WRITE);
     assign r_wr_bank = pair_q[1:0];
     assign r_wr_address = {2'b00, token_q, 9'b0} +
                           {3'b000, current_group};
@@ -404,6 +406,24 @@ module section_residual_add #(
     wire _unused_run_rows = &{1'b0, run_rows_q};
 
 `ifdef FORMAL
+    reg f_residual_past_valid = 1'b0;
+    always @(posedge clk) begin
+        f_residual_past_valid <= 1'b1;
+        if (rst_n) begin
+            assert(r_wr_valid == (!abort_run && (state_q == ST_WRITE)));
+            if (unexpected_rsp && (state_q == ST_WRITE)) begin
+                assert(r_wr_valid);
+                assert(!m_axis_tvalid);
+            end
+        end
+        if (f_residual_past_valid && rst_n &&
+            $past(rst_n && !abort_run && unexpected_rsp &&
+                  (state_q == ST_WRITE))) begin
+            assert(state_q == ST_CLEANUP);
+            assert(!m_axis_tvalid);
+        end
+    end
+
     always @* begin
         assert(s_axis_tready == (s_axis_tready_core && !abort_run));
         if (abort_run)

@@ -94,6 +94,7 @@ module section_rmsnorm_q8_pipeline #(
     , output wire        formal_reduce_rd_req_valid_raw
     , output wire        formal_source_rd_req_valid_raw
     , output wire        formal_cross_abort
+    , output wire        formal_scalar_cross_abort
     , output wire        formal_cleanup_abort_issued
     , output wire        formal_reduce_done_seen
     , output wire        formal_fault_latched
@@ -625,6 +626,7 @@ module section_rmsnorm_q8_pipeline #(
     assign formal_source_rd_req_valid_raw =
         scalar_formal_source_rd_req_valid_raw;
     assign formal_cross_abort = cross_abort_q;
+    assign formal_scalar_cross_abort = scalar_formal_cross_abort;
     assign formal_cleanup_abort_issued = cleanup_abort_issued_q;
     assign formal_reduce_done_seen = scalar_formal_reduce_done_seen;
     assign formal_fault_latched = fault_latched_q;

@@ -61,6 +61,13 @@ module decode_p3d_formal(input wire clk);
     reg [7:0] write_addr;
     reg [31:0] write_data;
     reg write_enable;
+    reg q8_cfg_restart_issued_q;
+    reg saw_q8_cfg_fault_q;
+    reg saw_q8_cfg_cleanup_q;
+    reg saw_q8_cfg_retired_q;
+    reg saw_q8_cfg_restart_gamma_q;
+    reg saw_q8_cfg_restart_begin_q;
+    reg saw_q8_cfg_restart_launch_q;
 
     always @* begin
         write_addr = 8'd0;
@@ -154,23 +161,93 @@ module decode_p3d_formal(input wire clk);
     wire [9:0] formal_p3d_q8_record_count;
     wire [9:0] formal_p3d_q8_record_expected;
     wire formal_p3d_norm_q8_done, formal_p3d_norm_seal_event;
+    wire formal_scratch_rd_req_accept, formal_scratch_select_p3d;
+    wire formal_p3d_select_rms, formal_scratch_leaf_rsp_valid;
+    wire formal_residual_cfg_fire;
+    reg formal_injected_abort_q = 1'b0;
 `ifdef FORMAL_P3D_COVER
+`ifdef FORMAL_P3D_ABORT
+    wire formal_inject_abort = rst_n && !formal_injected_abort_q &&
+                               (command_q == WAIT_ABORT_OWNER) &&
+                               (formal_scratch_rd_owner == 2'd3) &&
+                               (formal_p3d_rd_owner == 2'd1);
+`else
     wire formal_inject_abort = 1'b0;
+`endif
 `else
     (* anyseq *) reg formal_inject_abort;
-    reg formal_injected_abort_q = 1'b0;
-    always @(posedge clk) begin
-        if (!rst_n)
-            formal_injected_abort_q <= 1'b0;
-        else if (formal_inject_abort)
-            formal_injected_abort_q <= 1'b1;
-    end
     always @* begin
         assume(!formal_inject_abort ||
                (formal_rms_q8_record_pending &&
                 !formal_injected_abort_q));
     end
 `endif
+    always @(posedge clk) begin
+        if (!rst_n)
+            formal_injected_abort_q <= 1'b0;
+        else if (formal_inject_abort)
+            formal_injected_abort_q <= 1'b1;
+    end
+
+    (* anyseq *) reg formal_inject_inactive_norm_owner;
+    (* anyseq *) reg formal_inject_inactive_residual_owner;
+    (* anyseq *) reg formal_inject_ownerless_rsp;
+    (* anyseq *) reg formal_inject_ownerless_rsp_error;
+    (* anyseq *) reg formal_inject_q8_cfg_fault;
+    reg formal_ownerless_injected_q = 1'b0;
+    reg formal_q8_cfg_fault_injected_q = 1'b0;
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            formal_ownerless_injected_q <= 1'b0;
+            formal_q8_cfg_fault_injected_q <= 1'b0;
+        end else begin
+            if (formal_inject_ownerless_rsp)
+                formal_ownerless_injected_q <= 1'b1;
+            if (formal_inject_q8_cfg_fault)
+                formal_q8_cfg_fault_injected_q <= 1'b1;
+        end
+    end
+    always @* begin
+`ifdef FORMAL_P3D_Q8_CFG_COVER
+        assume(!formal_inject_inactive_norm_owner);
+        assume(!formal_inject_inactive_residual_owner);
+        assume(!formal_inject_ownerless_rsp);
+        assume(!formal_inject_ownerless_rsp_error);
+        assume(formal_inject_q8_cfg_fault ==
+               (!formal_q8_cfg_fault_injected_q &&
+                formal_residual_cfg_fire));
+`elsif FORMAL_P3D_INACTIVE_NORM
+        assume(formal_inject_inactive_norm_owner ==
+               (formal_p3d_active && !formal_p3d_cleanup &&
+                !formal_p3d_residual_started && !formal_abort_strobe));
+        assume(!formal_inject_inactive_residual_owner);
+        assume(!formal_inject_ownerless_rsp);
+        assume(!formal_inject_ownerless_rsp_error);
+        assume(!formal_inject_q8_cfg_fault);
+`elsif FORMAL_P3D_INACTIVE_RESIDUAL
+        assume(!formal_inject_inactive_norm_owner);
+        assume(formal_inject_inactive_residual_owner ==
+               (formal_p3d_active && !formal_p3d_cleanup &&
+                formal_p3d_residual_started && formal_down_start &&
+                !formal_abort_strobe));
+        assume(formal_inject_ownerless_rsp ==
+               (!formal_ownerless_injected_q &&
+                (formal_scratch_rd_owner == 2'd0) &&
+                (formal_p3d_rd_owner == 2'd0) &&
+                formal_scratch_rd_req_accept &&
+                formal_scratch_select_p3d && formal_p3d_select_rms &&
+                !formal_scratch_leaf_rsp_valid));
+        assume(formal_inject_ownerless_rsp_error ==
+               formal_inject_ownerless_rsp);
+        assume(!formal_inject_q8_cfg_fault);
+`else
+        assume(!formal_inject_inactive_norm_owner);
+        assume(!formal_inject_inactive_residual_owner);
+        assume(!formal_inject_ownerless_rsp);
+        assume(!formal_inject_ownerless_rsp_error);
+        assume(!formal_inject_q8_cfg_fault);
+`endif
+    end
 
     reg [6:0] gamma_beat_q;
     reg [6:0] residual_beat_q;
@@ -209,6 +286,14 @@ module decode_p3d_formal(input wire clk);
         .m_axis_tvalid(result_valid), .m_axis_tready(1'b1),
         .m_axis_tlast(result_last),
         .formal_inject_abort(formal_inject_abort),
+        .formal_inject_inactive_norm_owner(
+            formal_inject_inactive_norm_owner),
+        .formal_inject_inactive_residual_owner(
+            formal_inject_inactive_residual_owner),
+        .formal_inject_ownerless_rsp(formal_inject_ownerless_rsp),
+        .formal_inject_ownerless_rsp_error(
+            formal_inject_ownerless_rsp_error),
+        .formal_inject_q8_cfg_fault(formal_inject_q8_cfg_fault),
         .formal_ffn_phase(formal_ffn_phase),
         .formal_ffn_gate_ready(formal_ffn_gate_ready),
         .formal_scratch_rd_owner(formal_scratch_rd_owner),
@@ -267,7 +352,12 @@ module decode_p3d_formal(input wire clk);
         .formal_p3d_q8_record_count(formal_p3d_q8_record_count),
         .formal_p3d_q8_record_expected(formal_p3d_q8_record_expected),
         .formal_p3d_norm_q8_done(formal_p3d_norm_q8_done),
-        .formal_p3d_norm_seal_event(formal_p3d_norm_seal_event)
+        .formal_p3d_norm_seal_event(formal_p3d_norm_seal_event),
+        .formal_scratch_rd_req_accept(formal_scratch_rd_req_accept),
+        .formal_scratch_select_p3d(formal_scratch_select_p3d),
+        .formal_p3d_select_rms(formal_p3d_select_rms),
+        .formal_scratch_leaf_rsp_valid(formal_scratch_leaf_rsp_valid),
+        .formal_residual_cfg_fire(formal_residual_cfg_fire)
     );
 
     always @(posedge clk) begin
@@ -277,6 +367,7 @@ module decode_p3d_formal(input wire clk);
             slot_phase_q <= 2'd0;
             gamma_beat_q <= 7'd0;
             residual_beat_q <= 7'd0;
+            q8_cfg_restart_issued_q <= 1'b0;
         end else begin
             if (!formal_gamma_busy)
                 gamma_beat_q <= 7'd0;
@@ -316,13 +407,24 @@ module decode_p3d_formal(input wire clk);
                 end
                 WAIT_DONE: begin
                     slot_phase_q <= 2'd0;
-                    command_q <= WAIT_DONE;
+                    if (saw_q8_cfg_retired_q &&
+                        !q8_cfg_restart_issued_q) begin
+                        command_q <= CMD_MODEL;
+                        q8_cfg_restart_issued_q <= 1'b1;
+                    end else begin
+                        command_q <= WAIT_DONE;
+                    end
                 end
                 WAIT_ABORT_OWNER: begin
                     slot_phase_q <= 2'd0;
+`ifdef FORMAL_P3D_COVER
+                    if (formal_inject_abort)
+                        command_q <= WAIT_ABORT_DONE;
+`else
                     if ((formal_scratch_rd_owner == 2'd3) &&
                         (formal_p3d_rd_owner == 2'd1))
                         command_q <= CMD_ABORT;
+`endif
                 end
                 WAIT_ABORT_DONE: begin
                     slot_phase_q <= 2'd0;
@@ -364,6 +466,11 @@ module decode_p3d_formal(input wire clk);
     reg saw_rms_q8_final_q;
     reg saw_gamma_cfg_pending_q;
     reg saw_gamma_cfg_fire_q;
+    reg saw_ownerless_rsp_q;
+    reg saw_ownerless_owner_q;
+    reg saw_ownerless_new_rsp_q;
+    reg saw_inactive_norm_q;
+    reg saw_inactive_residual_q;
     always @(posedge clk) begin
         f_past_valid <= 1'b1;
         if (!rst_n) begin
@@ -381,6 +488,17 @@ module decode_p3d_formal(input wire clk);
             saw_rms_q8_final_q <= 1'b0;
             saw_gamma_cfg_pending_q <= 1'b0;
             saw_gamma_cfg_fire_q <= 1'b0;
+            saw_ownerless_rsp_q <= 1'b0;
+            saw_ownerless_owner_q <= 1'b0;
+            saw_ownerless_new_rsp_q <= 1'b0;
+            saw_q8_cfg_fault_q <= 1'b0;
+            saw_q8_cfg_cleanup_q <= 1'b0;
+            saw_q8_cfg_retired_q <= 1'b0;
+            saw_q8_cfg_restart_gamma_q <= 1'b0;
+            saw_q8_cfg_restart_begin_q <= 1'b0;
+            saw_q8_cfg_restart_launch_q <= 1'b0;
+            saw_inactive_norm_q <= 1'b0;
+            saw_inactive_residual_q <= 1'b0;
         end else begin
             if (formal_p3d_begin_ok)
                 saw_begin_q <= 1'b1;
@@ -417,6 +535,52 @@ module decode_p3d_formal(input wire clk);
                 saw_gamma_cfg_pending_q <= 1'b1;
             if (formal_gamma_cfg_fire)
                 saw_gamma_cfg_fire_q <= 1'b1;
+            if (formal_inject_ownerless_rsp)
+                saw_ownerless_rsp_q <= 1'b1;
+            if (saw_ownerless_rsp_q &&
+                (formal_scratch_rd_owner == 2'd3) &&
+                (formal_p3d_rd_owner == 2'd1))
+                saw_ownerless_owner_q <= 1'b1;
+            if (saw_ownerless_owner_q &&
+                formal_scratch_rd_rsp_valid &&
+                (formal_scratch_rd_owner == 2'd3) &&
+                (formal_p3d_rd_owner == 2'd1))
+                saw_ownerless_new_rsp_q <= 1'b1;
+            if (formal_inject_q8_cfg_fault)
+                saw_q8_cfg_fault_q <= 1'b1;
+            if (saw_q8_cfg_fault_q && formal_p3d_cleanup)
+                saw_q8_cfg_cleanup_q <= 1'b1;
+            if (saw_q8_cfg_cleanup_q && !formal_p3d_active &&
+                !formal_p3d_cleanup && !formal_p3d_kill &&
+                !formal_section_active && formal_section_done &&
+                !formal_abort_cleanup &&
+                (formal_scratch_rd_owner == 2'd0) &&
+                (formal_p3d_rd_owner == 2'd0) &&
+                !formal_scratch_rd_rsp_valid &&
+                (formal_q8_owner == 2'd0) &&
+                !formal_rms_q8_record_pending &&
+                !formal_kernel_abort_pending && !formal_r_valid &&
+                formal_norm_error && formal_norm_controller_error &&
+                (formal_quant_status != 6'd0))
+                saw_q8_cfg_retired_q <= 1'b1;
+            if (saw_q8_cfg_retired_q && formal_gamma_cfg_admit &&
+                !formal_p3d_active && !formal_p3d_cleanup &&
+                !formal_p3d_kill)
+                saw_q8_cfg_restart_gamma_q <= 1'b1;
+            if (saw_q8_cfg_restart_gamma_q && formal_p3d_begin_ok &&
+                formal_gamma_valid && !formal_p3d_active &&
+                !formal_p3d_cleanup && !formal_p3d_kill)
+                saw_q8_cfg_restart_begin_q <= 1'b1;
+            if (saw_q8_cfg_restart_begin_q && formal_q8_ingress_start &&
+                formal_p3d_active && !formal_p3d_cleanup &&
+                !formal_p3d_residual_started &&
+                (formal_q8_owner == 2'd1) && !formal_p3d_fault &&
+                !formal_abort_strobe && !formal_kernel_start)
+                saw_q8_cfg_restart_launch_q <= 1'b1;
+            if (formal_inject_inactive_norm_owner)
+                saw_inactive_norm_q <= 1'b1;
+            if (formal_inject_inactive_residual_owner)
+                saw_inactive_residual_q <= 1'b1;
 
             assert(!(formal_rms_rd_req && formal_residual_rd_req));
             assert(!(formal_rms_r_wr_valid && formal_residual_r_wr_valid));
@@ -442,28 +606,45 @@ module decode_p3d_formal(input wire clk);
             if (formal_gamma_cfg_fire)
                 assert(formal_gamma_cfg_pending && formal_gamma_cfg_ready);
 
-            if (formal_kernel_abort_now || formal_kernel_abort_pending) begin
+            if (formal_kernel_abort_pending) begin
                 assert(!w0_ready && !w1_ready && !w2_ready && !w3_ready);
                 assert(!formal_kernel_output_valid);
                 assert(!formal_kernel_sink_accept);
                 assert(!formal_kernel_start);
                 assert(!formal_p3d_clean_complete);
             end
-            if (formal_kernel_start)
-                assert(!formal_kernel_abort_now &&
-                       !formal_kernel_abort_pending);
+            if (formal_kernel_abort_now) begin
+                assert(!formal_p3d_clean_complete);
+                assert(!result_valid);
+            end
+            if (formal_kernel_start) begin
+                assert(!formal_kernel_abort_pending);
+                if (formal_kernel_abort_now) begin
+                    assert(formal_down_start);
+                    assert(formal_inject_inactive_residual_owner);
+                    assert(!result_valid);
+                end
+            end
             if (f_past_valid && $past(rst_n)) begin
                 assert(formal_kernel_abort_pending ==
-                       $past(formal_kernel_abort_now && formal_kernel_busy));
+                       $past(formal_kernel_abort_now &&
+                             (formal_kernel_busy || formal_kernel_start)));
                 if ($past(formal_gamma_cfg_admit))
                     assert(formal_gamma_cfg_pending);
                 if ($past(formal_gamma_cfg_fire)) begin
                     assert(!formal_gamma_cfg_pending);
                     assert(formal_gamma_busy);
                 end
-                if ($past(formal_kernel_abort_now && formal_kernel_busy)) begin
+                if ($past(formal_kernel_abort_now &&
+                          (formal_kernel_busy || formal_kernel_start))) begin
                     assert(formal_kernel_abort_pending);
                     assert(formal_p3d_cleanup || formal_abort_cleanup);
+                end
+                if ($past(formal_kernel_abort_now && formal_kernel_start)) begin
+                    assert(formal_kernel_abort_pending);
+                    assert(formal_p3d_cleanup && formal_p3d_kill);
+                    assert(formal_residual_error);
+                    assert(!result_valid);
                 end
                 if ($past(formal_kernel_abort_now ||
                           formal_kernel_abort_pending)) begin
@@ -487,7 +668,13 @@ module decode_p3d_formal(input wire clk);
             if (formal_p3d_cleanup || formal_p3d_kill)
                 assert(!formal_rms_q8_record_fire);
             if (formal_inject_abort) begin
+`ifdef FORMAL_P3D_COVER
+                assert(command_q == WAIT_ABORT_OWNER);
+                assert(formal_scratch_rd_owner == 2'd3);
+                assert(formal_p3d_rd_owner == 2'd1);
+`else
                 assert(formal_rms_q8_record_pending);
+`endif
                 assert(formal_abort_strobe);
                 assert(!formal_rms_q8_record_fire);
                 assert(!formal_p3d_norm_seal_event);
@@ -495,6 +682,38 @@ module decode_p3d_formal(input wire clk);
             if (formal_abort_strobe || formal_p3d_fault) begin
                 assert(!formal_rms_q8_record_fire);
                 assert(!formal_p3d_norm_seal_event);
+            end
+            if (formal_inject_inactive_norm_owner) begin
+                assert(formal_p3d_active);
+                assert(!formal_p3d_residual_started);
+                assert(!result_valid);
+                assert(!formal_p3d_norm_seal_event);
+                assert(!formal_p3d_clean_complete);
+            end
+            if (formal_inject_inactive_residual_owner) begin
+                assert(formal_down_start);
+                assert(formal_p3d_residual_started);
+                assert(!result_valid);
+                assert(!formal_scratch_r_wr_valid);
+                assert(!formal_p3d_norm_seal_event);
+                assert(!formal_p3d_clean_complete);
+            end
+            if (formal_inject_ownerless_rsp) begin
+                assert(formal_inject_ownerless_rsp_error);
+                assert(formal_scratch_rd_req_accept);
+                assert(formal_scratch_rd_rsp_valid);
+                assert(formal_scratch_rd_rsp_ready);
+                assert(formal_scratch_rd_owner == 2'd0);
+                assert(formal_p3d_rd_owner == 2'd0);
+                assert(!formal_p3d_fault);
+            end
+            if (formal_inject_q8_cfg_fault) begin
+                assert(formal_residual_cfg_fire);
+                assert(!formal_p3d_residual_started);
+                assert(!formal_down_start);
+                assert(!result_valid);
+                assert(!formal_p3d_norm_seal_event);
+                assert(!formal_p3d_clean_complete);
             end
             if (formal_rms_q8_record_pending &&
                 (formal_abort_strobe || formal_p3d_cleanup ||
@@ -562,16 +781,88 @@ module decode_p3d_formal(input wire clk);
                 $past(rst_n && formal_p3d_fault &&
                       formal_p3d_residual_started))
                 assert(formal_residual_error);
+            if (f_past_valid &&
+                $past(rst_n && formal_inject_inactive_norm_owner)) begin
+                assert(formal_p3d_active);
+                assert(formal_p3d_cleanup);
+                assert(formal_p3d_kill);
+                assert(!formal_p3d_residual_started);
+                assert(formal_norm_error);
+                assert(formal_norm_controller_error);
+            end
+            if (f_past_valid &&
+                $past(rst_n && formal_inject_inactive_residual_owner)) begin
+                assert(formal_p3d_active);
+                assert(formal_p3d_cleanup);
+                assert(formal_p3d_kill);
+                assert(formal_p3d_residual_started);
+                assert(formal_residual_error);
+            end
+            if (f_past_valid &&
+                $past(rst_n && formal_inject_ownerless_rsp)) begin
+                assert(formal_scratch_rd_owner == 2'd3);
+                assert(formal_p3d_rd_owner == 2'd1);
+            end
+            if (f_past_valid &&
+                $past(rst_n && formal_inject_q8_cfg_fault)) begin
+                assert(!formal_p3d_residual_started);
+                assert(!formal_down_start);
+                assert(formal_p3d_fault);
+            end
         end
 
+`ifdef FORMAL_P3D_Q8_CFG_COVER
+        cover(rst_n && saw_q8_cfg_fault_q && saw_q8_cfg_cleanup_q);
+        cover(rst_n && saw_q8_cfg_fault_q && saw_q8_cfg_cleanup_q &&
+              saw_q8_cfg_retired_q);
+        cover(rst_n && saw_q8_cfg_fault_q && saw_q8_cfg_cleanup_q &&
+              saw_q8_cfg_retired_q && saw_q8_cfg_restart_gamma_q);
+        cover(rst_n && saw_q8_cfg_fault_q && saw_q8_cfg_cleanup_q &&
+              saw_q8_cfg_retired_q && saw_q8_cfg_restart_gamma_q &&
+              saw_q8_cfg_restart_begin_q);
+        cover(rst_n && saw_q8_cfg_fault_q && saw_q8_cfg_cleanup_q &&
+              saw_q8_cfg_retired_q && saw_q8_cfg_restart_gamma_q &&
+              saw_q8_cfg_restart_begin_q && saw_q8_cfg_restart_launch_q);
+`elsif FORMAL_P3D_INACTIVE_NORM
+        cover(rst_n && saw_inactive_norm_q && formal_norm_error &&
+              formal_norm_controller_error);
+`elsif FORMAL_P3D_INACTIVE_RESIDUAL
+        cover(rst_n && saw_ownerless_rsp_q && saw_ownerless_owner_q &&
+              saw_ownerless_new_rsp_q && saw_inactive_residual_q &&
+              formal_residual_error);
+`else
 `ifdef FORMAL_P3D_ABORT
+`ifdef FORMAL_P3D_COVER
+        cover(rst_n && formal_injected_abort_q);
+        cover(rst_n && formal_injected_abort_q &&
+              saw_abort_cleanup_owner_q);
+        cover(rst_n && formal_injected_abort_q &&
+              saw_abort_cleanup_owner_q &&
+              !formal_p3d_active && !formal_p3d_cleanup &&
+              (formal_scratch_rd_owner == 2'd0) &&
+              (formal_p3d_rd_owner == 2'd0) &&
+              !formal_scratch_rd_rsp_valid);
+`endif
         cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
-              saw_abort_cleanup_owner_q && saw_gamma_exclusion_q &&
+              formal_injected_abort_q && saw_abort_cleanup_owner_q &&
+              saw_gamma_exclusion_q &&
               saw_gamma_cfg_pending_q && saw_gamma_cfg_fire_q &&
               !formal_p3d_active &&
               !formal_p3d_cleanup &&
-              (formal_scratch_rd_owner == 2'd0));
+              (formal_scratch_rd_owner == 2'd0) &&
+              (formal_p3d_rd_owner == 2'd0) &&
+              !formal_scratch_rd_rsp_valid);
 `else
+`ifdef FORMAL_P3D_COVER
+        cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
+              saw_rms_q8_accept_q && saw_rms_q8_fire_q &&
+              saw_rms_q8_final_q && saw_norm_seal_q && saw_gate_q8_q &&
+              saw_residual_start_q);
+        cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
+              saw_rms_q8_accept_q && saw_rms_q8_fire_q &&
+              saw_rms_q8_final_q && saw_norm_seal_q && saw_gate_q8_q &&
+              saw_residual_start_q && saw_residual_output_q);
+`endif
         cover(rst_n && saw_begin_q && saw_r_barrier_q && saw_rms_owner_q &&
               saw_rms_q8_accept_q && saw_rms_q8_fire_q &&
               saw_rms_q8_final_q && saw_norm_seal_q && saw_gate_q8_q &&
@@ -580,6 +871,7 @@ module decode_p3d_formal(input wire clk);
               saw_gamma_cfg_fire_q &&
               saw_residual_output_q && formal_section_done &&
               !formal_section_active && formal_r_valid);
+`endif
 `endif
     end
 

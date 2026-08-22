@@ -5,7 +5,59 @@
 
 struct Dut {
     Vdecode_top *t;
+    bool ownerless_rsp_armed;
+    bool ownerless_rsp_error;
+    uint8_t ownerless_rsp_route;
+    uint32_t ownerless_rsp_result;
 };
+
+enum : uint32_t {
+    OWNERLESS_COLLISION = 1u << 0,
+    OWNERLESS_OLD_READY = 1u << 1,
+    OWNERLESS_OLD_ISOLATED = 1u << 2,
+    OWNERLESS_OWNER_CAPTURED = 1u << 3,
+    OWNERLESS_NEW_ROUTED = 1u << 4,
+    OWNERLESS_VIOLATION = 1u << 5,
+    OWNERLESS_ERROR = 1u << 6,
+};
+
+static void observe_ownerless_response(Dut *d) {
+    auto *r = d->t->rootp;
+    if (!(d->ownerless_rsp_result & OWNERLESS_COLLISION)) return;
+
+    const uint8_t outer = r->decode_top__DOT__scratch_rd_owner_q;
+    const uint8_t sub = r->decode_top__DOT__p3d_rd_owner_q;
+    bool captured = false;
+    if (d->ownerless_rsp_route == 1)
+        captured = outer == 3 && sub == 1;
+    else if (d->ownerless_rsp_route == 2)
+        captured = outer == 2;
+    else if (d->ownerless_rsp_route == 3)
+        captured = outer == 1;
+    if (captured)
+        d->ownerless_rsp_result |= OWNERLESS_OWNER_CAPTURED;
+
+    const bool raw_valid =
+        r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_valid_q;
+    if (!raw_valid ||
+        !(d->ownerless_rsp_result & OWNERLESS_OWNER_CAPTURED))
+        return;
+
+    const bool rms = r->decode_top__DOT__rms_rd_rsp_valid;
+    const bool residual = r->decode_top__DOT__residual_rd_rsp_valid;
+    const bool pairer = r->decode_top__DOT__ffn_pairer_rd_rsp_valid;
+    bool routed = false;
+    if (d->ownerless_rsp_route == 1)
+        routed = outer == 3 && sub == 1 && rms && !residual && !pairer;
+    else if (d->ownerless_rsp_route == 2)
+        routed = outer == 2 && pairer && !rms && !residual;
+    else if (d->ownerless_rsp_route == 3)
+        routed = outer == 1 && !pairer && !rms && !residual;
+    if (routed)
+        d->ownerless_rsp_result |= OWNERLESS_NEW_ROUTED;
+    else
+        d->ownerless_rsp_result |= OWNERLESS_VIOLATION;
+}
 
 double sc_time_stamp() { return 0; }
 
@@ -18,19 +70,70 @@ extern "C" {
 Dut *dut_new(void) {
     Dut *d = new Dut();
     d->t = new Vdecode_top();
+    d->ownerless_rsp_armed = false;
+    d->ownerless_rsp_error = false;
+    d->ownerless_rsp_route = 0;
+    d->ownerless_rsp_result = 0;
     d->t->sim_inject_q8_numeric_error = 0;
     d->t->sim_inject_p3d_scratch_error = 0;
     d->t->sim_inject_residual_numeric_error = 0;
     d->t->sim_inject_down_activation_error = 0;
     d->t->sim_hold_p3d_rd_rsp = 0;
     d->t->sim_force_scratch_abort_strobe = 0;
+    d->t->sim_inject_inactive_norm_owner = 0;
+    d->t->sim_inject_inactive_residual_owner = 0;
     return d;
 }
 void dut_free(Dut *d) {
     delete d->t;
     delete d;
 }
-void dut_eval(Dut *d) { d->t->eval(); }
+void dut_eval(Dut *d) {
+    d->t->eval();
+    observe_ownerless_response(d);
+
+    auto *r = d->t->rootp;
+    if (!d->ownerless_rsp_armed ||
+        r->decode_top__DOT__scratch_rd_owner_q != 0 ||
+        !r->decode_top__DOT__scratch_rd_req_accept)
+        return;
+
+    uint8_t route = 3;
+    if (r->decode_top__DOT__scratch_select_p3d) {
+        if (!r->decode_top__DOT__p3d_select_rms) return;
+        route = 1;
+    } else if (r->decode_top__DOT__scratch_select_pairer) {
+        route = 2;
+    }
+    if (route != d->ownerless_rsp_route) return;
+
+    r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_valid_q = 1;
+    r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_error =
+        d->ownerless_rsp_error;
+
+    // Toggle an idle AXI protection input so Verilator resettles combinational
+    // logic after the deliberate internal-state force and before the clock edge.
+    const uint8_t old_arprot = d->t->s_axi_arprot;
+    d->t->s_axi_arprot = old_arprot ^ 1u;
+    d->t->eval();
+    d->t->s_axi_arprot = old_arprot;
+    d->t->eval();
+
+    const bool isolated = !r->decode_top__DOT__ffn_pairer_rd_rsp_valid &&
+                          !r->decode_top__DOT__rms_rd_rsp_valid &&
+                          !r->decode_top__DOT__residual_rd_rsp_valid;
+    d->ownerless_rsp_result |= OWNERLESS_COLLISION;
+    if (r->decode_top__DOT__scratch_rd_rsp_ready)
+        d->ownerless_rsp_result |= OWNERLESS_OLD_READY;
+    if (isolated)
+        d->ownerless_rsp_result |= OWNERLESS_OLD_ISOLATED;
+    if (d->ownerless_rsp_error)
+        d->ownerless_rsp_result |= OWNERLESS_ERROR;
+    if (!r->decode_top__DOT__scratch_rd_req_accept ||
+        !r->decode_top__DOT__scratch_rd_rsp_ready || !isolated)
+        d->ownerless_rsp_result |= OWNERLESS_VIOLATION;
+    d->ownerless_rsp_armed = false;
+}
 
 void dut_set_clk(Dut *d, int v) { d->t->s_axi_aclk = v; }
 void dut_set_rst_n(Dut *d, int v) { d->t->s_axi_aresetn = v; }
@@ -180,7 +283,12 @@ uint32_t dut_dbg_p3d_lifecycle(Dut *d) {
            (r->decode_top__DOT__scratch_rd_owner_q << 8) |
            (r->decode_top__DOT__p3d_rd_owner_q << 10) |
            (r->decode_top__DOT__u_section_scratch__DOT__rd_rsp_valid_q ?
-                0x1000u : 0u);
+                0x1000u : 0u) |
+           (r->decode_top__DOT__q8_fault_q ? 0x2000u : 0u) |
+           (r->decode_top__DOT__q8_fault_owner_q << 14) |
+           (r->decode_top__DOT__q8_fault_source_held_q ? 0x10000u : 0u) |
+           (r->decode_top__DOT__p3d_down_committed_q ? 0x20000u : 0u) |
+           (r->decode_top__DOT__p3d_down_launch ? 0x40000u : 0u);
 }
 uint32_t dut_dbg_p3d_launch(Dut *d) {
     auto *r = d->t->rootp;
@@ -248,7 +356,13 @@ uint32_t dut_dbg_control_boundaries(Dut *d) {
            (r->decode_top__DOT__kernel_m_axis_tready_core ? 0x400000u : 0u) |
            (r->decode_top__DOT__kernel_sink_accept ? 0x800000u : 0u) |
            (r->decode_top__DOT__kernel_m_axis_tvalid_raw ? 0x1000000u : 0u) |
-           (r->decode_top__DOT__kernel_m_axis_tlast ? 0x2000000u : 0u);
+           (r->decode_top__DOT__kernel_m_axis_tlast ? 0x2000000u : 0u) |
+           (r->decode_top__DOT__rms_p3d_kill_q ? 0x4000000u : 0u) |
+           (r->decode_top__DOT__rms_child_abort ? 0x8000000u : 0u) |
+           (r->decode_top__DOT__scratch_writer_abort ? 0x10000000u : 0u) |
+           (r->decode_top__DOT__scratch_r_wr_abort ? 0x20000000u : 0u) |
+           (r->decode_top__DOT__scratch_r_wr_ready ? 0x40000000u : 0u) |
+           (r->decode_top__DOT__rms_rd_rsp_ready ? 0x80000000u : 0u);
 }
 void dut_set_gate_q8_numeric_error(Dut *d, int v) {
     d->t->sim_inject_q8_numeric_error = v;
@@ -268,6 +382,22 @@ void dut_set_p3d_read_response_hold(Dut *d, int v) {
 void dut_force_scratch_abort_strobe(Dut *d, int v) {
     d->t->sim_force_scratch_abort_strobe = v;
     d->t->rootp->decode_top__DOT__scratch_abort_strobe = v;
+}
+void dut_set_inactive_norm_owner(Dut *d, int v) {
+    d->t->sim_inject_inactive_norm_owner = v;
+}
+void dut_set_inactive_residual_owner(Dut *d, int v) {
+    d->t->sim_inject_inactive_residual_owner = v;
+}
+void dut_arm_ownerless_response(Dut *d, uint32_t route, int error) {
+    d->ownerless_rsp_armed = true;
+    d->ownerless_rsp_error = error != 0;
+    d->ownerless_rsp_route = static_cast<uint8_t>(route);
+    d->ownerless_rsp_result = 0;
+}
+uint32_t dut_ownerless_response_result(Dut *d) {
+    return d->ownerless_rsp_result |
+           (static_cast<uint32_t>(d->ownerless_rsp_route) << 8);
 }
 int dut_axi_rvalid(Dut *d) { return d->t->s_axi_rvalid; }
 uint32_t dut_axi_rdata(Dut *d) { return d->t->s_axi_rdata; }

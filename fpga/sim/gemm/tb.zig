@@ -85,8 +85,11 @@ fn accWords(acc: i128) [4]u32 {
 // Directed emit-sweep case space: every leading-1 position (msb 0..102) × sign × emin.
 const DIR_EMINS = [_]i32{ -40, -7, 0, 5, 30 };
 const DIR_NMSB: usize = 103;
-const DIR_N: usize = 2 * DIR_NMSB * DIR_EMINS.len;
+const DIR_BASE_N: usize = 2 * DIR_NMSB * DIR_EMINS.len;
+const DIR_N: usize = DIR_BASE_N + 2;
 fn dirAcc(k: usize) i128 {
+    if (k == DIR_BASE_N) return 0;
+    if (k == DIR_BASE_N + 1) return -(@as(i128, 1) << 103);
     const msb = (k / DIR_EMINS.len) % DIR_NMSB;
     const neg = (k / DIR_EMINS.len) / DIR_NMSB;
     var mag: u128 = @as(u128, 1) << @intCast(msb);
@@ -94,6 +97,7 @@ fn dirAcc(k: usize) i128 {
     return if (neg == 1) -@as(i128, @intCast(mag)) else @as(i128, @intCast(mag));
 }
 fn dirEmin(k: usize) i32 {
+    if (k >= DIR_BASE_N) return -48;
     return DIR_EMINS[k % DIR_EMINS.len];
 }
 
@@ -340,7 +344,9 @@ pub fn main() !void {
     var pf_sats: usize = 0;
     for (0..C) |col| {
         c.dut_set_read_col(dut.h, @intCast(col));
-        dut.step(); // readout-resolve pipeline: one clock for rdS_q/rdC_q to capture this column
+        // One local read_col register followed by the redundant-pair resolve register.
+        dut.step();
+        dut.step();
         for (0..rows) |row| {
             c.dut_set_read_row(dut.h, @intCast(row));
             dut.eval();

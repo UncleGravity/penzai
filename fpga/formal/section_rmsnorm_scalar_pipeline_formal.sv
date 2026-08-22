@@ -508,7 +508,13 @@ module section_rmsnorm_scalar_pipeline_formal(input wire clk);
                     assert(rd_rsp_ready);
             end
             if (rd_rsp_ready)
-                assert(env_owner_q != OWNER_NONE || orphan_inject_now);
+                assert(env_owner_q != OWNER_NONE || orphan_inject_now ||
+                       abort_run || formal_cross_abort);
+            if ((abort_run || formal_cross_abort) && rd_rsp_valid &&
+                env_owner_q != OWNER_NONE) begin
+                assert(rd_rsp_ready && response_fire &&
+                       formal_rd_rsp_fire);
+            end
             if (formal_reduce_rd_req_fire)
                 assert(env_owner_q == OWNER_NONE && rd_req_role == 2'd0);
             if (formal_source_rd_req_fire)
@@ -669,6 +675,19 @@ module section_rmsnorm_scalar_pipeline_formal(input wire clk);
                 assert(formal_cleanup_abort_issued);
                 assert(!formal_cross_abort);
                 assert(!done && !error && status == 23'd0);
+            end
+            if (f_past_valid && $past(rst_n &&
+                (abort_run || formal_cross_abort) && rd_rsp_valid &&
+                formal_scratch_owner != OWNER_NONE)) begin
+                assert(formal_scratch_owner == OWNER_NONE);
+                assert(env_owner_q == OWNER_NONE);
+            end
+            if (f_past_valid && $past(rst_n &&
+                (abort_run || formal_cross_abort) && !rd_rsp_valid &&
+                formal_scratch_owner != OWNER_NONE)) begin
+                assert(formal_scratch_owner ==
+                       $past(formal_scratch_owner));
+                assert(env_owner_q == $past(env_owner_q));
             end
             if (saw_abort_q && cfg_count_q == 3'd1) begin
                 assert(!done);

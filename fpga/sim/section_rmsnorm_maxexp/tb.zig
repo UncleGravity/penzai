@@ -50,6 +50,7 @@ const Dut = struct {
         c.dut_set_abort(self.handle, 0);
         c.dut_set_group(self.handle, 0, &zero_group, 0, 0);
         c.dut_set_result_ready(self.handle, 0);
+        c.dut_force_summary_fatal(self.handle, 0);
         self.eval();
         for (0..4) |_| self.step();
         c.dut_set_rst_n(self.handle, 1);
@@ -343,7 +344,7 @@ fn verifyFaultsAndRestart(dut: *Dut) !void {
     try std.testing.expectEqual(@as(usize, 4), stats.cycles);
 }
 
-fn verifyFatalTreeBackpressure(dut: *Dut) !void {
+fn verifyFatalTreeDiscard(dut: *Dut) !void {
     const ones = [_]u32{0x3f80_0000} ** 8;
     var subnormal = ones;
     subnormal[2] = 0x0000_0001;
@@ -362,11 +363,12 @@ fn verifyFatalTreeBackpressure(dut: *Dut) !void {
     try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
     dut.step();
 
-    // The younger group remains presented while the fatal tree entry retires.
-    // The older healthy summary still contributes its sticky warning status.
+    // READY remains local to the input state while the fatal tree entry
+    // retires. The younger beat handshakes but the fatal priority branch
+    // discards it; the older healthy summary still contributes its warning.
     c.dut_set_group(dut.handle, 1, &ones, 0, 1);
     dut.eval();
-    try std.testing.expect(c.dut_group_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
     try std.testing.expect(c.dut_done(dut.handle) == 0);
     dut.step();
     try std.testing.expect(c.dut_done(dut.handle) != 0);
@@ -378,6 +380,43 @@ fn verifyFatalTreeBackpressure(dut: *Dut) !void {
     );
     c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
     dut.step();
+}
+
+fn verifyFatalSummaryDiscardAndRestart(dut: *Dut) !void {
+    const ones = [_]u32{0x3f80_0000} ** 8;
+
+    try configure(dut, 32, 1);
+    c.dut_set_result_ready(dut.handle, 1);
+    for (0..2) |_| {
+        c.dut_set_group(dut.handle, 1, &ones, 0, 0);
+        dut.eval();
+        try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+        dut.step();
+    }
+
+    // The oldest healthy entry is resident in the summary stage. Diagnose it
+    // there while a younger group handshakes; fatal priority must discard that
+    // accepted group and retire the run without publishing a result.
+    c.dut_force_summary_fatal(dut.handle, 1);
+    c.dut_set_group(dut.handle, 1, &ones, 0, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_group_ready(dut.handle) != 0);
+    try std.testing.expect(c.dut_done(dut.handle) == 0);
+    dut.step();
+    try std.testing.expect(c.dut_done(dut.handle) != 0);
+    try std.testing.expect(c.dut_error(dut.handle) != 0);
+    try std.testing.expectEqual(
+        section.RmsNormMaxExpStatus.nonfinite,
+        @as(u6, @truncate(c.dut_status(dut.handle))),
+    );
+    try std.testing.expect(c.dut_result_valid(dut.handle) == 0);
+
+    c.dut_force_summary_fatal(dut.handle, 0);
+    c.dut_set_group(dut.handle, 0, &zero_group, 0, 0);
+    dut.eval();
+    try std.testing.expect(c.dut_config_ready(dut.handle) != 0);
+    const restart = try runSuccess(dut, &ones, 8, 1, false, 0);
+    try std.testing.expectEqual(@as(usize, 4), restart.cycles);
 }
 
 fn verifyDrainAbortAndRestart(dut: *Dut) !void {
@@ -472,7 +511,8 @@ pub fn main() !void {
     const max_stats = try runSuccess(&dut, &max_values, 4096, 4, false, 0);
     try std.testing.expectEqual(@as(usize, max_values.len / 8 + 12), max_stats.cycles);
 
-    try verifyFatalTreeBackpressure(&dut);
+    try verifyFatalTreeDiscard(&dut);
+    try verifyFatalSummaryDiscardAndRestart(&dut);
     try verifyDrainAbortAndRestart(&dut);
     try verifyFaultsAndRestart(&dut);
 

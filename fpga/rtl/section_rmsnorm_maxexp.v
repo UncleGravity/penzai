@@ -38,6 +38,9 @@ module section_rmsnorm_maxexp (
     output wire [13:0]   result_rows,
     output reg           result_subnormal_warning,
     output wire          result_final
+`ifdef VERILATOR
+    , input wire         sim_force_summary_fatal
+`endif
 );
     localparam [5:0] STATUS_BAD_CFG           = 6'b000001;
     localparam [5:0] STATUS_NONFINITE         = 6'b000010;
@@ -79,17 +82,24 @@ module section_rmsnorm_maxexp (
                         (cfg_tokens != 3'd0) &&
                         (cfg_tokens <= 3'd4);
     wire cfg_accept = cfg_valid && cfg_ready;
+    wire summary_nonfinite_live = summary_nonfinite_q
+`ifdef VERILATOR
+                                  || sim_force_summary_fatal
+`endif
+                                  ;
     wire summary_fatal = summary_valid_q &&
                          (summary_scratch_q || summary_frame_bad_q ||
-                          summary_nonfinite_q);
+                          summary_nonfinite_live);
     wire tree_fatal = tree_valid_q &&
                       (tree_scratch_q || tree_frame_bad_q ||
                        tree_nonfinite_q);
 
     assign cfg_ready = rst_n && !abort_run && (state_q == ST_IDLE);
     assign busy = state_q != ST_IDLE;
-    assign s_group_ready = rst_n && !abort_run && (state_q == ST_INPUT) &&
-                           !tree_fatal && !summary_fatal;
+    // A registered fatal entry already makes the run irrevocable. Keep READY
+    // local to this input stage; the priority branches below discard any
+    // younger beat presented while the fatal entry retires.
+    assign s_group_ready = rst_n && !abort_run && (state_q == ST_INPUT);
     assign result_valid = rst_n && !abort_run && (state_q == ST_RESULT);
     assign result_token = token_q;
     assign result_rows = run_rows_q;
@@ -383,6 +393,11 @@ module section_rmsnorm_maxexp (
 
 `ifdef FORMAL
     reg f_past_valid = 1'b0;
+    always @* begin
+        assert(s_group_ready ==
+               (rst_n && !abort_run && (state_q == ST_INPUT)));
+    end
+
     always @(posedge clk) begin
         f_past_valid <= 1'b1;
         if (rst_n) begin
@@ -401,6 +416,14 @@ module section_rmsnorm_maxexp (
                 assert(result_token < run_tokens_q);
                 assert(result_rows == run_rows_q);
             end
+        end
+        if (f_past_valid && rst_n && !abort_run &&
+            $past(rst_n && !abort_run && (state_q == ST_INPUT) &&
+                  (summary_fatal || tree_fatal))) begin
+            assert(done && error && !busy);
+            assert(!tree_valid_q && !summary_valid_q);
+            assert(group_q == $past(group_q));
+            assert(token_q == $past(token_q));
         end
         if (f_past_valid && rst_n && !abort_run &&
             $past(rst_n && !abort_run && result_valid && !result_ready)) begin

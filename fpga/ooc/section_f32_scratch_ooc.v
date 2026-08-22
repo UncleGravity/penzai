@@ -15,6 +15,7 @@ module section_f32_scratch_ooc (
     input  wire [7:0]   s_axis_tkeep,
     input  wire         s_axis_tvalid,
     input  wire         s_axis_tlast,
+    input  wire         r_wr_abort,
     input  wire         r_wr_valid,
     input  wire [1:0]   r_wr_bank,
     input  wire [13:0]  r_wr_address,
@@ -50,6 +51,7 @@ module section_f32_scratch_ooc (
     reg [7:0] s_axis_tkeep_i;
     reg s_axis_tvalid_i;
     reg s_axis_tlast_i;
+    reg r_wr_abort_i;
     reg r_wr_valid_i;
     reg [1:0] r_wr_bank_i;
     reg [13:0] r_wr_address_i;
@@ -70,6 +72,7 @@ module section_f32_scratch_ooc (
         s_axis_tkeep_i <= s_axis_tkeep;
         s_axis_tvalid_i <= s_axis_tvalid;
         s_axis_tlast_i <= s_axis_tlast;
+        r_wr_abort_i <= r_wr_abort;
         r_wr_valid_i <= r_wr_valid;
         r_wr_bank_i <= r_wr_bank;
         r_wr_address_i <= r_wr_address;
@@ -110,10 +113,12 @@ module section_f32_scratch_ooc (
         .s_axis_tlast(s_axis_tlast_i),
         .wr_commit_valid(wr_commit_valid), .wr_commit_bank(wr_commit_bank),
         .wr_commit_address(wr_commit_address),
+        .r_wr_abort(r_wr_abort_i),
         .r_wr_valid(r_wr_valid_i), .r_wr_ready(r_wr_ready),
         .r_wr_bank(r_wr_bank_i), .r_wr_address(r_wr_address_i),
         .r_wr_data(r_wr_data_i), .r_wr_error(r_wr_error),
         .rd_req_valid(rd_req_valid_i), .rd_req_ready(rd_req_ready),
+        .rd_admission_idle(),
         .rd_quiescent(),
         .rd_req_role(rd_req_role_i), .rd_req_token(rd_req_token_i),
         .rd_req_group(rd_req_group_i),

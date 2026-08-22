@@ -8,6 +8,8 @@
     reg [31:0] f_output_bytes = 32'd0;
     reg [1:0] f_weight_fmt = 2'd1;
     reg [1:0] f_act_mode = ACT_PACKED_LOAD;
+    reg [31:0] f_pc_present_count = 32'd0;
+    reg [31:0] f_pc_collect_count = 32'd0;
 
     wire [31:0] f_effective_rows = (f_rows == 0) ? f_rowblocks * ROWS : f_rows;
     wire [31:0] f_final_rows = f_effective_rows - ((f_rowblocks - 1'b1) * ROWS);
@@ -30,6 +32,8 @@
             f_output_bytes <= 32'd0;
             f_weight_fmt <= 2'd1;
             f_act_mode <= ACT_PACKED_LOAD;
+            f_pc_present_count <= 32'd0;
+            f_pc_collect_count <= 32'd0;
         end else begin
             if (start_pulse) begin
                 f_run_active <= 1'b1;
@@ -41,8 +45,19 @@
                 f_output_bytes <= 32'd0;
                 f_weight_fmt <= weight_fmt;
                 f_act_mode <= act_mode;
+                f_pc_present_count <= 32'd0;
+                f_pc_collect_count <= 32'd0;
             end else if (kernel_done) begin
                 f_run_active <= 1'b0;
+            end
+            if (pc_walk_start) begin
+                f_pc_present_count <= 32'd0;
+                f_pc_collect_count <= 32'd0;
+            end else begin
+                if (pc_presenting)
+                    f_pc_present_count <= f_pc_present_count + 32'd1;
+                if (emit_collect_fire)
+                    f_pc_collect_count <= f_pc_collect_count + 32'd1;
             end
             if (m_axis_tvalid && m_axis_tready) begin
                 f_output_beats <= f_output_beats + 32'd1;
@@ -93,6 +108,26 @@
             if (state == ST_PRECOMPUTE) begin
                 assert(pc_col <= f_cols);
                 assert(wr_idx <= f_cols * EMIT_BEATS[15:0]);
+            end
+            if (pc_walk_active_q) begin
+                assert(state == ST_PRECOMPUTE);
+                assert(pc_col < f_cols);
+                assert(pc_beat < EMIT_BEATS);
+                assert((pc_col * EMIT_BEATS) + pc_beat ==
+                       f_pc_present_count);
+            end
+            assert(f_pc_present_count <= f_cols * EMIT_BEATS);
+            assert(f_pc_collect_count <= f_pc_present_count);
+            if (state == ST_PRECOMPUTE)
+                assert(wr_idx == f_pc_collect_count[WRW-1:0]);
+            assert(emit_vo == emit_vo_hi);
+            if (activation_abort)
+                assert(!emit_collect_fire);
+            if (f_gemm_past_valid &&
+                $past(rst_n && pc_walk_start && !activation_abort)) begin
+                assert(pc_walk_active_q);
+                assert(pc_col == 16'd0);
+                assert(pc_beat == {EBW{1'b0}});
             end
             if (state == ST_EMIT) begin
                 assert(emit_col < f_cols);
@@ -152,6 +187,10 @@
         cover(rst_n && f_run_active && f_rows == 0 && m_axis_tlast);
         cover(rst_n && m_axis_tvalid && m_axis_tready && m_axis_tkeep == 8'h0F && m_axis_tlast);
         cover(rst_n && kernel_done);
+        cover(rst_n && pc_presenting && pc_col == 16'd0 &&
+              pc_beat == {EBW{1'b0}});
+        cover(rst_n && pc_presenting && pc_col + 16'd1 == f_cols &&
+              pc_beat == EMIT_LAST[EBW-1:0]);
         cover(rst_n && busy_q &&
               (num_q1_blocks != f_q1_blocks || num_rowblocks != f_rowblocks || num_cols != f_cols));
 `endif

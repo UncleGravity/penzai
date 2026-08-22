@@ -119,6 +119,7 @@ module gemm_kernel #(
     // precompute walk + result buffer.
     reg [15:0]      pc_col;
     reg [EBW-1:0]   pc_beat;
+    reg             pc_walk_active_q;
     reg [WRW-1:0]   wr_idx;
     reg [63:0]      result_buf [0:BUF_DEPTH-1];
 
@@ -233,41 +234,87 @@ module gemm_kernel #(
     // acc[*][pc_col]) + the beat select + valid; R2 registers the beat-muxed lane pair + valid;
     // then gemm_emit. Off the throughput path (one-time fill), so +2 cycles are free; gemm_emit's
     // valid_in→valid_out and the wr_idx collection preserve order regardless of the latency.
-    wire pc_presenting = (state == ST_PRECOMPUTE) && (pc_col < run_num_cols);
+    wire pc_presenting = (state == ST_PRECOMPUTE) && pc_walk_active_q;
 
     reg [ROWS*ACC_W-1:0] rb_acc_q;    // R1: read_col-muxed bank (gemm_rowblock acc[*][pc_col])
-    reg [EBW-1:0]        pc_beat_d, pc_beat_q;
+    reg [EBW-1:0]        pc_beat_d, pc_beat_q, pc_beat_qq;
     reg                  pc_vld_a, pc_vld_q;
-    wire [2*ACC_W-1:0]   acc_pair_c = rb_acc_q[pc_beat_q*(2*ACC_W) +: 2*ACC_W];
+    wire [2*ACC_W-1:0]   acc_pair_c = rb_acc_q[pc_beat_qq*(2*ACC_W) +: 2*ACC_W];
     reg [2*ACC_W-1:0]    acc_pair_q;  // R2: beat-muxed lane pair
-    reg                  pc_vld_q2;
-    // gemm_rowblock now resolves accS+accC through one register (the readout-resolve pipeline),
-    // so rowblock_acc lags read_col (=pc_col) by one extra cycle. Match it: pc_beat is delayed 2
-    // (pc_beat_d→pc_beat_q) to align with rb_acc_q's column, and the valid carries one extra stage
-    // (pc_vld_a). The wr_idx collector is latency-tolerant, so nothing else moves.
+    reg                  pc_vld_q2, pc_vld_q3;
+    // The row-local read_col register plus the existing redundant-pair resolve register
+    // make rowblock_acc lag pc_col by two cycles. Match both boundaries with three beat
+    // stages through rb_acc_q and one corresponding valid stage through acc_pair_q.
     always @(posedge clk) begin
-        if (!rst_n) begin pc_vld_a <= 1'b0; pc_vld_q <= 1'b0; pc_vld_q2 <= 1'b0; end
-        else        begin pc_vld_a <= pc_presenting; pc_vld_q <= pc_vld_a; pc_vld_q2 <= pc_vld_q; end
+        if (!rst_n || start_pulse) begin
+            pc_vld_a <= 1'b0;
+            pc_vld_q <= 1'b0;
+            pc_vld_q2 <= 1'b0;
+            pc_vld_q3 <= 1'b0;
+        end else begin
+            pc_vld_a <= pc_presenting;
+            pc_vld_q <= pc_vld_a;
+            pc_vld_q2 <= pc_vld_q;
+            pc_vld_q3 <= pc_vld_q2;
+        end
         rb_acc_q   <= rowblock_acc;
         pc_beat_d  <= pc_beat;
         pc_beat_q  <= pc_beat_d;
+        pc_beat_qq <= pc_beat_q;
         acc_pair_q <= acc_pair_c;
     end
 
     wire        emit_vo, emit_vo_hi;
     wire [31:0] emit_f32_lo, emit_f32_hi;
     gemm_emit #(.ACC_W(ACC_W), .EXP_W(8)) u_emit_lo (
-        .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q2),
+        .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q3),
         .acc($signed(acc_pair_q[ACC_W-1:0])), .emin(run_emin),
         .valid_out(emit_vo), .f32(emit_f32_lo)
     );
     gemm_emit #(.ACC_W(ACC_W), .EXP_W(8)) u_emit_hi (
-        .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q2),
+        .clk(clk), .rst_n(rst_n), .valid_in(pc_vld_q3),
         .acc($signed(acc_pair_q[2*ACC_W-1:ACC_W])), .emin(run_emin),
         .valid_out(emit_vo_hi), .f32(emit_f32_hi)   // same timing as emit_vo
     );
 
     wire [15:0] n_total = run_num_cols * EMIT_BEATS[15:0];
+    wire pc_walk_start = busy_q && (state == ST_WAIT_DONE) &&
+                         (wait_cnt == {WW{1'b0}});
+    wire emit_collect_fire = emit_vo && (state == ST_PRECOMPUTE) &&
+                             !activation_abort;
+
+    // Keep the wide accumulator read-address walker outside the main FSM's abort
+    // priority. Abort clears only the local active bit; it cannot become a distributed
+    // clock enable for pc_col/pc_beat. A captured tail is ignored by emit_collect_fire.
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            pc_col  <= 16'd0;
+            pc_beat <= {EBW{1'b0}};
+        end else if (pc_walk_start) begin
+            pc_col  <= 16'd0;
+            pc_beat <= {EBW{1'b0}};
+        end else if (pc_walk_active_q) begin
+            if (pc_beat == EMIT_LAST[EBW-1:0]) begin
+                pc_beat <= {EBW{1'b0}};
+                pc_col  <= pc_col + 16'd1;
+            end else begin
+                pc_beat <= pc_beat + 1'b1;
+            end
+        end
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n)
+            pc_walk_active_q <= 1'b0;
+        else if (start_pulse || activation_abort)
+            pc_walk_active_q <= 1'b0;
+        else if (pc_walk_start)
+            pc_walk_active_q <= 1'b1;
+        else if (pc_walk_active_q &&
+                 (pc_beat == EMIT_LAST[EBW-1:0]) &&
+                 (pc_col + 16'd1 == run_num_cols))
+            pc_walk_active_q <= 1'b0;
+    end
 
     // EMIT: stream the buffer 2 fp32/beat, lane-major, with AXIS backpressure. NUM_ROWS
     // shortens only the final rowblock; zero or an exact multiple of ROWS preserves the
@@ -315,8 +362,6 @@ module gemm_kernel #(
             wait_cnt            <= {WW{1'b0}};
             emit_beat           <= {EBW{1'b0}};
             emit_col            <= 16'd0;
-            pc_col              <= 16'd0;
-            pc_beat             <= {EBW{1'b0}};
             wr_idx              <= {WRW{1'b0}};
             weight_scales_q     <= {ROWS*16{1'b0}};
             issue_valid_q       <= 1'b0;
@@ -345,7 +390,7 @@ module gemm_kernel #(
             // Collect emit-pipeline outputs into the result buffer (active in PRECOMPUTE).
             // wr_idx counts in feed order = {col, beat}, matching rd_idx; slice to the
             // address width (wr_idx is one bit wider to hold the BUF_DEPTH terminal count).
-            if (emit_vo) begin
+            if (emit_collect_fire) begin
                 result_buf[wr_idx[BUFAW-1:0]] <= {emit_f32_hi, emit_f32_lo};
                 wr_idx <= wr_idx + 1'b1;
             end
@@ -519,8 +564,6 @@ module gemm_kernel #(
                     // (FE_LAT + fma) so every accumulator is final, then precompute the emits.
                     ST_WAIT_DONE: begin
                         if (wait_cnt == {WW{1'b0}}) begin
-                            pc_col  <= 16'd0;
-                            pc_beat <= {EBW{1'b0}};
                             wr_idx  <= {WRW{1'b0}};
                             state   <= ST_PRECOMPUTE;
                         end else begin
@@ -531,14 +574,6 @@ module gemm_kernel #(
                     // Walk every (col, beat) through the emit pipeline into result_buf; the
                     // wr_idx collector (above) fills it on valid_out. Done once all N written.
                     ST_PRECOMPUTE: begin
-                        if (pc_col < run_num_cols) begin
-                            if (pc_beat == EMIT_LAST[EBW-1:0]) begin
-                                pc_beat <= {EBW{1'b0}};
-                                pc_col  <= pc_col + 16'd1;
-                            end else begin
-                                pc_beat <= pc_beat + 1'b1;
-                            end
-                        end
                         if (wr_idx == n_total[WRW-1:0]) begin
                             emit_beat <= {EBW{1'b0}};
                             emit_col  <= 16'd0;

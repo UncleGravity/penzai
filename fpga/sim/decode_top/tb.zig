@@ -111,12 +111,20 @@ const DBG_P3D_NORM_SEALED: u32 = 1 << 4;
 const DBG_P3D_RESIDUAL_STARTED: u32 = 1 << 5;
 const DBG_P3D_Q8_OWNER_MASK: u32 = 3 << 6;
 const DBG_P3D_Q8_OWNER_RMS: u32 = 1 << 6;
+const DBG_P3D_Q8_OWNER_GATE: u32 = 2 << 6;
 const DBG_P3D_OUTER_OWNER_MASK: u32 = 3 << 8;
 const DBG_P3D_OUTER_OWNER: u32 = 3 << 8;
 const DBG_P3D_SUBOWNER_MASK: u32 = 3 << 10;
 const DBG_P3D_SUBOWNER_RMS: u32 = 1 << 10;
 const DBG_P3D_SUBOWNER_RESIDUAL: u32 = 2 << 10;
 const DBG_P3D_RSP_VALID: u32 = 1 << 12;
+const DBG_P3D_Q8_FAULT: u32 = 1 << 13;
+const DBG_P3D_Q8_FAULT_OWNER_MASK: u32 = 3 << 14;
+const DBG_P3D_Q8_FAULT_OWNER_RMS: u32 = 1 << 14;
+const DBG_P3D_Q8_FAULT_OWNER_GATE: u32 = 2 << 14;
+const DBG_P3D_Q8_FAULT_HELD: u32 = 1 << 16;
+const DBG_P3D_DOWN_COMMITTED: u32 = 1 << 17;
+const DBG_P3D_DOWN_LAUNCH: u32 = 1 << 18;
 
 const DBG_P3D_BEGIN_OK: u32 = 1 << 0;
 const DBG_P3D_LEAF_START_Q: u32 = 1 << 1;
@@ -169,10 +177,17 @@ const DBG_CTRL_KERNEL_READY_CORE: u32 = 1 << 22;
 const DBG_CTRL_KERNEL_SINK_ACCEPT: u32 = 1 << 23;
 const DBG_CTRL_KERNEL_RAW_OUTPUT_VALID: u32 = 1 << 24;
 const DBG_CTRL_KERNEL_RAW_OUTPUT_LAST: u32 = 1 << 25;
+const DBG_CTRL_RMS_KILL_Q: u32 = 1 << 26;
+const DBG_CTRL_RMS_ABORT: u32 = 1 << 27;
+const DBG_CTRL_SCRATCH_WRITER_ABORT: u32 = 1 << 28;
+const DBG_CTRL_SCRATCH_R_ABORT: u32 = 1 << 29;
+const DBG_CTRL_SCRATCH_R_READY: u32 = 1 << 30;
+const DBG_CTRL_RMS_ABORT_DRAIN_READY: u32 = 1 << 31;
 
 const KERNEL_ST_IDLE: u32 = 0;
 const KERNEL_ST_LOAD_ACTS: u32 = 1;
 const KERNEL_ST_WISSUE: u32 = 4;
+const KERNEL_ST_PRECOMPUTE: u32 = 6;
 const KERNEL_ST_EMIT: u32 = 7;
 const KERNEL_ST_FINISH: u32 = 8;
 
@@ -192,12 +207,46 @@ const DBG_RMS_Q8_SEALED: u32 = 1 << 5;
 const DBG_RMS_Q8_OWNER: u32 = 1 << 6;
 const DBG_RMS_Q8_ACTIVE: u32 = 1 << 7;
 
+const OWNERLESS_ROUTE_P3D_RMS: u32 = 1;
+const OWNERLESS_ROUTE_PAIRER: u32 = 2;
+const OWNERLESS_ROUTE_DRAIN: u32 = 3;
+const OWNERLESS_COLLISION: u32 = 1 << 0;
+const OWNERLESS_OLD_READY: u32 = 1 << 1;
+const OWNERLESS_OLD_ISOLATED: u32 = 1 << 2;
+const OWNERLESS_OWNER_CAPTURED: u32 = 1 << 3;
+const OWNERLESS_NEW_ROUTED: u32 = 1 << 4;
+const OWNERLESS_VIOLATION: u32 = 1 << 5;
+const OWNERLESS_ERROR: u32 = 1 << 6;
+const OWNERLESS_COMPLETE: u32 = OWNERLESS_COLLISION | OWNERLESS_OLD_READY |
+    OWNERLESS_OLD_ISOLATED | OWNERLESS_OWNER_CAPTURED |
+    OWNERLESS_NEW_ROUTED;
+
 fn dbgRmsQ8Count(value: u32) u32 {
     return (value >> 8) & 0x3ff;
 }
 
 fn dbgRmsQ8Expected(value: u32) u32 {
     return (value >> 18) & 0x3ff;
+}
+
+fn expectOwnerlessResponse(
+    dut: *Dut,
+    route: u32,
+    injected_error: bool,
+) !void {
+    c.dut_eval(dut.h);
+    const result = c.dut_ownerless_response_result(dut.h);
+    if (result & OWNERLESS_COMPLETE != OWNERLESS_COMPLETE or
+        result & OWNERLESS_VIOLATION != 0 or
+        ((result & OWNERLESS_ERROR != 0) != injected_error) or
+        ((result >> 8) & 3) != route)
+    {
+        std.debug.print(
+            "ownerless response mismatch: route={d} error={} result=0x{x}\n",
+            .{ route, injected_error, result },
+        );
+        return error.OwnerlessResponseCollisionMismatch;
+    }
 }
 
 const WEIGHT_FMT_BINARY: u32 = 1;
@@ -972,8 +1021,13 @@ fn abortPlainKernelAtState(
     c.dut_force_scratch_abort_strobe(dut.h, 1);
     c.dut_eval(dut.h);
     var control = c.dut_dbg_control_boundaries(dut.h);
-    if (control & DBG_CTRL_KERNEL_ABORT_NOW == 0 or
+    if (control & (DBG_CTRL_KERNEL_ABORT_NOW | DBG_CTRL_RMS_ABORT |
+        DBG_CTRL_SCRATCH_WRITER_ABORT | DBG_CTRL_SCRATCH_R_ABORT) !=
+        (DBG_CTRL_KERNEL_ABORT_NOW | DBG_CTRL_RMS_ABORT |
+            DBG_CTRL_SCRATCH_WRITER_ABORT | DBG_CTRL_SCRATCH_R_ABORT) or
         control & DBG_CTRL_KERNEL_ABORT_Q != 0 or
+        control & DBG_CTRL_RMS_ABORT_DRAIN_READY == 0 or
+        control & (DBG_CTRL_RMS_KILL_Q | DBG_CTRL_SCRATCH_R_READY) != 0 or
         control & (DBG_CTRL_WEIGHT_READY | DBG_CTRL_ACTS_READY |
             DBG_CTRL_OUTPUT_VALID | DBG_CTRL_SCRATCH_R_WRITE |
             DBG_CTRL_SCRATCH_READ_ACCEPT |
@@ -1101,6 +1155,7 @@ fn verifyKernelAbortBoundaries() !void {
 
     try abortPlainKernelAtState(&dut, KERNEL_ST_LOAD_ACTS, 0xA807_0001, false);
     try abortPlainKernelAtState(&dut, KERNEL_ST_WISSUE, 0xA807_0002, false);
+    try abortPlainKernelAtState(&dut, KERNEL_ST_PRECOMPUTE, 0xA807_0006, false);
     try abortPlainKernelAtState(&dut, KERNEL_ST_EMIT, 0xA807_0003, false);
     try abortPlainKernelAtState(&dut, KERNEL_ST_EMIT, 0xA807_0004, true);
     try abortPlainKernelAtState(&dut, KERNEL_ST_FINISH, 0xA807_0005, false);
@@ -1875,6 +1930,193 @@ fn waitP3dTerminal(
         return error.P3dFaultTerminalStatusMismatch;
 }
 
+fn faultP3dInactiveNormOwner(dut: *Dut) !void {
+    const before = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (before & DBG_P3D_ACTIVE == 0 or
+        before & (DBG_P3D_CLEANUP | DBG_P3D_RESIDUAL_STARTED) != 0)
+        return error.P3dInactiveNormSetupMismatch;
+
+    c.dut_set_inactive_norm_owner(dut.h, 1);
+    c.dut_set_m_ready(dut.h, 1);
+    c.dut_eval(dut.h);
+    if (c.dut_m_valid(dut.h) != 0)
+        return error.P3dInactiveNormExposedOutput;
+    dut.step();
+    c.dut_set_inactive_norm_owner(dut.h, 0);
+    c.dut_eval(dut.h);
+
+    const diagnosed = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (diagnosed & (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL) !=
+        (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL) or
+        diagnosed & DBG_P3D_RESIDUAL_STARTED != 0 or
+        c.dut_m_valid(dut.h) != 0)
+        return error.P3dInactiveNormDiagnosisMismatch;
+
+    try waitP3dTerminal(dut, true, SCRATCH_ERROR_RMS);
+    const status = try axiRead(dut, REG_NORM_STATUS);
+    if (status & (NORM_DONE | NORM_ERROR) != (NORM_DONE | NORM_ERROR) or
+        status & (RESIDUAL_DONE | RESIDUAL_ERROR) != 0 or
+        try axiRead(dut, REG_NORM_ERROR) == 0)
+        return error.P3dInactiveNormStatusMismatch;
+}
+
+fn faultP3dInactiveResidualAtLaunch(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    epoch: u32,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        epoch,
+    );
+
+    var collided = false;
+    for (0..64) |_| {
+        c.dut_eval(dut.h);
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        if (lifecycle & (DBG_P3D_DOWN_COMMITTED | DBG_P3D_DOWN_LAUNCH) ==
+            (DBG_P3D_DOWN_COMMITTED | DBG_P3D_DOWN_LAUNCH))
+        {
+            if (c.dut_dbg_shared_activation(dut.h) &
+                DBG_SHARED_KERNEL_START == 0)
+                return error.P3dCommittedDownDidNotLaunchKernel;
+            c.dut_set_inactive_residual_owner(dut.h, 1);
+            c.dut_eval(dut.h);
+            const collided_lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+            const control = c.dut_dbg_control_boundaries(dut.h);
+            if (collided_lifecycle & DBG_P3D_DOWN_LAUNCH == 0 or
+                c.dut_dbg_shared_activation(dut.h) &
+                    DBG_SHARED_KERNEL_START == 0 or
+                c.dut_m_valid(dut.h) != 0 or
+                control & DBG_CTRL_SCRATCH_R_WRITE != 0)
+                return error.P3dInactiveResidualLaunchCollisionMismatch;
+            dut.step();
+            c.dut_set_inactive_residual_owner(dut.h, 0);
+            collided = true;
+            break;
+        }
+        dut.step();
+    }
+    if (!collided) return error.P3dCommittedDownLaunchTimeout;
+
+    c.dut_eval(dut.h);
+    const diagnosed = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (diagnosed & (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL |
+        DBG_P3D_RESIDUAL_STARTED) != (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP |
+        DBG_P3D_KILL | DBG_P3D_RESIDUAL_STARTED) or
+        c.dut_m_valid(dut.h) != 0)
+        return error.P3dInactiveResidualLaunchDiagnosisMismatch;
+
+    try waitP3dTerminal(dut, true, SCRATCH_ERROR_RESIDUAL);
+    const status = try axiRead(dut, REG_NORM_STATUS);
+    if (status & (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) !=
+        (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) or
+        status & NORM_ERROR != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) == 0)
+        return error.P3dInactiveResidualLaunchStatusMismatch;
+}
+
+fn faultP3dInactiveResidualAtFinalOutput(
+    dut: *Dut,
+    model_rows: usize,
+    ffn_rows: usize,
+    tokens: usize,
+    ports: [PORTS][]const u8,
+) !void {
+    configureScratch(dut, SCRATCH_MODE_DDR, SCRATCH_ROLE_X0, ffn_rows, tokens);
+    configureProjection(
+        dut,
+        model_rows,
+        model_rows,
+        ffn_rows / layout.Q1_BLOCK,
+        tokens,
+        WEIGHT_FMT_BINARY,
+        ACT_SCRATCH_SWIGLU,
+        0xF15F_FA22,
+    );
+
+    const w_beats = ports[0].len / PORT_BEAT_BYTES;
+    var wi = [_]usize{0} ** PORTS;
+    var collided = false;
+    for (0..CYCLE_LIMIT) |_| {
+        var w_valid = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port| {
+            const valid = wi[port] < w_beats;
+            w_valid[port] = valid;
+            const words = if (valid)
+                readPortBeat(ports[port], wi[port])
+            else
+                [_]u32{0} ** ROWS_PER_PORT;
+            c.dut_set_w(
+                dut.h,
+                @intCast(port),
+                &words,
+                @intFromBool(valid),
+            );
+        }
+        c.dut_set_a(dut.h, 0x7fc0_0000_7fc0_0000, 1, 1);
+        c.dut_set_m_ready(dut.h, 1);
+        c.dut_eval(dut.h);
+        var w_fire = [_]bool{false} ** PORTS;
+        for (0..PORTS) |port|
+            w_fire[port] = w_valid[port] and
+                c.dut_w_ready(dut.h, @intCast(port)) != 0;
+
+        if (c.dut_m_valid(dut.h) != 0 and c.dut_m_last(dut.h) != 0) {
+            if (c.dut_dbg_p3d_lifecycle(dut.h) &
+                DBG_P3D_RESIDUAL_STARTED == 0)
+                return error.P3dInactiveResidualFinalPhaseMismatch;
+            c.dut_set_inactive_residual_owner(dut.h, 1);
+            c.dut_eval(dut.h);
+            if (c.dut_m_valid(dut.h) != 0 or
+                c.dut_dbg_control_boundaries(dut.h) &
+                    DBG_CTRL_SCRATCH_R_WRITE != 0)
+                return error.P3dInactiveResidualFinalWasNotQuarantined;
+            dut.step();
+            c.dut_set_inactive_residual_owner(dut.h, 0);
+            for (0..PORTS) |port| {
+                if (w_fire[port]) wi[port] += 1;
+            }
+            collided = true;
+            break;
+        }
+
+        dut.step();
+        for (0..PORTS) |port| {
+            if (w_fire[port]) wi[port] += 1;
+        }
+    }
+    c.dut_set_a(dut.h, 0, 0, 0);
+    var zero = [_]u32{0} ** ROWS_PER_PORT;
+    for (0..PORTS) |port| c.dut_set_w(dut.h, @intCast(port), &zero, 0);
+    if (!collided) return error.P3dInactiveResidualFinalTimeout;
+
+    c.dut_eval(dut.h);
+    const diagnosed = c.dut_dbg_p3d_lifecycle(dut.h);
+    if (diagnosed & (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP | DBG_P3D_KILL |
+        DBG_P3D_RESIDUAL_STARTED) != (DBG_P3D_ACTIVE | DBG_P3D_CLEANUP |
+        DBG_P3D_KILL | DBG_P3D_RESIDUAL_STARTED) or
+        c.dut_m_valid(dut.h) != 0)
+        return error.P3dInactiveResidualFinalDiagnosisMismatch;
+
+    try waitP3dTerminal(dut, true, SCRATCH_ERROR_RESIDUAL);
+    const status = try axiRead(dut, REG_NORM_STATUS);
+    if (status & (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) !=
+        (NORM_DONE | RESIDUAL_DONE | RESIDUAL_ERROR) or
+        status & NORM_ERROR != 0 or
+        try axiRead(dut, REG_RESIDUAL_ERROR) == 0)
+        return error.P3dInactiveResidualFinalStatusMismatch;
+}
+
 fn rejectEarlyP3dResidualFrame(dut: *Dut, first_beat: u64) !void {
     var accepted = false;
     for (0..256) |_| {
@@ -2168,7 +2410,6 @@ fn faultP3dGateQ8(
 ) !void {
     try waitGateReady(dut);
     configureScratch(dut, SCRATCH_MODE_ONLY, SCRATCH_ROLE_X0, rows, tokens);
-    c.dut_set_gate_q8_numeric_error(dut.h, 1);
     configureProjection(
         dut,
         rows,
@@ -2181,10 +2422,28 @@ fn faultP3dGateQ8(
     );
 
     var entered_cleanup = false;
+    var injected = false;
     for (0..128) |_| {
         c.dut_eval(dut.h);
         if (c.dut_a_ready(dut.h) != 0 or c.dut_m_valid(dut.h) != 0)
             return error.P3dGateFaultExposedStream;
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        if (!injected and lifecycle & DBG_P3D_Q8_OWNER_MASK ==
+            DBG_P3D_Q8_OWNER_GATE)
+        {
+            c.dut_set_gate_q8_numeric_error(dut.h, 1);
+            c.dut_eval(dut.h);
+            dut.step();
+            c.dut_set_gate_q8_numeric_error(dut.h, 0);
+            c.dut_eval(dut.h);
+            const captured = c.dut_dbg_p3d_lifecycle(dut.h);
+            if (captured & DBG_P3D_Q8_FAULT == 0 or
+                captured & DBG_P3D_Q8_FAULT_OWNER_MASK !=
+                    DBG_P3D_Q8_FAULT_OWNER_GATE)
+                return error.P3dGateFaultOwnerWasNotCaptured;
+            injected = true;
+            continue;
+        }
         if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
             entered_cleanup = true;
             break;
@@ -2192,6 +2451,7 @@ fn faultP3dGateQ8(
         dut.step();
     }
     c.dut_set_gate_q8_numeric_error(dut.h, 0);
+    if (!injected) return error.P3dGateOwnerWasNotAcquired;
     if (!entered_cleanup) return error.P3dGateFaultDidNotTrigger;
     try waitP3dTerminal(
         dut,
@@ -2224,10 +2484,18 @@ fn faultP3dRmsQ8(dut: *Dut, residual_beats: []const u64) !void {
 
     c.dut_set_gate_q8_numeric_error(dut.h, 1);
     var entered_cleanup = false;
+    var captured_owner = false;
     for (0..128) |_| {
         c.dut_eval(dut.h);
         if (c.dut_m_valid(dut.h) != 0)
             return error.P3dRmsQ8FaultExposedStream;
+        const lifecycle = c.dut_dbg_p3d_lifecycle(dut.h);
+        if (lifecycle & DBG_P3D_Q8_FAULT != 0) {
+            if (lifecycle & DBG_P3D_Q8_FAULT_OWNER_MASK !=
+                DBG_P3D_Q8_FAULT_OWNER_RMS)
+                return error.P3dRmsQ8FaultOwnerMismatch;
+            captured_owner = true;
+        }
         if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_CLEANUP != 0) {
             entered_cleanup = true;
             break;
@@ -2235,6 +2503,7 @@ fn faultP3dRmsQ8(dut: *Dut, residual_beats: []const u64) !void {
         dut.step();
     }
     c.dut_set_gate_q8_numeric_error(dut.h, 0);
+    if (!captured_owner) return error.P3dRmsQ8FaultOwnerWasNotCaptured;
     if (!entered_cleanup) return error.P3dRmsQ8FaultDidNotTrigger;
     try waitP3dTerminal(
         dut,
@@ -2352,22 +2621,10 @@ fn abortStreamingGateWithOutstandingRead(
                 DBG_FFN_PAIRER_ORPHAN | DBG_FFN_ABORT_CLEANUP) != 0)
                 return error.FfnAbortRequestWasNotFresh;
 
-            // Surface a live GATE quantizer status before the host abort clears
-            // q8_ingress. The same edge accepts the AXI write while the pairer
-            // advances its staged group; the following edge accepts the scratch
-            // request and commits the abort strobe.
-            c.dut_set_gate_q8_numeric_error(dut.h, 1);
-            c.dut_eval(dut.h);
-            c.dut_set_axi_write(dut.h, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT, 1);
+            // Advance the staged request to the shared scratch arbiter first.
+            // The Q8 diagnostic is then captured on the request-accept edge, so
+            // its registered self-abort sees an already-retained owner.
             dut.step();
-            c.dut_set_gate_q8_numeric_error(dut.h, 0);
-            const fault_error = c.dut_dbg_scratch_error(dut.h);
-            if (fault_error & (SCRATCH_ERROR_SECTION | SCRATCH_ERROR_SWIGLU_Q8) !=
-                (SCRATCH_ERROR_SECTION | SCRATCH_ERROR_SWIGLU_Q8))
-            {
-                std.debug.print("GATE numeric diagnostic after injection: 0x{x}\n", .{fault_error});
-                return error.FfnGateNumericDiagnosticMismatch;
-            }
             for (0..PORTS) |port| {
                 if (w_fire[port]) wi[port] += 1;
             }
@@ -2378,18 +2635,32 @@ fn abortStreamingGateWithOutstandingRead(
             if (c.dut_dbg_scratch_read_fire(dut.h) == 0)
                 return error.FfnAbortReadDidNotIssue;
 
+            c.dut_set_gate_q8_numeric_error(dut.h, 1);
+            dut.step();
+            c.dut_set_gate_q8_numeric_error(dut.h, 0);
+            c.dut_eval(dut.h);
+            const captured = c.dut_dbg_p3d_lifecycle(dut.h);
+            if (captured & DBG_P3D_Q8_FAULT == 0 or
+                captured & DBG_P3D_Q8_FAULT_OWNER_MASK !=
+                    DBG_P3D_Q8_FAULT_OWNER_GATE)
+                return error.FfnGateNumericFaultOwnerMismatch;
+            const owned = c.dut_dbg_ffn_lifecycle(dut.h);
+            if (owned & DBG_FFN_OWNER_MASK != DBG_FFN_OWNER_PAIRER or
+                owned & DBG_FFN_ACTIVE == 0 or
+                owned & (DBG_FFN_RSP_VALID | DBG_FFN_PAIRER_ORPHAN) != 0)
+                return error.FfnAbortReadWasNotOutstanding;
+
+            c.dut_set_axi_write(dut.h, REG_SCRATCH_CTRL, SCRATCH_CTRL_ABORT, 1);
             dut.step();
             c.dut_set_axi_idle(dut.h);
             c.dut_eval(dut.h);
-            const owned = c.dut_dbg_ffn_lifecycle(dut.h);
-            if (owned & DBG_FFN_OWNER_MASK != DBG_FFN_OWNER_PAIRER or
-                owned & DBG_FFN_ACTIVE == 0 or owned & DBG_FFN_RSP_VALID != 0)
-                return error.FfnAbortReadWasNotOutstanding;
-
-            // The strobe is now visible to every section leaf. The read has not
-            // reached the response boundary, so the pairer must retain an orphan.
-            dut.step();
-            c.dut_eval(dut.h);
+            const fault_error = c.dut_dbg_scratch_error(dut.h);
+            if (fault_error & (SCRATCH_ERROR_SECTION | SCRATCH_ERROR_SWIGLU_Q8) !=
+                (SCRATCH_ERROR_SECTION | SCRATCH_ERROR_SWIGLU_Q8))
+            {
+                std.debug.print("GATE numeric diagnostic after registered capture: 0x{x}\n", .{fault_error});
+                return error.FfnGateNumericDiagnosticMismatch;
+            }
             const aborted = c.dut_dbg_ffn_lifecycle(dut.h);
             if (aborted & (DBG_FFN_ACTIVE | DBG_FFN_ABORT_CLEANUP |
                 DBG_FFN_PAIRER_ORPHAN) != (DBG_FFN_ACTIVE |
@@ -3437,6 +3708,11 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         stale_restart & DBG_P3D_CLEANUP != 0 or
         try axiRead(&dut, REG_QUANT_STATUS) != 0)
         return error.P3dStaleQ8WasAttributedToNewSection;
+    c.dut_arm_ownerless_response(
+        dut.h,
+        OWNERLESS_ROUTE_P3D_RMS,
+        1,
+    );
     try sendP3dResidual(&dut, &residual_beats);
     const rms_q8_records: u32 =
         @intCast(tokens * ffn_rows / shared_layout.q8_block);
@@ -3453,6 +3729,8 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         &.{},
     );
     try verifyP3dRmsQ8Accounting(&dut, rms_q8_records);
+    try expectOwnerlessResponse(&dut, OWNERLESS_ROUTE_P3D_RMS, true);
+    c.dut_arm_ownerless_response(dut.h, OWNERLESS_ROUTE_PAIRER, 0);
     const gate = try runStreamingGateProjection(
         &dut,
         ffn_rows,
@@ -3460,6 +3738,7 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         0xF15F_D001,
         port_views[1],
     );
+    try expectOwnerlessResponse(&dut, OWNERLESS_ROUTE_PAIRER, false);
     const external = try runP3dDown(
         a,
         &dut,
@@ -3543,6 +3822,79 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
         );
     }
 
+    // Wrong residual-child activity before the DOWN phase is diagnosed as a
+    // norm/controller fault. The same-edge public boundary is quarantined and
+    // the accepted gamma reload proves cleanup is immediately restart-safe.
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try faultP3dInactiveNormOwner(&dut);
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Reach the registered DOWN launch boundary, then collide it with stale
+    // RMS-child activity. The internal launch is tentative, while all public
+    // effects are blocked and the next edge diagnoses a residual fault.
+    const inactive_launch_epoch: u32 = 0xF15F_FA21;
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        inactive_launch_epoch,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        inactive_launch_epoch,
+        port_views[1],
+    );
+    try faultP3dInactiveResidualAtLaunch(
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        inactive_launch_epoch,
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
+    // Repeat through a live final residual beat. Wrong RMS-child activity may
+    // let an internal doomed beat retire, but must suppress the external final
+    // transfer and finish with residual attribution before the next restart.
+    const inactive_final_epoch: u32 = 0xF15F_FA22;
+    try beginP3dSection(&dut, model_rows, ffn_rows, tokens, false);
+    try sendP3dResidual(&dut, &residual_beats);
+    try runScratchOnlyProjection(
+        &dut,
+        ffn_rows,
+        q1_blocks,
+        tokens,
+        SCRATCH_ROLE_X1,
+        ACT_RAW_LOAD,
+        inactive_final_epoch,
+        port_views[0],
+        &.{},
+    );
+    _ = try runStreamingGateProjection(
+        &dut,
+        ffn_rows,
+        tokens,
+        inactive_final_epoch,
+        port_views[1],
+    );
+    try faultP3dInactiveResidualAtFinalOutput(
+        &dut,
+        model_rows,
+        ffn_rows,
+        tokens,
+        port_views[2],
+    );
+    try loadP3dGamma(&dut, model_rows, &gamma_beats);
+
     // Gamma framing is fail-closed, and an invalid table cannot begin a P3d
     // section or open any stream.
     try rejectEarlyP3dGammaFrame(&dut, model_rows, gamma_beats[0]);
@@ -3622,6 +3974,25 @@ fn runP3dSectionCase(a: std.mem.Allocator) !void {
     }
     c.dut_set_p3d_scratch_error(dut.h, 0);
     if (!rms_fault) return error.P3dRmsScratchFaultDidNotTrigger;
+    var cut_control = c.dut_dbg_control_boundaries(dut.h);
+    if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_KILL == 0 or
+        cut_control & DBG_CTRL_SCRATCH_R_READY == 0 or
+        cut_control & (DBG_CTRL_RMS_KILL_Q | DBG_CTRL_RMS_ABORT |
+            DBG_CTRL_SCRATCH_WRITER_ABORT |
+            DBG_CTRL_SCRATCH_R_ABORT) != 0)
+        return error.P3dRmsKillWasNotDelayedAtFaultBoundary;
+    dut.step();
+    cut_control = c.dut_dbg_control_boundaries(dut.h);
+    if (c.dut_dbg_p3d_lifecycle(dut.h) & DBG_P3D_KILL != 0 or
+        cut_control & (DBG_CTRL_RMS_KILL_Q | DBG_CTRL_RMS_ABORT |
+            DBG_CTRL_SCRATCH_WRITER_ABORT | DBG_CTRL_SCRATCH_R_ABORT |
+            DBG_CTRL_RMS_ABORT_DRAIN_READY) !=
+            (DBG_CTRL_RMS_KILL_Q | DBG_CTRL_RMS_ABORT |
+                DBG_CTRL_SCRATCH_WRITER_ABORT | DBG_CTRL_SCRATCH_R_ABORT |
+                DBG_CTRL_RMS_ABORT_DRAIN_READY) or
+        cut_control & (DBG_CTRL_SCRATCH_R_READY |
+            DBG_CTRL_SCRATCH_R_WRITE) != 0)
+        return error.P3dRmsKillDelayedBoundaryMismatch;
     try waitP3dTerminal(
         &dut,
         true,
@@ -3998,8 +4369,12 @@ fn runRawResidentCase(a: std.mem.Allocator, ternary: bool, blocks: usize, cols: 
             scratch_status & SCRATCH_ANY_ERROR != 0)
             return error.ScratchX0CommitMismatch;
 
+        c.dut_arm_ownerless_response(dut.h, OWNERLESS_ROUTE_DRAIN, 1);
         try drainScratch(a, &dut, SCRATCH_ROLE_X1, rows, cols, tee_up.result);
+        try expectOwnerlessResponse(&dut, OWNERLESS_ROUTE_DRAIN, true);
+        c.dut_arm_ownerless_response(dut.h, OWNERLESS_ROUTE_DRAIN, 0);
         try drainScratch(a, &dut, SCRATCH_ROLE_X0, rows, cols, tee_gate.result);
+        try expectOwnerlessResponse(&dut, OWNERLESS_ROUTE_DRAIN, false);
 
         // A reuse-state error terminates the GEMM before output. The coupled
         // writer must be aborted too, otherwise it would remain busy forever.

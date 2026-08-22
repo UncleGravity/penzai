@@ -20,19 +20,20 @@ module section_f32_scratch_direct_formal(input wire clk);
     localparam [4:0] PH_BAD_WRITE      = 5'd9;
     localparam [4:0] PH_X0_REQ         = 5'd10;
     localparam [4:0] PH_X0_WAIT        = 5'd11;
-    localparam [4:0] PH_ABORT_WRITE    = 5'd12;
-    localparam [4:0] PH_ABORT_REQ      = 5'd13;
-    localparam [4:0] PH_ABORT_WAIT     = 5'd14;
-    localparam [4:0] PH_ACCEPT_COLLIDE = 5'd15;
-    localparam [4:0] PH_ACCEPT_WAIT    = 5'd16;
-    localparam [4:0] PH_ACCEPT_REQ     = 5'd17;
-    localparam [4:0] PH_ACCEPT_CHECK   = 5'd18;
-    localparam [4:0] PH_ISSUE_REQ      = 5'd19;
-    localparam [4:0] PH_ISSUE_WRITE    = 5'd20;
-    localparam [4:0] PH_ISSUE_WAIT     = 5'd21;
-    localparam [4:0] PH_ISSUE_CHECK_REQ = 5'd22;
-    localparam [4:0] PH_ISSUE_CHECK    = 5'd23;
-    localparam [4:0] PH_DONE           = 5'd24;
+    localparam [4:0] PH_STREAM_ABORT_WRITE = 5'd12;
+    localparam [4:0] PH_DIRECT_ABORT_WRITE = 5'd13;
+    localparam [4:0] PH_ABORT_REQ      = 5'd14;
+    localparam [4:0] PH_ABORT_WAIT     = 5'd15;
+    localparam [4:0] PH_ACCEPT_COLLIDE = 5'd16;
+    localparam [4:0] PH_ACCEPT_WAIT    = 5'd17;
+    localparam [4:0] PH_ACCEPT_REQ     = 5'd18;
+    localparam [4:0] PH_ACCEPT_CHECK   = 5'd19;
+    localparam [4:0] PH_ISSUE_REQ      = 5'd20;
+    localparam [4:0] PH_ISSUE_WRITE    = 5'd21;
+    localparam [4:0] PH_ISSUE_WAIT     = 5'd22;
+    localparam [4:0] PH_ISSUE_CHECK_REQ = 5'd23;
+    localparam [4:0] PH_ISSUE_CHECK    = 5'd24;
+    localparam [4:0] PH_DONE           = 5'd25;
 
     function automatic [63:0] r_word(input token, input [1:0] bank);
         r_word = {8'h10, 53'd0, token, bank};
@@ -69,7 +70,8 @@ module section_f32_scratch_direct_formal(input wire clk);
                       (phase == PH_R1_WRITE) ||
                       (phase == PH_X0_BLOCK) ||
                       (phase == PH_BAD_WRITE) ||
-                      (phase == PH_ABORT_WRITE) ||
+                      (phase == PH_STREAM_ABORT_WRITE) ||
+                      (phase == PH_DIRECT_ABORT_WRITE) ||
                       (phase == PH_ACCEPT_COLLIDE) ||
                       (phase == PH_ISSUE_WRITE);
     wire r_wr_ready;
@@ -78,11 +80,13 @@ module section_f32_scratch_direct_formal(input wire clk);
                            (phase == PH_ISSUE_WRITE) ? 2'd1 : 2'd0;
     wire [13:0] r_wr_address = (phase == PH_R1_WRITE ||
                                 phase == PH_X0_BLOCK ||
-                                phase == PH_ABORT_WRITE) ? 14'd512 :
+                                phase == PH_STREAM_ABORT_WRITE ||
+                                phase == PH_DIRECT_ABORT_WRITE) ? 14'd512 :
                                (phase == PH_BAD_WRITE) ? 14'd2048 : 14'd0;
     wire [63:0] r_wr_data = (phase == PH_R0_WRITE) ? r_word(1'b0, index) :
                               (phase == PH_R1_WRITE) ? r_word(1'b1, index) :
-                              (phase == PH_ABORT_WRITE) ? ABORT_WORD :
+                              (phase == PH_STREAM_ABORT_WRITE) ? ABORT_WORD :
+                              (phase == PH_DIRECT_ABORT_WRITE) ? BAD_WORD :
                               (phase == PH_BAD_WRITE) ? BAD_WORD :
                               (phase == PH_ACCEPT_COLLIDE) ? ACCEPT_WORD :
                               (phase == PH_ISSUE_WRITE) ? ISSUE_WORD : BAD_WORD;
@@ -99,6 +103,7 @@ module section_f32_scratch_direct_formal(input wire clk);
                         (phase == PH_ISSUE_CHECK_REQ);
     wire rd_req_ready;
     wire rd_quiescent;
+    wire rd_admission_idle;
     wire [1:0] rd_req_role = (phase == PH_X0_REQ) ? ROLE_X0 : ROLE_R;
     wire [2:0] rd_req_token = ((phase == PH_R1_REQ) ||
                                (phase == PH_ABORT_REQ)) ? 3'd1 : 3'd0;
@@ -108,7 +113,8 @@ module section_f32_scratch_direct_formal(input wire clk);
     wire [255:0] rd_rsp_data;
     wire rd_rsp_error;
 
-    wire wr_abort = phase == PH_ABORT_WRITE;
+    wire wr_abort = phase == PH_STREAM_ABORT_WRITE;
+    wire r_wr_abort = phase == PH_DIRECT_ABORT_WRITE;
 
     section_f32_scratch dut (
         .clk(clk), .rst_n(rst_n),
@@ -122,10 +128,12 @@ module section_f32_scratch_direct_formal(input wire clk);
         .s_axis_tlast(stream_last),
         .wr_commit_valid(wr_commit_valid), .wr_commit_bank(wr_commit_bank),
         .wr_commit_address(wr_commit_address),
+        .r_wr_abort(r_wr_abort),
         .r_wr_valid(r_wr_valid), .r_wr_ready(r_wr_ready),
         .r_wr_bank(r_wr_bank), .r_wr_address(r_wr_address),
         .r_wr_data(r_wr_data), .r_wr_error(r_wr_error),
         .rd_req_valid(rd_req_valid), .rd_req_ready(rd_req_ready),
+        .rd_admission_idle(rd_admission_idle),
         .rd_quiescent(rd_quiescent),
         .rd_req_role(rd_req_role), .rd_req_token(rd_req_token),
         .rd_req_group(11'd0),
@@ -169,8 +177,10 @@ module section_f32_scratch_direct_formal(input wire clk);
                 end
                 PH_BAD_WRITE: if (r_wr_fire) phase <= PH_X0_REQ;
                 PH_X0_REQ: if (rd_issue_valid) phase <= PH_X0_WAIT;
-                PH_X0_WAIT: if (rd_rsp_valid) phase <= PH_ABORT_WRITE;
-                PH_ABORT_WRITE: phase <= PH_ABORT_REQ;
+                PH_X0_WAIT: if (rd_rsp_valid) phase <= PH_STREAM_ABORT_WRITE;
+                PH_STREAM_ABORT_WRITE: if (r_wr_fire)
+                    phase <= PH_DIRECT_ABORT_WRITE;
+                PH_DIRECT_ABORT_WRITE: phase <= PH_ABORT_REQ;
                 PH_ABORT_REQ: if (rd_issue_valid) phase <= PH_ABORT_WAIT;
                 PH_ABORT_WAIT: if (rd_rsp_valid) phase <= PH_ACCEPT_COLLIDE;
                 PH_ACCEPT_COLLIDE: if (rd_issue_valid && r_wr_fire)
@@ -200,8 +210,10 @@ module section_f32_scratch_direct_formal(input wire clk);
         if (rst_n && f_past_valid && $past(rst_n)) begin
             assert(rd_quiescent == !read_owned_q);
             if (rd_quiescent)
+                assert(rd_admission_idle);
+            if (rd_quiescent)
                 assert(rd_req_ready);
-            assert(r_wr_ready == (!wr_busy && !wr_abort));
+            assert(r_wr_ready == (!wr_busy && !r_wr_abort));
             assert(r_wr_error == (r_wr_valid && r_wr_ready &&
                                   r_wr_address >= 14'd2048));
             assert(wr_cfg_ready == (!wr_busy && !wr_abort && !r_wr_valid));
@@ -211,7 +223,13 @@ module section_f32_scratch_direct_formal(input wire clk);
                 assert(!r_wr_ready);
                 assert(!r_wr_error);
             end
-            if (phase == PH_ABORT_WRITE) begin
+            if (phase == PH_STREAM_ABORT_WRITE) begin
+                assert(wr_abort && !r_wr_abort);
+                assert(r_wr_ready);
+                assert(!r_wr_error);
+            end
+            if (phase == PH_DIRECT_ABORT_WRITE) begin
+                assert(!wr_abort && r_wr_abort);
                 assert(!r_wr_ready);
                 assert(!r_wr_error);
             end
@@ -238,7 +256,7 @@ module section_f32_scratch_direct_formal(input wire clk);
                     PH_ABORT_WAIT:
                         assert(!rd_rsp_error && rd_rsp_data ==
                                {r_word(1'b1, 2'd3), r_word(1'b1, 2'd2),
-                                r_word(1'b1, 2'd1), r_word(1'b1, 2'd0)});
+                                r_word(1'b1, 2'd1), ABORT_WORD});
                     PH_X0_WAIT:
                         assert(!rd_rsp_error && rd_rsp_data ==
                                {x0_word(2'd3), x0_word(2'd2),

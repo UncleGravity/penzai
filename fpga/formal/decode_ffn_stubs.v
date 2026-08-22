@@ -147,10 +147,11 @@ module section_f32_scratch (
     output wire s_axis_tready_core,
     input wire s_axis_tlast, output wire wr_commit_valid,
     output wire [1:0] wr_commit_bank, output wire [13:0] wr_commit_address,
-    input wire r_wr_valid, output wire r_wr_ready,
+    input wire r_wr_abort, input wire r_wr_valid, output wire r_wr_ready,
     input wire [1:0] r_wr_bank, input wire [13:0] r_wr_address,
     input wire [63:0] r_wr_data, output wire r_wr_error,
     input wire rd_req_valid, output wire rd_req_ready,
+    output wire rd_admission_idle,
     output wire rd_quiescent,
     input wire [1:0] rd_req_role, input wire [2:0] rd_req_token,
     input wire [10:0] rd_req_group, output wire rd_issue_valid,
@@ -169,10 +170,11 @@ module section_f32_scratch (
     assign wr_commit_valid = 1'b0;
     assign wr_commit_bank = 2'd0;
     assign wr_commit_address = 14'd0;
-    assign r_wr_ready = rst_n && !wr_abort;
+    assign r_wr_ready = rst_n && !r_wr_abort;
     assign r_wr_error = 1'b0;
     assign rd_req_ready = rst_n && !rd_pending_q &&
                           (!rd_valid_q || rd_rsp_ready);
+    assign rd_admission_idle = rst_n && !rd_pending_q;
     assign rd_quiescent = rst_n && !rd_pending_q && !rd_valid_q;
     assign rd_issue_valid = rd_req_valid && rd_req_ready;
     assign rd_issue_address = {3'd0, rd_req_group};
@@ -219,7 +221,7 @@ module section_f32_scratch (
 
     wire _unused = &{1'b0, wr_cfg_role, wr_cfg_rows, wr_cfg_tokens,
                      s_axis_tdata, s_axis_tkeep, s_axis_tvalid,
-                     s_axis_tlast, r_wr_valid, r_wr_bank, r_wr_address,
+                     s_axis_tlast, r_wr_abort, r_wr_valid, r_wr_bank, r_wr_address,
                      r_wr_data, rd_req_role, rd_req_token};
 endmodule
 

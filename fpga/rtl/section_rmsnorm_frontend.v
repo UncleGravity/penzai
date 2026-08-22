@@ -261,6 +261,9 @@ module section_rmsnorm_frontend (
         .result_rows(maxexp_result_rows),
         .result_subnormal_warning(maxexp_result_subnormal),
         .result_final(maxexp_result_final)
+`ifdef VERILATOR
+        , .sim_force_summary_fatal(1'b0)
+`endif
     );
 
     // ---- Token-major scratch replay and fixed sumsq ----

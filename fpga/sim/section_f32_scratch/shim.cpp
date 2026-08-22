@@ -14,6 +14,7 @@ Dut *dut_new(void) {
     Dut *d = new Dut();
     d->top = new Vsection_f32_scratch();
     d->top->r_wr_valid = 0;
+    d->top->r_wr_abort = 0;
     d->top->r_wr_bank = 0;
     d->top->r_wr_address = 0;
     d->top->r_wr_data = 0;
@@ -37,6 +38,7 @@ void dut_set_write_config(Dut *d, int valid, uint8_t role, uint16_t rows, uint8_
 }
 
 void dut_set_write_abort(Dut *d, int value) { d->top->wr_abort = value; }
+void dut_set_r_write_abort(Dut *d, int value) { d->top->r_wr_abort = value; }
 
 void dut_set_write_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int last) {
     d->top->s_axis_tvalid = valid;

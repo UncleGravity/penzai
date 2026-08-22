@@ -47,6 +47,7 @@ const Dut = struct {
         c.dut_set_rst_n(self.handle, 0);
         c.dut_set_write_config(self.handle, 0, 0, 0, 0);
         c.dut_set_write_abort(self.handle, 0);
+        c.dut_set_r_write_abort(self.handle, 0);
         c.dut_set_write_stream(self.handle, 0, 0, 0, 0);
         c.dut_set_r_write(self.handle, 0, 0, 0, 0);
         c.dut_set_read_request(self.handle, 0, 0, 0, 0);
@@ -418,17 +419,43 @@ fn testDirectResidualWrites(dut: *Dut) !void {
         try expectGroup(dut, .residual, token, 0, @intCast(10 + token), token_usize);
     }
 
-    // Abort suppresses direct acceptance and leaves the committed group intact.
+    // Stream-writer abort is independent of direct-R admission.
     c.dut_set_r_write(dut.handle, 1, 1, 0, pairWord(14, .residual, 0, 2));
     c.dut_set_write_abort(dut.handle, 1);
     dut.eval();
-    try std.testing.expect(c.dut_r_write_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) != 0);
     try std.testing.expect(c.dut_r_write_error(dut.handle) == 0);
     dut.step();
     c.dut_set_write_abort(dut.handle, 0);
     c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
     dut.eval();
-    try expectGroup(dut, .residual, 0, 0, 10, 1);
+
+    var split_abort_group = try readGroup(dut, .residual, 0, 0, 1);
+    try std.testing.expect(!split_abort_group.is_error);
+    for (0..4) |bank| {
+        const expected = if (bank == 1)
+            pairWord(14, .residual, 0, 2)
+        else
+            pairWord(10, .residual, 0, @intCast(bank * 2));
+        try std.testing.expectEqual(expected, split_abort_group.lanes[bank]);
+    }
+
+    // Direct-R abort alone suppresses acceptance and preserves that update.
+    c.dut_set_r_write(dut.handle, 1, 1, 0, pairWord(15, .residual, 0, 2));
+    c.dut_set_r_write_abort(dut.handle, 1);
+    dut.eval();
+    try std.testing.expect(c.dut_r_write_ready(dut.handle) == 0);
+    try std.testing.expect(c.dut_r_write_error(dut.handle) == 0);
+    dut.step();
+    c.dut_set_r_write_abort(dut.handle, 0);
+    c.dut_set_r_write(dut.handle, 0, 0, 0, 0);
+    dut.eval();
+    split_abort_group = try readGroup(dut, .residual, 0, 0, 1);
+    try std.testing.expect(!split_abort_group.is_error);
+    try std.testing.expectEqual(
+        pairWord(14, .residual, 0, 2),
+        split_abort_group.lanes[1],
+    );
 
     // A live GEMM-order writer owns the physical write port. Direct valid must
     // backpressure without perturbing either stream.
@@ -479,7 +506,10 @@ fn testDirectResidualWrites(dut: *Dut) !void {
     try std.testing.expectEqual(pairWord(12, .residual, 0, 0), updated.lanes[0]);
     for (1..4) |bank| {
         try std.testing.expectEqual(
-            pairWord(10, .residual, 0, @intCast(bank * 2)),
+            if (bank == 1)
+                pairWord(14, .residual, 0, 2)
+            else
+                pairWord(10, .residual, 0, @intCast(bank * 2)),
             updated.lanes[bank],
         );
     }

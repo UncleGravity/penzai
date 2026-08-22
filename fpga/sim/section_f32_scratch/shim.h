@@ -16,6 +16,7 @@ void dut_set_clk(Dut *d, int value);
 void dut_set_rst_n(Dut *d, int value);
 void dut_set_write_config(Dut *d, int valid, uint8_t role, uint16_t rows, uint8_t tokens);
 void dut_set_write_abort(Dut *d, int value);
+void dut_set_r_write_abort(Dut *d, int value);
 void dut_set_write_stream(Dut *d, int valid, uint64_t data, uint8_t keep, int last);
 void dut_set_r_write(Dut *d, int valid, uint8_t bank, uint16_t address, uint64_t data);
 void dut_set_read_request(Dut *d, int valid, uint8_t role, uint8_t token, uint16_t group);

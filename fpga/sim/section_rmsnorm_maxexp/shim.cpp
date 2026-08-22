@@ -45,6 +45,10 @@ void dut_set_result_ready(Dut *d, int value) {
     d->top->result_ready = value;
 }
 
+void dut_force_summary_fatal(Dut *d, int value) {
+    d->top->sim_force_summary_fatal = value;
+}
+
 int dut_config_ready(Dut *d) { return d->top->cfg_ready; }
 int dut_busy(Dut *d) { return d->top->busy; }
 int dut_done(Dut *d) { return d->top->done; }

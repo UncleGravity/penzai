@@ -53,6 +53,10 @@ void dut_set_residual_numeric_error(Dut *, int);
 void dut_set_down_activation_error(Dut *, int);
 void dut_set_p3d_read_response_hold(Dut *, int);
 void dut_force_scratch_abort_strobe(Dut *, int);
+void dut_set_inactive_norm_owner(Dut *, int);
+void dut_set_inactive_residual_owner(Dut *, int);
+void dut_arm_ownerless_response(Dut *, uint32_t route, int error);
+uint32_t dut_ownerless_response_result(Dut *);
 
 #ifdef __cplusplus
 }
