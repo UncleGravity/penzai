@@ -12,9 +12,8 @@ pub const HeapError = error{
     BackendFailure,
 };
 
-/// Fake heap: a plain host allocation standing in for board DRAM, used off the
-/// board (`--mem fake`) for the fake full-stack tests.  Offset bookkeeping is
-/// delegated to `Regions`; this type only owns the bytes.
+/// In-memory heap used for protocol and allocator tests without a board.
+/// Offset bookkeeping is delegated to `Regions`; this type only owns the bytes.
 pub const Heap = struct {
     const Self = @This();
 

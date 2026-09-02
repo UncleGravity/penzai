@@ -45,7 +45,7 @@
           };
 
           # Build with clang/libc++ (not the default gcc/libstdc++). The Zig
-          # host compiles host/chat.cpp with Zig's bundled libc++, so the
+          # host compiles host/llama/prompt.cpp with Zig's bundled libc++, so the
           # common_chat_* C++ API (which takes std::string by ref) must be
           # mangled/ABI-matched under libc++ (std::__1) too — otherwise the host
           # link fails with undefined std::__1::basic_string symbols. This
@@ -79,7 +79,7 @@
 
           mkLlamaCpp =
             { pname
-            , patches ? [ ]
+            , patches ? [ ./patches/llama-inference-v1.patch ]
             , withUi ? false
             , extraCmakeFlags
             , buildPhase
@@ -145,9 +145,7 @@
             '';
           };
 
-          # DL-enabled llama.cpp: GGML_BACKEND_DL=ON + tools, so stock llama-cli can
-          # dlopen out-of-tree backends (libggml-penzai). No greedy-drop patch — the
-          # .so path samples host-side in llama-cli, not on the backend.
+          # DL-enabled llama.cpp tools with the versioned whole-token executor patch.
           llama-cpp-dl = mkLlamaCpp {
             pname = "penzai-llama-cpp-dl";
             withUi = true;
@@ -205,11 +203,9 @@
 
           # Source tree for the Zig builds, restricted to what `zig build`
           # actually reads (per the b.path()/addCosim()/sby references in
-          # build.zig). Using ./. verbatim would snapshot every tracked file —
-          # including ~100 MB of experiments/ logs and fpga/bitstream images —
-          # into the store on every edit, and any change to those would
-          # needlessly rebuild every Zig package. (models/, external/ etc. are
-          # untracked, so the git flake fetcher already keeps them out.)
+          # build.zig). Using ./. verbatim would make unrelated routed artifacts
+          # invalidate every Zig package. Local models are untracked and remain
+          # outside the flake source.
           zigSrc = pkgs.lib.fileset.toSource {
             root = ./.;
             fileset = pkgs.lib.fileset.unions [
@@ -218,10 +214,10 @@
               ./host
               ./shared
               ./test
-              ./fpga/formal
+              ./fpga/build
               ./fpga/regmap
               ./fpga/rtl
-              ./fpga/sim
+              ./fpga/verify
             ];
           };
 
@@ -332,6 +328,18 @@
             llamaLib = llama-cpp-dl;
           };
 
+          penzai-core = mkPenzai "releasefast" "ReleaseFast";
+          penzai-app = pkgs.runCommand "penzai-releasefast" {
+            nativeBuildInputs = [ pkgs.makeWrapper ];
+          } ''
+            mkdir -p "$out/bin"
+            makeWrapper ${penzai-core}/bin/penzai "$out/bin/penzai" \
+              --set-default PENZAI_LLAMA_SERVER ${llama-cpp-dl}/bin/llama-server \
+              --set-default PENZAI_GGML_BACKEND_PATH ${penzai-backend-so}/lib/libggml-penzai.${soExt} \
+              --set-default GGML_BACKEND_PATH ${llama-cpp-dl}/bin/libggml-cpu.so \
+              --prefix ${dynamicLibraryPathVar} : ${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib
+          '';
+
           mkApp = package: program: description: {
             type = "app";
             program = "${package}/bin/${program}";
@@ -349,20 +357,34 @@
 
                 BOARD="''${BOARD:-ubuntu@kria}"
                 BOARD_TMP="''${BOARD_TMP:-/tmp/penzai}"
+                SSH_BIN="''${PENZAI_SSH_BIN:-/usr/bin/ssh}"
+                SCP_BIN="''${PENZAI_SCP_BIN:-/usr/bin/scp}"
                 REMOTE_BIN="$BOARD_TMP/penzaid"
                 REMOTE_KILL_PATTERN="$BOARD_TMP/[p]enzaid"
+
+                [ -x "$SSH_BIN" ] || SSH_BIN=ssh
+                [ -x "$SCP_BIN" ] || SCP_BIN=scp
+
+                SSH_ARGS=(-o BatchMode=yes -o StrictHostKeyChecking=yes -o ConnectTimeout=10)
+                if [ -n "''${PENZAI_SSH_IDENTITY:-}" ]; then
+                  [ -r "$PENZAI_SSH_IDENTITY" ] || {
+                    echo "ERROR: PENZAI_SSH_IDENTITY is not readable: $PENZAI_SSH_IDENTITY" >&2
+                    exit 1
+                  }
+                  SSH_ARGS+=(-o IdentityAgent=none -o IdentitiesOnly=yes -i "$PENZAI_SSH_IDENTITY")
+                fi
 
                 echo "== deploy ${label} penzaid -> $BOARD:$REMOTE_BIN =="
                 echo "== stop existing penzaid on $BOARD =="
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "sudo pkill -f '$REMOTE_KILL_PATTERN' 2>/dev/null || true"
+                "$SSH_BIN" "''${SSH_ARGS[@]}" "$BOARD" "sudo pkill -f '$REMOTE_KILL_PATTERN' 2>/dev/null || true"
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "mkdir -p '$BOARD_TMP' && rm -f '$REMOTE_BIN'"
+                "$SSH_BIN" "''${SSH_ARGS[@]}" "$BOARD" "mkdir -p '$BOARD_TMP' && rm -f '$REMOTE_BIN'"
 
                 echo "== copying penzaid to $BOARD:$REMOTE_BIN =="
-                scp "${penzaidPackage}/bin/penzaid" "$BOARD:$REMOTE_BIN"
+                "$SCP_BIN" "''${SSH_ARGS[@]}" "${penzaidPackage}/bin/penzaid" "$BOARD:$REMOTE_BIN"
                 # shellcheck disable=SC2029
-                ssh "$BOARD" "chmod u+w,+x '$REMOTE_BIN'"
+                "$SSH_BIN" "''${SSH_ARGS[@]}" "$BOARD" "chmod u+w,+x '$REMOTE_BIN'"
                 echo "== deployed $REMOTE_BIN =="
               '';
             };
@@ -378,31 +400,53 @@
 
                 BOARD="''${BOARD:-ubuntu@kria}"
                 BOARD_TMP="''${BOARD_TMP:-/tmp/penzai}"
-                PENZAI_PORT="''${PENZAI_PORT:-29092}"
+                PENZAI_LOCAL_PORT="''${PENZAI_LOCAL_PORT:-''${PENZAI_PORT:-29092}}"
+                PENZAI_REMOTE_PORT="''${PENZAI_REMOTE_PORT:-29092}"
+                PENZAI_FORWARD="''${PENZAI_FORWARD:-1}"
                 PENZAI_MEM="''${PENZAI_MEM:-xrt}"
-                PENZAI_HEAP_MIB="''${PENZAI_HEAP_MIB:-768}"
-                # Which PL op backends to probe — must match the resident bitstream
-                # (probing an absent IP faults fatally). Default matmul (the matmul
-                # bitstream); set PENZAI_PL_OPS=flash for the flash bitstream.
-                PENZAI_PL_OPS="''${PENZAI_PL_OPS:-matmul}"
-                PENZAI_PL_VERIFY="''${PENZAI_PL_VERIFY:-0}"
-                PENZAI_PL_SCRATCH_VERIFY="''${PENZAI_PL_SCRATCH_VERIFY:-0}"
-                # seq.v on-PL descriptor dispatch. The daemon enables this on the
-                # PRESENCE (not the value) of PENZAI_SEQ, so forward it only when the
-                # caller set it — forwarding an empty value would still switch seq.v on.
-                # Requires a bitstream carrying seq_top (combined-v1+); use PENZAI_SEQ=1.
-                PENZAI_SEQ="''${PENZAI_SEQ:-}"
+                PENZAI_HEAP_MIB="''${PENZAI_HEAP_MIB:-1500}"
+                SSH_BIN="''${PENZAI_SSH_BIN:-/usr/bin/ssh}"
                 REMOTE_BIN="$BOARD_TMP/penzaid"
 
-                SEQ_FWD=""
-                if [ -n "$PENZAI_SEQ" ]; then
-                  SEQ_FWD="PENZAI_SEQ='$PENZAI_SEQ' "
+                [ -x "$SSH_BIN" ] || SSH_BIN=ssh
+
+                SSH_ARGS=(
+                  -o BatchMode=yes
+                  -o StrictHostKeyChecking=yes
+                  -o ConnectTimeout=10
+                  -o ServerAliveInterval=15
+                  -o ServerAliveCountMax=3
+                  -o TCPKeepAlive=yes
+                )
+                case "$PENZAI_FORWARD" in
+                  1)
+                    SSH_ARGS+=(
+                      -o ExitOnForwardFailure=yes
+                      -L "127.0.0.1:$PENZAI_LOCAL_PORT:127.0.0.1:$PENZAI_REMOTE_PORT"
+                    )
+                    ;;
+                  0) ;;
+                  *)
+                    echo "ERROR: PENZAI_FORWARD must be 0 or 1" >&2
+                    exit 1
+                    ;;
+                esac
+                if [ -n "''${PENZAI_SSH_IDENTITY:-}" ]; then
+                  [ -r "$PENZAI_SSH_IDENTITY" ] || {
+                    echo "ERROR: PENZAI_SSH_IDENTITY is not readable: $PENZAI_SSH_IDENTITY" >&2
+                    exit 1
+                  }
+                  SSH_ARGS+=(-o IdentityAgent=none -o IdentitiesOnly=yes -i "$PENZAI_SSH_IDENTITY")
                 fi
 
-                echo "== serve penzaid on $BOARD tcp:0.0.0.0:$PENZAI_PORT mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB pl_ops=$PENZAI_PL_OPS verify=$PENZAI_PL_VERIFY scratch_verify=$PENZAI_PL_SCRATCH_VERIFY seq=''${PENZAI_SEQ:-off} =="
+                if [ "$PENZAI_FORWARD" = 1 ]; then
+                  echo "== forward tcp:127.0.0.1:$PENZAI_LOCAL_PORT -> $BOARD tcp:127.0.0.1:$PENZAI_REMOTE_PORT =="
+                else
+                  echo "== use independently managed tunnel to $BOARD tcp:127.0.0.1:$PENZAI_REMOTE_PORT =="
+                fi
+                echo "== serve penzaid mem=$PENZAI_MEM heap_mib=$PENZAI_HEAP_MIB =="
                 # shellcheck disable=SC2029
-                # Must run as root for PL to work. sudo strips env, so forward via `env`.
-                exec ssh "$BOARD" "sudo env PENZAI_PL_OPS='$PENZAI_PL_OPS' PENZAI_PL_VERIFY='$PENZAI_PL_VERIFY' PENZAI_PL_SCRATCH_VERIFY='$PENZAI_PL_SCRATCH_VERIFY' ''${SEQ_FWD}'$REMOTE_BIN' serve --device 'tcp:0.0.0.0:$PENZAI_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
+                exec "$SSH_BIN" "''${SSH_ARGS[@]}" "$BOARD" "sudo '$REMOTE_BIN' serve --device 'tcp:127.0.0.1:$PENZAI_REMOTE_PORT' --mem '$PENZAI_MEM' --heap-mib '$PENZAI_HEAP_MIB'"
               '';
             };
 
@@ -414,54 +458,42 @@
 
                 "${penzaiPackage}/bin/penzai" run \
                   -m ./models/Bonsai-1.7B/Bonsai-1.7B-Q1_0.gguf \
-                  --device tcp:kria:29092 \
                   --prompt "hello" \
                   --max-tokens 7 \
-                  --prof
-                say hello
+                  --metrics summary
               '';
             };
 
-          mkP0Benchmark = penzaiPackage:
-            pkgs.writeShellApplication {
-              name = "p0-benchmark";
-              runtimeInputs = [ pkgs.python3 pkgs.git ];
-              text = ''
-                exec python3 ${./tools/p0-benchmark.py} --penzai "${penzaiPackage}/bin/penzai" "$@"
-              '';
-            };
-
-          # Stock llama-cli wired to dlopen libggml-penzai. Talks to a penzaid at
-          # PENZAI_HOST/PENZAI_PORT (default 127.0.0.1:9000). The residency flags the
-          # in-process driver hard-codes must be passed here:
-          #   PENZAI_HOST=… llama-cli-penzai --device penzai -ngl 999 --no-op-offload -fa on -m model.gguf
+          # Patched llama tools with the Penzai executor selected by default.
           llama-cli-penzai = pkgs.writeShellScriptBin "llama-cli-penzai" ''
             set -e
             export GGML_BACKEND_PATH="${penzai-backend-so}/lib/libggml-penzai.${soExt}"
+            export PENZAI_METRICS=none
             export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
-            exec "${llama-cpp-dl}/bin/llama-cli" "$@"
+            exec "${llama-cpp-dl}/bin/llama-cli" \
+              --device penzai -ngl 999 --no-op-offload -fa on \
+              --no-context-shift -c 4096 -b 32 -ub 16 --temp 0 --no-warmup "$@"
           '';
 
-          # Stock llama-server wired to dlopen libggml-penzai — the OpenAI-compatible
-          # HTTP server sibling of llama-cli-penzai. Same residency flags apply; add
-          # --host/--port for the listener, e.g.:
-          #   PENZAI_HOST=kria llama-server-penzai --device penzai -ngl 999 \
-          #     --no-op-offload -fa on -m model.gguf --host 0.0.0.0 --port 8080
           llama-server-penzai = pkgs.writeShellScriptBin "llama-server-penzai" ''
             set -e
             export GGML_BACKEND_PATH="${penzai-backend-so}/lib/libggml-penzai.${soExt}"
+            export PENZAI_METRICS=none
             export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib''${${dynamicLibraryPathVar}:+:''${${dynamicLibraryPathVar}}}"
-            exec "${llama-cpp-dl}/bin/llama-server" "$@"
+            exec "${llama-cpp-dl}/bin/llama-server" \
+              --device penzai -ngl 999 --no-op-offload -fa on \
+              --parallel 1 --no-context-shift \
+              --ctx-size 4096 --batch-size 32 --ubatch-size 16 \
+              --temp 0 --no-warmup "$@"
           '';
         in
         rec {
           packages = rec {
             inherit llama-cpp llama-cpp-dl penzai-backend-so llama-cli-penzai llama-server-penzai;
 
-            penzai = mkPenzai "releasefast" "ReleaseFast";
+            penzai = penzai-app;
             penzaid = mkPenzaid "releasefast" "ReleaseFast";
-            # Native (host-arch) penzaid for local TCP testing of the .so — `--mem fake`,
-            # no board, no cross-compile. The KR260 `penzaid` above won't run on the host.
+            # Native penzaid for protocol and memory testing without a board.
             penzaid-native = mkZigPackage {
               pname = "penzaid-native";
               step = "install-penzaid-native";
@@ -471,7 +503,6 @@
             deploy-penzaid = mkDeploy "deploy-penzaid" "ReleaseFast" penzaid;
             serve-penzaid = mkServe "serve-penzaid";
             hello = mkHello penzai;
-            p0-benchmark = mkP0Benchmark penzai;
 
             default = penzai;
           };
@@ -485,7 +516,6 @@
             serve-penzaid = mkApp packages.serve-penzaid "serve-penzaid" "Run the deployed KR260 penzaid daemon over SSH";
             penzaid-native = mkApp packages.penzaid-native "penzaid-native" "Run a local native penzaid daemon";
             hello = mkApp packages.hello "hello" "Run the Bonsai hello inference path";
-            p0-benchmark = mkApp packages.p0-benchmark "p0-benchmark" "Run the reproducible P0 Q1/Q2 benchmark matrix";
             llama-cli-penzai = mkApp packages.llama-cli-penzai "llama-cli-penzai" "Stock llama-cli with the out-of-tree penzai backend";
             llama-server-penzai = mkApp packages.llama-server-penzai "llama-server-penzai" "Stock llama-server (HTTP) with the out-of-tree penzai backend";
           };
@@ -496,8 +526,32 @@
               pname = "penzai-zig-tests";
               step = "test";
             };
-            formal-control = mkZigCheck {
-              pname = "penzai-formal-control";
+            rtl-lint = mkZigCheck {
+              pname = "penzai-rtl-lint";
+              step = "lint-rtl";
+              extraNativeBuildInputs = [
+                pkgs.bash
+                pkgs.verilator
+              ];
+            };
+            rtl-sim = mkZigCheck {
+              pname = "penzai-rtl-sim";
+              step = "test-rtl";
+              extraNativeBuildInputs = [
+                pkgs.bash
+                pkgs.verilator
+              ];
+            };
+            rtl-synth = mkZigCheck {
+              pname = "penzai-rtl-synth";
+              step = "synth-rtl";
+              extraNativeBuildInputs = [
+                pkgs.bash
+                pkgs.yosys
+              ];
+            };
+            rtl-formal = mkZigCheck {
+              pname = "penzai-rtl-formal";
               step = "formal";
               extraNativeBuildInputs = [
                 pkgs.yosys
@@ -505,14 +559,31 @@
                 pkgs.boolector
               ];
             };
-            rtl-cosim = mkZigCheck {
-              pname = "penzai-rtl-cosim";
-              step = "test-rtl";
-              extraNativeBuildInputs = [
-                pkgs.verilator
+            llama-inference = pkgs.runCommand "penzai-llama-inference-smoke" {
+              nativeBuildInputs = [
                 pkgs.python3
+                pkgs.libcxxStdenv.cc
               ];
-            };
+            } ''
+              cc -std=c11 -Wall -Wextra -Werror \
+                -I${llama-cpp-src}/include \
+                -I${llama-cpp-dl}/include/ggml \
+                -L${llama-cpp-dl}/lib \
+                -Wl,-rpath,${llama-cpp-dl}/lib \
+                ${zigSrc}/test/llama_logits_probe.c \
+                -lllama -lggml \
+                -o llama-logits-probe
+              export ${dynamicLibraryPathVar}="${llama-cpp-dl}/lib:${llama-cpp-dl}/bin:${penzai-backend-so}/lib"
+              python3 ${zigSrc}/test/llama_inference_smoke.py \
+                --llama-cli ${llama-cpp-dl}/bin/llama-cli \
+                --llama-server ${llama-cpp-dl}/bin/llama-server \
+                --penzai ${penzai-app}/bin/penzai \
+                --backend ${penzai-backend-so}/lib/libggml-penzai.${soExt} \
+                --cpu-backend ${llama-cpp-dl}/bin/libggml-cpu.so \
+                --logits-probe ./llama-logits-probe
+              mkdir -p "$out"
+              touch "$out/passed"
+            '';
             inherit (packages) penzai penzaid;
           };
 

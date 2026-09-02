@@ -1,0 +1,1325 @@
+diff --git a/common/common.cpp b/common/common.cpp
+index 8f13217..a083bf4 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -6,6 +6,7 @@
+ #include "fit.h"
+ #include "log.h"
+ #include "llama.h"
++#include "penzai-inference-v1.h"
+ #include "sampling.h"
+ #include "speculative.h"
+ #include "unicode.h"
+@@ -1214,12 +1215,35 @@ struct common_init_result::impl {
+     std::vector<llama_sampler_seq_config> samplers_seq_config;
+ };
+-
++
++static bool common_has_inference_v1_device(const llama_model_params & mparams) {
++    if (mparams.devices == nullptr) {
++        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
++            ggml_backend_dev_t device = ggml_backend_dev_get(i);
++            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
++            if (reg != nullptr &&
++                ggml_backend_reg_get_proc_address(reg, PENZAI_INFERENCE_V1_SYMBOL) != nullptr) {
++                return true;
++            }
++        }
++        return false;
++    }
++
++    for (ggml_backend_dev_t * device = mparams.devices; *device != nullptr; ++device) {
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(*device);
++        if (reg != nullptr &&
++            ggml_backend_reg_get_proc_address(reg, PENZAI_INFERENCE_V1_SYMBOL) != nullptr) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ common_init_result::common_init_result(common_params & params, bool model_only) :
+     pimpl(new impl{}) {
+     auto mparams = common_model_params_to_llama(params);
+     auto cparams = common_context_params_to_llama(params);
+-
++
+-    if (params.fit_params) {
++    if (params.fit_params && !common_has_inference_v1_device(mparams)) {
+         COM_TRC("%s", "fitting params to device memory ...\n");
+         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
+         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
+@@ -1228,6 +1252,8 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+             params.fit_params_target.data(),
+             params.fit_params_min_ctx,
+             params.verbosity >= LOG_LEVEL_DEBUG ? GGML_LOG_LEVEL_DEBUG : GGML_LOG_LEVEL_ERROR);
++    } else if (params.fit_params) {
++        COM_TRC("%s", "skipping generic device-memory fitting for a whole-token executor\n");
+     }
+-
++
+     llama_model * model = llama_model_load_from_file(params.model.path.c_str(), mparams);
+@@ -1241,6 +1267,21 @@ common_init_result::common_init_result(common_params & params, bool model_only)
+         return;
+     }
+-
++
++    if (penzai_llama_model_has_inference_v1(model)) {
++        if (cparams.n_seq_max != 1) {
++            COM_ERR("%s", "penzai.inference.v1 requires --parallel 1\n");
++            return;
++        }
++        if (!params.lora_adapters.empty() || !params.control_vectors.empty()) {
++            COM_ERR("%s", "penzai.inference.v1 does not support LoRA or control-vector adapters\n");
++            return;
++        }
++        // llama-cli sends requests through an embedded llama-server. Make its
++        // inherited default compatible while preserving rejection of explicit
++        // cache_prompt=true requests in the server request path.
++        params.cache_prompt = false;
++    }
++
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+-
++
+     // load and optionally apply lora adapters
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 75a299e..99e88a3 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -187,6 +187,21 @@ std::string common_params_sampling::print() const {
+ struct common_sampler * common_sampler_init(const struct llama_model * model, struct common_params_sampling & params) {
+     const llama_vocab * vocab = llama_model_get_vocab(model);
+-
++
++    if (penzai_llama_model_has_inference_v1(model)) {
++        const bool unsupported =
++            params.temp > 0.0f || params.dynatemp_range != 0.0f ||
++            params.penalty_repeat != 1.0f || params.penalty_freq != 0.0f || params.penalty_present != 0.0f ||
++            params.dry_multiplier != 0.0f || params.xtc_probability != 0.0f ||
++            params.adaptive_target >= 0.0f || params.mirostat != 0 || params.ignore_eos ||
++            params.n_probs != 0 || params.has_logit_bias() || !params.grammar.empty() ||
++            params.reasoning_budget_tokens >= 0 || params.reasoning_control || params.backend_sampling;
++        if (unsupported) {
++            throw std::invalid_argument(
++                "penzai.inference.v1 supports raw greedy generation only; use temperature 0 without "
++                "penalties, grammar, logit bias, logprobs, reasoning control, or backend sampling");
++        }
++    }
++
+     llama_sampler_chain_params lparams = llama_sampler_chain_default_params();
+-
++
+     lparams.no_perf = params.no_perf;
+diff --git a/include/llama.h b/include/llama.h
+index a311ac2..e24c85d 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -629,6 +629,10 @@ extern "C" {
+     // Returns true if the model contains a decoder that requires llama_decode() call
+     LLAMA_API bool llama_model_has_decoder(const struct llama_model * model);
+-
++
++    // Penzai extension query used by llama.cpp tools to reject unsupported
++    // sampling and server modes before execution begins.
++    LLAMA_API bool penzai_llama_model_has_inference_v1(const struct llama_model * model);
++
+     // For encoder-decoder models, this function returns id of the token that must be provided
+     // to the decoder to start generating output sequence. For other models, it returns -1.
+     LLAMA_API llama_token llama_model_decoder_start_token(const struct llama_model * model);
+diff --git a/include/penzai-inference-v1.h b/include/penzai-inference-v1.h
+new file mode 100644
+index 0000000..943033c
+--- /dev/null
++++ b/include/penzai-inference-v1.h
+@@ -0,0 +1,175 @@
++#ifndef PENZAI_INFERENCE_V1_H
++#define PENZAI_INFERENCE_V1_H
++
++#include <stdint.h>
++
++#ifdef __cplusplus
++extern "C" {
++#endif
++
++#define PENZAI_INFERENCE_V1_ABI_VERSION 1u
++#define PENZAI_INFERENCE_V1_SYMBOL "penzai.inference.v1"
++
++enum penzai_inference_status_v1 {
++    PENZAI_INFERENCE_STATUS_OK_V1 = 0,
++    PENZAI_INFERENCE_STATUS_INVALID_ARGUMENT_V1 = -1,
++    PENZAI_INFERENCE_STATUS_UNSUPPORTED_V1 = -2,
++    PENZAI_INFERENCE_STATUS_IO_V1 = -3,
++    PENZAI_INFERENCE_STATUS_DEVICE_V1 = -4,
++    PENZAI_INFERENCE_STATUS_STATE_V1 = -5,
++};
++
++enum penzai_inference_feature_v1 {
++    PENZAI_INFERENCE_FEATURE_GREEDY_ONLY_V1 = UINT64_C(1) << 0,
++    PENZAI_INFERENCE_FEATURE_SINGLE_SEQUENCE_V1 = UINT64_C(1) << 1,
++    PENZAI_INFERENCE_FEATURE_WINNER_LOGIT_V1 = UINT64_C(1) << 2,
++};
++
++enum penzai_inference_weight_format_v1 {
++    PENZAI_INFERENCE_WEIGHT_NONE_V1 = 0,
++    PENZAI_INFERENCE_WEIGHT_F32_V1 = 1,
++    PENZAI_INFERENCE_WEIGHT_F16_V1 = 2,
++    PENZAI_INFERENCE_WEIGHT_Q1_0_V1 = 3,
++    PENZAI_INFERENCE_WEIGHT_Q2_0_V1 = 4,
++};
++
++enum penzai_inference_model_flag_v1 {
++    // Tensor bytes are valid only for the duration of load_model().
++    PENZAI_INFERENCE_MODEL_SOURCE_EPHEMERAL_V1 = UINT64_C(1) << 0,
++    PENZAI_INFERENCE_MODEL_TIED_OUTPUT_V1 = UINT64_C(1) << 1,
++};
++
++enum penzai_inference_execute_flag_v1 {
++    PENZAI_INFERENCE_EXECUTE_EMIT_WINNER_V1 = UINT64_C(1) << 0,
++};
++
++enum penzai_inference_result_flag_v1 {
++    PENZAI_INFERENCE_RESULT_HAS_WINNER_V1 = UINT64_C(1) << 0,
++};
++
++struct penzai_inference_tensor_source_v1 {
++    uint32_t struct_size;
++    uint32_t format;
++    uint32_t rank;
++    uint32_t reserved0;
++    uint64_t dimensions[4];
++    const void * data;
++    uint64_t data_size;
++    const char * name;
++    uint32_t name_size;
++    uint32_t reserved1;
++};
++
++struct penzai_inference_layer_v1 {
++    uint32_t struct_size;
++    uint32_t reserved0;
++    struct penzai_inference_tensor_source_v1 query;
++    struct penzai_inference_tensor_source_v1 key;
++    struct penzai_inference_tensor_source_v1 value;
++    struct penzai_inference_tensor_source_v1 attention_output;
++    struct penzai_inference_tensor_source_v1 gate;
++    struct penzai_inference_tensor_source_v1 up;
++    struct penzai_inference_tensor_source_v1 ffn_down;
++    struct penzai_inference_tensor_source_v1 attention_norm;
++    struct penzai_inference_tensor_source_v1 attention_q_norm;
++    struct penzai_inference_tensor_source_v1 attention_k_norm;
++    struct penzai_inference_tensor_source_v1 ffn_norm;
++};
++
++struct penzai_inference_model_descriptor_v1 {
++    uint32_t struct_size;
++    uint32_t reserved0;
++    uint64_t flags;
++    const char * architecture;
++    uint32_t architecture_size;
++    uint32_t block_count;
++    uint32_t context_length;
++    uint32_t embedding_length;
++    uint32_t feed_forward_length;
++    uint32_t attention_head_count;
++    uint32_t attention_head_count_kv;
++    uint32_t attention_key_length;
++    uint32_t attention_value_length;
++    uint32_t vocabulary_size;
++    uint32_t rope_original_context;
++    float rope_scaling_factor;
++    float rope_frequency_base;
++    float rms_epsilon;
++    uint32_t reserved1;
++    struct penzai_inference_tensor_source_v1 embedding;
++    // Zeroed when PENZAI_INFERENCE_MODEL_TIED_OUTPUT_V1 is set.
++    struct penzai_inference_tensor_source_v1 output;
++    struct penzai_inference_tensor_source_v1 output_norm;
++    const struct penzai_inference_layer_v1 * layers;
++    uint32_t layer_count;
++    uint32_t reserved2;
++};
++
++struct penzai_inference_model_result_v1 {
++    uint32_t struct_size;
++    uint32_t reserved0;
++    void * model;
++    uint32_t max_context_tokens;
++    uint32_t max_tile_tokens;
++    uint64_t features;
++};
++
++struct penzai_inference_session_params_v1 {
++    uint32_t struct_size;
++    uint32_t capacity_tokens;
++    uint64_t flags;
++};
++
++struct penzai_inference_execute_request_v1 {
++    uint32_t struct_size;
++    uint32_t first_position;
++    uint32_t token_count;
++    uint32_t reserved0;
++    uint64_t flags;
++    const uint32_t * token_ids;
++};
++
++struct penzai_inference_execute_result_v1 {
++    uint32_t struct_size;
++    uint32_t committed_tokens;
++    uint64_t flags;
++    uint32_t token_id;
++    float winning_logit;
++    uint64_t device_cycles;
++    uint64_t device_time_ns;
++};
++
++struct penzai_inference_v1 {
++    uint32_t abi_version;
++    uint32_t struct_size;
++    uint64_t features;
++    // On any status, a non-null result->model transfers ownership to the
++    // caller and will be released exactly once with unload_model().
++    int32_t (*load_model)(
++        void * device,
++        const struct penzai_inference_model_descriptor_v1 * descriptor,
++        struct penzai_inference_model_result_v1 * result);
++    void (*unload_model)(void * model);
++    // On any status, a non-null *session transfers ownership to the caller
++    // and will be released exactly once with close_session().
++    int32_t (*open_session)(
++        void * model,
++        const struct penzai_inference_session_params_v1 * params,
++        void ** session);
++    void (*close_session)(void * session);
++    int32_t (*reset_session)(void * session);
++    int32_t (*execute)(
++        void * session,
++        const struct penzai_inference_execute_request_v1 * request,
++        struct penzai_inference_execute_result_v1 * result);
++    const char * (*status_message)(int32_t status);
++    void * reserved[8];
++};
++
++typedef const struct penzai_inference_v1 * (*penzai_inference_query_v1_fn)(void);
++
++#ifdef __cplusplus
++}
++#endif
++
++#endif
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index eed041e..f31a421 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -79,6 +79,128 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
+     /*.n_tokens_per_seq =*/ 1,
+ };
+-
++
++static const char * penzai_inference_status_detail(const penzai_inference_v1 * api, int32_t status) {
++    if (api->status_message == nullptr) {
++        return "no provider detail";
++    }
++    const char * detail = api->status_message(status);
++    return detail != nullptr ? detail : "no provider detail";
++}
++
++class penzai_inference_no_update final : public llama_memory_context_i {
++public:
++    bool next() override { return false; }
++    bool apply() override { return true; }
++    const llama_ubatch & get_ubatch() const override { return ubatch; }
++    llama_memory_status get_status() const override { return LLAMA_MEMORY_STATUS_NO_UPDATE; }
++
++private:
++    llama_ubatch ubatch = {};
++};
++
++class penzai_inference_memory final : public llama_memory_i {
++public:
++    penzai_inference_memory(
++            const penzai_inference_v1 * api,
++            void * session,
++            uint32_t capacity,
++            uint32_t max_tile) :
++        api(api), session(session), capacity_tokens(capacity), max_tile_tokens(max_tile) {
++    }
++
++    ~penzai_inference_memory() override {
++        if (session != nullptr) {
++            api->close_session(session);
++        }
++    }
++
++    llama_memory_context_ptr init_batch(llama_batch_allocr &, uint32_t, bool) override { return nullptr; }
++    llama_memory_context_ptr init_full() override { return nullptr; }
++    llama_memory_context_ptr init_update(llama_context *, bool) override {
++        return std::make_unique<penzai_inference_no_update>();
++    }
++
++    bool get_can_shift() const override { return false; }
++
++    void clear(bool) override {
++        if (!reset()) {
++            LLAMA_LOG_ERROR("%s: penzai.inference.v1 session reset failed\n", __func__);
++        }
++    }
++
++    bool seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) override {
++        if (seq_id != 0 && seq_id != -1) {
++            return false;
++        }
++        if (p1 < 0 && p0 == static_cast<llama_pos>(position_tokens)) {
++            return true;
++        }
++        if (p1 < 0 && p0 <= 0) {
++            return reset();
++        }
++        return false;
++    }
++
++    void seq_cp(llama_seq_id, llama_seq_id, llama_pos, llama_pos) override {
++        healthy = false;
++        LLAMA_LOG_ERROR("%s: sequence copies are unsupported by penzai.inference.v1\n", __func__);
++    }
++    void seq_keep(llama_seq_id seq_id) override {
++        if (seq_id != 0) {
++            healthy = false;
++        }
++    }
++    void seq_add(llama_seq_id, llama_pos, llama_pos, llama_pos) override {
++        healthy = false;
++        LLAMA_LOG_ERROR("%s: context shifting is unsupported by penzai.inference.v1\n", __func__);
++    }
++    void seq_div(llama_seq_id, llama_pos, llama_pos, int) override {
++        healthy = false;
++        LLAMA_LOG_ERROR("%s: sequence division is unsupported by penzai.inference.v1\n", __func__);
++    }
++
++    llama_pos seq_pos_min(llama_seq_id seq_id) const override {
++        return seq_id == 0 && position_tokens != 0 ? 0 : -1;
++    }
++    llama_pos seq_pos_max(llama_seq_id seq_id) const override {
++        return seq_id == 0 && position_tokens != 0 ? static_cast<llama_pos>(position_tokens - 1) : -1;
++    }
++
++    std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const override { return {}; }
++
++    [[noreturn]] void state_write(llama_io_write_i &, llama_seq_id, llama_state_seq_flags) const override {
++        throw std::runtime_error("state export is unsupported by penzai.inference.v1");
++    }
++    [[noreturn]] void state_read(llama_io_read_i &, llama_seq_id, llama_state_seq_flags) override {
++        throw std::runtime_error("state import is unsupported by penzai.inference.v1");
++    }
++
++    bool reset() {
++        const int32_t status = api->reset_session(session);
++        healthy = status == PENZAI_INFERENCE_STATUS_OK_V1;
++        if (healthy) {
++            position_tokens = 0;
++        }
++        return healthy;
++    }
++
++    void fail_and_reset() {
++        const int32_t status = api->reset_session(session);
++        position_tokens = 0;
++        healthy = false;
++        if (status != PENZAI_INFERENCE_STATUS_OK_V1) {
++            LLAMA_LOG_ERROR("%s: penzai.inference.v1 recovery reset failed\n", __func__);
++        }
++    }
++
++    const penzai_inference_v1 * api;
++    void * session;
++    uint32_t capacity_tokens;
++    uint32_t max_tile_tokens;
++    uint32_t position_tokens = 0;
++    bool healthy = true;
++};
++
+ llama_context::llama_context(
+         const llama_model & model,
+               llama_context_params params) :
+@@ -162,5 +284,8 @@ llama_context::llama_context(
+     // before the reserve passes run later in this function. This avoids a later
+     // re-reserve when graph nodes change.
+     if (params.samplers != nullptr && params.n_samplers > 0) {
++        if (model.inference_v1 != nullptr) {
++            throw std::runtime_error("backend samplers are unsupported by penzai.inference.v1");
++        }
+         for (size_t i = 0; i < params.n_samplers; ++i) {
+             const auto & config = params.samplers[i];
+@@ -280,21 +405,25 @@ llama_context::llama_context(
+         }
+     }
+-
++
+-    // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
+-    cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+-
+-    if (cparams.kv_unified) {
++    if (model.has_inference_v1()) {
+         cparams.n_ctx_seq = cparams.n_ctx;
+     } else {
+-        cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
+-        cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
++        // ref: https://github.com/ggml-org/llama.cpp/pull/17046#discussion_r2503085732
++        cparams.n_ctx = GGML_PAD(cparams.n_ctx, 256);
+-
++
+-        if (cparams.n_ctx_seq == 0) {
+-            throw std::runtime_error("n_ctx_seq == 0");
+-        }
++        if (cparams.kv_unified) {
++            cparams.n_ctx_seq = cparams.n_ctx;
++        } else {
++            cparams.n_ctx_seq = cparams.n_ctx / cparams.n_seq_max;
++            cparams.n_ctx_seq = GGML_PAD(cparams.n_ctx_seq, 256);
++
++            if (cparams.n_ctx_seq == 0) {
++                throw std::runtime_error("n_ctx_seq == 0");
++            }
+-
++
+-        if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
+-            cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
+-            LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
++            if (cparams.n_ctx != cparams.n_ctx_seq * cparams.n_seq_max) {
++                cparams.n_ctx =  cparams.n_ctx_seq * cparams.n_seq_max;
++                LLAMA_LOG_WARN("%s: n_ctx is not divisible by n_seq_max - rounding down to %u\n", __func__, cparams.n_ctx);
++            }
+         }
+     }
+@@ -322,6 +451,59 @@ llama_context::llama_context(
+                 __func__, cparams.n_ctx_seq, hparams.n_ctx_train);
+     }
+-
++
++    if (model.has_inference_v1()) {
++        if (cparams.n_seq_max != 1) {
++            throw std::runtime_error("penzai.inference.v1 requires exactly one sequence");
++        }
++        if (!cparams.causal_attn || cparams.embeddings || cparams.pooling_type != LLAMA_POOLING_TYPE_NONE ||
++            cparams.ctx_type != LLAMA_CONTEXT_TYPE_DEFAULT || cparams.ctx_other != nullptr) {
++            throw std::runtime_error("penzai.inference.v1 supports causal text generation only");
++        }
++        if (cparams.n_ctx_seq > model.inference_max_context_tokens) {
++            throw std::runtime_error(format("requested context %u exceeds penzai.inference.v1 limit %u",
++                    cparams.n_ctx_seq, model.inference_max_context_tokens));
++        }
++
++        penzai_inference_session_params_v1 session_params = {};
++        session_params.struct_size = sizeof(session_params);
++        session_params.capacity_tokens = cparams.n_ctx_seq;
++        void * session = nullptr;
++        const int32_t status = model.inference_v1->open_session(
++                model.inference_model, &session_params, &session);
++        if (status != PENZAI_INFERENCE_STATUS_OK_V1 || session == nullptr) {
++            if (session != nullptr) {
++                model.inference_v1->close_session(session);
++            }
++            throw std::runtime_error(format("penzai.inference.v1 session open failed: status=%d, %s",
++                    status, penzai_inference_status_detail(model.inference_v1, status)));
++        }
++
++        std::unique_ptr<penzai_inference_memory> direct_memory;
++        try {
++            direct_memory = std::make_unique<penzai_inference_memory>(
++                    model.inference_v1, session, cparams.n_ctx_seq, model.inference_max_tile_tokens);
++        } catch (...) {
++            model.inference_v1->close_session(session);
++            throw;
++        }
++        memory = std::move(direct_memory);
++
++        inference_logits.resize(model.vocab.n_tokens(), -std::numeric_limits<float>::infinity());
++        logits = {inference_logits.data(), inference_logits.size()};
++        sampling.logits = {};
++        sampling.sampled = {&inference_winning_token, 1};
++        sampling.candidates = {&inference_winning_token, 1};
++        sampling.logits_count.assign(1, 0);
++        sampling.probs_count.assign(1, 0);
++        sampling.candidates_count.assign(1, 0);
++        output_ids.resize(cparams.n_batch, -1);
++        llama_set_abort_callback(this, params.abort_callback, params.abort_callback_data);
++
++        LLAMA_LOG_INFO("%s: direct whole-token context ready (tile=%u, context=%u)\n",
++                __func__, model.inference_max_tile_tokens, cparams.n_ctx_seq);
++        return;
++    }
++
+     if (!hparams.vocab_only) {
+         // GPU backends
+         for (const auto & dev : model.devices) {
+@@ -1199,6 +1381,11 @@ void llama_context::set_warmup(bool value) {
+ }
+-
++
+ bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
++    if (model.has_inference_v1() && sampler != nullptr) {
++        LLAMA_LOG_ERROR("%s: backend samplers are unsupported by penzai.inference.v1\n", __func__);
++        return false;
++    }
++
+     if (!sampler && sampling.samplers.count(seq_id) == 0) {
+         return true;
+     }
+@@ -1305,6 +1492,11 @@ bool llama_context::set_adapter_cvec(
+                 int32_t   n_embd,
+                 int32_t   il_start,
+                 int32_t   il_end) {
++    if (model.has_inference_v1()) {
++        LLAMA_LOG_ERROR("%s: control-vector adapters are unsupported by penzai.inference.v1\n", __func__);
++        return false;
++    }
++
+     LLAMA_LOG_DEBUG("%s: il_start = %d, il_end = %d\n", __func__, il_start, il_end);
+-
++
+     bool res = cvec->apply(model, data, len, n_embd, il_start, il_end);
+@@ -1391,6 +1583,11 @@ int llama_context::encode(const llama_batch & batch_inp) {
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+-
++
++    if (model.has_inference_v1()) {
++        LLAMA_LOG_ERROR("%s: penzai.inference.v1 models do not expose encoder graphs\n", __func__);
++        return -1;
++    }
++
+     if (batch_inp.n_tokens == 0) {
+         LLAMA_LOG_ERROR("%s: n_tokens == 0\n", __func__);
+         return -1;
+@@ -1690,11 +1887,176 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
+     return false; // all sequences use backend sampling
+ }
+-
++
++int llama_context::decode_inference_v1(const llama_batch & batch_inp) {
++    if (batch_inp.token == nullptr || batch_inp.embd != nullptr || batch_inp.n_tokens <= 0 ||
++        static_cast<uint32_t>(batch_inp.n_tokens) > cparams.n_batch) {
++        LLAMA_LOG_ERROR("%s: penzai.inference.v1 requires a non-empty token batch within n_batch\n", __func__);
++        return -1;
++    }
++
++    auto * direct_memory = static_cast<penzai_inference_memory *>(memory.get());
++    if (direct_memory == nullptr || !direct_memory->healthy) {
++        LLAMA_LOG_ERROR("%s: penzai.inference.v1 session is unavailable\n", __func__);
++        return -3;
++    }
++
++    int32_t output_index = batch_inp.logits == nullptr ? batch_inp.n_tokens - 1 : -1;
++    if (batch_inp.logits != nullptr) {
++        for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
++            if (batch_inp.logits[i] == 0) {
++                continue;
++            }
++            if (output_index >= 0) {
++                LLAMA_LOG_ERROR("%s: penzai.inference.v1 supports at most one output per batch\n", __func__);
++                return -1;
++            }
++            output_index = i;
++        }
++    }
++
++    const uint64_t position_end = static_cast<uint64_t>(direct_memory->position_tokens) +
++        static_cast<uint32_t>(batch_inp.n_tokens);
++    if (position_end > direct_memory->capacity_tokens) {
++        LLAMA_LOG_WARN("%s: penzai.inference.v1 context capacity exceeded\n", __func__);
++        return 1;
++    }
++
++    for (int32_t i = 0; i < batch_inp.n_tokens; ++i) {
++        const llama_token token = batch_inp.token[i];
++        if (token < 0 || static_cast<uint32_t>(token) >= model.vocab.n_tokens()) {
++            LLAMA_LOG_ERROR("%s: invalid token %d at batch index %d\n", __func__, token, i);
++            return -1;
++        }
++
++        const int32_t n_seq = batch_inp.n_seq_id != nullptr ? batch_inp.n_seq_id[i] : 1;
++        if (batch_inp.seq_id != nullptr && batch_inp.seq_id[i] == nullptr) {
++            LLAMA_LOG_ERROR("%s: missing sequence id at batch index %d\n", __func__, i);
++            return -1;
++        }
++        const llama_seq_id seq_id = batch_inp.seq_id != nullptr ? batch_inp.seq_id[i][0] : 0;
++        if (n_seq != 1 || seq_id != 0) {
++            LLAMA_LOG_ERROR("%s: penzai.inference.v1 accepts only sequence 0\n", __func__);
++            return -1;
++        }
++
++        const uint32_t expected_position = direct_memory->position_tokens + static_cast<uint32_t>(i);
++        if (batch_inp.pos != nullptr && batch_inp.pos[i] != static_cast<llama_pos>(expected_position)) {
++            LLAMA_LOG_ERROR("%s: non-contiguous position %d, expected %u\n",
++                    __func__, batch_inp.pos[i], expected_position);
++            return -1;
++        }
++    }
++
++    std::fill(output_ids.begin(), output_ids.end(), -1);
++    std::fill(inference_logits.begin(), inference_logits.end(), -std::numeric_limits<float>::infinity());
++    inference_winning_token = LLAMA_TOKEN_NULL;
++    inference_winning_logit = 0.0f;
++    sampling.logits_count[0] = 0;
++    sampling.probs_count[0] = 0;
++    sampling.candidates_count[0] = 0;
++    n_outputs = 0;
++    output_swaps.clear();
++
++    const int64_t started_us = ggml_time_us();
++    std::vector<uint32_t> token_ids;
++    token_ids.reserve(direct_memory->max_tile_tokens);
++
++    uint32_t offset = 0;
++    while (offset < static_cast<uint32_t>(batch_inp.n_tokens)) {
++        if (abort_callback != nullptr && abort_callback(abort_callback_data)) {
++            if (offset != 0) {
++                direct_memory->fail_and_reset();
++            }
++            return 2;
++        }
++
++        uint32_t count = std::min(
++            direct_memory->max_tile_tokens,
++            static_cast<uint32_t>(batch_inp.n_tokens) - offset);
++        if (output_index >= static_cast<int32_t>(offset) &&
++            output_index < static_cast<int32_t>(offset + count)) {
++            count = static_cast<uint32_t>(output_index) - offset + 1;
++        }
++
++        token_ids.clear();
++        for (uint32_t i = 0; i < count; ++i) {
++            token_ids.push_back(static_cast<uint32_t>(batch_inp.token[offset + i]));
++        }
++
++        const bool emit_winner = output_index == static_cast<int32_t>(offset + count - 1);
++        penzai_inference_execute_request_v1 request = {};
++        request.struct_size = sizeof(request);
++        request.first_position = direct_memory->position_tokens;
++        request.token_count = count;
++        request.flags = emit_winner ? PENZAI_INFERENCE_EXECUTE_EMIT_WINNER_V1 : 0;
++        request.token_ids = token_ids.data();
++
++        penzai_inference_execute_result_v1 result = {};
++        result.struct_size = sizeof(result);
++        const int32_t status = model.inference_v1->execute(direct_memory->session, &request, &result);
++        const uint32_t expected_committed = direct_memory->position_tokens + count;
++        const uint64_t expected_flags = emit_winner ? PENZAI_INFERENCE_RESULT_HAS_WINNER_V1 : 0;
++        if (status != PENZAI_INFERENCE_STATUS_OK_V1 ||
++            result.committed_tokens != expected_committed ||
++            (result.flags & PENZAI_INFERENCE_RESULT_HAS_WINNER_V1) != expected_flags) {
++            LLAMA_LOG_ERROR("%s: penzai.inference.v1 execute failed: status=%d, %s\n",
++                    __func__, status, penzai_inference_status_detail(model.inference_v1, status));
++            direct_memory->fail_and_reset();
++            return -3;
++        }
++
++        direct_memory->position_tokens = expected_committed;
++        if (emit_winner) {
++            if (result.token_id >= static_cast<uint32_t>(model.vocab.n_tokens()) ||
++                !std::isfinite(result.winning_logit)) {
++                LLAMA_LOG_ERROR("%s: penzai.inference.v1 returned an invalid winner\n", __func__);
++                direct_memory->fail_and_reset();
++                return -3;
++            }
++            inference_winning_token = static_cast<llama_token>(result.token_id);
++            inference_winning_logit = result.winning_logit;
++            inference_logits[result.token_id] = result.winning_logit;
++        }
++
++        offset += count;
++    }
++
++    if (output_index >= 0) {
++        n_outputs = 1;
++        output_ids[output_index] = 0;
++        sampling.logits_count[0] = 0;
++        sampling.candidates_count[0] = 1;
++    }
++
++    const int64_t elapsed_us = ggml_time_us() - started_us;
++    if (batch_inp.n_tokens == 1) {
++        if (!cparams.no_perf) {
++            t_eval_us += elapsed_us;
++        }
++        n_eval++;
++    } else {
++        if (!cparams.no_perf) {
++            t_p_eval_us += elapsed_us;
++        }
++        n_p_eval += batch_inp.n_tokens;
++    }
++    if (!has_evaluated_once) {
++        t_load_us = ggml_time_us() - t_start_us;
++        has_evaluated_once = true;
++    }
++
++    return 0;
++}
++
+ int llama_context::decode(const llama_batch & batch_inp) {
+     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
+     // so accept either present rather than requiring exactly one.
+     GGML_ASSERT(batch_inp.token || batch_inp.embd);
+-
++
++    if (model.has_inference_v1()) {
++        return decode_inference_v1(batch_inp);
++    }
++
+     if (!memory) {
+         LLAMA_LOG_DEBUG("%s: cannot decode batches with this context (calling encode() instead)\n", __func__);
+         return encode(batch_inp);
+@@ -2355,4 +2717,9 @@ llm_graph_result * llama_context::get_gf_res_reserve() const {
+ ggml_cgraph * llama_context::graph_reserve(
+         uint32_t n_tokens, uint32_t n_seqs, uint32_t n_outputs, const llama_memory_context_i * mctx, bool split_only, size_t * sizes) {
++    if (model.has_inference_v1()) {
++        LLAMA_LOG_ERROR("%s: penzai.inference.v1 models do not expose GGML graphs\n", __func__);
++        return nullptr;
++    }
++
+     LLAMA_LOG_DEBUG("%s: reserving a graph for ubatch with n_tokens = %4u, n_seqs = %2u, n_outputs = %4u\n", __func__, n_tokens, n_seqs, n_outputs);
+     GGML_ASSERT(n_outputs >= 1);
+@@ -3820,6 +4187,11 @@ int32_t llama_set_adapters_lora(
+         GGML_ASSERT(n_adapters == 0 && "invalid llama_set_adapters_lora call");
+     }
+-
++
++    if (ctx->get_model().has_inference_v1() && n_adapters != 0) {
++        LLAMA_LOG_ERROR("%s: LoRA adapters are unsupported by penzai.inference.v1\n", __func__);
++        return -1;
++    }
++
+     ctx->set_adapters_lora(adapters, n_adapters, scales);
+-
++
+     return 0;
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa..f0ad304 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -217,6 +217,8 @@ struct llama_context {
+             int64_t                          t_loop_start);
+-
++
+ private:
++    int decode_inference_v1(const llama_batch & batch_inp);
++
+     //
+     // output
+     //
+@@ -370,5 +372,11 @@ private:
+     // host buffer for the model output (logits and embeddings)
+     ggml_backend_buffer_ptr buf_output;
+-
++
++    // Direct-executor output storage. The hardware contract returns one
++    // winning token/logit rather than a full vocabulary vector.
++    std::vector<float> inference_logits;
++    float inference_winning_logit = 0.0f;
++    llama_token inference_winning_token = LLAMA_TOKEN_NULL;
++
+     // keep copies of the per-sequence memory on the device
+     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 4c10e41..84ce332 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -1044,6 +1044,11 @@ llama_model::~llama_model() {
+     for (auto * lora : loras) {
+         delete lora;
+     }
++
++    if (inference_model != nullptr && inference_v1 != nullptr) {
++        inference_v1->unload_model(inference_model);
++        inference_model = nullptr;
++    }
+ }
+-
++
+ void llama_model_base::load_stats(llama_model_loader & ml) {
+@@ -1239,6 +1244,52 @@ void llama_model_base::load_vocab(llama_model_loader & ml) {
+     vocab.load(ml, kv);
+ }
+-
++
++static uint32_t penzai_inference_weight_format(ggml_type type) {
++    switch (type) {
++        case GGML_TYPE_F32:  return PENZAI_INFERENCE_WEIGHT_F32_V1;
++        case GGML_TYPE_F16:  return PENZAI_INFERENCE_WEIGHT_F16_V1;
++        case GGML_TYPE_Q1_0: return PENZAI_INFERENCE_WEIGHT_Q1_0_V1;
++        case GGML_TYPE_Q2_0: return PENZAI_INFERENCE_WEIGHT_Q2_0_V1;
++        default:             return PENZAI_INFERENCE_WEIGHT_NONE_V1;
++    }
++}
++
++static penzai_inference_tensor_source_v1 penzai_inference_tensor_source(
++        const llama_model_loader & ml,
++        const ggml_tensor * tensor) {
++    if (tensor == nullptr) {
++        return {};
++    }
++
++    const auto & weight = ml.require_weight(ggml_get_name(tensor));
++    const auto & mapping = ml.mappings.at(weight.idx);
++
++    penzai_inference_tensor_source_v1 result = {};
++    result.struct_size = sizeof(result);
++    result.format = penzai_inference_weight_format(tensor->type);
++    result.rank = static_cast<uint32_t>(ggml_n_dims(tensor));
++    for (uint32_t i = 0; i < 4; ++i) {
++        result.dimensions[i] = static_cast<uint64_t>(tensor->ne[i]);
++    }
++    result.data = static_cast<const uint8_t *>(mapping->addr()) + weight.offs;
++    result.data_size = static_cast<uint64_t>(ggml_nbytes(tensor));
++    result.name = ggml_get_name(tensor);
++    result.name_size = static_cast<uint32_t>(strlen(result.name));
++    return result;
++}
++
++static bool penzai_inference_same_source(
++        const llama_model_loader & ml,
++        const ggml_tensor * first,
++        const ggml_tensor * second) {
++    if (first == nullptr || second == nullptr) {
++        return false;
++    }
++    const auto & a = ml.require_weight(ggml_get_name(first));
++    const auto & b = ml.require_weight(ggml_get_name(second));
++    return a.idx == b.idx && a.offs == b.offs && ggml_nbytes(first) == ggml_nbytes(second);
++}
++
+ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     const auto & split_mode   = params.split_mode;
+     const auto & use_mlock    = params.use_mlock;
+@@ -1254,57 +1305,74 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     LLAMA_LOG_INFO("%s: loading model tensors, this can take a while... (mmap = %s, direct_io = %s)\n",
+         __func__, ml.use_mmap ? "true" : "false", ml.use_direct_io ? "true" : "false");
+-
++
+-    // build a list of buffer types for the CPU and GPU devices
+-    pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
+-    for (const auto & dev : devices) {
+-        buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
+-        // add CPU buffer types as a fallback
+-        buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
+-        pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
+-    }
+-
+     ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+     if (cpu_dev == nullptr) {
+         throw std::runtime_error(format("%s: no CPU backend found", __func__));
+     }
+-
++
++    // A whole-token executor needs GGML tensors only as structural metadata for
++    // locating mmap sources. Never ask that device for graph buffer support.
++    if (inference_v1 != nullptr) {
++        ggml_backend_buffer_type_t cpu_buft = ggml_backend_dev_buffer_type(cpu_dev);
++        if (cpu_buft == nullptr) {
++            throw std::runtime_error(format("%s: CPU backend has no buffer type", __func__));
++        }
++        pimpl->cpu_buft_list.emplace_back(cpu_dev, cpu_buft);
++    } else {
++        // build a list of buffer types for the CPU and GPU devices
++        pimpl->cpu_buft_list = make_cpu_buft_list(devices, params.use_extra_bufts, params.no_host);
++        for (const auto & dev : devices) {
++            buft_list_t buft_list = make_gpu_buft_list(dev.dev, split_mode, tensor_split);
++            // add CPU buffer types as a fallback
++            buft_list.insert(buft_list.end(), pimpl->cpu_buft_list.begin(), pimpl->cpu_buft_list.end());
++            pimpl->gpu_buft_list.emplace(dev.dev, std::move(buft_list));
++        }
++    }
++
+     // calculate the split points
+-    bool all_zero = tensor_split == nullptr || std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
+     std::vector<float> splits(n_devices());
+-    if (all_zero) {
+-        // default split, by free memory
+-        for (size_t i = 0; i < n_devices(); ++i) {
+-            ggml_backend_dev_t dev = devices[i].dev;
+-            size_t total;
+-            size_t free;
+-            ggml_backend_dev_memory(dev, &free, &total);
+-
+-            // devices can return 0 bytes for free and total memory if they do not
+-            // have any to report. in this case, we will use the host memory as a fallback
+-            // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
+-            if (free == 0 && total == 0) {
+-                ggml_backend_dev_memory(cpu_dev, &free, &total);
++    if (inference_v1 == nullptr) {
++        const bool all_zero = tensor_split == nullptr ||
++            std::all_of(tensor_split, tensor_split + n_devices(), [](float x) { return x == 0.0f; });
++        if (all_zero) {
++            // default split, by free memory
++            for (size_t i = 0; i < n_devices(); ++i) {
++                ggml_backend_dev_t dev = devices[i].dev;
++                size_t total;
++                size_t free;
++                ggml_backend_dev_memory(dev, &free, &total);
++
++                // devices can return 0 bytes for free and total memory if they do not
++                // have any to report. in this case, we will use the host memory as a fallback
++                // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
++                if (free == 0 && total == 0) {
++                    ggml_backend_dev_memory(cpu_dev, &free, &total);
++                }
++                splits[i] = free;
+             }
+-            splits[i] = free;
++        } else {
++            std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+         }
+-    } else {
+-        std::copy(tensor_split, tensor_split + n_devices(), splits.begin());
+-    }
+-
++
+-    // sum and normalize the splits to get the split points
+-    float split_sum = 0.0f;
+-    for (size_t i = 0; i < n_devices(); ++i) {
+-        split_sum += splits[i];
+-        splits[i] = split_sum;
+-    }
+-    for (size_t i = 0; i < n_devices(); ++i) {
+-        splits[i] /= split_sum;
++        // sum and normalize the splits to get the split points
++        float split_sum = 0.0f;
++        for (size_t i = 0; i < n_devices(); ++i) {
++            split_sum += splits[i];
++            splits[i] = split_sum;
++        }
++        for (size_t i = 0; i < n_devices(); ++i) {
++            splits[i] /= split_sum;
++        }
+     }
+-
++
+     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
+     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
+     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
+         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
++        if (inference_v1 != nullptr) {
++            LLAMA_LOG_DEBUG("load_tensors: layer %3d uses CPU structural metadata, is_swa = %d\n", il, is_swa);
++            return {cpu_dev, &pimpl->cpu_buft_list};
++        }
+         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
+             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+             return {cpu_dev, &pimpl->cpu_buft_list};
+@@ -1518,6 +1586,116 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
+     ml.init_mappings(true, use_mlock ? &pimpl->mlock_mmaps : nullptr);
+     pimpl->mappings.reserve(ml.mappings.size());
+-
++
++    if (inference_v1 != nullptr) {
++        if (!ml.use_mmap || ml.files.empty()) {
++            throw std::runtime_error("penzai.inference.v1 requires a memory-mapped GGUF file");
++        }
++
++        if (ml.check_tensors) {
++            for (const auto & [_, ctx_ptr] : ml.ctx_map) {
++                for (ggml_tensor * tensor = ggml_get_first_tensor(ctx_ptr.get()); tensor != nullptr;
++                     tensor = ggml_get_next_tensor(ctx_ptr.get(), tensor)) {
++                    const auto source = penzai_inference_tensor_source(ml, tensor);
++                    if (!ggml_validate_row_data(tensor->type, source.data, static_cast<size_t>(source.data_size))) {
++                        throw std::runtime_error(format("tensor '%s' has invalid data", ggml_get_name(tensor)));
++                    }
++                }
++            }
++        }
++
++        std::vector<penzai_inference_layer_v1> inference_layers;
++        inference_layers.reserve(layers.size());
++        for (const auto & layer : layers) {
++            penzai_inference_layer_v1 layer_descriptor = {};
++            layer_descriptor.struct_size = sizeof(layer_descriptor);
++            layer_descriptor.query = penzai_inference_tensor_source(ml, layer.wq);
++            layer_descriptor.key = penzai_inference_tensor_source(ml, layer.wk);
++            layer_descriptor.value = penzai_inference_tensor_source(ml, layer.wv);
++            layer_descriptor.attention_output = penzai_inference_tensor_source(ml, layer.wo);
++            layer_descriptor.gate = penzai_inference_tensor_source(ml, layer.ffn_gate);
++            layer_descriptor.up = penzai_inference_tensor_source(ml, layer.ffn_up);
++            layer_descriptor.ffn_down = penzai_inference_tensor_source(ml, layer.ffn_down);
++            layer_descriptor.attention_norm = penzai_inference_tensor_source(ml, layer.attn_norm);
++            layer_descriptor.attention_q_norm = penzai_inference_tensor_source(ml, layer.attn_q_norm);
++            layer_descriptor.attention_k_norm = penzai_inference_tensor_source(ml, layer.attn_k_norm);
++            layer_descriptor.ffn_norm = penzai_inference_tensor_source(ml, layer.ffn_norm);
++            inference_layers.push_back(layer_descriptor);
++        }
++
++        const std::string architecture = arch_name();
++        const bool tied_output = penzai_inference_same_source(ml, tok_embd, output);
++        penzai_inference_model_descriptor_v1 descriptor = {};
++        descriptor.struct_size = sizeof(descriptor);
++        descriptor.flags = PENZAI_INFERENCE_MODEL_SOURCE_EPHEMERAL_V1 |
++            (tied_output ? PENZAI_INFERENCE_MODEL_TIED_OUTPUT_V1 : 0);
++        descriptor.architecture = architecture.c_str();
++        descriptor.architecture_size = static_cast<uint32_t>(architecture.size());
++        descriptor.block_count = static_cast<uint32_t>(layers.size());
++        descriptor.context_length = hparams.n_ctx_train;
++        descriptor.embedding_length = hparams.n_embd;
++        descriptor.feed_forward_length = hparams.n_ff(0);
++        descriptor.attention_head_count = hparams.n_head(0);
++        descriptor.attention_head_count_kv = hparams.n_head_kv(0);
++        descriptor.attention_key_length = hparams.n_embd_head_k(0);
++        descriptor.attention_value_length = hparams.n_embd_head_v(0);
++        descriptor.vocabulary_size = static_cast<uint32_t>(vocab.n_tokens());
++        descriptor.rope_original_context = hparams.n_ctx_orig_yarn;
++        descriptor.rope_scaling_factor = 1.0f / hparams.rope_freq_scale_train;
++        descriptor.rope_frequency_base = hparams.rope_freq_base_train;
++        descriptor.rms_epsilon = hparams.f_norm_rms_eps;
++        descriptor.embedding = penzai_inference_tensor_source(ml, tok_embd);
++        if (!tied_output) {
++            descriptor.output = penzai_inference_tensor_source(ml, output);
++        }
++        descriptor.output_norm = penzai_inference_tensor_source(ml, output_norm);
++        descriptor.layers = inference_layers.data();
++        descriptor.layer_count = static_cast<uint32_t>(inference_layers.size());
++
++        penzai_inference_model_result_v1 result = {};
++        result.struct_size = sizeof(result);
++        const int32_t status = inference_v1->load_model(inference_device, &descriptor, &result);
++        if (status != PENZAI_INFERENCE_STATUS_OK_V1) {
++            const char * detail = inference_v1->status_message ? inference_v1->status_message(status) : nullptr;
++            if (result.model != nullptr) {
++                inference_v1->unload_model(result.model);
++            }
++            throw std::runtime_error(format("penzai.inference.v1 model load failed: status=%d%s%s",
++                    status, detail ? ", " : "", detail ? detail : ""));
++        }
++
++        const uint64_t required_features = PENZAI_INFERENCE_FEATURE_GREEDY_ONLY_V1 |
++            PENZAI_INFERENCE_FEATURE_SINGLE_SEQUENCE_V1 |
++            PENZAI_INFERENCE_FEATURE_WINNER_LOGIT_V1;
++        if (result.model == nullptr || result.max_context_tokens == 0 || result.max_tile_tokens == 0 ||
++            (result.features & required_features) != required_features) {
++            if (result.model != nullptr) {
++                inference_v1->unload_model(result.model);
++            }
++            throw std::runtime_error("penzai.inference.v1 returned an invalid model contract");
++        }
++
++        inference_model = result.model;
++        inference_max_context_tokens = result.max_context_tokens;
++        inference_max_tile_tokens = result.max_tile_tokens;
++        inference_features = result.features;
++
++        if (params.progress_callback && !params.progress_callback(1.0f, params.progress_callback_user_data)) {
++            inference_v1->unload_model(inference_model);
++            inference_model = nullptr;
++            return false;
++        }
++
++        // The direct executor consumed all tensor sources synchronously. Keep
++        // tensor metadata for model inspection, but allocate no weight buffers.
++        for (auto & [_, ctx_ptr] : ml.ctx_map) {
++            pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::vector<ggml_backend_buffer_ptr>{});
++        }
++
++        LLAMA_LOG_INFO("%s: model provisioned by penzai.inference.v1 (tile=%u, context=%u)\n",
++                __func__, inference_max_tile_tokens, inference_max_context_tokens);
++        return true;
++    }
++
+     // create the backend buffers
+     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_buf_maps;
+     ctx_buf_maps.reserve(ml.ctx_map.size());
+@@ -1688,6 +1866,10 @@ size_t llama_model::n_devices() const {
+     return devices.size();
+ }
+-
++
++bool llama_model::has_inference_v1() const {
++    return inference_v1 != nullptr && inference_model != nullptr;
++}
++
+ const float * llama_model::tensor_split() const {
+     return params.tensor_split;
+ }
+diff --git a/src/llama-model.h b/src/llama-model.h
+index 45b054c..6610691 100644
+--- a/src/llama-model.h
++++ b/src/llama-model.h
+@@ -1,5 +1,7 @@
+ #pragma once
+-
++
++#include "penzai-inference-v1.h"
++
+ #include "llama.h"
+ #include "llama-arch.h"
+ #include "llama-graph.h"
+@@ -617,5 +619,14 @@ struct llama_model {
+     // list of devices used in this model
+     std::vector<llama_device> devices;
+-
++
++    // Optional whole-token executor discovered from one selected GGML device.
++    // The executor owns the packed model; llama keeps vocabulary and metadata.
++    const struct penzai_inference_v1 * inference_v1 = nullptr;
++    void * inference_device = nullptr;
++    void * inference_model = nullptr;
++    uint32_t inference_max_context_tokens = 0;
++    uint32_t inference_max_tile_tokens = 0;
++    uint64_t inference_features = 0;
++
+     // for quantize-stats only
+     std::vector<std::pair<std::string, struct ggml_tensor *>> tensors_by_name;
+@@ -642,6 +653,7 @@ struct llama_model {
+     size_t size() const; // file size
+     size_t n_tensors() const;
+     size_t n_devices() const;
++    bool has_inference_v1() const;
+     const float * tensor_split() const;
+-
++
+     uint32_t n_gpu_layers() const;
+diff --git a/src/llama.cpp b/src/llama.cpp
+index 0de6048..e22df5a 100644
+--- a/src/llama.cpp
++++ b/src/llama.cpp
+@@ -275,6 +275,62 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
+     return true;
+ }
+-
++
++static bool penzai_discover_inference_v1(llama_model * model) {
++    const penzai_inference_v1 * selected = nullptr;
++    ggml_backend_dev_t selected_device = nullptr;
++
++    for (const auto & device : model->devices) {
++        ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device.dev);
++        if (reg == nullptr) {
++            continue;
++        }
++
++        void * proc = ggml_backend_reg_get_proc_address(reg, PENZAI_INFERENCE_V1_SYMBOL);
++        if (proc == nullptr) {
++            continue;
++        }
++        if (selected != nullptr) {
++            LLAMA_LOG_ERROR("%s: more than one selected device exposes %s\n", __func__, PENZAI_INFERENCE_V1_SYMBOL);
++            return false;
++        }
++
++        const auto query = reinterpret_cast<penzai_inference_query_v1_fn>(proc);
++        const penzai_inference_v1 * api = query();
++        const size_t required_size = offsetof(penzai_inference_v1, status_message) + sizeof(api->status_message);
++        const uint64_t required_features = PENZAI_INFERENCE_FEATURE_GREEDY_ONLY_V1 |
++            PENZAI_INFERENCE_FEATURE_SINGLE_SEQUENCE_V1 |
++            PENZAI_INFERENCE_FEATURE_WINNER_LOGIT_V1;
++        if (api == nullptr || api->abi_version != PENZAI_INFERENCE_V1_ABI_VERSION ||
++            api->struct_size < required_size ||
++            (api->features & required_features) != required_features ||
++            api->load_model == nullptr || api->unload_model == nullptr ||
++            api->open_session == nullptr || api->close_session == nullptr ||
++            api->reset_session == nullptr || api->execute == nullptr) {
++            LLAMA_LOG_ERROR("%s: device %s exposes an incompatible %s contract\n",
++                    __func__, ggml_backend_dev_name(device.dev), PENZAI_INFERENCE_V1_SYMBOL);
++            return false;
++        }
++
++        selected = api;
++        selected_device = device.dev;
++    }
++
++    if (selected == nullptr) {
++        return true;
++    }
++    if (model->devices.size() != 1) {
++        LLAMA_LOG_ERROR("%s: %s requires exactly one selected accelerator device\n",
++                __func__, PENZAI_INFERENCE_V1_SYMBOL);
++        return false;
++    }
++
++    model->inference_v1 = selected;
++    model->inference_device = selected_device;
++    LLAMA_LOG_INFO("%s: using whole-token executor %s from device %s\n",
++            __func__, PENZAI_INFERENCE_V1_SYMBOL, ggml_backend_dev_name(selected_device));
++    return true;
++}
++
+ // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
+ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * metadata, llama_model_set_tensor_data_t set_tensor_data, void * set_tensor_data_ud,
+         const std::string & fname, std::vector<std::string> & splits, FILE * file, llama_model_params & params) {
+@@ -289,6 +345,9 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
+         if (!ok) {
+             return {-1, nullptr};
+         }
++        if (!params.vocab_only && !penzai_discover_inference_v1(model_ptr.get())) {
++            return {-1, nullptr};
++        }
+-
++
+         auto * model = dynamic_cast<llama_model_base *>(model_ptr.get());
+         if (model == nullptr) {
+@@ -430,6 +489,10 @@ struct llama_model * llama_model_load_from_file(
+     return llama_model_load_from_file_impl(nullptr, nullptr, nullptr, path_model, splits, /*file*/ nullptr, params);
+ }
+-
++
++bool penzai_llama_model_has_inference_v1(const struct llama_model * model) {
++    return model != nullptr && model->has_inference_v1();
++}
++
+ struct llama_model * llama_model_load_from_splits(
+         const char ** paths,
+         size_t n_paths,
+@@ -579,3 +642,2 @@ const char * llama_print_system_info(void) {
+     return s.c_str();
+ }
+-
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 715477e..d4d1db2 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1152,6 +1152,21 @@ private:
+             return false;
+         }
+-
++
++        if (penzai_llama_model_has_inference_v1(model_tgt)) {
++            if (has_mmproj || has_spec) {
++                SRV_ERR("%s", "penzai.inference.v1 does not support multimodal or speculative execution\n");
++                return false;
++            }
++            if (!params_base.slot_save_path.empty()) {
++                SRV_ERR("%s", "penzai.inference.v1 does not support slot state save or restore\n");
++                return false;
++            }
++            params_base.ctx_shift = false;
++            params_base.n_cache_reuse = 0;
++            params_base.n_ctx_checkpoints = 0;
++            params_base.cache_ram_mib = 0;
++        }
++
+         vocab = llama_model_get_vocab(model_tgt);
+-
++
+         n_ctx = llama_n_ctx(ctx_tgt);
+@@ -1253,6 +1268,8 @@ private:
+         slots.clear();
+-
++
+-        ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
++        ctx_tgt_seq_rm_type = penzai_llama_model_has_inference_v1(model_tgt)
++            ? COMMON_CONTEXT_SEQ_RM_TYPE_FULL
++            : common_context_can_seq_rm(ctx_tgt);
+         if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+             SRV_WRN("%s", "speculative decoding not supported by this context\n");
+         }
+@@ -1748,6 +1765,11 @@ private:
+             return false;
+         }
+-
++
++        if (penzai_llama_model_has_inference_v1(model_tgt) && task.params.cache_prompt) {
++            send_error(task, "penzai.inference.v1 does not support prompt caching", ERROR_TYPE_INVALID_REQUEST);
++            return false;
++        }
++
+         SLT_DBG(slot, "launching slot : %s\n", safe_json_to_str(slot.to_json()).c_str());
+-
++
+         // initialize samplers

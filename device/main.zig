@@ -1,17 +1,17 @@
 const std = @import("std");
 const shared = @import("shared");
 const device_tcp = @import("transport/tcp.zig");
-const seq_smoke = @import("runtime").seq_smoke;
 
 const protocol_transport = shared.protocol_transport;
+const default_receipt_path = "/lib/firmware/xilinx/penzai/deployment_receipt.tsv";
 
 const CliError = error{
     InvalidCommand,
     InvalidOption,
     InvalidNumber,
     MissingValue,
-    UnsupportedDevice,
-} || protocol_transport.ParseError || device_tcp.ServeError || std.process.Args.Iterator.InitError || std.Io.Writer.Error || seq_smoke.Error;
+} || protocol_transport.ParseError || device_tcp.ServeError ||
+    std.process.Args.Iterator.InitError || std.Io.Writer.Error;
 
 pub fn main(init: std.process.Init) !void {
     var stdout_buf: [4096]u8 = undefined;
@@ -46,19 +46,14 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         return;
     }
 
-    if (std.mem.eql(u8, command, "seq-smoke")) {
-        try seq_smoke.run(stdout);
-        return;
-    }
-
     if (!std.mem.eql(u8, command, "serve")) return error.InvalidCommand;
 
-    var device_text: []const u8 = "tcp:0.0.0.0:9000";
+    var device_text: []const u8 = "tcp:127.0.0.1:29092";
     var options: device_tcp.ServeOptions = .{
         .receipt_path = if (std.c.getenv("PENZAI_BITSTREAM_RECEIPT")) |value|
             std.mem.span(value)
         else
-            "/lib/firmware/xilinx/penzai-combined-v1/deployment_receipt.tsv",
+            default_receipt_path,
     };
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--device")) {
@@ -89,21 +84,16 @@ fn runMain(init: std.process.Init, stdout: *std.Io.Writer, stderr: *std.Io.Write
         }
     }
 
-    const device = try protocol_transport.parseDeviceSpec(device_text);
-    switch (device) {
-        .fake => return error.UnsupportedDevice,
-        .tcp => |tcp| {
-            try stdout.print("penzaid serve device=tcp host={s} port={d} heap_mib={d} mem={s} receipt={s}\n", .{
-                tcp.host,
-                tcp.port,
-                options.heap_mib,
-                @tagName(options.memory),
-                options.receipt_path,
-            });
-            try stdout.flush();
-            try device_tcp.serve(init.io, init.gpa, tcp, options);
-        },
-    }
+    const tcp = try protocol_transport.parseTcpSpec(device_text);
+    try stdout.print("penzaid serve device=tcp host={s} port={d} heap_mib={d} mem={s} receipt={s}\n", .{
+        tcp.host,
+        tcp.port,
+        options.heap_mib,
+        @tagName(options.memory),
+        options.receipt_path,
+    });
+    try stdout.flush();
+    try device_tcp.serve(init.io, init.gpa, tcp, options);
 }
 
 fn requireValue(args: *std.process.Args.Iterator) CliError![]const u8 {
@@ -127,12 +117,14 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
         \\
         \\commands:
         \\  serve      run the board/device runtime over TCP
-        \\  seq-smoke  seq.v bring-up gate A: no-DMA replay/timeout/abort test (penzaid must be stopped)
         \\  help       show this help
         \\
     );
 }
 
-test {
-    _ = @import("transport/tcp.zig");
+test "serve defaults to the deployment receipt" {
+    try std.testing.expectEqualStrings(
+        "/lib/firmware/xilinx/penzai/deployment_receipt.tsv",
+        default_receipt_path,
+    );
 }

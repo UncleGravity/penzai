@@ -1,23 +1,9 @@
-# external/
 .DS_Store
 .zig-cache/
 zig-out/
 models/
 config.env
 
-# Nix
 result
 result-*
-
-# verilator output
 obj_dir/
-
-# FPGA generated build and analysis artifacts
-fpga/bitstream/analysis/
-fpga/bitstream/out/*
-!fpga/bitstream/out/*.bit
-!fpga/bitstream/out/*.bit.bin
-fpga/ooc/out/
-
-# Benchmarks
-benchmarks/p0/runs/

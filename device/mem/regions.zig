@@ -15,7 +15,7 @@ pub const Allocation = struct {
 };
 
 /// Offset bookkeeping for a single linear backing store of `size` bytes,
-/// shared by the fake (host memory) and XRT (board DRAM) heaps.  It owns no
+/// shared by the in-memory and XRT (board DRAM) heaps. It owns no
 /// bytes — only the map from handles to byte ranges — so the same policy is
 /// tested once and reused by both backends.
 ///
@@ -27,8 +27,7 @@ pub const Allocation = struct {
 ///     bounds checks and offset resolution.
 ///
 /// First-fit over `free`; O(n) in the number of live/free extents, which stays
-/// small (llama.cpp allocates a handful of coarse buffers — weights, KV,
-/// compute, output — and reallocates the compute buffer as it grows).
+/// small because model provisioning uses a handful of coarse buffers.
 pub const Regions = struct {
     const Self = @This();
 

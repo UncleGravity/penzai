@@ -1,11 +1,9 @@
 //! TCP transport — the real-wire byte channel under the link. `Endpoint` owns the
-//! socket, TCP_NODELAY, the persistent 64 KiB stream buffers, and the zero-copy
-//! `callInto` (readFrameInto) the logits download relies on; `TcpTransport` adapts
-//! it to the link `Transport` interface (Endpoint.Error mapped to LinkError). The
-//! host's only transport that crosses the network; the in-process fake is fake.zig.
+//! socket and persistent 64 KiB stream buffers. `TcpTransport` adapts it to the
+//! typed client interface.
 const std = @import("std");
 const shared = @import("shared");
-const link = @import("link.zig");
+const link = @import("client.zig");
 
 const protocol_transport = shared.protocol_transport;
 
@@ -61,23 +59,6 @@ pub const Endpoint = struct {
             else => error.Transport,
         };
     }
-
-    pub fn callInto(
-        self: *Self,
-        allocator: std.mem.Allocator,
-        request_frame: []const u8,
-        payload_out: []u8,
-    ) Error!protocol_transport.FrameIntoResult {
-        var writer = self.stream.writer(self.io, &self.write_buf);
-        protocol_transport.writeFrame(&writer.interface, request_frame) catch return error.Transport;
-
-        var reader = self.stream.reader(self.io, &self.read_buf);
-        return protocol_transport.readFrameInto(allocator, &reader.interface, payload_out) catch |err| switch (err) {
-            error.OutOfMemory => error.OutOfMemory,
-            error.BadFrame => error.Protocol,
-            else => error.Transport,
-        };
-    }
 };
 
 /// Disable Nagle: our request/response ping-pong of small frames otherwise eats
@@ -123,25 +104,8 @@ pub const TcpTransport = struct {
         self.endpoint.deinit();
     }
 
-    pub fn ioHandle(self: *Self) ?std.Io {
-        return self.endpoint.io;
-    }
-
     pub fn call(self: *Self, allocator: std.mem.Allocator, request_frame: []const u8) link.LinkError![]u8 {
         return self.endpoint.call(allocator, request_frame) catch |err| switch (err) {
-            error.OutOfMemory => return error.OutOfMemory,
-            error.Protocol => return error.Protocol,
-            error.InvalidAddress, error.Transport => return error.Transport,
-        };
-    }
-
-    pub fn callInto(
-        self: *Self,
-        allocator: std.mem.Allocator,
-        request_frame: []const u8,
-        payload_out: []u8,
-    ) link.LinkError!protocol_transport.FrameIntoResult {
-        return self.endpoint.callInto(allocator, request_frame, payload_out) catch |err| switch (err) {
             error.OutOfMemory => return error.OutOfMemory,
             error.Protocol => return error.Protocol,
             error.InvalidAddress, error.Transport => return error.Transport,

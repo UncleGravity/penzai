@@ -1,0 +1,86 @@
+# Penzai accelerator AXI-Lite register map - single source of truth.
+# Format: offset  name  access  reset  description...
+# Unlisted bits in read-only registers read zero. CTRL command bits are W1P.
+
+0x000 ID                      ro 0xB05A4000 accelerator identifier
+0x004 VERSION                 ro 0x00010007 exact engine interface version
+0x008 LAYOUT_HASH_LO          ro 0x2FC14A79 low half of canonical v5 layout hash
+0x00C LAYOUT_HASH_HI          ro 0xC255C7A5 high half of canonical v5 layout hash
+0x010 CTRL                    wo 0x00000000 bits 0..5 model_spec-clear/begin/layer/seal/execute/run-clear; bits 6..11 ACK commit/error/result/model_spec-error/frontend-error/metrics
+0x014 STATUS                  ro 0x00000000 live core, clear, model_spec, pending event, ready, error, and metrics-pending bit 18
+0x018 CYCLES_LO               ro 0x00000000 low half of last completed or canceled EXEC cycle count
+0x01C CYCLES_HI               ro 0x00000000 high half of last completed or canceled EXEC cycle count
+0x020 CLK_HZ                  ro 0x00000000 fabric clock in Hz, supplied by wrapper parameter
+0x024 ACTIVE_MODEL_SPEC_ID       ro 0x00000000 sealed model_spec ID
+0x028 ACTIVE_MODEL_SPEC_HASH_LO  ro 0x00000000 low half of sealed model_spec hash
+0x02C ACTIVE_MODEL_SPEC_HASH_HI  ro 0x00000000 high half of sealed model_spec hash
+0x030 DEBUG                   ro 0x00000000 live layer bits 5:0 and stage bits 12:8
+0x034 FRONTEND_ERROR          ro 0x00000000 sticky wrapper error code
+0x038 AXI_MASTERS             ro 0x00000007 native AXI master count
+
+0x040 MODEL_SPEC_ID              rw 0x00000001 staged canonical model_spec ID
+0x044 MODEL_SPEC_HASH_LO         rw 0x2FC14A79 staged model_spec hash low
+0x048 MODEL_SPEC_HASH_HI         rw 0xC255C7A5 staged model_spec hash high
+0x04C MODEL_SPEC_LAYER_COUNT     rw 0x0000001C staged layer count
+0x050 MODEL_SPEC_HIDDEN_BLOCKS   rw 0x00000040 staged D/32
+0x054 MODEL_SPEC_FFN_BLOCKS      rw 0x000000C0 staged F/32
+0x058 MODEL_SPEC_Q_HEADS         rw 0x00000010 staged query heads
+0x05C MODEL_SPEC_KV_HEADS        rw 0x00000008 staged KV heads
+0x060 MODEL_SPEC_HEAD_DIM        rw 0x00000080 staged head dimension
+0x064 MODEL_SPEC_WEIGHT_FMT      rw 0x00000001 staged low-bit weight format
+0x068 MODEL_SPEC_CONTEXT_LIMIT   rw 0x00008000 staged maximum context
+0x06C MODEL_SPEC_VOCAB_ROWS      rw 0x00025075 staged vocabulary rows
+0x070 MODEL_SPEC_EMBED_ADDR_LO   rw 0x00000000 staged embedding base low
+0x074 MODEL_SPEC_EMBED_ADDR_HI   rw 0x00000000 staged embedding base high
+0x078 MODEL_SPEC_LM_ADDR_LO      rw 0x00000000 staged LM-head base low
+0x07C MODEL_SPEC_LM_ADDR_HI      rw 0x00000000 staged LM-head base high
+0x080 MODEL_SPEC_FINAL_ADDR_LO   rw 0x00000000 staged final-norm base low
+0x084 MODEL_SPEC_FINAL_ADDR_HI   rw 0x00000000 staged final-norm base high
+0x088 MODEL_SPEC_ROPE_ADDR_LO    rw 0x00000000 staged RoPE table base low
+0x08C MODEL_SPEC_ROPE_ADDR_HI    rw 0x00000000 staged RoPE table base high
+0x090 MODEL_SPEC_LAYER_INDEX     rw 0x00000000 staged descriptor layer
+0x094 MODEL_SPEC_LAYER_WORD      rw 0x00000000 staged descriptor word 0..7
+0x098 MODEL_SPEC_LAYER_DATA_LO   rw 0x00000000 staged descriptor data low
+0x09C MODEL_SPEC_LAYER_DATA_HI   rw 0x00000000 staged descriptor data high
+
+0x0B0 CMD_KV_CAPACITY         rw 0x00000000 staged allocated KV capacity in tokens
+0x0C0 CMD_TAG                 rw 0x00000000 staged EXEC tag
+0x0C4 CMD_MODEL_SPEC_ID          rw 0x00000001 staged EXEC model_spec ID
+0x0C8 CMD_MODEL_SPEC_HASH_LO     rw 0x2FC14A79 staged EXEC model_spec hash low
+0x0CC CMD_MODEL_SPEC_HASH_HI     rw 0xC255C7A5 staged EXEC model_spec hash high
+0x0D0 CMD_SHAPE               rw 0x00000101 token count bits 3:0, lane mask bits 15:8, emit-logits bit 16
+0x0D4 CMD_POSITION_BASE       rw 0x00000000 staged first token position
+0x0D8 CMD_KV_BASE_LO          rw 0x00000000 staged KV arena base low
+0x0DC CMD_KV_BASE_HI          rw 0x00000000 staged KV arena base high
+0x0E0 CMD_TOKEN0              rw 0x00000000 staged token ID lane 0
+0x0E4 CMD_TOKEN1              rw 0x00000000 staged token ID lane 1
+0x0E8 CMD_TOKEN2              rw 0x00000000 staged token ID lane 2
+0x0EC CMD_TOKEN3              rw 0x00000000 staged token ID lane 3
+0x0F0 CMD_TOKEN4              rw 0x00000000 staged token ID lane 4
+0x0F4 CMD_TOKEN5              rw 0x00000000 staged token ID lane 5
+0x0F8 CMD_TOKEN6              rw 0x00000000 staged token ID lane 6
+0x0FC CMD_TOKEN7              rw 0x00000000 staged token ID lane 7
+
+0x100 COMMIT_TAG              ro 0x00000000 captured commit tag
+0x104 COMMIT_MODEL_SPEC_ID       ro 0x00000000 captured commit model_spec ID
+0x108 COMMIT_MODEL_SPEC_HASH_LO  ro 0x00000000 captured commit model_spec hash low
+0x10C COMMIT_MODEL_SPEC_HASH_HI  ro 0x00000000 captured commit model_spec hash high
+0x110 COMMIT_INFO             ro 0x00000000 token count bits 3:0, KV length bits 20:4, logits-valid bit 21
+0x120 ERROR_TAG               ro 0x00000000 captured runtime error tag
+0x124 ERROR_CODE_DETAIL       ro 0x00000000 error code bits 15:0 and detail bits 23:16
+0x128 ERROR_LOCATION          ro 0x00000000 layer bits 5:0 and stage bits 12:8
+0x140 RESULT_TOKEN_STATUS     ro 0x00000000 token bits 17:0, status bits 25:18, error bit 26
+0x144 RESULT_LOGIT            ro 0x00000000 greedy logit FP32 bits
+0x150 MODEL_SPEC_ERROR           ro 0x00000000 config code bits 7:0, layer bits 13:8, word bits 18:16
+
+0x160 METRICS_SCHEMA          ro 0x00010000 metrics schema major/minor
+0x164 METRICS_CAPABILITIES    ro 0x00280B1D core bank, saturating counters, frozen snapshot, indexed read, 11 stages, 40 metrics
+0x168 METRICS_STATUS          ro 0x00000008 valid/recording/sealing/enabled/overflow bits 0..4 and outcome bits 6:5
+0x16C METRICS_TAG             ro 0x00000000 captured EXEC tag
+0x170 METRICS_INDEX           rw 0x00000000 selected metric ID bits 6:0
+0x174 METRICS_DATA_LO         ro 0x00000000 selected metric value, native widths zero-extended to 32 bits
+0x178 METRICS_DATA_HI         ro 0x00000000 selected metric high word; nonzero only for total cycles
+0x17C METRICS_OVERFLOW0       ro 0x00000000 sticky saturation bits for metric IDs 0..31
+0x180 METRICS_OVERFLOW1       ro 0x00000000 sticky saturation bits for metric IDs 32..63
+0x184 METRICS_OVERFLOW2       ro 0x00000000 reserved overflow extension
+0x188 METRICS_OVERFLOW3       ro 0x00000000 reserved overflow extension

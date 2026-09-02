@@ -1,13 +1,14 @@
 const std = @import("std");
 
-pub const version: u16 = 2;
-pub const encoded_len: usize = 552;
+pub const version: u16 = 5;
+pub const encoded_len: usize = 520;
 
 const magic: u32 = 0x5041_4350; // "PCAP", little-endian on the wire.
 
-pub const Engine = struct {
-    pub const matmul: u32 = 1 << 0;
-    pub const flash: u32 = 1 << 1;
+pub const Feature = struct {
+    pub const inference: u32 = 1 << 0;
+    pub const metrics_summary: u32 = 1 << 1;
+    pub const metrics_full: u32 = 1 << 2;
 };
 
 pub const Format = struct {
@@ -136,26 +137,25 @@ pub const Receipt = struct {
 };
 
 pub const EngineInfo = struct {
-    id: u32 = 0,
-    version: u32 = 0,
+    interface_id: u32 = 0,
+    interface_version: u32 = 0,
     clock_hz: u32 = 0,
-    dim0: u32 = 0,
-    dim1: u32 = 0,
-    dim2: u32 = 0,
-    dim3: u32 = 0,
-    dim4: u32 = 0,
+    token_tile_max: u32 = 0,
+    token_lanes: u32 = 0,
+    model_spec_count: u32 = 0,
+    context_tokens_max: u32 = 0,
+    address_record_bytes: u32 = 0,
 };
 
 pub const Report = struct {
     receipt_status: ReceiptStatus = .missing,
     wire_abi: u16 = 0,
-    profile_abi: u16 = 0,
-    engine_mask: u32 = 0,
+    metrics_schema: u16 = 0,
+    feature_mask: u32 = 0,
     format_mask: u32 = 0,
     identity_flags: u32 = 0,
     manifest_schema: u32 = 0,
-    matmul: EngineInfo = .{},
-    flash: EngineInfo = .{},
+    engine: EngineInfo = .{},
     run_id: Text128 = .{},
     variant: Text64 = .{},
     git_commit: Text64 = .{},
@@ -192,13 +192,12 @@ pub fn encode(report: Report, out: []u8) error{OutputTooSmall}!usize {
     putU8(out, &cursor, @intFromEnum(report.receipt_status));
     putU8(out, &cursor, 0);
     putU16(out, &cursor, report.wire_abi);
-    putU16(out, &cursor, report.profile_abi);
-    putU32(out, &cursor, report.engine_mask);
+    putU16(out, &cursor, report.metrics_schema);
+    putU32(out, &cursor, report.feature_mask);
     putU32(out, &cursor, report.format_mask);
     putU32(out, &cursor, report.identity_flags);
     putU32(out, &cursor, report.manifest_schema);
-    putEngine(out, &cursor, report.matmul);
-    putEngine(out, &cursor, report.flash);
+    putEngine(out, &cursor, report.engine);
     putText(128, out, &cursor, report.run_id);
     putText(64, out, &cursor, report.variant);
     putText(64, out, &cursor, report.git_commit);
@@ -219,13 +218,12 @@ pub fn decode(bytes: []const u8) DecodeError!Report {
     var report: Report = .{
         .receipt_status = status,
         .wire_abi = takeU16(bytes, &cursor),
-        .profile_abi = takeU16(bytes, &cursor),
-        .engine_mask = takeU32(bytes, &cursor),
+        .metrics_schema = takeU16(bytes, &cursor),
+        .feature_mask = takeU32(bytes, &cursor),
         .format_mask = takeU32(bytes, &cursor),
         .identity_flags = takeU32(bytes, &cursor),
         .manifest_schema = takeU32(bytes, &cursor),
-        .matmul = takeEngine(bytes, &cursor),
-        .flash = takeEngine(bytes, &cursor),
+        .engine = takeEngine(bytes, &cursor),
     };
     report.run_id = try takeText(128, bytes, &cursor);
     report.variant = try takeText(64, bytes, &cursor);
@@ -238,19 +236,28 @@ pub fn decode(bytes: []const u8) DecodeError!Report {
 }
 
 fn putEngine(out: []u8, cursor: *usize, info: EngineInfo) void {
-    inline for (.{ info.id, info.version, info.clock_hz, info.dim0, info.dim1, info.dim2, info.dim3, info.dim4 }) |value| putU32(out, cursor, value);
+    inline for (.{
+        info.interface_id,
+        info.interface_version,
+        info.clock_hz,
+        info.token_tile_max,
+        info.token_lanes,
+        info.model_spec_count,
+        info.context_tokens_max,
+        info.address_record_bytes,
+    }) |value| putU32(out, cursor, value);
 }
 
 fn takeEngine(bytes: []const u8, cursor: *usize) EngineInfo {
     return .{
-        .id = takeU32(bytes, cursor),
-        .version = takeU32(bytes, cursor),
+        .interface_id = takeU32(bytes, cursor),
+        .interface_version = takeU32(bytes, cursor),
         .clock_hz = takeU32(bytes, cursor),
-        .dim0 = takeU32(bytes, cursor),
-        .dim1 = takeU32(bytes, cursor),
-        .dim2 = takeU32(bytes, cursor),
-        .dim3 = takeU32(bytes, cursor),
-        .dim4 = takeU32(bytes, cursor),
+        .token_tile_max = takeU32(bytes, cursor),
+        .token_lanes = takeU32(bytes, cursor),
+        .model_spec_count = takeU32(bytes, cursor),
+        .context_tokens_max = takeU32(bytes, cursor),
+        .address_record_bytes = takeU32(bytes, cursor),
     };
 }
 
@@ -303,17 +310,25 @@ fn takeU32(bytes: []const u8, cursor: *usize) u32 {
 test "capability payload roundtrips exactly" {
     var report: Report = .{
         .receipt_status = .loaded,
-        .wire_abi = 12,
-        .profile_abi = 6,
-        .engine_mask = Engine.matmul | Engine.flash,
+        .wire_abi = 18,
+        .metrics_schema = 1,
+        .feature_mask = Feature.inference | Feature.metrics_summary,
         .format_mask = Format.weight_q1_0 | Format.weight_q2_0_g64 | Format.activation_q8_0,
         .identity_flags = IdentityFlag.bitstream_hash_verified,
         .manifest_schema = 1,
-        .matmul = .{ .id = 0xB05A2000, .version = 11, .clock_hz = 300_000_000, .dim0 = 16, .dim1 = 4, .dim2 = 8, .dim3 = 16384 },
-        .flash = .{ .id = 0xF1A54A01, .version = 1, .clock_hz = 300_000_000, .dim0 = 8, .dim1 = 128, .dim2 = 32, .dim3 = 8, .dim4 = 64 },
+        .engine = .{
+            .interface_id = 0xB05A_4000,
+            .interface_version = 0x0001_0007,
+            .clock_hz = 285_000_000,
+            .token_tile_max = 8,
+            .token_lanes = 4,
+            .model_spec_count = 3,
+            .context_tokens_max = 65_536,
+            .address_record_bytes = 64,
+        },
     };
-    try report.run_id.set("20260804T120000Z-deadbeef-w512-p4-f300-clean");
-    try report.variant.set("w512-p4-f300");
+    try report.run_id.set("20260804T120000Z-deadbeef-f225");
+    try report.variant.set("f225");
     try report.git_commit.set("deadbeef1234");
     try report.bitstream_sha256.set("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
     try report.manifest_sha256.set("1123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef");
@@ -332,7 +347,7 @@ test "deployment receipt requires the existing manifest identity" {
         "receipt_schema_version\t1\n" ++
         "manifest_schema_version\t1\n" ++
         "run_id\tclean-run\n" ++
-        "variant\tw512-p4-f300\n" ++
+        "variant\tf225\n" ++
         "git_commit\tdeadbeef1234\n" ++
         "git_dirty\t0\n" ++
         "source_sha256\t2222\n" ++
@@ -350,7 +365,7 @@ test "deployment receipt requires explicit dirty state" {
         "receipt_schema_version\t1\n" ++
         "manifest_schema_version\t1\n" ++
         "run_id\tincomplete-run\n" ++
-        "variant\tw512-p4-f300\n" ++
+        "variant\tf225\n" ++
         "git_commit\tdeadbeef1234\n" ++
         "source_sha256\t2222\n" ++
         "manifest_sha256\t3333\n" ++

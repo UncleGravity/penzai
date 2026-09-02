@@ -1,10 +1,13 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const shared = @import("shared");
 const runtime_mod = @import("runtime");
 const server_mod = @import("server");
 
 const protocol_transport = shared.protocol_transport;
 const capabilities = shared.capabilities;
+const framing = shared.framing;
+const wire = shared.wire;
 
 const net = std.Io.net;
 
@@ -23,14 +26,20 @@ pub const ServeError = error{
     XrtBOAllocFailed,
     XrtBOMapFailed,
     XrtBOSyncFailed,
+    EngineOpenFailed,
 };
 
 pub const ServeOptions = struct {
-    heap_mib: u32 = 16,
+    heap_mib: u32 = 1500,
     max_requests: ?u32 = null,
-    memory: MemoryBackend = .fake,
+    memory: MemoryBackend = .xrt,
     receipt_path: []const u8 = "",
 };
+
+test "board daemon defaults to the development heap" {
+    const options: ServeOptions = .{};
+    try std.testing.expectEqual(@as(u32, 1500), options.heap_mib);
+}
 
 pub const MemoryBackend = enum {
     fake,
@@ -64,9 +73,24 @@ fn serveWithRuntime(
 
     var remaining = options.max_requests;
     while (remaining == null or remaining.? > 0) {
-        var stream = listener.accept(io) catch return error.Transport;
-        defer stream.close(io);
-        const handled = try serveStream(io, allocator, &runtime, stream, remaining);
+        var stream = listener.accept(io) catch |err| switch (err) {
+            // A peer can disappear between the kernel queuing and accepting it.
+            // That is a client failure, not a listener failure.
+            error.ConnectionAborted => continue,
+            else => return error.Transport,
+        };
+        const result = serveStream(io, allocator, &runtime, stream, remaining);
+        stream.close(io);
+        const handled = result catch |err| switch (err) {
+            // One client owns the runtime at a time. A malformed frame or a
+            // broken socket ends only that client's turn, then accept resumes.
+            error.Protocol, error.Transport => {
+                if (!builtin.is_test)
+                    std.debug.print("device client ended with {s}; accepting the next client\n", .{@errorName(err)});
+                continue;
+            },
+            error.OutOfMemory => return error.OutOfMemory,
+        };
         if (remaining) |*n| {
             if (handled >= n.*) {
                 n.* = 0;
@@ -110,6 +134,7 @@ fn mapInitError(err: anyerror) ServeError {
         error.XrtBOAllocFailed => error.XrtBOAllocFailed,
         error.XrtBOMapFailed => error.XrtBOMapFailed,
         error.XrtBOSyncFailed => error.XrtBOSyncFailed,
+        error.EngineOpenFailed => error.EngineOpenFailed,
         else => error.Transport,
     };
 }
@@ -130,7 +155,7 @@ fn serveStream(
     runtime: anytype,
     stream: net.Stream,
     max_requests: ?u32,
-) ServeError!u32 {
+) error{ OutOfMemory, Transport, Protocol }!u32 {
     setNoDelay(stream.socket.handle);
     var handled: u32 = 0;
     // Persistent per-connection stream buffers (and reader/writer), so request
@@ -185,4 +210,130 @@ fn resolveListenAddress(spec: protocol_transport.TcpSpec) !net.IpAddress {
         return .{ .ip4 = net.Ip4Address.loopback(spec.port) };
     }
     return net.IpAddress.parse(spec.host, spec.port);
+}
+
+test "native TCP reconnect, malformed isolation, and sequential reuse" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    const listen_address: net.IpAddress = .{ .ip4 = net.Ip4Address.loopback(0) };
+    var listener = try listen_address.listen(io, .{ .reuse_address = true });
+    var listener_open = true;
+    defer if (listener_open) listener.deinit(io);
+
+    const TestServer = struct {
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        listener: *net.Server,
+        result: ?ServeError = null,
+
+        fn run(self: *@This()) void {
+            serveWithRuntime(
+                runtime_mod.Runtime,
+                self.io,
+                self.allocator,
+                self.listener,
+                4096,
+                .{ .memory = .fake, .max_requests = 4 },
+            ) catch |err| {
+                self.result = err;
+            };
+        }
+    };
+
+    var test_server = TestServer{
+        .io = io,
+        .allocator = allocator,
+        .listener = &listener,
+    };
+    const thread = try std.Thread.spawn(.{}, TestServer.run, .{&test_server});
+    var thread_joined = false;
+    defer if (!thread_joined) {
+        if (listener_open) {
+            listener.deinit(io);
+            listener_open = false;
+        }
+        thread.join();
+    };
+
+    const address = listener.socket.address;
+
+    // A successful request may disconnect and a later client reuses the same
+    // runtime state. Keep an allocation alive across the reconnect to prove it.
+    var first = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    var request_meta: [64]u8 = undefined;
+    const alloc_len = try wire.encodeAlloc(&request_meta, 1, 64, 64);
+    const alloc_response = try callTestClient(io, allocator, first, request_meta[0..alloc_len], "");
+    try std.testing.expectEqual(wire.Status.ok, alloc_response.status);
+    try std.testing.expect(alloc_response.handle != 0);
+    first.close(io);
+
+    // A complete but invalid framing header must close only this connection.
+    var malformed = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    try writeTestBytes(io, malformed, &([_]u8{0} ** framing.header_len));
+    malformed.close(io);
+
+    // A disconnect in the middle of a header is isolated in the same way.
+    var partial = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    try writeTestBytes(io, partial, "PNZ1\x01\x00\x00\x00");
+    partial.close(io);
+
+    // The next connection can free the first client's allocation and can issue
+    // multiple sequential requests without reconnecting.
+    var reused = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    const free_len = try wire.encodeFree(&request_meta, 2, alloc_response.handle);
+    const free_response = try callTestClient(io, allocator, reused, request_meta[0..free_len], "");
+    try std.testing.expectEqual(wire.Status.ok, free_response.status);
+    const hello_len = try wire.encodeHello(&request_meta, 3);
+    const hello_response = try callTestClient(io, allocator, reused, request_meta[0..hello_len], "");
+    try std.testing.expectEqual(@as(u64, 3), hello_response.request_id);
+    try std.testing.expectEqual(wire.Status.ok, hello_response.status);
+    reused.close(io);
+
+    // A final reconnect proves accept resumed after both clean and bad clients.
+    var final_client = try address.connect(io, .{ .mode = .stream, .protocol = .tcp });
+    defer final_client.close(io);
+    const capabilities_len = try wire.encodeCapabilities(&request_meta, 4);
+    const capabilities_response = try callTestClient(
+        io,
+        allocator,
+        final_client,
+        request_meta[0..capabilities_len],
+        "",
+    );
+    try std.testing.expectEqual(@as(u64, 4), capabilities_response.request_id);
+    try std.testing.expectEqual(wire.Status.ok, capabilities_response.status);
+
+    thread.join();
+    thread_joined = true;
+    if (test_server.result) |err| return err;
+    listener.deinit(io);
+    listener_open = false;
+}
+
+fn callTestClient(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    stream: net.Stream,
+    metadata: []const u8,
+    payload: []const u8,
+) !wire.ResponseMeta {
+    var request: [framing.header_len + 64]u8 = undefined;
+    const request_len = try framing.encode(metadata, payload, &request);
+    var write_buf: [256]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try protocol_transport.writeFrame(&writer.interface, request[0..request_len]);
+
+    var read_buf: [256]u8 = undefined;
+    var reader = stream.reader(io, &read_buf);
+    const response_bytes = try protocol_transport.readFrameAlloc(allocator, &reader.interface);
+    defer allocator.free(response_bytes);
+    const response = try framing.decode(response_bytes);
+    return wire.decodeResponseMeta(response.metadata);
+}
+
+fn writeTestBytes(io: std.Io, stream: net.Stream, bytes: []const u8) !void {
+    var write_buf: [64]u8 = undefined;
+    var writer = stream.writer(io, &write_buf);
+    try writer.interface.writeAll(bytes);
+    try writer.interface.flush();
 }

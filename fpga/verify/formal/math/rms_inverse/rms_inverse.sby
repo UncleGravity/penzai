@@ -1,0 +1,28 @@
+[tasks]
+bmc
+faults
+cover
+
+[options]
+bmc: mode bmc
+bmc: depth 112
+faults: mode bmc
+faults: depth 24
+cover: mode cover
+cover: depth 160
+
+[engines]
+bmc: abc bmc3
+faults: abc bmc3
+cover: smtbmc boolector
+
+[script]
+bmc: read -formal -D FORMAL -D FORMAL_BMC arithmetic_stubs.v rms_inverse.v harness.sv
+faults: read -formal -D FORMAL -D FORMAL_FAULTS arithmetic_stubs.v rms_inverse.v harness.sv
+cover: read -formal -D FORMAL -D FORMAL_COVER arithmetic_stubs.v rms_inverse.v harness.sv
+prep -top rms_inverse_harness -flatten
+
+[files]
+fpga/verify/formal/math/rms_inverse/arithmetic_stubs.v
+fpga/rtl/vector/rms_inverse.v
+fpga/verify/formal/math/rms_inverse/harness.sv

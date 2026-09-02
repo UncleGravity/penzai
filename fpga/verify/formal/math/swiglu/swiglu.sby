@@ -1,0 +1,27 @@
+[tasks]
+prove
+bmc
+cover
+
+[options]
+prove: mode prove
+prove: depth 20
+bmc: mode bmc
+bmc: depth 32
+cover: mode cover
+cover: depth 96
+
+[engines]
+prove: abc pdr
+bmc: smtbmc boolector
+cover: smtbmc boolector
+
+[script]
+read -formal -D FORMAL arithmetic_stubs.v swiglu.v harness.sv
+prep -top swiglu_harness -flatten
+
+[files]
+fpga/rtl/lib/fmt.vh
+fpga/verify/formal/math/swiglu/arithmetic_stubs.v
+fpga/rtl/vector/swiglu.v
+fpga/verify/formal/math/swiglu/harness.sv
