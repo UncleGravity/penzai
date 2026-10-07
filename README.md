@@ -2,6 +2,19 @@
 
 1-Bit / 1.58-Bit LLM inference accelerator on FPGA (KR260)
 
+![Llama generating tokens](docs/assets/llama-token-generation.gif)
+
+## Model support
+
+| Model | Parameters | Weight encoding | HuggingFace |
+| --- | ---: | --- | --- |
+| `Bonsai-1.7B` | 1.7B | `Q1_0` | [prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) |
+| `Ternary-Bonsai-1.7B` | 1.7B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf) |
+| `Bonsai-4B` | 4B | `Q1_0` | [prism-ml/Bonsai-4B-gguf](https://huggingface.co/prism-ml/Bonsai-4B-gguf) |
+| `Ternary-Bonsai-4B` | 4B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-4B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf) |
+| `Bonsai-8B` | 8B | `Q1_0` | [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf) |
+| `Ternary-Bonsai-8B` | 8B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-8B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf) |
+
 ## Load The Bitstream
 
 ```bash
@@ -34,25 +47,14 @@ nix run .#llama-cli-penzai -- \
   -no-cnv
 ```
 
-## Model support
-
-| Model | Parameters | Weight encoding | HuggingFace |
-| --- | ---: | --- | --- |
-| `Bonsai-1.7B` | 1.7B | `Q1_0` | [prism-ml/Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Bonsai-1.7B-gguf) |
-| `Ternary-Bonsai-1.7B` | 1.7B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-1.7B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-1.7B-gguf) |
-| `Bonsai-4B` | 4B | `Q1_0` | [prism-ml/Bonsai-4B-gguf](https://huggingface.co/prism-ml/Bonsai-4B-gguf) |
-| `Ternary-Bonsai-4B` | 4B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-4B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-4B-gguf) |
-| `Bonsai-8B` | 8B | `Q1_0` | [prism-ml/Bonsai-8B-gguf](https://huggingface.co/prism-ml/Bonsai-8B-gguf) |
-| `Ternary-Bonsai-8B` | 8B | `Q2_0` (group 64) | [prism-ml/Ternary-Bonsai-8B-gguf](https://huggingface.co/prism-ml/Ternary-Bonsai-8B-gguf) |
+```sh
+nix develop -c zig build test
+nix develop -c zig build verify-rtl
+nix flake check --no-build
+```
 
 - [Architecture](docs/architecture.md)
 - [CLI and llama integration](docs/cli.md)
 - [KR260 deployment](docs/deployment.md)
 - [Metrics](docs/metrics.md)
 - [Verification and qualification](docs/verification.md)
-
-```sh
-nix develop -c zig build test
-nix develop -c zig build verify-rtl
-nix flake check --no-build
-```
